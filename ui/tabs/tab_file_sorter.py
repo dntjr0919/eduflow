@@ -1,8 +1,11 @@
 """
 [탭 1] 📁 스마트 파일 자동 분류기 (ui/tabs/tab_file_sorter.py)
-- ui/styles/theme.qss 모던 카드 레이아웃, setObjectName, setProperty("role", ...), style().polish() 강제 적용
+- 기존 QGroupBox를 HoverZoomCard(1초 호버 시 Z-order 최상단 부상 + OutCubic 대각선 슬라이딩 확대/축소)로 교체
+- 모든 입력 필드 최소 높이 34px 이상, verticalSpacing 12px 이상 적용
+- '자동 분류 규칙 설정' 카드 및 '최근 파일 분류 내역' 카드에 [ ⛶ 전체화면 ] / [ 🗗 원래 크기로 ] 포커스 토글 버튼 제공
 """
 
+import html
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -17,16 +20,18 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -42,6 +47,7 @@ from services.file_sorter_service import (
     RealtimeFolderWatchWorker,
 )
 from services.notifier import NotificationService
+from ui.components.hover_zoom_card import HoverZoomCard
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -57,6 +63,18 @@ def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
         st.polish(widget)
 
 
+def build_floating_tooltip(title: str, lines: List[str]) -> str:
+    """테이블/리스트 항목 위에 마우스를 올렸을 때 플로팅 팝업 카드 형태로 전체 내용을 보여주는 HTML 툴팁."""
+    escaped_title = html.escape(title)
+    body_html = "<br/>".join(lines)
+    return (
+        f"<div style='min-width: 260px; padding: 2px 4px;'>"
+        f"<div style='color: #60a5fa; font-weight: 700; margin-bottom: 4px;'>{escaped_title}</div>"
+        f"<div style='color: #f8fafc; line-height: 1.45;'>{body_html}</div>"
+        f"</div>"
+    )
+
+
 class RuleEditDialog(QDialog):
     """분류 규칙 추가 및 수정을 위한 모달 다이얼로그."""
 
@@ -64,26 +82,31 @@ class RuleEditDialog(QDialog):
         super().__init__(parent)
         apply_qss_role(self, obj_name="RuleEditModal")
         self.setWindowTitle("분류 규칙 설정" if rule_data else "새 분류 규칙 추가")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(520)
         self.rule_data = rule_data or {}
         self._init_ui()
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(12)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
 
         form = QFormLayout()
-        form.setSpacing(10)
+        form.setVerticalSpacing(12)
+        form.setHorizontalSpacing(16)
+        form.setContentsMargins(6, 6, 6, 6)
 
         self.spin_priority = QSpinBox()
+        self.spin_priority.setMinimumHeight(34)
         self.spin_priority.setRange(1, 999)
         self.spin_priority.setValue(int(self.rule_data.get("priority", 10)))
 
         self.edit_name = QLineEdit(str(self.rule_data.get("rule_name", "")))
+        self.edit_name.setMinimumHeight(34)
         self.edit_name.setPlaceholderText("예: 공문 및 시행문 / 성적 평가자료")
 
         self.combo_match_type = QComboBox()
+        self.combo_match_type.setMinimumHeight(34)
         self.combo_match_type.addItem("파일명 키워드 포함 (keyword)", "keyword")
         self.combo_match_type.addItem("파일 확장자 일치 (extension)", "extension")
         self.combo_match_type.addItem("키워드 + 확장자 모두 일치 (both)", "both")
@@ -93,12 +116,15 @@ class RuleEditDialog(QDialog):
             self.combo_match_type.setCurrentIndex(idx)
 
         self.edit_keywords = QLineEdit(str(self.rule_data.get("keywords", "")))
+        self.edit_keywords.setMinimumHeight(34)
         self.edit_keywords.setPlaceholderText("쉼표(,)로 구분 (예: 공문,시행,협조,접수)")
 
         self.edit_extensions = QLineEdit(str(self.rule_data.get("extensions", "")))
+        self.edit_extensions.setMinimumHeight(34)
         self.edit_extensions.setPlaceholderText("쉼표(,)로 구분 (예: .hwp,.hwpx,.pdf,.xlsx)")
 
         self.edit_folder = QLineEdit(str(self.rule_data.get("category_folder", "")))
+        self.edit_folder.setMinimumHeight(34)
         self.edit_folder.setPlaceholderText("Target 폴더 아래 생성될 하위 폴더명 (예: 01_공문서_시행문)")
 
         self.chk_active = QCheckBox("이 규칙 활성화")
@@ -182,6 +208,7 @@ class FileSorterTab(QWidget):
         self.notifier = NotificationService()
         self.sorter_service = FileSorterService(self.db)
         self._is_watching = False
+        self._focused_card: Optional[str] = None
 
         self.realtime_sorted_signal.connect(self._on_realtime_file_sorted)
         self._init_ui()
@@ -193,15 +220,30 @@ class FileSorterTab(QWidget):
             self.toggle_realtime_watch(force_state=True)
 
     def _init_ui(self) -> None:
-        main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(12)
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
 
-        top_group = QGroupBox("📂 폴더 지정 및 스마트 분류 실행 옵션")
-        apply_qss_role(top_group, obj_name="SorterFolderGroup")
-        top_layout = QVBoxLayout(top_group)
-        top_layout.setContentsMargins(15, 15, 15, 15)
-        top_layout.setSpacing(10)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        content_widget = QWidget()
+        content_widget.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
+        main_layout = QVBoxLayout(content_widget)
+        main_layout.setContentsMargins(14, 14, 24, 24)
+        main_layout.setSpacing(14)
+
+        self.top_group = HoverZoomCard(
+            title="📂 폴더 지정 및 스마트 분류 실행 옵션",
+            parent=content_widget,
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.top_group, role="hoverZoomCard", obj_name="SorterFolderGroup")
+        top_layout = self.top_group.body_layout()
 
         folders_row = QHBoxLayout()
         folders_row.setSpacing(16)
@@ -226,7 +268,8 @@ class FileSorterTab(QWidget):
         src_header.addWidget(btn_open_src)
 
         self.list_source_dirs = QListWidget()
-        self.list_source_dirs.setMaximumHeight(88)
+        self.list_source_dirs.setMouseTracking(True)
+        self.list_source_dirs.setMinimumHeight(76)
         src_box.addLayout(src_header)
         src_box.addWidget(self.list_source_dirs)
         folders_row.addLayout(src_box, stretch=3)
@@ -235,21 +278,25 @@ class FileSorterTab(QWidget):
         target_lbl = QLabel("<b>분류 기준 상위 폴더 (Target Base Directory)</b>")
         target_input_row = QHBoxLayout()
         self.edit_target_dir = QLineEdit()
+        self.edit_target_dir.setMinimumHeight(34)
         self.edit_target_dir.setPlaceholderText("분류된 하위 폴더들이 생성될 기준 폴더 경로")
         self.edit_target_dir.editingFinished.connect(self._save_ui_to_config)
         btn_browse_target = QPushButton("찾아보기...")
         apply_qss_role(btn_browse_target)
+        btn_browse_target.setMinimumHeight(34)
         btn_open_target = QPushButton("열기")
         apply_qss_role(btn_open_target)
+        btn_open_target.setMinimumHeight(34)
         btn_browse_target.clicked.connect(self._on_browse_target_dir)
         btn_open_target.clicked.connect(self._on_open_target_dir)
-        target_input_row.addWidget(self.edit_target_dir)
+        target_input_row.addWidget(self.edit_target_dir, stretch=1)
         target_input_row.addWidget(btn_browse_target)
         target_input_row.addWidget(btn_open_target)
 
         opts_row = QHBoxLayout()
         opts_row.addWidget(QLabel("처리 방식:"))
         self.combo_action_mode = QComboBox()
+        self.combo_action_mode.setMinimumHeight(34)
         self.combo_action_mode.addItem("파일 이동 (shutil.move)", "move")
         self.combo_action_mode.addItem("파일 복사 (원본 유지)", "copy")
         self.combo_action_mode.currentIndexChanged.connect(self._save_ui_to_config)
@@ -257,6 +304,7 @@ class FileSorterTab(QWidget):
 
         opts_row.addWidget(QLabel("중복 파일명:"))
         self.combo_dup_policy = QComboBox()
+        self.combo_dup_policy.setMinimumHeight(34)
         self.combo_dup_policy.addItem("번호 추가 (파일명_(1).ext)", "number")
         self.combo_dup_policy.addItem("날짜시간 추가 (파일명_YYYYMMDD.ext)", "date")
         self.combo_dup_policy.currentIndexChanged.connect(self._save_ui_to_config)
@@ -279,12 +327,12 @@ class FileSorterTab(QWidget):
 
         self.btn_run_once = QPushButton("🚀 즉시 1회 분류 실행")
         apply_qss_role(self.btn_run_once, role="primary", obj_name="BtnRunSortOnce")
-        self.btn_run_once.setMinimumHeight(40)
+        self.btn_run_once.setMinimumHeight(38)
         self.btn_run_once.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_run_once.clicked.connect(self.run_batch_sort_once)
 
         self.btn_toggle_watch = QPushButton("👁️ 실시간 자동 감시 모드: OFF (클릭하여 시작)")
-        self.btn_toggle_watch.setMinimumHeight(40)
+        self.btn_toggle_watch.setMinimumHeight(38)
         self.btn_toggle_watch.setCheckable(True)
         self.btn_toggle_watch.setCursor(Qt.CursorShape.PointingHandCursor)
         self._update_watch_button_style(False)
@@ -300,14 +348,29 @@ class FileSorterTab(QWidget):
         action_bar.addStretch()
 
         top_layout.addLayout(action_bar)
-        main_layout.addWidget(top_group)
+        main_layout.addWidget(self.top_group)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        # ---------------------------------------------------------------------
+        # 카드 1: 자동 분류 규칙 설정 (HoverZoomCard + [ ⛶ 전체화면 ] 버튼)
+        # ---------------------------------------------------------------------
+        self.rules_group = HoverZoomCard(
+            title="📋 자동 분류 규칙 설정 (우선순위 숫자가 작을수록 먼저 매칭되며, 하위 폴더가 없으면 자동 생성됩니다)",
+            parent=content_widget,
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.rules_group, role="hoverZoomCard", obj_name="SorterRulesGroup")
+        self.rules_group.setMinimumHeight(240)
 
-        rules_group = QGroupBox("📋 자동 분류 규칙 설정 (우선순위 숫자가 작을수록 먼저 매칭되며, 하위 폴더가 없으면 자동 생성됩니다)")
-        apply_qss_role(rules_group, obj_name="SorterRulesGroup")
-        rules_layout = QVBoxLayout(rules_group)
-        rules_layout.setContentsMargins(15, 15, 15, 15)
+        self.btn_focus_rules = QPushButton("⛶ 전체화면")
+        apply_qss_role(self.btn_focus_rules, role="cardMax", obj_name="CardMaxButton")
+        self.btn_focus_rules.setCheckable(True)
+        self.btn_focus_rules.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_focus_rules.setToolTip("자동 분류 규칙 설정 카드를 전체화면으로 확대하거나 원래 크기로 복원합니다.")
+        self.btn_focus_rules.clicked.connect(lambda: self._toggle_card_focus("rules"))
+        self.rules_group.add_header_widget(self.btn_focus_rules)
+
+        rules_layout = self.rules_group.body_layout()
 
         rules_btn_bar = QHBoxLayout()
         btn_add_rule = QPushButton("+ 새 규칙 추가")
@@ -333,6 +396,8 @@ class FileSorterTab(QWidget):
 
         self.table_rules = QTableWidget(0, 8)
         self.table_rules.setAlternatingRowColors(True)
+        self.table_rules.setMouseTracking(True)
+        self.table_rules.verticalHeader().setDefaultSectionSize(32)
         self.table_rules.setHorizontalHeaderLabels(
             ["ID", "우선순위", "활성", "규칙 이름", "매칭 방식", "키워드 (쉼표 구분)", "확장자 (쉼표 구분)", "생성/이동할 하위 폴더명"]
         )
@@ -350,13 +415,30 @@ class FileSorterTab(QWidget):
         r_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.table_rules.hideColumn(0)
 
-        rules_layout.addWidget(self.table_rules)
-        splitter.addWidget(rules_group)
+        rules_layout.addWidget(self.table_rules, stretch=1)
+        main_layout.addWidget(self.rules_group, stretch=1)
 
-        history_group = QGroupBox("🕒 최근 파일 분류 내역 및 실행 취소 (원래 위치로 되돌리기)")
-        apply_qss_role(history_group, obj_name="SorterHistoryGroup")
-        history_layout = QVBoxLayout(history_group)
-        history_layout.setContentsMargins(15, 15, 15, 15)
+        # ---------------------------------------------------------------------
+        # 카드 2: 최근 파일 분류 내역 및 실행 취소 (HoverZoomCard + [ ⛶ 전체화면 ] 버튼)
+        # ---------------------------------------------------------------------
+        self.history_group = HoverZoomCard(
+            title="🕒 최근 파일 분류 내역 및 실행 취소 (원래 위치로 되돌리기)",
+            parent=content_widget,
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.history_group, role="hoverZoomCard", obj_name="SorterHistoryGroup")
+        self.history_group.setMinimumHeight(220)
+
+        self.btn_focus_history = QPushButton("⛶ 전체화면")
+        apply_qss_role(self.btn_focus_history, role="cardMax", obj_name="CardMaxButton")
+        self.btn_focus_history.setCheckable(True)
+        self.btn_focus_history.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_focus_history.setToolTip("최근 파일 분류 내역 카드를 전체화면으로 확대하거나 원래 크기로 복원합니다.")
+        self.btn_focus_history.clicked.connect(lambda: self._toggle_card_focus("history"))
+        self.history_group.add_header_widget(self.btn_focus_history)
+
+        history_layout = self.history_group.body_layout()
 
         hist_btn_bar = QHBoxLayout()
         btn_undo_selected = QPushButton("↩️ 선택 항목 실행 취소 (원래 폴더로 복구)")
@@ -382,6 +464,8 @@ class FileSorterTab(QWidget):
 
         self.table_history = QTableWidget(0, 8)
         self.table_history.setAlternatingRowColors(True)
+        self.table_history.setMouseTracking(True)
+        self.table_history.verticalHeader().setDefaultSectionSize(32)
         self.table_history.setHorizontalHeaderLabels(
             ["ID", "작업 시각", "상태", "파일명", "분류 폴더", "적용 규칙", "원래 경로", "이동된 경로"]
         )
@@ -398,19 +482,67 @@ class FileSorterTab(QWidget):
         h_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.table_history.hideColumn(0)
 
-        history_layout.addWidget(self.table_history)
-        splitter.addWidget(history_group)
+        history_layout.addWidget(self.table_history, stretch=1)
+        main_layout.addWidget(self.history_group, stretch=1)
 
-        splitter.setSizes([330, 260])
-        main_layout.addWidget(splitter, stretch=1)
+        scroll.setWidget(content_widget)
+        outer_layout.addWidget(scroll)
+
+    # =========================================================================
+    # 섹션 카드 전체화면 포커스 토글 ([ ⛶ 전체화면 ] <-> [ 🗗 원래 크기로 ])
+    # =========================================================================
+    def _toggle_card_focus(self, target: str) -> None:
+        if self._focused_card == target:
+            self._focused_card = None
+            self.rules_group.set_zoom_enabled(True)
+            self.history_group.set_zoom_enabled(True)
+            self.top_group.show()
+            self.rules_group.show()
+            self.history_group.show()
+            self.btn_focus_rules.setChecked(False)
+            self.btn_focus_rules.setText("⛶ 전체화면")
+            self.btn_focus_history.setChecked(False)
+            self.btn_focus_history.setText("⛶ 전체화면")
+            return
+
+        self._focused_card = target
+        self.top_group.hide()
+        if target == "rules":
+            self.rules_group.set_zoom_enabled(False)
+            self.rules_group.show()
+            self.history_group.hide()
+            self.btn_focus_rules.setChecked(True)
+            self.btn_focus_rules.setText("🗗 원래 크기로")
+            self.btn_focus_history.setChecked(False)
+            self.btn_focus_history.setText("⛶ 전체화면")
+        elif target == "history":
+            self.history_group.set_zoom_enabled(False)
+            self.rules_group.hide()
+            self.history_group.show()
+            self.btn_focus_history.setChecked(True)
+            self.btn_focus_history.setText("🗗 원래 크기로")
+            self.btn_focus_rules.setChecked(False)
+            self.btn_focus_rules.setText("⛶ 전체화면")
+
+    def _add_source_dir_item(self, path_str: str) -> None:
+        item = QListWidgetItem(path_str)
+        item.setToolTip(
+            build_floating_tooltip(
+                "📂 감시/원본 폴더 전체 경로",
+                [html.escape(path_str)],
+            )
+        )
+        self.list_source_dirs.addItem(item)
 
     def _load_config_to_ui(self) -> None:
         sec = self.config.get_section("file_sorter")
         self.list_source_dirs.clear()
         for src in sec.get("source_dirs", []):
-            self.list_source_dirs.addItem(src)
+            self._add_source_dir_item(src)
 
-        self.edit_target_dir.setText(sec.get("target_base_dir", ""))
+        target_str = sec.get("target_base_dir", "")
+        self.edit_target_dir.setText(target_str)
+        self.edit_target_dir.setToolTip(target_str)
 
         mode_idx = self.combo_action_mode.findData(sec.get("action_mode", "move"))
         if mode_idx >= 0:
@@ -428,11 +560,13 @@ class FileSorterTab(QWidget):
             for i in range(self.list_source_dirs.count())
             if self.list_source_dirs.item(i).text().strip()
         ]
+        target_str = self.edit_target_dir.text().strip()
+        self.edit_target_dir.setToolTip(target_str)
         self.config.update_section(
             "file_sorter",
             {
                 "source_dirs": src_dirs,
-                "target_base_dir": self.edit_target_dir.text().strip(),
+                "target_base_dir": target_str,
                 "action_mode": self.combo_action_mode.currentData(),
                 "duplicate_policy": self.combo_dup_policy.currentData(),
                 "include_unmatched": self.chk_unmatched.isChecked(),
@@ -449,7 +583,7 @@ class FileSorterTab(QWidget):
                 for i in range(self.list_source_dirs.count())
             ]
             if norm not in existing:
-                self.list_source_dirs.addItem(norm)
+                self._add_source_dir_item(norm)
                 self._save_ui_to_config()
 
     def _on_remove_source_dir(self) -> None:
@@ -505,20 +639,36 @@ class FileSorterTab(QWidget):
             act_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             name_item = QTableWidgetItem(r["rule_name"])
-            mtype_item = QTableWidgetItem(type_labels.get(r["match_type"], r["match_type"]))
+            mtype_str = type_labels.get(r["match_type"], r["match_type"])
+            mtype_item = QTableWidgetItem(mtype_str)
             mtype_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             kw_item = QTableWidgetItem(r["keywords"] or "-")
             ext_item = QTableWidgetItem(r["extensions"] or "-")
             folder_item = QTableWidgetItem(f"📁 {r['category_folder']}")
 
-            self.table_rules.setItem(row_idx, 0, id_item)
-            self.table_rules.setItem(row_idx, 1, pri_item)
-            self.table_rules.setItem(row_idx, 2, act_item)
-            self.table_rules.setItem(row_idx, 3, name_item)
-            self.table_rules.setItem(row_idx, 4, mtype_item)
-            self.table_rules.setItem(row_idx, 5, kw_item)
-            self.table_rules.setItem(row_idx, 6, ext_item)
-            self.table_rules.setItem(row_idx, 7, folder_item)
+            tooltip_html = build_floating_tooltip(
+                f"📋 규칙: {r['rule_name']} (우선순위 {r['priority']})",
+                [
+                    f"<b>상태 / 매칭 방식:</b> {active_str} / {html.escape(mtype_str)}",
+                    f"<b>파일명 키워드:</b> {html.escape(r['keywords'] or '-')}",
+                    f"<b>파일 확장자:</b> {html.escape(r['extensions'] or '-')}",
+                    f"<b>이동할 하위 폴더:</b> 📁 {html.escape(r['category_folder'])}",
+                ],
+            )
+
+            row_items = [
+                id_item,
+                pri_item,
+                act_item,
+                name_item,
+                mtype_item,
+                kw_item,
+                ext_item,
+                folder_item,
+            ]
+            for col_idx, it in enumerate(row_items):
+                it.setToolTip(tooltip_html)
+                self.table_rules.setItem(row_idx, col_idx, it)
 
     def _get_selected_rule_data(self) -> Optional[Dict[str, Any]]:
         row = self.table_rules.currentRow()
@@ -705,6 +855,16 @@ class FileSorterTab(QWidget):
             orig_item = QTableWidgetItem(h["original_path"])
             dest_item = QTableWidgetItem(h["target_path"])
 
+            tooltip_html = build_floating_tooltip(
+                f"📄 {h['file_name']}",
+                [
+                    f"<b>작업 시각 / 상태:</b> {html.escape(h['created_at'])} ({status_str})",
+                    f"<b>분류 폴더 / 규칙:</b> 📁 {html.escape(h['category_folder'])} ({html.escape(h['rule_name'])})",
+                    f"<b>원래 경로:</b> {html.escape(h['original_path'])}",
+                    f"<b>이동된 경로:</b> {html.escape(h['target_path'])}",
+                ],
+            )
+
             items = [
                 id_item,
                 time_item,
@@ -716,6 +876,7 @@ class FileSorterTab(QWidget):
                 dest_item,
             ]
             for col_idx, it in enumerate(items):
+                it.setToolTip(tooltip_html)
                 if is_undone:
                     it.setForeground(QBrush(QColor("#94a3b8")))
                 self.table_history.setItem(row_idx, col_idx, it)

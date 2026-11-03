@@ -1,22 +1,25 @@
 """
 [탭 4] 🏫 학급 경영 도구함 (ui/tabs/tab_classroom_tools.py)
-- 모든 위젯에 setObjectName / setProperty("role", ...) 및 style().polish() 강제 적용
+- HoverZoomCard 적용, QScrollArea 반응형 스크롤 지원
 """
 
 import random
 from typing import Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QFrame,
     QGridLayout,
-    QGroupBox,
     QLabel,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 from core.base_worker import TaskRunner
 from core.database import DatabaseManager
+from ui.components.hover_zoom_card import HoverZoomCard
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -43,35 +46,56 @@ class ClassroomToolsTab(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(12)
+        outer_lay = QVBoxLayout(self)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        container = QWidget()
+        container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 14, 24, 24)
+        layout.setSpacing(14)
 
         header_lbl = QLabel(
-            "<b>🏫 학급 경영 미니 툴 스테이션 (모듈형 카드 레이아웃)</b> — 새로운 학급 도구 위젯을 카드 단위로 계속 추가할 수 있습니다."
+            "<b>🏫 학급 경영 미니 툴 스테이션 (모듈형 카드 레이아웃)</b> — 카드 위에 1초간 마우스를 올리면 부드럽게 확대됩니다."
         )
         apply_qss_role(header_lbl, role="infoBanner", obj_name="ClassroomHeaderBanner")
         layout.addWidget(header_lbl)
 
         grid = QGridLayout()
-        grid.setSpacing(14)
+        grid.setVerticalSpacing(16)
+        grid.setHorizontalSpacing(16)
 
-        card_attendance = QGroupBox("📋 1. 학급 출결 체크 & 증빙서류 관리 (확장 슬롯)")
-        apply_qss_role(card_attendance, obj_name="CardAttendance")
-        c1_lay = QVBoxLayout(card_attendance)
-        c1_lay.setContentsMargins(15, 15, 15, 15)
+        card_attendance = HoverZoomCard(
+            title="📋 1. 학급 출결 체크 & 증빙서류 관리 (확장 슬롯)",
+            parent=container,
+            zoom_ratio=1.15,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(card_attendance, role="hoverZoomCard", obj_name="CardAttendance")
+        c1_lay = card_attendance.body_layout()
         c1_lay.addWidget(
             QLabel("결석계, 교외체험학습 신청서/보고서 제출 현황 체크 및 자동 서류 생성 기능이 이곳에 연결됩니다.")
         )
         c1_lay.addStretch()
 
-        card_cleaning = QGroupBox("🧹 2. 청소 당번 / 1인 1역 랜덤 배정기")
-        apply_qss_role(card_cleaning, obj_name="CardCleaning")
-        c2_lay = QVBoxLayout(card_cleaning)
-        c2_lay.setContentsMargins(15, 15, 15, 15)
+        card_cleaning = HoverZoomCard(
+            title="🧹 2. 청소 당번 / 1인 1역 랜덤 배정기",
+            parent=container,
+            zoom_ratio=1.15,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(card_cleaning, role="hoverZoomCard", obj_name="CardCleaning")
+        c2_lay = card_cleaning.body_layout()
         btn_assign = QPushButton("🎲 등록된 학생 명렬표 기준 랜덤 순번 추첨")
         apply_qss_role(btn_assign, role="primary", obj_name="BtnRandomAssign")
         btn_assign.setMinimumHeight(38)
+        btn_assign.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_assign.clicked.connect(self._on_random_assign)
         self.txt_cleaning_result = QTextEdit()
         apply_qss_role(self.txt_cleaning_result, obj_name="WebAiInputBox")
@@ -79,17 +103,25 @@ class ClassroomToolsTab(QWidget):
         c2_lay.addWidget(btn_assign)
         c2_lay.addWidget(self.txt_cleaning_result)
 
-        card_seating = QGroupBox("🪑 3. 학급 자리 배치 및 모둠 편성기 (확장 슬롯)")
-        apply_qss_role(card_seating, obj_name="CardSeating")
-        c3_lay = QVBoxLayout(card_seating)
-        c3_lay.setContentsMargins(15, 15, 15, 15)
+        card_seating = HoverZoomCard(
+            title="🪑 3. 학급 자리 배치 및 모둠 편성기 (확장 슬롯)",
+            parent=container,
+            zoom_ratio=1.15,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(card_seating, role="hoverZoomCard", obj_name="CardSeating")
+        c3_lay = card_seating.body_layout()
         c3_lay.addWidget(QLabel("칠판 기준 좌석 그리드 배치 및 엑셀/이미지 출력 모듈이 이곳에 연결됩니다."))
         c3_lay.addStretch()
 
-        card_counsel = QGroupBox("📝 4. 학생 관찰·상담 메모장 (확장 슬롯)")
-        apply_qss_role(card_counsel, obj_name="CardCounsel")
-        c4_lay = QVBoxLayout(card_counsel)
-        c4_lay.setContentsMargins(15, 15, 15, 15)
+        card_counsel = HoverZoomCard(
+            title="📝 4. 학생 관찰·상담 메모장 (확장 슬롯)",
+            parent=container,
+            zoom_ratio=1.15,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(card_counsel, role="hoverZoomCard", obj_name="CardCounsel")
+        c4_lay = card_counsel.body_layout()
         c4_lay.addWidget(QLabel("학생별 수시 관찰 기록 및 학기말 행동특성/종합의견 초안 생성 모듈 슬롯입니다."))
         c4_lay.addStretch()
 
@@ -99,6 +131,8 @@ class ClassroomToolsTab(QWidget):
         grid.addWidget(card_counsel, 1, 1)
 
         layout.addLayout(grid, stretch=1)
+        scroll.setWidget(container)
+        outer_lay.addWidget(scroll)
 
     def _on_random_assign(self) -> None:
         students = self.db.get_students()

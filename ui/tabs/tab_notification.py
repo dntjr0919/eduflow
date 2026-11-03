@@ -1,6 +1,6 @@
 """
 [탭 5] 🔔 외부 연동 및 자동 알림 센터 (ui/tabs/tab_notification.py)
-- 모든 위젯에 setObjectName / setProperty("role", ...) 및 style().polish() 강제 적용
+- HoverZoomCard 적용, QScrollArea 반응형 스크롤 및 폼 레이아웃 여백 확보
 """
 
 from datetime import datetime
@@ -8,10 +8,12 @@ from typing import Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLineEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -19,6 +21,7 @@ from PyQt6.QtWidgets import (
 from core.base_worker import PeriodicWorker, TaskRunner
 from core.config_manager import ConfigManager
 from services.notifier import NotificationService
+from ui.components.hover_zoom_card import HoverZoomCard
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -72,19 +75,38 @@ class NotificationCenterTab(QWidget):
         self._init_ui()
 
     def _init_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(14)
+        outer_lay = QVBoxLayout(self)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
 
-        sheet_group = QGroupBox("📊 구글 시트 / 구글 설문지 응답 실시간 감시 워커")
-        apply_qss_role(sheet_group, obj_name="GoogleSheetWatchGroup")
-        s_lay = QVBoxLayout(sheet_group)
-        s_lay.setContentsMargins(15, 15, 15, 15)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        container = QWidget()
+        container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 14, 24, 24)
+        layout.setSpacing(16)
+
+        sheet_group = HoverZoomCard(
+            title="📊 구글 시트 / 구글 설문지 응답 실시간 감시 워커",
+            parent=container,
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(sheet_group, role="hoverZoomCard", obj_name="GoogleSheetWatchGroup")
+        s_lay = sheet_group.body_layout()
 
         form = QFormLayout()
+        form.setVerticalSpacing(12)
+        form.setHorizontalSpacing(16)
+        form.setContentsMargins(6, 4, 6, 4)
         self.edit_sheet_url = QLineEdit(
             self.config.get("api_and_integrations", "google_sheet_url", "")
         )
+        self.edit_sheet_url.setMinimumHeight(34)
         self.edit_sheet_url.setPlaceholderText("https://docs.google.com/spreadsheets/d/...")
         form.addRow("감시 대상 Google 시트 URL:", self.edit_sheet_url)
         s_lay.addLayout(form)
@@ -93,11 +115,13 @@ class NotificationCenterTab(QWidget):
         self.btn_toggle_sheet = QPushButton("📡 구글 시트 실시간 폴링 감시: OFF (클릭하여 시작)")
         apply_qss_role(self.btn_toggle_sheet, role="slate", obj_name="BtnToggleSheetWatch")
         self.btn_toggle_sheet.setMinimumHeight(38)
+        self.btn_toggle_sheet.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_toggle_sheet.clicked.connect(self._toggle_sheet_watch)
 
         btn_sim_row = QPushButton("🧪 새 설문지 응답 감지 시뮬레이션")
         apply_qss_role(btn_sim_row, obj_name="BtnSimulateSheetRow")
         btn_sim_row.setMinimumHeight(38)
+        btn_sim_row.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_sim_row.clicked.connect(self._simulate_new_row)
 
         btn_bar.addWidget(self.btn_toggle_sheet)
@@ -106,14 +130,23 @@ class NotificationCenterTab(QWidget):
         s_lay.addLayout(btn_bar)
         layout.addWidget(sheet_group)
 
-        notify_group = QGroupBox("🔔 즉시 알림 & 카카오톡 연동 발송 센터 (services/notifier.py 연동)")
-        apply_qss_role(notify_group, obj_name="ManualNotifyGroup")
-        n_lay = QVBoxLayout(notify_group)
-        n_lay.setContentsMargins(15, 15, 15, 15)
+        notify_group = HoverZoomCard(
+            title="🔔 즉시 알림 & 카카오톡 연동 발송 센터 (services/notifier.py 연동)",
+            parent=container,
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(notify_group, role="hoverZoomCard", obj_name="ManualNotifyGroup")
+        n_lay = notify_group.body_layout()
 
         n_form = QFormLayout()
+        n_form.setVerticalSpacing(12)
+        n_form.setHorizontalSpacing(16)
+        n_form.setContentsMargins(6, 4, 6, 4)
         self.edit_notify_title = QLineEdit("학급 공지 / 설문 응답 알림")
+        self.edit_notify_title.setMinimumHeight(34)
         self.edit_notify_msg = QLineEdit("새로운 학부모 상담 신청 설문 응답이 접수되었습니다.")
+        self.edit_notify_msg.setMinimumHeight(34)
         n_form.addRow("알림 제목:", self.edit_notify_title)
         n_form.addRow("알림 본문:", self.edit_notify_msg)
         n_lay.addLayout(n_form)
@@ -122,6 +155,7 @@ class NotificationCenterTab(QWidget):
         btn_send_now = QPushButton("🚀 설정된 채널(토스트 / 카톡 / 웹훅)로 즉시 발송")
         apply_qss_role(btn_send_now, role="primary", obj_name="BtnSendManualNotify")
         btn_send_now.setMinimumHeight(38)
+        btn_send_now.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_send_now.clicked.connect(self._on_send_manual_notification)
         send_bar.addWidget(btn_send_now)
         send_bar.addStretch()
@@ -134,6 +168,8 @@ class NotificationCenterTab(QWidget):
         n_lay.addWidget(self.txt_event_log)
 
         layout.addWidget(notify_group, stretch=1)
+        scroll.setWidget(container)
+        outer_lay.addWidget(scroll)
 
     def _toggle_sheet_watch(self) -> None:
         if self._watching_sheet:

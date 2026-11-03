@@ -30,14 +30,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "api_and_integrations": {
         # 멀티 LLM 공급자 및 수동 프롬프트 모드 설정
         "use_manual_prompt_mode": True,   # 기본값: API 키 없이 수동 프롬프트 복사/붙여넣기 모드 사용
-        "ai_provider": "gemini",          # "gemini", "openai", "claude", "custom"
+        "ai_provider": "gemini",          # "gemini", "openai", "claude", "openrouter", "ollama"
         "gemini_api_key": "",
-        "gemini_model": "gemini-2.5-flash",
+        "gemini_model": "gemini-1.5-flash",
         "openai_api_key": "",
-        "openai_model": "gpt-4o",
+        "openai_model": "gpt-4o-mini",
         "claude_api_key": "",
         "claude_model": "claude-3-7-sonnet-latest",
-        "custom_base_url": "http://localhost:11434/v1",
+        "openrouter_api_key": "",
+        "openrouter_model": "meta-llama/llama-3.3-70b-instruct:free",
+        "openrouter_base_url": "https://openrouter.ai/api/v1",
+        "ollama_base_url": "http://localhost:11434",
+        "ollama_model": "llama3.2",
+        "custom_base_url": "http://localhost:11434",
         "custom_api_key": "",
         "custom_model": "llama3.2",
         # Google Sheets & 카카오톡 외부 연동 설정

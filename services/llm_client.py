@@ -17,6 +17,7 @@ import base64
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -228,9 +229,9 @@ class GeminiProvider(BaseLlmProvider):
     3순위: 표준 REST API (설치된 SDK가 없어도 즉시 동작)
     """
 
-    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
         self.api_key = api_key.strip()
-        self.model_name = model_name.strip() or "gemini-2.5-flash"
+        self.model_name = model_name.strip() or "gemini-1.5-flash"
 
     def generate(
         self,
@@ -336,10 +337,15 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
         api_key: str,
         model_name: str = "gpt-4o",
         base_url: Optional[str] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
     ):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip() or "gpt-4o"
-        self.base_url = (base_url or "https://api.openai.com/v1").strip().rstrip("/")
+        raw_base = (base_url or "https://api.openai.com/v1").strip().rstrip("/")
+        if ("11434" in raw_base or "ollama" in raw_base.lower()) and not raw_base.lower().endswith("/v1"):
+            raw_base = f"{raw_base}/v1"
+        self.base_url = raw_base
+        self.extra_headers = dict(extra_headers or {})
 
     def generate(
         self,
@@ -376,6 +382,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             client = OpenAI(
                 api_key=self.api_key or "ollama",
                 base_url=self.base_url,
+                default_headers=self.extra_headers or None,
             )
             completion = client.chat.completions.create(
                 model=self.model_name,
@@ -387,7 +394,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
 
         # 2) REST API 직접 호출
         endpoint = f"{self.base_url}/chat/completions"
-        headers = {"Content-Type": "application/json; charset=utf-8"}
+        headers = {"Content-Type": "application/json; charset=utf-8", **self.extra_headers}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
@@ -522,7 +529,8 @@ class MultiLlmClient:
         self.config = ConfigManager()
         sec = self.config.get_section("api_and_integrations")
 
-        self.provider = (provider or sec.get("ai_provider", "gemini")).lower().strip()
+        raw_provider = (provider or sec.get("ai_provider", "gemini")).lower().strip()
+        self.provider = normalize_provider_code(raw_provider)
         self.api_key, self.model_name, self.base_url = self._resolve_credentials(
             sec, self.provider, api_key, model_name, base_url
         )
@@ -537,19 +545,41 @@ class MultiLlmClient:
     ) -> Tuple[str, str, str]:
         if provider == "openai":
             key = override_key if override_key is not None else sec.get("openai_api_key", "")
-            model = override_model or sec.get("openai_model", "gpt-4o")
+            model = override_model or sec.get("openai_model", "gpt-4o-mini")
             url = override_url or "https://api.openai.com/v1"
         elif provider == "claude":
             key = override_key if override_key is not None else sec.get("claude_api_key", "")
             model = override_model or sec.get("claude_model", "claude-3-7-sonnet-latest")
             url = override_url or "https://api.anthropic.com"
-        elif provider == "custom":
+        elif provider == "openrouter":
+            key = override_key if override_key is not None else (
+                sec.get("openrouter_api_key") or sec.get("custom_api_key", "")
+            )
+            model = (
+                override_model
+                or sec.get("openrouter_model")
+                or "meta-llama/llama-3.3-70b-instruct:free"
+            )
+            url = (
+                override_url
+                or sec.get("openrouter_base_url")
+                or "https://openrouter.ai/api/v1"
+            )
+        elif provider in ("ollama", "custom"):
             key = override_key if override_key is not None else sec.get("custom_api_key", "")
-            model = override_model or sec.get("custom_model", "llama3.2")
-            url = override_url or sec.get("custom_base_url", "http://localhost:11434/v1")
+            model = (
+                override_model
+                or sec.get("ollama_model")
+                or sec.get("custom_model", "llama3.2")
+            )
+            url = (
+                override_url
+                or sec.get("ollama_base_url")
+                or sec.get("custom_base_url", "http://localhost:11434")
+            )
         else:
             key = override_key if override_key is not None else sec.get("gemini_api_key", "")
-            model = override_model or sec.get("gemini_model", "gemini-2.5-flash")
+            model = override_model or sec.get("gemini_model", "gemini-1.5-flash")
             url = override_url or "https://generativelanguage.googleapis.com"
 
         return str(key).strip(), str(model).strip(), str(url).strip()
@@ -562,7 +592,7 @@ class MultiLlmClient:
         sec = self.config.get_section("api_and_integrations")
         if bool(sec.get("use_manual_prompt_mode", True)):
             return True
-        if self.provider == "custom":
+        if self.provider in ("ollama", "custom") and is_ollama_base_url(self.base_url):
             # 로컬 Ollama 등은 API Key 없이 Base URL만 있어도 동작 가능
             return not bool(self.base_url)
         return not bool(self.api_key)
@@ -581,11 +611,22 @@ class MultiLlmClient:
                 api_key=self.api_key,
                 model_name=self.model_name,
             )
-        elif self.provider == "custom":
+        elif self.provider == "openrouter":
             return OpenAiCompatibleProvider(
                 api_key=self.api_key,
                 model_name=self.model_name,
-                base_url=self.base_url,
+                base_url=self.base_url or "https://openrouter.ai/api/v1",
+                extra_headers={
+                    "HTTP-Referer": "https://github.com/dntjr0919/eduflow",
+                    "X-Title": "EduFlow",
+                    "User-Agent": "EduFlow-Client/2.0",
+                },
+            )
+        elif self.provider in ("ollama", "custom"):
+            return OpenAiCompatibleProvider(
+                api_key=self.api_key,
+                model_name=self.model_name,
+                base_url=self.base_url or "http://localhost:11434/v1",
             )
         else:
             raise ValueError(f"지원하지 않는 AI 공급자입니다: {self.provider}")
@@ -617,3 +658,296 @@ class MultiLlmClient:
             return True, f"✅ [{self.provider.upper()} / {self.model_name}] 연결 성공!\n응답: {preview}"
         except Exception as exc:
             return False, f"❌ [{self.provider.upper()} / {self.model_name}] 연결 실패:\n{exc}"
+
+
+# =============================================================================
+# 4. 공급자별 사용 가능 모델 목록 동적 조회 (Gemini / OpenAI / Claude / Ollama·OpenRouter)
+# =============================================================================
+# - SDK 설치 여부와 무관하게 동작하도록 각 공급자의 공식 REST 모델 목록 API를 urllib로 직접 호출합니다.
+# - 텍스트 채팅(생성)에 적합한 모델만 필터링하고, 추천 기본 모델을 함께 반환합니다.
+
+MODEL_LIST_TIMEOUT_SEC = 10
+OLLAMA_DEFAULT_ROOT = "http://localhost:11434"
+
+# 목록에 존재하면 최우선으로 추천하는 모델 (앞쪽일수록 우선)
+RECOMMENDED_MODEL_CANDIDATES: Dict[str, List[str]] = {
+    "gemini": ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"],
+    "openai": ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"],
+    "claude": ["claude-3-7-sonnet-latest", "claude-3-5-haiku-latest"],
+    "openrouter": ["meta-llama/llama-3.3-70b-instruct:free", "meta-llama/llama-3.3-70b-instruct"],
+    "ollama": [],
+    "custom": [],
+}
+
+
+def normalize_provider_code(provider: str) -> str:
+    """UI 표시명('Google Gemini', 'OpenRouter', 'Ollama (로컬)' 등) 또는 코드값을 내부 공급자 코드로 정규화합니다."""
+    p = (provider or "").lower().strip()
+    if "gemini" in p or "google" in p:
+        return "gemini"
+    if "claude" in p or "anthropic" in p:
+        return "claude"
+    if "openrouter" in p:
+        return "openrouter"
+    if "ollama" in p or "custom" in p:
+        return "ollama"
+    if "openai" in p or "gpt" in p:
+        return "openai"
+    return p or "gemini"
+
+
+def is_ollama_base_url(base_url: str) -> bool:
+    """Custom Base URL이 비어 있거나 로컬 Ollama 서버(기본 11434 포트)를 가리키는지 판별합니다."""
+    url = (base_url or "").strip().lower()
+    return (not url) or ("11434" in url) or ("ollama" in url)
+
+
+def _ollama_root_url(base_url: str) -> str:
+    """'http://localhost:11434/v1' 같은 OpenAI 호환 주소에서 Ollama 네이티브 루트 주소를 추출합니다."""
+    url = (base_url or "").strip().rstrip("/") or OLLAMA_DEFAULT_ROOT
+    if not url.startswith(("http://", "https://")):
+        url = f"http://{url}"
+    for suffix in ("/v1", "/api"):
+        if url.lower().endswith(suffix):
+            url = url[: -len(suffix)]
+    return url.rstrip("/")
+
+
+def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = MODEL_LIST_TIMEOUT_SEC) -> Dict[str, Any]:
+    """GET 요청 후 JSON을 반환합니다. 실패 시 사용자 친화적인 RuntimeError를 발생시킵니다."""
+    req = urllib.request.Request(url, headers=headers or {}, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        if e.code in (401, 403):
+            raise RuntimeError(
+                f"인증 실패 (HTTP {e.code}): API Key가 올바르지 않거나 모델 목록 조회 권한이 없습니다.\n{body}"
+            ) from e
+        if e.code == 404:
+            raise RuntimeError(f"요청한 주소를 찾을 수 없습니다 (HTTP 404): {url}") from e
+        raise RuntimeError(f"서버 오류 (HTTP {e.code}): {body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"서버에 연결할 수 없습니다: {e.reason}\n주소({url.split('?')[0]})와 네트워크/서버 실행 상태를 확인해 주세요."
+        ) from e
+    except TimeoutError as e:
+        raise RuntimeError(f"서버 응답 시간이 초과되었습니다 ({timeout}초): {url.split('?')[0]}") from e
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"서버 응답을 해석할 수 없습니다 (JSON 아님): {url.split('?')[0]}") from e
+
+
+def pick_recommended_model(provider: str, models: List[str]) -> str:
+    """
+    공급자별 최적 추천 모델을 선별합니다 (폐기 모델 및 404 유발 모델 제외).
+    - Gemini: 1순위 1.5-flash (8b 제외), 2순위 일반 flash (2.5 제외)
+    - OpenAI: gpt-4o-mini 우선
+    - Claude: sonnet, haiku 우선
+    """
+    if not models:
+        return ""
+
+    p = (provider or "").lower().strip()
+    if "gemini" in p or "google" in p:
+        # 1순위: 1.5-flash 또는 최신 안정 flash 모델 (8b 제외)
+        candidates = [m for m in models if "1.5-flash" in m and "8b" not in m]
+        if candidates:
+            if "gemini-1.5-flash" in candidates:
+                return "gemini-1.5-flash"
+            return candidates[0]
+        # 2순위: 그 외 일반 flash 모델 (단, 에러를 유발하는 2.5-flash 제외)
+        flash_models = [m for m in models if "flash" in m and "2.5" not in m]
+        if flash_models:
+            return flash_models[0]
+        # 3순위: 2.5를 제외한 첫 번째 모델
+        non_25 = [m for m in models if "2.5" not in m]
+        return non_25[0] if non_25 else models[0]
+
+    elif "openai" in p or "gpt" in p:
+        candidates = [m for m in models if "gpt-4o-mini" in m]
+        return candidates[0] if candidates else models[0]
+
+    elif "claude" in p or "anthropic" in p:
+        for cand in RECOMMENDED_MODEL_CANDIDATES.get("claude", []):
+            if cand in models:
+                return cand
+        for kw in ("sonnet", "haiku"):
+            hit = next((m for m in models if kw in m), None)
+            if hit:
+                return hit
+        return models[0]
+
+    elif "openrouter" in p:
+        return next(
+            (m for m in models if "llama-3.3-70b-instruct" in m or "free" in m),
+            models[0] if models else "",
+        )
+
+    return models[0]
+
+
+def _pick_recommended(provider_code: str, models: List[str], fallback_keywords: List[str]) -> str:
+    return pick_recommended_model(provider_code, models)
+
+
+def _list_gemini_models(api_key: str) -> Tuple[List[str], str]:
+    models: List[str] = []
+    page_token = ""
+    excluded = ("embedding", "aqa", "imagen", "veo", "tts", "image-generation", "native-audio")
+    for _ in range(10):  # 페이지네이션 안전 상한
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models"
+            f"?pageSize=1000&key={urllib.parse.quote(api_key)}"
+        )
+        if page_token:
+            url += f"&pageToken={urllib.parse.quote(page_token)}"
+        data = _http_get_json(url)
+        for m in data.get("models", []):
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            name = str(m.get("name", "")).replace("models/", "")
+            if name and not any(ex in name for ex in excluded):
+                models.append(name)
+        page_token = data.get("nextPageToken", "")
+        if not page_token:
+            break
+    models = sorted(set(models), reverse=True)            # 최신 버전 우선
+    models.sort(key=lambda x: "flash" not in x)            # flash 계열을 앞으로 (안정 정렬)
+    return models, pick_recommended_model("gemini", models)
+
+
+def _list_openai_models(api_key: str, base_url: str = "") -> Tuple[List[str], str]:
+    url = (base_url or "https://api.openai.com/v1").strip().rstrip("/")
+    data = _http_get_json(f"{url}/models", headers={"Authorization": f"Bearer {api_key}"})
+    prefixes = ("gpt-", "o1", "o3", "o4", "chatgpt")
+    excluded = ("audio", "realtime", "transcribe", "transcription", "tts", "image", "search", "embedding", "moderation")
+    models = sorted(
+        {
+            str(m.get("id", ""))
+            for m in data.get("data", [])
+            if str(m.get("id", "")).startswith(prefixes)
+            and not any(ex in str(m.get("id", "")) for ex in excluded)
+        },
+        reverse=True,
+    )
+    return models, _pick_recommended("openai", models, ["mini", "turbo"])
+
+
+def _list_claude_models(api_key: str) -> Tuple[List[str], str]:
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
+    models: List[str] = []
+    after_id = ""
+    for _ in range(10):
+        url = "https://api.anthropic.com/v1/models?limit=1000"
+        if after_id:
+            url += f"&after_id={urllib.parse.quote(after_id)}"
+        data = _http_get_json(url, headers=headers)
+        # Anthropic API는 최신 출시 순으로 반환하므로 순서를 그대로 유지
+        models.extend(str(m.get("id", "")) for m in data.get("data", []) if "claude" in str(m.get("id", "")))
+        if not data.get("has_more"):
+            break
+        after_id = data.get("last_id", "")
+        if not after_id:
+            break
+    models = list(dict.fromkeys(models))
+    return models, _pick_recommended("claude", models, ["sonnet", "haiku"])
+
+
+def _list_openrouter_models(api_key: str, base_url: str = "") -> Tuple[List[str], str]:
+    """OpenRouter 공식 API 엔드포인트(/api/v1/models)에서 사용 가능한 모델 목록을 조회합니다."""
+    if not api_key or not api_key.strip():
+        return [], "OpenRouter API Key를 입력해주세요."
+    url = "https://openrouter.ai/api/v1/models"
+    if base_url and "openrouter.ai" in base_url:
+        cleaned = base_url.strip().rstrip("/")
+        url = cleaned if cleaned.endswith("/models") else f"{cleaned}/models"
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "HTTP-Referer": "https://github.com/dntjr0919/eduflow",
+        "X-Title": "EduFlow",
+        "User-Agent": "EduFlow-Client/2.0",
+    }
+    data = _http_get_json(url, headers=headers, timeout=10)
+    models = [str(item["id"]) for item in data.get("data", []) if item.get("id")]
+    models.sort()
+    # 추천: 가성비/무료 모델 우선 매핑
+    rec = next(
+        (m for m in models if "llama-3.3-70b-instruct" in m or "free" in m),
+        models[0] if models else "",
+    )
+    return models, rec
+
+
+def _list_ollama_models(base_url: str = "") -> Tuple[List[str], str]:
+    """로컬 Ollama REST API(/api/tags)에서 설치된 모델 목록을 조회합니다."""
+    base = base_url.strip() if base_url else "http://localhost:11434"
+    base = _ollama_root_url(base)
+    url = f"{base}/api/tags"
+    try:
+        data = _http_get_json(url, headers={"User-Agent": "EduFlow-Client/2.0"}, timeout=4)
+        models = [str(item["name"]) for item in data.get("models", []) if item.get("name")]
+        return models, (models[0] if models else "")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"로컬 Ollama 서버({base})에 연결하지 못했습니다.\n"
+            f"Ollama가 실행 중인지 확인해 주세요 (명령: ollama serve).\n\n상세: {exc}"
+        ) from exc
+
+
+def _list_custom_models(api_key: str, base_url: str) -> Tuple[List[str], str]:
+    """하위 호환용: 로컬 Ollama(/api/tags) 또는 OpenRouter 등 OpenAI 호환 서버(/models) 조회."""
+    if "openrouter" in (base_url or "").lower():
+        return _list_openrouter_models(api_key, base_url)
+    if is_ollama_base_url(base_url):
+        return _list_ollama_models(base_url)
+    url = base_url.strip().rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    data = _http_get_json(f"{url}/models", headers=headers)
+    models = sorted({str(m.get("id", "")) for m in data.get("data", []) if m.get("id")})
+    return models, (models[0] if models else "")
+
+
+def fetch_available_models(provider: str, api_key: str = "", base_url: str = "") -> Tuple[List[str], str]:
+    """
+    공급자별 사용 가능 모델 목록과 추천 기본 모델명을 반환합니다.
+    실패 시 원인을 담은 RuntimeError/ValueError를 발생시킵니다 (UI 경고 메시지용).
+    반환값: (models: List[str], recommended_model: str)
+    """
+    provider_lower = (provider or "").lower().strip()
+    code = normalize_provider_code(provider)
+    key = (api_key or "").strip()
+    url = (base_url or "").strip()
+
+    # 1. OpenRouter (공식 API 엔드포인트)
+    if "openrouter" in provider_lower or code == "openrouter":
+        return _list_openrouter_models(key, url)
+
+    # 2. Ollama (로컬 REST API)
+    if "ollama" in provider_lower or code == "ollama":
+        return _list_ollama_models(url)
+
+    if code in ("gemini", "openai", "claude") and not key:
+        raise ValueError(f"{provider} API Key를 먼저 입력해 주세요.")
+
+    if code == "gemini":
+        return _list_gemini_models(key)
+    if code == "openai":
+        return _list_openai_models(key)
+    if code == "claude":
+        return _list_claude_models(key)
+    if code == "custom":
+        return _list_custom_models(key, url)
+    raise ValueError(f"지원하지 않는 AI 공급자입니다: {provider}")
+
+
+def get_available_models(provider: str, api_key: str = "", base_url: str = "") -> Tuple[List[str], str]:
+    """
+    fetch_available_models의 안전 래퍼. 어떤 오류가 나도 예외를 던지지 않고 ([], "")를 반환합니다.
+    반환값: (models: List[str], recommended_model: str)
+    """
+    try:
+        return fetch_available_models(provider, api_key, base_url)
+    except Exception as exc:
+        print(f"[{provider} Model List Error]: {exc}")
+        return [], ""

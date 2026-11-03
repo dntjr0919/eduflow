@@ -2,6 +2,7 @@
 메인 윈도우 모듈 (ui/main_window.py).
 - QTabWidget을 완전히 제거하고 QHBoxLayout 기반의
   [좌측 다크 사이드바(QListWidget)] + [우측 밝은 메인 컨텐츠(QStackedWidget)] 구조로 구현
+- 사이드바 상단 햄버거 토글 버튼([ ☰ ]) 및 QPropertyAnimation 기반 부드러운 접기/펼치기 지원
 - 모든 프레임/위젯에 setObjectName(), WA_StyledBackground, style().polish()를 명시적으로 적용하여
   ui/styles/theme.qss가 100% 렌더링되도록 보장
 """
@@ -9,7 +10,7 @@
 from datetime import datetime
 from typing import Dict, List
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt
+from PyQt6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -61,17 +62,21 @@ def polish_widget(widget: QWidget, role: str = "", obj_name: str = "") -> None:
 class MainWindow(QMainWindow):
     """확장형 교무/업무 자동화 데스크톱 워크스테이션 메인 윈도우."""
 
+    SIDEBAR_EXPANDED_WIDTH = 248
+    SIDEBAR_COLLAPSED_WIDTH = 64
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("교무·행정 AI 워크스테이션 v2.0")
-        self.resize(1360, 860)
-        self.setMinimumSize(1080, 720)
+        self.resize(1380, 860)
+        self.setMinimumSize(1040, 680)
 
         self.config = ConfigManager()
         self.db = DatabaseManager()
         self.task_runner = TaskRunner(self)
         self.notifier = NotificationService()
         self._force_quit = False
+        self._sidebar_collapsed = False
         self._page_meta: List[Dict[str, str]] = []
 
         self._init_ui()
@@ -96,42 +101,67 @@ class MainWindow(QMainWindow):
         outer_layout.setSpacing(0)
 
         # ---------------------------------------------------------------------
-        # 1. 좌측 다크 사이드바 (SidebarContainer + SidebarNavList)
+        # 1. 좌측 다크 사이드바 (SidebarContainer + 접기/펼치기 토글 애니메이션)
         # ---------------------------------------------------------------------
         self.sidebar_frame = QFrame(central)
         polish_widget(self.sidebar_frame, obj_name="SidebarContainer")
-        self.sidebar_frame.setFixedWidth(255)
+        self.sidebar_frame.setMinimumWidth(self.SIDEBAR_EXPANDED_WIDTH)
+        self.sidebar_frame.setMaximumWidth(self.SIDEBAR_EXPANDED_WIDTH)
 
-        sidebar_layout = QVBoxLayout(self.sidebar_frame)
-        sidebar_layout.setContentsMargins(16, 22, 16, 18)
-        sidebar_layout.setSpacing(8)
+        self.sidebar_layout = QVBoxLayout(self.sidebar_frame)
+        self.sidebar_layout.setContentsMargins(14, 18, 14, 16)
+        self.sidebar_layout.setSpacing(6)
 
-        brand_title = QLabel("✨ AI 교무 워크스테이션")
-        polish_widget(brand_title, obj_name="SidebarBrandTitle")
+        # 사이드바 상단: 브랜드 타이틀 + [ ☰ ] 햄버거 토글 버튼
+        brand_top_row = QHBoxLayout()
+        brand_top_row.setContentsMargins(0, 0, 0, 0)
+        brand_top_row.setSpacing(6)
 
-        brand_sub = QLabel("Smart Teacher Desktop Hub")
-        polish_widget(brand_sub, obj_name="SidebarBrandSubtitle")
+        self.brand_title = QLabel("✨ AI 교무 워크스테이션")
+        polish_widget(self.brand_title, obj_name="SidebarBrandTitle")
 
-        nav_section_lbl = QLabel("WORKSPACE MENU")
-        polish_widget(nav_section_lbl, obj_name="SidebarSectionLabel")
+        self.btn_sidebar_toggle = QPushButton("☰")
+        polish_widget(self.btn_sidebar_toggle, obj_name="SidebarToggleBtn")
+        self.btn_sidebar_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 접기 / 펼치기")
+        self.btn_sidebar_toggle.clicked.connect(self.toggle_sidebar)
+
+        brand_top_row.addWidget(self.brand_title, stretch=1)
+        brand_top_row.addWidget(self.btn_sidebar_toggle, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self.brand_sub = QLabel("Smart Teacher Desktop Hub")
+        polish_widget(self.brand_sub, obj_name="SidebarBrandSubtitle")
+
+        self.nav_section_lbl = QLabel("WORKSPACE MENU")
+        polish_widget(self.nav_section_lbl, obj_name="SidebarSectionLabel")
 
         self.sidebar_nav = QListWidget(self.sidebar_frame)
         polish_widget(self.sidebar_nav, obj_name="SidebarNavList")
         self.sidebar_nav.setSpacing(4)
+        self.sidebar_nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.sidebar_nav.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sidebar_nav.currentRowChanged.connect(self._on_sidebar_nav_changed)
 
-        btn_hide_tray = QPushButton("🔽  시스템 트레이로 숨기기")
-        polish_widget(btn_hide_tray, obj_name="SidebarTrayButton")
-        btn_hide_tray.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_hide_tray.setToolTip("창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다.")
-        btn_hide_tray.clicked.connect(self.hide_to_system_tray)
+        self.btn_hide_tray = QPushButton("🔽  시스템 트레이로 숨기기")
+        polish_widget(self.btn_hide_tray, obj_name="SidebarTrayButton")
+        self.btn_hide_tray.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_hide_tray.setToolTip("창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다.")
+        self.btn_hide_tray.clicked.connect(self.hide_to_system_tray)
 
-        sidebar_layout.addWidget(brand_title)
-        sidebar_layout.addWidget(brand_sub)
-        sidebar_layout.addWidget(nav_section_lbl)
-        sidebar_layout.addWidget(self.sidebar_nav, stretch=1)
-        sidebar_layout.addWidget(btn_hide_tray)
+        self.sidebar_layout.addLayout(brand_top_row)
+        self.sidebar_layout.addWidget(self.brand_sub)
+        self.sidebar_layout.addWidget(self.nav_section_lbl)
+        self.sidebar_layout.addWidget(self.sidebar_nav, stretch=1)
+        self.sidebar_layout.addWidget(self.btn_hide_tray)
+
+        # 사이드바 너비 애니메이션 그룹 (minimumWidth & maximumWidth 동시 제어)
+        self._sidebar_anim_group = QParallelAnimationGroup(self)
+        self._anim_min_w = QPropertyAnimation(self.sidebar_frame, b"minimumWidth", self)
+        self._anim_max_w = QPropertyAnimation(self.sidebar_frame, b"maximumWidth", self)
+        for anim in (self._anim_min_w, self._anim_max_w):
+            anim.setDuration(220)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._sidebar_anim_group.addAnimation(anim)
 
         outer_layout.addWidget(self.sidebar_frame)
 
@@ -149,7 +179,7 @@ class MainWindow(QMainWindow):
         top_header = QFrame(self.workspace_frame)
         polish_widget(top_header, obj_name="TopHeaderBar")
         top_header_layout = QHBoxLayout(top_header)
-        top_header_layout.setContentsMargins(24, 16, 24, 16)
+        top_header_layout.setContentsMargins(24, 14, 24, 14)
 
         title_col = QVBoxLayout()
         title_col.setSpacing(3)
@@ -244,16 +274,96 @@ class MainWindow(QMainWindow):
         outer_layout.addWidget(self.workspace_frame, stretch=1)
 
     # =========================================================================
+    # 좌측 다크 사이드바 접기/펼치기 토글 (Collapsible Sidebar)
+    # =========================================================================
+    def toggle_sidebar(self) -> None:
+        self._sidebar_collapsed = not self._sidebar_collapsed
+        current_w = self.sidebar_frame.width()
+        target_w = (
+            self.SIDEBAR_COLLAPSED_WIDTH
+            if self._sidebar_collapsed
+            else self.SIDEBAR_EXPANDED_WIDTH
+        )
+
+        self._sidebar_anim_group.stop()
+        self._anim_min_w.setStartValue(current_w)
+        self._anim_min_w.setEndValue(target_w)
+        self._anim_max_w.setStartValue(current_w)
+        self._anim_max_w.setEndValue(target_w)
+
+        collapsed_str = "true" if self._sidebar_collapsed else "false"
+        self.sidebar_frame.setProperty("collapsed", collapsed_str)
+        self.sidebar_nav.setProperty("collapsed", collapsed_str)
+        self.btn_hide_tray.setProperty("collapsed", collapsed_str)
+
+        if self._sidebar_collapsed:
+            self.sidebar_layout.setContentsMargins(8, 18, 8, 16)
+            self.brand_title.hide()
+            self.brand_sub.hide()
+            self.nav_section_lbl.hide()
+            self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 펼치기")
+            self.btn_hide_tray.setText("🔽")
+            self.btn_hide_tray.setToolTip(
+                "<b>시스템 트레이로 숨기기</b><br/>창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다."
+            )
+            for idx, meta in enumerate(self._page_meta):
+                item = self.sidebar_nav.item(idx)
+                if item is not None:
+                    item.setText(meta["icon"])
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setToolTip(
+                        f"<div style='padding:2px 4px;'><b>{meta['title']}</b><br/>"
+                        f"<span style='color:#cbd5e1;'>{meta['desc']}</span></div>"
+                    )
+        else:
+            self.sidebar_layout.setContentsMargins(14, 18, 14, 16)
+            self.brand_title.show()
+            self.brand_sub.show()
+            self.nav_section_lbl.show()
+            self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 접기")
+            self.btn_hide_tray.setText("🔽  시스템 트레이로 숨기기")
+            self.btn_hide_tray.setToolTip("창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다.")
+            for idx, meta in enumerate(self._page_meta):
+                item = self.sidebar_nav.item(idx)
+                if item is not None:
+                    item.setText(meta["title"])
+                    item.setTextAlignment(
+                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+                    )
+                    item.setToolTip(
+                        f"<div style='padding:2px 4px;'><b>{meta['title']}</b><br/>"
+                        f"<span style='color:#cbd5e1;'>{meta['desc']}</span></div>"
+                    )
+
+        for w in (self.sidebar_frame, self.sidebar_nav, self.btn_hide_tray):
+            st = w.style()
+            if st is not None:
+                st.unpolish(w)
+                st.polish(w)
+
+        self._sidebar_anim_group.start()
+
+    # =========================================================================
     # 모듈형 페이지 등록 (좌측 QListWidget + 우측 QStackedWidget 동시 등록)
     # =========================================================================
     def register_tab(self, widget: QWidget, title: str, tooltip: str = "") -> int:
         polish_widget(widget)
         idx = self.stacked_widget.addWidget(widget)
+        parts = title.strip().split()
+        icon_only = parts[0] if parts else "•"
+
         item = QListWidgetItem(title)
-        if tooltip:
-            item.setToolTip(tooltip)
+        rich_tip = (
+            f"<div style='padding:2px 4px;'><b>{title.strip()}</b><br/>"
+            f"<span style='color:#cbd5e1;'>{tooltip}</span></div>"
+            if tooltip
+            else title.strip()
+        )
+        item.setToolTip(rich_tip)
         self.sidebar_nav.addItem(item)
-        self._page_meta.append({"title": title, "desc": tooltip})
+        self._page_meta.append(
+            {"title": title, "icon": icon_only, "desc": tooltip}
+        )
         return idx
 
     def _register_all_tabs(self) -> None:
@@ -332,6 +442,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(percent)
         if status_msg:
             self.lbl_single_line_log.setText(status_msg)
+            self.lbl_single_line_log.setToolTip(status_msg)
 
     def _on_worker_error(self, err_msg: str) -> None:
         self.append_log("ERROR", err_msg)
@@ -369,6 +480,7 @@ class MainWindow(QMainWindow):
         self.log_console.append(html)
 
         one_line = message.replace("\n", " ").strip()
+        self.lbl_single_line_log.setToolTip(f"[{ts}] [{lvl}] {one_line}")
         if len(one_line) > 95:
             one_line = one_line[:95] + "..."
         self.lbl_single_line_log.setText(f"[{ts}] {one_line}")

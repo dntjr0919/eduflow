@@ -1,16 +1,19 @@
 """
 [탭 3] 📊 성적 및 수업 자료 관리 (ui/tabs/tab_grade_material.py)
-- 모든 위젯에 setObjectName / setProperty("role", ...) 및 style().polish() 강제 적용
+- HoverZoomCard 적용, QScrollArea 반응형 스크롤, 카드 최대화 토글 버튼 지원
 """
 
+import html
 from typing import Optional
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -19,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 from core.base_worker import TaskRunner
 from core.database import DatabaseManager
+from ui.components.hover_zoom_card import HoverZoomCard
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -42,20 +46,44 @@ class GradeMaterialTab(QWidget):
         apply_qss_role(self, obj_name="GradeMaterialTabPage")
         self.task_runner = task_runner
         self.db = DatabaseManager()
+        self._focused_card: Optional[str] = None
         self._init_ui()
         self.refresh_student_preview()
 
     def _init_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
+        outer_lay = QVBoxLayout(self)
+        outer_lay.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
+        container = QWidget()
+        container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(14, 14, 24, 24)
         layout.setSpacing(12)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
 
-        left_group = QGroupBox("📊 학생 명렬표 연동 성적/수행평가 관리 (확장용 스켈레톤)")
-        apply_qss_role(left_group, obj_name="GradeRosterGroup")
-        l_lay = QVBoxLayout(left_group)
-        l_lay.setContentsMargins(15, 15, 15, 15)
+        self.left_group = HoverZoomCard(
+            title="📊 학생 명렬표 연동 성적/수행평가 관리 (확장용 스켈레톤)",
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.left_group, role="hoverZoomCard", obj_name="GradeRosterGroup")
+
+        self.btn_focus_left = QPushButton("⛶ 전체화면")
+        apply_qss_role(self.btn_focus_left, role="cardMax", obj_name="CardMaxButton")
+        self.btn_focus_left.setCheckable(True)
+        self.btn_focus_left.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_focus_left.clicked.connect(lambda: self._toggle_card_focus("left"))
+        self.left_group.add_header_widget(self.btn_focus_left)
+
+        l_lay = self.left_group.body_layout()
 
         top_bar = QHBoxLayout()
         btn_reload = QPushButton("🔄 환경설정 학생 명렬표 불러오기")
@@ -67,15 +95,28 @@ class GradeMaterialTab(QWidget):
 
         self.table_grades = QTableWidget(0, 5)
         self.table_grades.setAlternatingRowColors(True)
+        self.table_grades.setMouseTracking(True)
+        self.table_grades.verticalHeader().setDefaultSectionSize(32)
         self.table_grades.setHorizontalHeaderLabels(["학번", "이름", "1차 지필", "수행평가", "비고/피드백"])
         header = self.table_grades.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         l_lay.addWidget(self.table_grades)
 
-        right_group = QGroupBox("📚 교과 수업 자료 버전 및 폴더 관리 (확장용 스켈레톤)")
-        apply_qss_role(right_group, obj_name="CourseMaterialGroup")
-        r_lay = QVBoxLayout(right_group)
-        r_lay.setContentsMargins(15, 15, 15, 15)
+        self.right_group = HoverZoomCard(
+            title="📚 교과 수업 자료 버전 및 폴더 관리 (확장용 스켈레톤)",
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.right_group, role="hoverZoomCard", obj_name="CourseMaterialGroup")
+
+        self.btn_focus_right = QPushButton("⛶ 전체화면")
+        apply_qss_role(self.btn_focus_right, role="cardMax", obj_name="CardMaxButton")
+        self.btn_focus_right.setCheckable(True)
+        self.btn_focus_right.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_focus_right.clicked.connect(lambda: self._toggle_card_focus("right"))
+        self.right_group.add_header_widget(self.btn_focus_right)
+
+        r_lay = self.right_group.body_layout()
         desc = QLabel(
             "이 영역에는 학기별·단원별 수업 자료(PPT, 활동지, 평가문항) 버전 관리 및\n"
             "원클릭 폴더 트리 생성/백업 모듈이 추가됩니다."
@@ -84,18 +125,60 @@ class GradeMaterialTab(QWidget):
         r_lay.addWidget(desc)
         r_lay.addStretch()
 
-        splitter.addWidget(left_group)
-        splitter.addWidget(right_group)
-        splitter.setSizes([600, 450])
-        layout.addWidget(splitter)
+        self.splitter.addWidget(self.left_group)
+        self.splitter.addWidget(self.right_group)
+        self.splitter.setSizes([600, 450])
+        layout.addWidget(self.splitter, stretch=1)
+
+        scroll.setWidget(container)
+        outer_lay.addWidget(scroll)
+
+    def _toggle_card_focus(self, target: str) -> None:
+        if self._focused_card == target:
+            self._focused_card = None
+            self.left_group.set_zoom_enabled(True)
+            self.right_group.set_zoom_enabled(True)
+            self.left_group.show()
+            self.right_group.show()
+            self.btn_focus_left.setChecked(False)
+            self.btn_focus_left.setText("⛶ 전체화면")
+            self.btn_focus_right.setChecked(False)
+            self.btn_focus_right.setText("⛶ 전체화면")
+            self.splitter.setSizes([600, 450])
+            return
+
+        self._focused_card = target
+        if target == "left":
+            self.left_group.set_zoom_enabled(False)
+            self.left_group.show()
+            self.right_group.hide()
+            self.btn_focus_left.setChecked(True)
+            self.btn_focus_left.setText("🗗 원래 크기로")
+            self.btn_focus_right.setChecked(False)
+            self.btn_focus_right.setText("⛶ 전체화면")
+        else:
+            self.right_group.set_zoom_enabled(False)
+            self.left_group.hide()
+            self.right_group.show()
+            self.btn_focus_right.setChecked(True)
+            self.btn_focus_right.setText("🗗 원래 크기로")
+            self.btn_focus_left.setChecked(False)
+            self.btn_focus_left.setText("⛶ 전체화면")
 
     def refresh_student_preview(self) -> None:
         students = self.db.get_students()
         self.table_grades.setRowCount(0)
         for idx, s in enumerate(students):
             self.table_grades.insertRow(idx)
-            self.table_grades.setItem(idx, 0, QTableWidgetItem(str(s["student_id"])))
-            self.table_grades.setItem(idx, 1, QTableWidgetItem(s["name"]))
-            self.table_grades.setItem(idx, 2, QTableWidgetItem("-"))
-            self.table_grades.setItem(idx, 3, QTableWidgetItem("-"))
-            self.table_grades.setItem(idx, 4, QTableWidgetItem(s.get("memo", "")))
+            sid_it = QTableWidgetItem(str(s["student_id"]))
+            name_it = QTableWidgetItem(s["name"])
+            m1_it = QTableWidgetItem("-")
+            p_it = QTableWidgetItem("-")
+            memo_it = QTableWidgetItem(s.get("memo", ""))
+            tip = (
+                f"<div style='padding:2px 4px;'><b>[{html.escape(str(s['student_id']))}] {html.escape(s['name'])}</b><br/>"
+                f"비고: {html.escape(s.get('memo', '') or '-')}</div>"
+            )
+            for col, it in enumerate((sid_it, name_it, m1_it, p_it, memo_it)):
+                it.setToolTip(tip)
+                self.table_grades.setItem(idx, col, it)

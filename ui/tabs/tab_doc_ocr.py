@@ -1,14 +1,16 @@
 """
 [탭 2] 📄 문서 처리 & AI OCR / 파일 병합 (ui/tabs/tab_doc_ocr.py)
+- 기존 QGroupBox를 HoverZoomCard(1초 호버 시 Z-order 최상단 부상 + OutCubic 대각선 슬라이딩 확대/축소)로 교체
 - 1순위 핵심 구현: [학번/이름 기준 제출 파일 분석 · 미제출자 대조 · 표준 파일명 일괄 변경 · 학번순 단일 PDF 병합]
 - 2순위 구현: [2. AI OCR 및 문서 텍스트 보정] 서브탭 하단 실행 영역에 QHBoxLayout으로
   1) [🤖 AI 자동 실행 (API 사용)] 버튼 (기존 워커 연결)
   2) [📋 수동 복붙 모드 열기] 버튼 (클릭 시 ManualLlmDialog 팝업 연결)
   을 나란히 배치
-- 모든 위젯에 setObjectName / setProperty("role", ...) 및 style().polish() 강제 적용
+- '제출 파일 학번순 정렬 미리보기' 카드 및 '미제출자 명단' 카드에 [ ⛶ 전체화면 ] / [ 🗗 원래 크기로 ] 포커스 토글 버튼 제공
 """
 
 import csv
+import html
 import mimetypes
 import os
 import re
@@ -27,14 +29,17 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -54,6 +59,7 @@ from services.llm_client import (
     format_parsed_json_to_readable_text,
 )
 from services.notifier import NotificationService
+from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
 
 try:
@@ -87,6 +93,18 @@ def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     if st is not None:
         st.unpolish(widget)
         st.polish(widget)
+
+
+def build_floating_tooltip(title: str, lines: List[str]) -> str:
+    """테이블/목록 항목 위에 마우스를 올렸을 때 플로팅 팝업 카드 형태로 전체 내용을 보여주는 HTML 툴팁."""
+    escaped_title = html.escape(title)
+    body_html = "<br/>".join(lines)
+    return (
+        f"<div style='min-width: 260px; padding: 2px 4px;'>"
+        f"<div style='color: #60a5fa; font-weight: 700; margin-bottom: 4px;'>{escaped_title}</div>"
+        f"<div style='color: #f8fafc; line-height: 1.45;'>{body_html}</div>"
+        f"</div>"
+    )
 
 
 def _student_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str, str]:
@@ -671,12 +689,13 @@ class DocOcrTab(QWidget):
 
         self._analyzed_items: List[Dict[str, Any]] = []
         self._missing_students: List[Dict[str, Any]] = []
+        self._focused_card: Optional[str] = None
 
         self._init_ui()
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
         self.sub_tabs = QTabWidget()
@@ -699,33 +718,47 @@ class DocOcrTab(QWidget):
     # [서브탭 1] 학번/이름 기준 파일 취합 · 미제출자 확인 · 표준 이름 변경 · PDF 병합
     # =========================================================================
     def _build_student_merge_subtab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
         page = QWidget()
+        page.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
         apply_qss_role(page, obj_name="SubTabStudentMerge")
         main_lay = QVBoxLayout(page)
-        main_lay.setContentsMargins(15, 15, 15, 15)
-        main_lay.setSpacing(10)
+        main_lay.setContentsMargins(8, 8, 22, 22)
+        main_lay.setSpacing(12)
 
-        cfg_group = QGroupBox("📂 1단계: 학생 제출물 폴더 선택 및 학번/이름 정규표현식(Regex) 설정")
-        apply_qss_role(cfg_group, obj_name="SubmissionRegexGroup")
-        cfg_lay = QVBoxLayout(cfg_group)
-        cfg_lay.setContentsMargins(15, 15, 15, 15)
-        cfg_lay.setSpacing(10)
+        self.cfg_group = HoverZoomCard(
+            title="📂 1단계: 학생 제출물 폴더 선택 및 학번/이름 정규표현식(Regex) 설정",
+            parent=page,
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.cfg_group, role="hoverZoomCard", obj_name="SubmissionRegexGroup")
+        cfg_lay = self.cfg_group.body_layout()
 
         folder_row = QHBoxLayout()
         folder_row.addWidget(QLabel("<b>제출물 폴더:</b>"))
         self.edit_submission_dir = QLineEdit()
+        self.edit_submission_dir.setMinimumHeight(34)
         self.edit_submission_dir.setPlaceholderText(
             "학생들이 제출한 파일(PDF, HWP, DOCX, XLSX 등)이 들어있는 폴더를 선택하세요..."
         )
         btn_browse_sub = QPushButton("폴더 찾아보기...")
         apply_qss_role(btn_browse_sub)
+        btn_browse_sub.setMinimumHeight(34)
         btn_browse_sub.clicked.connect(self._on_browse_submission_dir)
         btn_open_sub = QPushButton("폴더 열기")
         apply_qss_role(btn_open_sub)
+        btn_open_sub.setMinimumHeight(34)
         btn_open_sub.clicked.connect(self._on_open_submission_dir)
 
         self.chk_recursive = QCheckBox("하위 폴더까지 포함 검색")
         self.combo_ext_filter = QComboBox()
+        self.combo_ext_filter.setMinimumHeight(34)
         self.combo_ext_filter.addItem("모든 제출 문서 (PDF/HWP/Office/이미지)", "all")
         self.combo_ext_filter.addItem("PDF 파일만 (.pdf)", "pdf")
         self.combo_ext_filter.addItem("한글 파일만 (.hwp, .hwpx)", "hwp")
@@ -742,15 +775,18 @@ class DocOcrTab(QWidget):
         regex_row = QHBoxLayout()
         regex_row.addWidget(QLabel("학번 정규식(4~5자리):"))
         self.edit_id_regex = QLineEdit(r"(?<!\d)(\d{4,5})(?!\d)")
+        self.edit_id_regex.setMinimumHeight(34)
         regex_row.addWidget(QLabel("이름 정규식:"))
         self.edit_name_regex = QLineEdit(r"([가-힣]{2,4})")
+        self.edit_name_regex.setMinimumHeight(34)
         regex_row.addWidget(QLabel("표준 파일명 과제명:"))
         self.edit_assignment_title = QLineEdit("수행평가과제")
+        self.edit_assignment_title.setMinimumHeight(34)
         self.edit_assignment_title.textChanged.connect(self._on_assignment_title_changed)
 
         self.btn_scan_analyze = QPushButton("🔍 폴더 스캔 & 명렬표 미제출자 대조 실행")
         apply_qss_role(self.btn_scan_analyze, role="primary", obj_name="BtnScanAnalyze")
-        self.btn_scan_analyze.setMinimumHeight(38)
+        self.btn_scan_analyze.setMinimumHeight(36)
         self.btn_scan_analyze.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_scan_analyze.clicked.connect(self.run_submission_analysis)
 
@@ -760,7 +796,7 @@ class DocOcrTab(QWidget):
         regex_row.addWidget(self.btn_scan_analyze)
         cfg_lay.addLayout(regex_row)
 
-        main_lay.addWidget(cfg_group)
+        main_lay.addWidget(self.cfg_group)
 
         summary_bar = QHBoxLayout()
         self.lbl_summary_badge = QLabel(
@@ -770,12 +806,29 @@ class DocOcrTab(QWidget):
         summary_bar.addWidget(self.lbl_summary_badge, stretch=1)
         main_lay.addLayout(summary_bar)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
 
-        left_group = QGroupBox("📋 2단계: 제출 파일 학번순 정렬 및 표준 파일명 미리보기 (더블클릭하여 학번/이름 직접 수정 가능)")
-        apply_qss_role(left_group, obj_name="SubmittedFilesGroup")
-        left_lay = QVBoxLayout(left_group)
-        left_lay.setContentsMargins(15, 15, 15, 15)
+        # ---------------------------------------------------------------------
+        # 좌측 카드: 제출 파일 학번순 정렬 미리보기 (HoverZoomCard + [ ⛶ 전체화면 ] 버튼)
+        # ---------------------------------------------------------------------
+        self.left_group = HoverZoomCard(
+            title="📋 2단계: 제출 파일 학번순 정렬 및 표준 파일명 미리보기 (더블클릭하여 학번/이름 직접 수정 가능)",
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.left_group, role="hoverZoomCard", obj_name="SubmittedFilesGroup")
+        self.left_group.setMinimumHeight(260)
+
+        self.btn_focus_submissions = QPushButton("⛶ 전체화면")
+        apply_qss_role(self.btn_focus_submissions, role="cardMax", obj_name="CardMaxButton")
+        self.btn_focus_submissions.setCheckable(True)
+        self.btn_focus_submissions.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_focus_submissions.setToolTip("제출 파일 미리보기 카드를 전체화면으로 크게 보거나 원래 크기로 복원합니다.")
+        self.btn_focus_submissions.clicked.connect(lambda: self._toggle_card_focus("submissions"))
+        self.left_group.add_header_widget(self.btn_focus_submissions)
+
+        left_lay = self.left_group.body_layout()
 
         left_top_bar = QHBoxLayout()
         btn_check_all = QPushButton("전체 선택")
@@ -784,6 +837,7 @@ class DocOcrTab(QWidget):
         apply_qss_role(btn_uncheck_all)
         btn_check_all.clicked.connect(lambda: self._set_all_files_checked(True))
         btn_uncheck_all.clicked.connect(lambda: self._set_all_files_checked(False))
+
         left_top_bar.addWidget(btn_check_all)
         left_top_bar.addWidget(btn_uncheck_all)
         left_top_bar.addStretch()
@@ -791,6 +845,8 @@ class DocOcrTab(QWidget):
 
         self.table_submissions = QTableWidget(0, 7)
         self.table_submissions.setAlternatingRowColors(True)
+        self.table_submissions.setMouseTracking(True)
+        self.table_submissions.verticalHeader().setDefaultSectionSize(32)
         self.table_submissions.setHorizontalHeaderLabels(
             [
                 "선택",
@@ -814,13 +870,29 @@ class DocOcrTab(QWidget):
         sub_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         sub_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
 
-        left_lay.addWidget(self.table_submissions)
-        splitter.addWidget(left_group)
+        left_lay.addWidget(self.table_submissions, stretch=1)
+        self.splitter.addWidget(self.left_group)
 
-        right_group = QGroupBox("🚨 미제출자 명단 (환경설정 학생 명렬표 DB 자동 대조)")
-        apply_qss_role(right_group, obj_name="MissingStudentsGroup")
-        right_lay = QVBoxLayout(right_group)
-        right_lay.setContentsMargins(15, 15, 15, 15)
+        # ---------------------------------------------------------------------
+        # 우측 카드: 미제출자 명단 (HoverZoomCard + [ ⛶ 전체화면 ] 버튼)
+        # ---------------------------------------------------------------------
+        self.right_group = HoverZoomCard(
+            title="🚨 미제출자 명단 (환경설정 학생 명렬표 DB 자동 대조)",
+            zoom_ratio=1.12,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.right_group, role="hoverZoomCard", obj_name="MissingStudentsGroup")
+        self.right_group.setMinimumHeight(260)
+
+        self.btn_focus_missing = QPushButton("⛶ 전체화면")
+        apply_qss_role(self.btn_focus_missing, role="cardMax", obj_name="CardMaxButton")
+        self.btn_focus_missing.setCheckable(True)
+        self.btn_focus_missing.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_focus_missing.setToolTip("미제출자 명단 카드를 전체화면으로 크게 보거나 원래 크기로 복원합니다.")
+        self.btn_focus_missing.clicked.connect(lambda: self._toggle_card_focus("missing"))
+        self.right_group.add_header_widget(self.btn_focus_missing)
+
+        right_lay = self.right_group.body_layout()
 
         missing_btn_bar = QHBoxLayout()
         btn_copy_missing = QPushButton("📋 미제출자 명단 복사")
@@ -838,6 +910,8 @@ class DocOcrTab(QWidget):
 
         self.table_missing = QTableWidget(0, 5)
         self.table_missing.setAlternatingRowColors(True)
+        self.table_missing.setMouseTracking(True)
+        self.table_missing.verticalHeader().setDefaultSectionSize(32)
         self.table_missing.setHorizontalHeaderLabels(
             ["학번", "학년-반-번호", "이름", "학생 연락처", "학부모 연락처"]
         )
@@ -850,24 +924,29 @@ class DocOcrTab(QWidget):
         miss_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         miss_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
 
-        right_lay.addWidget(self.table_missing)
-        splitter.addWidget(right_group)
+        right_lay.addWidget(self.table_missing, stretch=1)
+        self.splitter.addWidget(self.right_group)
 
-        splitter.setSizes([720, 440])
-        main_lay.addWidget(splitter, stretch=1)
+        self.splitter.setSizes([720, 440])
+        main_lay.addWidget(self.splitter, stretch=1)
 
-        action_group = QGroupBox("🚀 3단계: 학번순 파일명 일괄 표준화 & 단일 PDF 병합 실행 (비동기 백그라운드 처리)")
-        apply_qss_role(action_group, obj_name="BatchMergeActionGroup")
-        act_lay = QHBoxLayout(action_group)
-        act_lay.setContentsMargins(15, 15, 15, 15)
+        self.action_group = HoverZoomCard(
+            title="🚀 3단계: 학번순 파일명 일괄 표준화 & 단일 PDF 병합 실행 (비동기 백그라운드 처리)",
+            parent=page,
+            zoom_ratio=1.10,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.action_group, role="hoverZoomCard", obj_name="BatchMergeActionGroup")
+        act_lay = QHBoxLayout()
 
         self.combo_rename_mode = QComboBox()
+        self.combo_rename_mode.setMinimumHeight(34)
         self.combo_rename_mode.addItem("안전 모드: 하위 '_정리완료' 폴더에 표준 파일명으로 복사 생성 (원본 보존)", "copy")
         self.combo_rename_mode.addItem("직접 변경: 원본 폴더 내에서 파일명을 즉시 표준 형식으로 변경", "move")
 
         self.btn_execute_rename = QPushButton("✏️ 학번순 표준 파일명([학번]_[이름]_과제명) 일괄 적용")
         apply_qss_role(self.btn_execute_rename, role="teal", obj_name="BtnExecuteStandardRename")
-        self.btn_execute_rename.setMinimumHeight(40)
+        self.btn_execute_rename.setMinimumHeight(38)
         self.btn_execute_rename.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_execute_rename.clicked.connect(self.run_standard_rename)
 
@@ -876,7 +955,7 @@ class DocOcrTab(QWidget):
 
         self.btn_execute_pdf_merge = QPushButton("📑 학번 순서대로 단일 PDF 병합 저장 (pypdf)")
         apply_qss_role(self.btn_execute_pdf_merge, role="danger", obj_name="BtnExecutePdfMerge")
-        self.btn_execute_pdf_merge.setMinimumHeight(40)
+        self.btn_execute_pdf_merge.setMinimumHeight(38)
         self.btn_execute_pdf_merge.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_execute_pdf_merge.clicked.connect(self.run_pdf_merge)
 
@@ -886,24 +965,76 @@ class DocOcrTab(QWidget):
         act_lay.addWidget(self.chk_pdf_bookmark)
         act_lay.addWidget(self.btn_execute_pdf_merge)
 
-        main_lay.addWidget(action_group)
-        return page
+        self.action_group.body_layout().addLayout(act_lay)
+        main_lay.addWidget(self.action_group)
+        scroll.setWidget(page)
+        return scroll
+
+    # =========================================================================
+    # 섹션 카드 전체화면 포커스 토글 ([ ⛶ 전체화면 ] <-> [ 🗗 원래 크기로 ])
+    # =========================================================================
+    def _toggle_card_focus(self, target: str) -> None:
+        if self._focused_card == target:
+            self._focused_card = None
+            self.left_group.set_zoom_enabled(True)
+            self.right_group.set_zoom_enabled(True)
+            self.cfg_group.show()
+            self.action_group.show()
+            self.left_group.show()
+            self.right_group.show()
+            self.btn_focus_submissions.setChecked(False)
+            self.btn_focus_submissions.setText("⛶ 전체화면")
+            self.btn_focus_missing.setChecked(False)
+            self.btn_focus_missing.setText("⛶ 전체화면")
+            self.splitter.setSizes([720, 440])
+            return
+
+        self._focused_card = target
+        self.cfg_group.hide()
+        if target == "submissions":
+            self.left_group.set_zoom_enabled(False)
+            self.left_group.show()
+            self.right_group.hide()
+            self.action_group.show()
+            self.btn_focus_submissions.setChecked(True)
+            self.btn_focus_submissions.setText("🗗 원래 크기로")
+            self.btn_focus_missing.setChecked(False)
+            self.btn_focus_missing.setText("⛶ 전체화면")
+        elif target == "missing":
+            self.right_group.set_zoom_enabled(False)
+            self.left_group.hide()
+            self.right_group.show()
+            self.action_group.hide()
+            self.btn_focus_missing.setChecked(True)
+            self.btn_focus_missing.setText("🗗 원래 크기로")
+            self.btn_focus_submissions.setChecked(False)
+            self.btn_focus_submissions.setText("⛶ 전체화면")
 
     # =========================================================================
     # [서브탭 2] 2. AI OCR 및 문서 텍스트 보정 (하단 QHBoxLayout 2버튼 나란히 배치)
     # =========================================================================
     def _build_ocr_subtab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
         w = QWidget()
+        w.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+        )
         apply_qss_role(w, obj_name="SubTabAiOcr")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(15, 15, 15, 15)
+        lay.setContentsMargins(8, 8, 22, 22)
         lay.setSpacing(12)
 
-        grp = QGroupBox("🤖 2. AI OCR 및 문서 텍스트 보정 (멀티 LLM API & 수동 프롬프트 복붙 하이브리드)")
-        apply_qss_role(grp, obj_name="AiOcrHybridGroup")
-        g_lay = QVBoxLayout(grp)
-        g_lay.setContentsMargins(15, 15, 15, 15)
-        g_lay.setSpacing(12)
+        grp = HoverZoomCard(
+            title="🤖 2. AI OCR 및 문서 텍스트 보정 (멀티 LLM API & 수동 프롬프트 복붙 하이브리드)",
+            parent=w,
+            zoom_ratio=1.10,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(grp, role="hoverZoomCard", obj_name="AiOcrHybridGroup")
+        g_lay = grp.body_layout()
 
         # 상단 파일 추가 및 결과 저장 툴바
         file_toolbar = QHBoxLayout()
@@ -915,7 +1046,8 @@ class DocOcrTab(QWidget):
         apply_qss_role(btn_save_txt, obj_name="BtnSaveOcrMarkdown")
 
         self.list_ocr_files = QListWidget()
-        self.list_ocr_files.setMaximumHeight(110)
+        self.list_ocr_files.setMouseTracking(True)
+        self.list_ocr_files.setMinimumHeight(90)
 
         btn_add.clicked.connect(self._on_add_ocr_files)
         btn_clear.clicked.connect(self.list_ocr_files.clear)
@@ -931,9 +1063,12 @@ class DocOcrTab(QWidget):
 
         # 보정 지침 입력란
         form = QFormLayout()
+        form.setVerticalSpacing(12)
+        form.setHorizontalSpacing(16)
         self.edit_ocr_prompt = QLineEdit(
             "스캔/추출된 문서의 오탈자를 문맥에 맞게 교정하고, 핵심 3줄 요약과 후속 조치 사항을 정리해 주세요."
         )
+        self.edit_ocr_prompt.setMinimumHeight(34)
         form.addRow("AI 보정/요약 지침:", self.edit_ocr_prompt)
         g_lay.addLayout(form)
 
@@ -968,21 +1103,30 @@ class DocOcrTab(QWidget):
         g_lay.addLayout(exec_btn_layout)
 
         lay.addWidget(grp)
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     # =========================================================================
     # [서브탭 3] 다중 보고서 엑셀 취합기 UI
     # =========================================================================
     def _build_excel_aggregator_subtab(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+
         w = QWidget()
         apply_qss_role(w, obj_name="SubTabExcelAggregator")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(15, 15, 15, 15)
+        lay.setContentsMargins(8, 8, 22, 22)
 
-        grp = QGroupBox("다중 엑셀(.xlsx) / CSV 보고서 파일 단일 요약본 병합기")
-        apply_qss_role(grp, obj_name="ExcelAggregatorGroup")
-        g_lay = QVBoxLayout(grp)
-        g_lay.setContentsMargins(15, 15, 15, 15)
+        grp = HoverZoomCard(
+            title="다중 엑셀(.xlsx) / CSV 보고서 파일 단일 요약본 병합기",
+            parent=w,
+            zoom_ratio=1.10,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(grp, role="hoverZoomCard", obj_name="ExcelAggregatorGroup")
+        g_lay = grp.body_layout()
 
         top_bar = QHBoxLayout()
         btn_add = QPushButton("+ 취합할 엑셀/CSV 보고서 파일 추가")
@@ -995,6 +1139,7 @@ class DocOcrTab(QWidget):
         btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self.list_excel_files = QListWidget()
+        self.list_excel_files.setMouseTracking(True)
         btn_add.clicked.connect(self._on_add_excel_files)
         btn_clear.clicked.connect(self.list_excel_files.clear)
         btn_run.clicked.connect(self._on_run_excel_aggregator)
@@ -1007,7 +1152,8 @@ class DocOcrTab(QWidget):
         g_lay.addLayout(top_bar)
         g_lay.addWidget(self.list_excel_files)
         lay.addWidget(grp)
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     # =========================================================================
     # [서브탭 1] 핸들러
@@ -1017,6 +1163,7 @@ class DocOcrTab(QWidget):
         if folder:
             norm = str(Path(folder).resolve())
             self.edit_submission_dir.setText(norm)
+            self.edit_submission_dir.setToolTip(norm)
             folder_name = Path(norm).name
             if folder_name:
                 self.edit_assignment_title.setText(folder_name)
@@ -1091,10 +1238,12 @@ class DocOcrTab(QWidget):
             )
             chk_item.setData(Qt.ItemDataRole.UserRole, item)
 
-            sid_item = QTableWidgetItem(str(item.get("student_id", "")))
+            sid_str = str(item.get("student_id", ""))
+            sid_item = QTableWidgetItem(sid_str)
             sid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            name_item = QTableWidgetItem(str(item.get("name", "")))
+            name_str = str(item.get("name", ""))
+            name_item = QTableWidgetItem(name_str)
             name_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             status_str = str(item.get("match_status", ""))
@@ -1108,22 +1257,40 @@ class DocOcrTab(QWidget):
             else:
                 status_item.setForeground(QBrush(QColor("#dc2626")))
 
-            orig_name_item = QTableWidgetItem(str(item.get("orig_name", "")))
+            orig_name_str = str(item.get("orig_name", ""))
+            orig_name_item = QTableWidgetItem(orig_name_str)
             orig_name_item.setFlags(orig_name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            new_name_item = QTableWidgetItem(str(item.get("new_name", "")))
+            new_name_str = str(item.get("new_name", ""))
+            new_name_item = QTableWidgetItem(new_name_str)
             new_name_item.setForeground(QBrush(QColor("#1d4ed8")))
 
-            orig_path_item = QTableWidgetItem(str(item.get("orig_path", "")))
+            orig_path_str = str(item.get("orig_path", ""))
+            orig_path_item = QTableWidgetItem(orig_path_str)
             orig_path_item.setFlags(orig_path_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
-            self.table_submissions.setItem(row_idx, 0, chk_item)
-            self.table_submissions.setItem(row_idx, 1, sid_item)
-            self.table_submissions.setItem(row_idx, 2, name_item)
-            self.table_submissions.setItem(row_idx, 3, status_item)
-            self.table_submissions.setItem(row_idx, 4, orig_name_item)
-            self.table_submissions.setItem(row_idx, 5, new_name_item)
-            self.table_submissions.setItem(row_idx, 6, orig_path_item)
+            tooltip_html = build_floating_tooltip(
+                f"📄 [{sid_str or '학번미상'}] {name_str or '이름미상'}",
+                [
+                    f"<b>명렬표 대조 상태:</b> {html.escape(status_str)}",
+                    f"<b>원본 파일명:</b> {html.escape(orig_name_str)}",
+                    f"<b>변경될 표준 파일명:</b> <span style='color:#93c5fd;'>{html.escape(new_name_str)}</span>",
+                    f"<b>원본 전체 경로:</b> {html.escape(orig_path_str)}",
+                ],
+            )
+
+            row_items = [
+                chk_item,
+                sid_item,
+                name_item,
+                status_item,
+                orig_name_item,
+                new_name_item,
+                orig_path_item,
+            ]
+            for col_idx, it in enumerate(row_items):
+                it.setToolTip(tooltip_html)
+                self.table_submissions.setItem(row_idx, col_idx, it)
 
         self.table_submissions.blockSignals(False)
 
@@ -1132,7 +1299,8 @@ class DocOcrTab(QWidget):
         for row_idx, stu in enumerate(self._missing_students):
             self.table_missing.insertRow(row_idx)
 
-            sid_item = QTableWidgetItem(str(stu.get("student_id", "")))
+            sid_str = str(stu.get("student_id", ""))
+            sid_item = QTableWidgetItem(sid_str)
             sid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             sid_item.setForeground(QBrush(QColor("#dc2626")))
 
@@ -1140,17 +1308,29 @@ class DocOcrTab(QWidget):
             gcn_item = QTableWidgetItem(gcn)
             gcn_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            name_item = QTableWidgetItem(str(stu.get("name", "")))
+            name_str = str(stu.get("name", ""))
+            name_item = QTableWidgetItem(name_str)
             name_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            contact_item = QTableWidgetItem(str(stu.get("contact", "")))
-            parent_item = QTableWidgetItem(str(stu.get("parent_contact", "")))
+            contact_str = str(stu.get("contact", ""))
+            contact_item = QTableWidgetItem(contact_str)
 
-            self.table_missing.setItem(row_idx, 0, sid_item)
-            self.table_missing.setItem(row_idx, 1, gcn_item)
-            self.table_missing.setItem(row_idx, 2, name_item)
-            self.table_missing.setItem(row_idx, 3, contact_item)
-            self.table_missing.setItem(row_idx, 4, parent_item)
+            parent_str = str(stu.get("parent_contact", ""))
+            parent_item = QTableWidgetItem(parent_str)
+
+            tooltip_html = build_floating_tooltip(
+                f"🚨 미제출: [{sid_str}] {name_str}",
+                [
+                    f"<b>학년-반-번호:</b> {gcn}",
+                    f"<b>학생 연락처:</b> {html.escape(contact_str or '-')}",
+                    f"<b>학부모 연락처:</b> {html.escape(parent_str or '-')}",
+                    f"<b>비고:</b> {html.escape(str(stu.get('memo', '') or '-'))}",
+                ],
+            )
+
+            for col_idx, it in enumerate((sid_item, gcn_item, name_item, contact_item, parent_item)):
+                it.setToolTip(tooltip_html)
+                self.table_missing.setItem(row_idx, col_idx, it)
 
     def _on_submission_table_item_changed(self, changed_item: QTableWidgetItem) -> None:
         row = changed_item.row()
@@ -1419,7 +1599,9 @@ class DocOcrTab(QWidget):
             "문서 및 이미지 (*.png *.jpg *.jpeg *.pdf *.txt *.md *.csv *.tif *.bmp *.webp);;모든 파일 (*)",
         )
         for f in files:
-            self.list_ocr_files.addItem(f)
+            it = QListWidgetItem(f)
+            it.setToolTip(build_floating_tooltip("📄 OCR 대상 파일 경로", [html.escape(f)]))
+            self.list_ocr_files.addItem(it)
 
     def _on_open_manual_llm_dialog(self) -> None:
         """[📋 수동 복붙 모드 열기] 버튼 클릭 시 ManualLlmDialog가 팝업됩니다."""
@@ -1488,7 +1670,9 @@ class DocOcrTab(QWidget):
             self, "취합할 보고서 선택", "", "스프레드시트 (*.xlsx *.csv);;모든 파일 (*)"
         )
         for f in files:
-            self.list_excel_files.addItem(f)
+            it = QListWidgetItem(f)
+            it.setToolTip(build_floating_tooltip("📊 취합 대상 보고서 경로", [html.escape(f)]))
+            self.list_excel_files.addItem(it)
 
     def _on_run_excel_aggregator(self) -> None:
         files = [self.list_excel_files.item(i).text() for i in range(self.list_excel_files.count())]

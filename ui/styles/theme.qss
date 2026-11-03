@@ -28,16 +28,49 @@ QWidget {
 }
 
 /* ----------------------------------------------------------------------------
-   2. 좌측 다크 사이드바 (ChatGPT / Gemini 스타일 네비게이션)
+   1-1. 세련된 플로팅 툴팁 (Hover Floating Info Card)
+   ---------------------------------------------------------------------------- */
+QToolTip {
+    background-color: #0f172a;
+    color: #f8fafc;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+}
+
+/* ----------------------------------------------------------------------------
+   2. 좌측 다크 사이드바 (ChatGPT / Gemini 스타일 네비게이션 & 접기/펼치기)
    ---------------------------------------------------------------------------- */
 QFrame#SidebarContainer {
     background-color: #0f172a;
     border-right: 1px solid #1e293b;
 }
 
+QPushButton#SidebarToggleBtn {
+    background-color: #1e293b;
+    color: #f8fafc;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 5px 9px;
+    font-size: 15px;
+    font-weight: 700;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
+    text-align: center;
+}
+
+QPushButton#SidebarToggleBtn:hover {
+    background-color: #2563eb;
+    border-color: #3b82f6;
+    color: #ffffff;
+}
+
 QLabel#SidebarBrandTitle {
     color: #f8fafc;
-    font-size: 16px;
+    font-size: 15px;
     font-weight: 700;
     padding: 2px 4px;
 }
@@ -45,14 +78,14 @@ QLabel#SidebarBrandTitle {
 QLabel#SidebarBrandSubtitle {
     color: #94a3b8;
     font-size: 11px;
-    padding: 0px 4px 8px 4px;
+    padding: 0px 4px 6px 4px;
 }
 
 QLabel#SidebarSectionLabel {
     color: #64748b;
     font-size: 11px;
     font-weight: 700;
-    padding: 8px 10px 4px 10px;
+    padding: 6px 10px 4px 10px;
 }
 
 QListWidget#SidebarNavList {
@@ -66,10 +99,19 @@ QListWidget#SidebarNavList::item {
     background-color: transparent;
     color: #cbd5e1;
     border-radius: 10px;
-    padding: 11px 14px;
+    padding: 11px 12px;
     margin-bottom: 4px;
     font-size: 13px;
     font-weight: 600;
+}
+
+QListWidget#SidebarNavList[collapsed="true"] {
+    padding: 4px 2px;
+}
+
+QListWidget#SidebarNavList[collapsed="true"]::item {
+    padding: 11px 0px;
+    font-size: 17px;
 }
 
 QListWidget#SidebarNavList::item:hover {
@@ -88,10 +130,17 @@ QPushButton#SidebarTrayButton {
     color: #e2e8f0;
     border: 1px solid #334155;
     border-radius: 10px;
-    padding: 9px 14px;
+    padding: 9px 12px;
     font-size: 12px;
     font-weight: 600;
     text-align: left;
+    min-height: 36px;
+}
+
+QPushButton#SidebarTrayButton[collapsed="true"] {
+    padding: 9px 0px;
+    text-align: center;
+    font-size: 16px;
 }
 
 QPushButton#SidebarTrayButton:hover {
@@ -101,10 +150,19 @@ QPushButton#SidebarTrayButton:hover {
 }
 
 /* ----------------------------------------------------------------------------
-   3. 우측 메인 컨텐츠 영역 (밝고 넓은 모던 워크스페이스)
+   3. 우측 메인 컨텐츠 영역 (밝고 넓은 모던 워크스페이스 & 스크롤 영역)
    ---------------------------------------------------------------------------- */
 QFrame#WorkspaceContainer {
     background-color: #f1f5f9;
+}
+
+QScrollArea {
+    background-color: transparent;
+    border: none;
+}
+
+QScrollArea > QWidget > QWidget {
+    background-color: transparent;
 }
 
 QFrame#TopHeaderBar {
@@ -138,8 +196,21 @@ QStackedWidget#MainStackedWidget {
 }
 
 /* ----------------------------------------------------------------------------
-   4. 카드형 그룹박스 (Google Material Design 3 Surface Card)
+   4. HoverZoomCard & 카드형 그룹박스 & 전체화면 포커스 토글 버튼
    ---------------------------------------------------------------------------- */
+HoverZoomCard, QFrame[role="hoverZoomCard"] {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+}
+
+QLabel#HoverCardTitle {
+    color: #0f172a;
+    font-size: 13.5px;
+    font-weight: 700;
+    padding: 2px 0px;
+}
+
 QGroupBox {
     background-color: #ffffff;
     border: 1px solid #e2e8f0;
@@ -161,6 +232,30 @@ QGroupBox::title {
     border-radius: 6px;
     color: #0f172a;
     font-weight: 700;
+}
+
+/* 섹션 카드 우측 상단 전체화면/원래크기 포커스 토글 버튼 */
+QPushButton#CardMaxButton, QPushButton[role="cardMax"] {
+    background-color: #f1f5f9;
+    color: #334155;
+    border: 1px solid #cbd5e1;
+    border-radius: 7px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    min-height: 26px;
+}
+
+QPushButton#CardMaxButton:hover, QPushButton[role="cardMax"]:hover {
+    background-color: #e0f2fe;
+    color: #0369a1;
+    border-color: #7dd3fc;
+}
+
+QPushButton#CardMaxButton:checked, QPushButton[role="cardMax"]:checked {
+    background-color: #dbeafe;
+    color: #1d4ed8;
+    border-color: #60a5fa;
 }
 
 /* 안내 배너 라벨 */
@@ -217,9 +312,10 @@ QPushButton {
     color: #1e293b;
     border: 1px solid #cbd5e1;
     border-radius: 8px;
-    padding: 7px 14px;
+    padding: 6px 14px;
     font-size: 13px;
     font-weight: 600;
+    min-height: 24px;
 }
 
 QPushButton:hover {
@@ -324,15 +420,17 @@ QPushButton[role="slate"]:hover {
 }
 
 /* ----------------------------------------------------------------------------
-   7. 입력창, 콤보박스, 스핀박스, 텍스트 에디터 (웹 AI 프롬프트 창 감성)
+   7. 입력창, 콤보박스, 스핀박스 (최소 높이 34px 및 상하 패딩 4px 8px 보장)
    ---------------------------------------------------------------------------- */
 QLineEdit, QComboBox, QSpinBox {
     background-color: #ffffff;
     color: #0f172a;
-    border: 1px solid #cbd5e1;
-    border-radius: 8px;
-    padding: 6px 10px;
-    min-height: 20px;
+    border: 1px solid #D0D5DD;
+    border-radius: 6px;
+    padding: 4px 10px;
+    min-height: 34px;
+    height: 34px;
+    font-size: 13px;
     selection-background-color: #bfdbfe;
     selection-color: #0f172a;
 }
@@ -342,9 +440,8 @@ QLineEdit:hover, QComboBox:hover, QSpinBox:hover {
 }
 
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
-    border: 2px solid #3b82f6;
+    border: 1px solid #4F46E5;
     background-color: #ffffff;
-    padding: 5px 9px;
 }
 
 QLineEdit:read-only {
@@ -353,8 +450,42 @@ QLineEdit:read-only {
 }
 
 QComboBox::drop-down {
-    border: none;
-    width: 24px;
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 28px;
+    border-left: 1px solid #E4E7EC;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    background-color: #F8FAFC;
+}
+
+QComboBox::drop-down:hover {
+    background-color: #EEF2F6;
+}
+
+QComboBox::down-arrow {
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid #475467;
+    margin-right: 2px;
+}
+
+QComboBox QAbstractItemView {
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    background-color: #FFFFFF;
+    selection-background-color: #EEF2F6;
+    selection-color: #1D2939;
+    padding: 4px;
+    outline: none;
+    min-height: 120px;
+}
+
+QComboBox QAbstractItemView::item {
+    min-height: 28px;
+    padding: 4px 8px;
 }
 
 QTextEdit, QListWidget {
@@ -372,7 +503,7 @@ QTextEdit:focus, QListWidget:focus {
 }
 
 /* ----------------------------------------------------------------------------
-   8. 테이블 위젯 (모던 데이터 그리드)
+   8. 테이블 위젯 (모던 데이터 그리드 & 행 여백 보장)
    ---------------------------------------------------------------------------- */
 QTableWidget {
     background-color: #ffffff;
@@ -383,6 +514,10 @@ QTableWidget {
     gridline-color: #f1f5f9;
     selection-background-color: #dbeafe;
     selection-color: #1e3a8a;
+}
+
+QTableWidget::item {
+    padding: 4px 8px;
 }
 
 QHeaderView::section {
@@ -406,6 +541,7 @@ QCheckBox {
     spacing: 7px;
     color: #334155;
     font-weight: 500;
+    min-height: 26px;
 }
 
 /* 스플리터 핸들 */
@@ -415,12 +551,12 @@ QSplitter::handle {
 }
 
 QSplitter::handle:horizontal {
-    width: 4px;
+    width: 5px;
     margin: 4px 2px;
 }
 
 QSplitter::handle:vertical {
-    height: 4px;
+    height: 5px;
     margin: 2px 4px;
 }
 
@@ -532,7 +668,7 @@ QTextEdit#ParsedPreviewBox {
 }
 
 /* ----------------------------------------------------------------------------
-   11. 모던 스크롤바 (macOS / Web 슬림 스타일)
+   11. 모던 스크롤바 (macOS / Web 슬림 스타일 — 모든 테이블/리스트/스크롤 영역 공통)
    ---------------------------------------------------------------------------- */
 QScrollBar:vertical {
     background: transparent;
@@ -542,7 +678,7 @@ QScrollBar:vertical {
 
 QScrollBar::handle:vertical {
     background: #cbd5e1;
-    min-height: 24px;
+    min-height: 28px;
     border-radius: 4px;
 }
 
@@ -554,6 +690,10 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
 }
 
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background: none;
+}
+
 QScrollBar:horizontal {
     background: transparent;
     height: 8px;
@@ -562,7 +702,7 @@ QScrollBar:horizontal {
 
 QScrollBar::handle:horizontal {
     background: #cbd5e1;
-    min-width: 24px;
+    min-width: 28px;
     border-radius: 4px;
 }
 
@@ -572,4 +712,8 @@ QScrollBar::handle:horizontal:hover {
 
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
     width: 0px;
+}
+
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background: none;
 }
