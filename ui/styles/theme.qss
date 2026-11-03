@@ -1,0 +1,575 @@
+/* ============================================================================
+   교무·업무 자동화 데스크톱 워크스테이션 — Modern Web AI & Material Design 3 QSS
+   File: ui/styles/theme.qss
+   Font Stack: Pretendard, Segoe UI, Apple SD Gothic Neo
+   Layout: Dark Left Navigation Sidebar + Clean Light Surface Main Content
+   ============================================================================ */
+
+* {
+    font-family: "Pretendard", "Segoe UI Variable Display", "Segoe UI", "Apple SD Gothic Neo", sans-serif;
+    font-size: 13px;
+    outline: none;
+}
+
+/* ----------------------------------------------------------------------------
+   1. 메인 윈도우 및 다이얼로그 기본 배경
+   ---------------------------------------------------------------------------- */
+QMainWindow {
+    background-color: #0f172a;
+}
+
+QDialog {
+    background-color: #f8fafc;
+    color: #0f172a;
+}
+
+QWidget {
+    color: #1e293b;
+}
+
+/* ----------------------------------------------------------------------------
+   2. 좌측 다크 사이드바 (ChatGPT / Gemini 스타일 네비게이션)
+   ---------------------------------------------------------------------------- */
+QFrame#SidebarContainer {
+    background-color: #0f172a;
+    border-right: 1px solid #1e293b;
+}
+
+QLabel#SidebarBrandTitle {
+    color: #f8fafc;
+    font-size: 16px;
+    font-weight: 700;
+    padding: 2px 4px;
+}
+
+QLabel#SidebarBrandSubtitle {
+    color: #94a3b8;
+    font-size: 11px;
+    padding: 0px 4px 8px 4px;
+}
+
+QLabel#SidebarSectionLabel {
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 8px 10px 4px 10px;
+}
+
+QListWidget#SidebarNavList {
+    background-color: transparent;
+    border: none;
+    padding: 4px;
+    outline: none;
+}
+
+QListWidget#SidebarNavList::item {
+    background-color: transparent;
+    color: #cbd5e1;
+    border-radius: 10px;
+    padding: 11px 14px;
+    margin-bottom: 4px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QListWidget#SidebarNavList::item:hover {
+    background-color: #1e293b;
+    color: #ffffff;
+}
+
+QListWidget#SidebarNavList::item:selected {
+    background-color: #2563eb;
+    color: #ffffff;
+    font-weight: 700;
+}
+
+QPushButton#SidebarTrayButton {
+    background-color: #1e293b;
+    color: #e2e8f0;
+    border: 1px solid #334155;
+    border-radius: 10px;
+    padding: 9px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+}
+
+QPushButton#SidebarTrayButton:hover {
+    background-color: #334155;
+    border-color: #475569;
+    color: #ffffff;
+}
+
+/* ----------------------------------------------------------------------------
+   3. 우측 메인 컨텐츠 영역 (밝고 넓은 모던 워크스페이스)
+   ---------------------------------------------------------------------------- */
+QFrame#WorkspaceContainer {
+    background-color: #f1f5f9;
+}
+
+QFrame#TopHeaderBar {
+    background-color: #ffffff;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+QLabel#PageHeaderTitle {
+    color: #0f172a;
+    font-size: 18px;
+    font-weight: 700;
+}
+
+QLabel#PageHeaderDesc {
+    color: #64748b;
+    font-size: 12px;
+}
+
+QLabel#AiModeBadge {
+    background-color: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+    border-radius: 12px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+QStackedWidget#MainStackedWidget {
+    background-color: #f1f5f9;
+}
+
+/* ----------------------------------------------------------------------------
+   4. 카드형 그룹박스 (Google Material Design 3 Surface Card)
+   ---------------------------------------------------------------------------- */
+QGroupBox {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    margin-top: 12px;
+    padding: 18px 14px 14px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 14px;
+    top: 2px;
+    padding: 2px 8px;
+    background-color: #ffffff;
+    border-radius: 6px;
+    color: #0f172a;
+    font-weight: 700;
+}
+
+/* 안내 배너 라벨 */
+QLabel[role="infoBanner"] {
+    background-color: #eff6ff;
+    color: #1e3a8a;
+    border: 1px solid #bfdbfe;
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-weight: 600;
+}
+
+QLabel[role="mutedText"] {
+    color: #64748b;
+    font-size: 12px;
+}
+
+/* ----------------------------------------------------------------------------
+   5. 서브 탭 (QTabWidget — 탭 2 내부 서브탭 등)
+   ---------------------------------------------------------------------------- */
+QTabWidget::pane {
+    background-color: transparent;
+    border: none;
+    margin-top: 6px;
+}
+
+QTabBar::tab {
+    background-color: #e2e8f0;
+    color: #475569;
+    border: none;
+    border-radius: 10px;
+    padding: 9px 18px;
+    margin-right: 6px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QTabBar::tab:hover {
+    background-color: #cbd5e1;
+    color: #0f172a;
+}
+
+QTabBar::tab:selected {
+    background-color: #2563eb;
+    color: #ffffff;
+    font-weight: 700;
+}
+
+/* ----------------------------------------------------------------------------
+   6. 버튼 (Material Design 3 Pill / Rounded 8px~10px & Hover 이펙트)
+   ---------------------------------------------------------------------------- */
+QPushButton {
+    background-color: #f8fafc;
+    color: #1e293b;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 7px 14px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QPushButton:hover {
+    background-color: #e2e8f0;
+    border-color: #94a3b8;
+    color: #0f172a;
+}
+
+QPushButton:pressed {
+    background-color: #cbd5e1;
+}
+
+QPushButton:disabled {
+    background-color: #f1f5f9;
+    color: #94a3b8;
+    border-color: #e2e8f0;
+}
+
+/* Primary 버튼 (파란색 포인트) */
+QPushButton[role="primary"] {
+    background-color: #2563eb;
+    color: #ffffff;
+    border: 1px solid #1d4ed8;
+    border-radius: 9px;
+    font-weight: 700;
+}
+
+QPushButton[role="primary"]:hover {
+    background-color: #1d4ed8;
+    border-color: #1e40af;
+}
+
+QPushButton[role="primary"]:pressed {
+    background-color: #1e40af;
+}
+
+/* Success 버튼 (에메랄드 그린) */
+QPushButton[role="success"] {
+    background-color: #10b981;
+    color: #ffffff;
+    border: 1px solid #059669;
+    border-radius: 9px;
+    font-weight: 700;
+}
+
+QPushButton[role="success"]:hover {
+    background-color: #059669;
+    border-color: #047857;
+}
+
+/* Teal / 보조 액센트 버튼 */
+QPushButton[role="teal"] {
+    background-color: #0f766e;
+    color: #ffffff;
+    border: 1px solid #115e59;
+    border-radius: 9px;
+    font-weight: 700;
+}
+
+QPushButton[role="teal"]:hover {
+    background-color: #115e59;
+}
+
+/* Danger / 강조 레드 버튼 */
+QPushButton[role="danger"] {
+    background-color: #e11d48;
+    color: #ffffff;
+    border: 1px solid #be123c;
+    border-radius: 9px;
+    font-weight: 700;
+}
+
+QPushButton[role="danger"]:hover {
+    background-color: #be123c;
+}
+
+/* Warning / 실행취소 아웃라인 버튼 */
+QPushButton[role="warningOutline"] {
+    background-color: #fffbeb;
+    color: #b45309;
+    border: 1px solid #fde68a;
+    border-radius: 8px;
+    font-weight: 700;
+}
+
+QPushButton[role="warningOutline"]:hover {
+    background-color: #fef3c7;
+    border-color: #f59e0b;
+}
+
+/* Dark Slate 토글 버튼 (감시 OFF 등) */
+QPushButton[role="slate"] {
+    background-color: #475569;
+    color: #ffffff;
+    border: 1px solid #334155;
+    border-radius: 9px;
+    font-weight: 700;
+}
+
+QPushButton[role="slate"]:hover {
+    background-color: #334155;
+}
+
+/* ----------------------------------------------------------------------------
+   7. 입력창, 콤보박스, 스핀박스, 텍스트 에디터 (웹 AI 프롬프트 창 감성)
+   ---------------------------------------------------------------------------- */
+QLineEdit, QComboBox, QSpinBox {
+    background-color: #ffffff;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 6px 10px;
+    min-height: 20px;
+    selection-background-color: #bfdbfe;
+    selection-color: #0f172a;
+}
+
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover {
+    border-color: #94a3b8;
+}
+
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+    border: 2px solid #3b82f6;
+    background-color: #ffffff;
+    padding: 5px 9px;
+}
+
+QLineEdit:read-only {
+    background-color: #f8fafc;
+    color: #64748b;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 24px;
+}
+
+QTextEdit, QListWidget {
+    background-color: #ffffff;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+    padding: 8px 10px;
+    selection-background-color: #bfdbfe;
+    selection-color: #0f172a;
+}
+
+QTextEdit:focus, QListWidget:focus {
+    border: 2px solid #3b82f6;
+}
+
+/* ----------------------------------------------------------------------------
+   8. 테이블 위젯 (모던 데이터 그리드)
+   ---------------------------------------------------------------------------- */
+QTableWidget {
+    background-color: #ffffff;
+    alternate-background-color: #f8fafc;
+    color: #1e293b;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    gridline-color: #f1f5f9;
+    selection-background-color: #dbeafe;
+    selection-color: #1e3a8a;
+}
+
+QHeaderView::section {
+    background-color: #f8fafc;
+    color: #475569;
+    font-size: 12px;
+    font-weight: 700;
+    border: none;
+    border-bottom: 1px solid #e2e8f0;
+    border-right: 1px solid #f1f5f9;
+    padding: 8px 10px;
+}
+
+QTableCornerButton::section {
+    background-color: #f8fafc;
+    border: none;
+}
+
+/* 체크박스 */
+QCheckBox {
+    spacing: 7px;
+    color: #334155;
+    font-weight: 500;
+}
+
+/* 스플리터 핸들 */
+QSplitter::handle {
+    background-color: #e2e8f0;
+    border-radius: 2px;
+}
+
+QSplitter::handle:horizontal {
+    width: 4px;
+    margin: 4px 2px;
+}
+
+QSplitter::handle:vertical {
+    height: 4px;
+    margin: 2px 4px;
+}
+
+QSplitter::handle:hover {
+    background-color: #3b82f6;
+}
+
+/* ----------------------------------------------------------------------------
+   9. 하단 상태 표시줄 및 확장형 실시간 로그 콘솔 서랍 (Drawer)
+   ---------------------------------------------------------------------------- */
+QFrame#BottomStatusContainer {
+    background-color: #ffffff;
+    border-top: 1px solid #e2e8f0;
+}
+
+QLabel#StatusTaskBadge {
+    background-color: #f1f5f9;
+    color: #0f172a;
+    border-radius: 8px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+QLabel#StatusSingleLineLog {
+    color: #64748b;
+    font-size: 12px;
+    padding: 0 8px;
+}
+
+QProgressBar#ModernProgressBar {
+    background-color: #e2e8f0;
+    border: none;
+    border-radius: 6px;
+    min-height: 12px;
+    max-height: 12px;
+    text-align: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+QProgressBar#ModernProgressBar::chunk {
+    background-color: qlineargradient(
+        x1: 0, y1: 0, x2: 1, y2: 0,
+        stop: 0 #2563eb, stop: 1 #06b6d4
+    );
+    border-radius: 6px;
+}
+
+QFrame#LogConsoleDrawer {
+    background-color: #0f172a;
+    border-top: 1px solid #1e293b;
+}
+
+QTextEdit#DarkLogConsole {
+    background-color: #0f172a;
+    color: #e2e8f0;
+    border: 1px solid #1e293b;
+    border-radius: 10px;
+    padding: 8px 12px;
+    font-family: "Consolas", "Pretendard", monospace;
+    font-size: 12px;
+}
+
+/* ----------------------------------------------------------------------------
+   10. 수동 LLM 프롬프트 모달 (ManualLlmDialog 전용 스타일)
+   ---------------------------------------------------------------------------- */
+QDialog#ManualLlmModal {
+    background-color: #f1f5f9;
+}
+
+QFrame#ModalHeaderCard {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+}
+
+QTextEdit#PromptCodeBox {
+    background-color: #0f172a;
+    color: #e2e8f0;
+    border: 1px solid #1e293b;
+    border-radius: 12px;
+    padding: 12px;
+    font-family: "Consolas", "Pretendard", monospace;
+    font-size: 12px;
+}
+
+QTextEdit#WebAiInputBox {
+    background-color: #ffffff;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+    border-radius: 12px;
+    padding: 12px;
+    font-size: 13px;
+}
+
+QTextEdit#WebAiInputBox:focus {
+    border: 2px solid #2563eb;
+}
+
+QTextEdit#ParsedPreviewBox {
+    background-color: #f0fdf4;
+    color: #14532d;
+    border: 1px solid #bbf7d0;
+    border-radius: 12px;
+    padding: 12px;
+    font-size: 13px;
+}
+
+/* ----------------------------------------------------------------------------
+   11. 모던 스크롤바 (macOS / Web 슬림 스타일)
+   ---------------------------------------------------------------------------- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 2px;
+}
+
+QScrollBar::handle:vertical {
+    background: #cbd5e1;
+    min-height: 24px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #94a3b8;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 2px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #cbd5e1;
+    min-width: 24px;
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #94a3b8;
+}
+
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
