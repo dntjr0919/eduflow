@@ -58,6 +58,7 @@ from services.docx_extractor_service import (
     load_all_schemas,
     load_single_schema,
 )
+from services.excel_merger_service import merge_excel_assignments
 from services.record_generator_service import (
     generate_records_from_excel,
     get_active_ai_info,
@@ -76,6 +77,7 @@ from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
 from ui.dialogs.docx_schema_create_dialog import DocxSchemaCreateDialog
 from ui.dialogs.prompt_edit_dialog import PromptEditDialog
+from ui.utils import install_no_scroll_wheel_filter
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -100,6 +102,7 @@ SUPPORTED_SUBMISSION_EXTS = {
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     """위젯에 objectName 및 role 속성을 부여하고 style().polish()를 즉시 호출합니다."""
     widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    install_no_scroll_wheel_filter(widget)
     if obj_name:
         widget.setObjectName(obj_name)
     if role:
@@ -292,27 +295,27 @@ class StudentSubmissionAnalyzeWorker(BaseWorker):
                         extracted_name = cand_str
                         break
 
-            match_status = "❓ 미등록/확인필요"
+            match_status = "미등록/확인필요"
             matched_student: Optional[Dict[str, Any]] = None
 
             if extracted_id and extracted_id in roster_by_id:
                 matched_student = roster_by_id[extracted_id]
                 official_name = matched_student["name"]
                 if extracted_name == official_name:
-                    match_status = "✅ 명렬표 일치"
+                    match_status = "명렬표 일치"
                 else:
                     extracted_name = official_name
-                    match_status = "✅ 학번 매칭(이름보완)"
+                    match_status = "학번 매칭(이름보완)"
             elif extracted_name and extracted_name in roster_by_name:
                 candidates = roster_by_name[extracted_name]
                 if len(candidates) == 1:
                     matched_student = candidates[0]
                     extracted_id = str(matched_student["student_id"])
-                    match_status = "✅ 이름 매칭(학번보완)"
+                    match_status = "이름 매칭(학번보완)"
                 else:
-                    match_status = "⚠️ 동명이인(학번확인)"
+                    match_status = "동명이인(학번확인)"
             elif extracted_id or extracted_name:
-                match_status = "⚠️ 명렬표 외 추출"
+                match_status = "명렬표 외 추출"
 
             if matched_student is not None:
                 submitted_student_ids.add(str(matched_student["student_id"]))
@@ -634,6 +637,7 @@ class DocxToExcelWorker(BaseWorker):
             schema_path=self.schema_path,
             output_path=self.output_xlsx,
             progress_callback=lambda pct, msg: self.emit_progress(pct, msg),
+            log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
             stop_checker=self.is_stop_requested,
         )
         if self.is_stop_requested():
@@ -643,8 +647,55 @@ class DocxToExcelWorker(BaseWorker):
         out_path = res.get("output_file", "")
         succ = res.get("success", 0)
         tot = res.get("total", 0)
+        failed = res.get("failed", 0)
+        errors = res.get("errors", [])
+
+        if failed > 0:
+            self.emit_log("ERROR", f"총 {len(errors)}개 파일 추출 실패 상세:")
+            for e in errors:
+                self.emit_log("ERROR", f"  • {e.get('파일명', '알수없음')}: {e.get('오류내용', '원인 미상')}")
+            self.emit_log("INFO", "생성된 엑셀 파일 내 '오류 파일' 시트에도 상세 내용이 기록되었습니다.")
+
         self.emit_log("SUCCESS", f"엑셀 추출 완료: {out_path} (성공 {succ}/{tot}명)")
         self.emit_progress(100, f"추출 완료 ({succ}/{tot}명)")
+        return res
+
+
+class ExcelColumnMergeWorker(BaseWorker):
+    """여러 개의 과제 엑셀 파일을 '학번' 기준으로 가로 결합(Column Merge)하는 백그라운드 워커."""
+
+    def __init__(
+        self,
+        excel_paths: List[Path | str],
+        output_path: Optional[Path | str] = None,
+    ):
+        super().__init__(task_name="다중 과제 엑셀 가로 병합")
+        self.excel_paths = [Path(p) for p in excel_paths]
+        self.output_path = Path(output_path) if output_path else None
+
+    def execute(self) -> Dict[str, Any]:
+        self.emit_log("INFO", f"다중 과제 엑셀 가로 병합 시작 (대상 파일: {len(self.excel_paths)}개)")
+        res = merge_excel_assignments(
+            excel_paths=self.excel_paths,
+            output_path=self.output_path,
+            log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
+            progress_callback=lambda pct, msg: self.emit_progress(pct, msg),
+            stop_checker=self.is_stop_requested,
+        )
+        if self.is_stop_requested():
+            self.emit_log("WARN", "사용자 요청으로 엑셀 가로 병합 작업이 중단되었습니다.")
+            return res
+
+        out_path = res.get("output_file", "")
+        stu_cnt = res.get("total_students", 0)
+        col_cnt = res.get("merged_columns", 0)
+        rev_cnt = res.get("review_count", 0)
+        err_cnt = res.get("error_count", 0)
+
+        self.emit_log("SUCCESS", f"엑셀 가로 병합 완료: {out_path} (학생 {stu_cnt}명, 열 {col_cnt}개)")
+        if rev_cnt > 0 or err_cnt > 0:
+            self.emit_log("WARN", f"확인 필요 항목 발생: 이름 불일치 {rev_cnt}건, 학번 오류 {err_cnt}건 (엑셀 [검토_및_오류] 시트 참조)")
+        self.emit_progress(100, f"병합 완료 ({stu_cnt}명 통합)")
         return res
 
 
@@ -731,6 +782,7 @@ class IntegratedPipelineWorker(BaseWorker):
             schema_path=self.schema_path,
             output_path=intermediate_excel,
             progress_callback=lambda pct, msg: self.emit_progress(int(pct * 0.4), f"1단계 DOCX 추출: {msg}"),
+            log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
             stop_checker=self.is_stop_requested,
         )
 
@@ -738,8 +790,15 @@ class IntegratedPipelineWorker(BaseWorker):
             self.emit_log("WARN", "1단계 진행 중 사용자에 의해 작업이 중단되었습니다.")
             return {"step1": step1_res, "step2": None, "output_path": str(intermediate_excel)}
 
+        step1_errors = step1_res.get("errors", [])
+        if step1_res.get("failed", 0) > 0:
+            self.emit_log("ERROR", f"총 {len(step1_errors)}개 파일 추출 실패 상세:")
+            for e in step1_errors:
+                self.emit_log("ERROR", f"  • {e.get('파일명', '알수없음')}: {e.get('오류내용', '원인 미상')}")
+            self.emit_log("INFO", "생성된 엑셀 파일 내 '오류 파일' 시트에도 상세 내용이 기록되었습니다.")
+
         if step1_res.get("success", 0) == 0:
-            raise ValueError(f"1단계 DOCX 과제 추출 결과 유효한 데이터가 없습니다. (오류: {len(step1_res.get('errors', []))}건)")
+            raise ValueError(f"1단계 DOCX 과제 추출 결과 유효한 데이터가 없습니다. (오류: {len(step1_errors)}건)")
 
         self.emit_log("SUCCESS", f"1단계 완료: 중간 엑셀 생성됨 -> {step1_res.get('output_file')}")
 
@@ -765,7 +824,7 @@ class IntegratedPipelineWorker(BaseWorker):
             self.emit_log("WARN", "2단계 진행 중 사용자에 의해 작업이 안전하게 중단되었습니다.")
         else:
             self.emit_progress(100, "전체 일괄 처리 완료!")
-            self.emit_log("SUCCESS", f"🎉 원클릭 일괄 파이프라인 완료! 최종 파일: {step2_res.get('output_path')}")
+            self.emit_log("SUCCESS", f"원클릭 일괄 파이프라인 완료! 최종 파일: {step2_res.get('output_path')}")
 
         return {
             "step1": step1_res,
@@ -788,6 +847,7 @@ class DocOcrTab(QWidget):
     TASK_DOCX_EXTRACT = "doc_tab_docx_extract"
     TASK_RECORD_GEN = "doc_tab_record_gen"
     TASK_INTEGRATED = "doc_tab_integrated_pipeline"
+    TASK_COLUMN_MERGE = "doc_tab_excel_column_merge"
 
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -812,17 +872,29 @@ class DocOcrTab(QWidget):
         apply_qss_role(self.sub_tabs, obj_name="DocOcrSubTabWidget")
         self.sub_tabs.addTab(
             self._build_student_merge_subtab(),
-            "🗂️ 1. 학번/이름 기준 파일 취합 · 미제출자 대조 · PDF 병합",
+            "1. 파일 취합 & 명렬표 대조 & PDF 병합",
         )
         self.sub_tabs.addTab(
             self._build_ocr_subtab(),
-            "🔍 2. AI OCR 및 문서 텍스트 보정",
+            "2. AI OCR 및 텍스트 보정",
         )
         self.sub_tabs.addTab(
             self._build_excel_aggregator_subtab(),
-            "📝 3. 과제 취합 및 AI 과세특·채점 자동화",
+            "3. 과제 파이프라인 (DOCX 추출 + AI 세특)",
         )
         layout.addWidget(self.sub_tabs)
+
+    # =========================================================================
+    # 공통 레이아웃 헬퍼 (Stitch 상단 라벨 + 하단 필드 블록)
+    # =========================================================================
+    def _field_block(self, label_text: str, field_layout: QHBoxLayout) -> QVBoxLayout:
+        block = QVBoxLayout()
+        block.setSpacing(4)
+        lbl = QLabel(label_text)
+        apply_qss_role(lbl, role="fieldLabel")
+        block.addWidget(lbl)
+        block.addLayout(field_layout)
+        return block
 
     # =========================================================================
     # [서브탭 1] 학번/이름 기준 파일 취합 · 미제출자 확인 · 표준 이름 변경 · PDF 병합
@@ -831,10 +903,12 @@ class DocOcrTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         page = QWidget()
+        page.setMinimumWidth(0)
         page.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.MinimumExpanding
         )
         apply_qss_role(page, obj_name="SubTabStudentMerge")
         main_lay = QVBoxLayout(page)
@@ -842,10 +916,10 @@ class DocOcrTab(QWidget):
         main_lay.setSpacing(12)
 
         self.cfg_group = HoverZoomCard(
-            title="📂 1단계: 학생 제출물 폴더 선택 및 학번/이름 정규표현식(Regex) 설정",
+            title="1단계: 학생 제출물 폴더 선택 및 정규표현식(Regex) 설정",
             parent=page,
-            zoom_ratio=1.12,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.cfg_group, role="hoverZoomCard", obj_name="SubmissionRegexGroup")
         cfg_lay = self.cfg_group.body_layout()
@@ -853,22 +927,23 @@ class DocOcrTab(QWidget):
         folder_row = QHBoxLayout()
         folder_row.addWidget(QLabel("<b>제출물 폴더:</b>"))
         self.edit_submission_dir = QLineEdit()
-        self.edit_submission_dir.setMinimumHeight(34)
+        self.edit_submission_dir.setMinimumHeight(32)
         self.edit_submission_dir.setPlaceholderText(
             "학생들이 제출한 파일(PDF, HWP, DOCX, XLSX 등)이 들어있는 폴더를 선택하세요..."
         )
         btn_browse_sub = QPushButton("폴더 찾아보기...")
-        apply_qss_role(btn_browse_sub)
-        btn_browse_sub.setMinimumHeight(34)
+        apply_qss_role(btn_browse_sub, role="secondary")
+        btn_browse_sub.setMinimumHeight(32)
         btn_browse_sub.clicked.connect(self._on_browse_submission_dir)
         btn_open_sub = QPushButton("폴더 열기")
-        apply_qss_role(btn_open_sub)
-        btn_open_sub.setMinimumHeight(34)
+        apply_qss_role(btn_open_sub, role="outline")
+        btn_open_sub.setMinimumHeight(32)
         btn_open_sub.clicked.connect(self._on_open_submission_dir)
 
         self.chk_recursive = QCheckBox("하위 폴더까지 포함 검색")
         self.combo_ext_filter = QComboBox()
-        self.combo_ext_filter.setMinimumHeight(34)
+        self.combo_ext_filter.setMinimumHeight(32)
+        install_no_scroll_wheel_filter(self.combo_ext_filter)
         self.combo_ext_filter.addItem("모든 제출 문서 (PDF/HWP/Office/이미지)", "all")
         self.combo_ext_filter.addItem("PDF 파일만 (.pdf)", "pdf")
         self.combo_ext_filter.addItem("한글 파일만 (.hwp, .hwpx)", "hwp")
@@ -877,60 +952,69 @@ class DocOcrTab(QWidget):
         folder_row.addWidget(self.edit_submission_dir, stretch=1)
         folder_row.addWidget(btn_browse_sub)
         folder_row.addWidget(btn_open_sub)
-        folder_row.addSpacing(8)
-        folder_row.addWidget(self.combo_ext_filter)
-        folder_row.addWidget(self.chk_recursive)
         cfg_lay.addLayout(folder_row)
 
+        # 검색 옵션은 별도 행으로 분리 (한 줄에 몰아넣어 창 최소 너비가 커지는 문제 방지)
+        option_row = QHBoxLayout()
+        option_row.addWidget(QLabel("검색 대상:"))
+        option_row.addWidget(self.combo_ext_filter, stretch=1)
+        option_row.addSpacing(8)
+        option_row.addWidget(self.chk_recursive)
+        option_row.addStretch()
+        cfg_lay.addLayout(option_row)
+
         regex_row = QHBoxLayout()
-        regex_row.addWidget(QLabel("학번 정규식(4~5자리):"))
+        regex_row.addWidget(QLabel("학번 정규식:"))
         self.edit_id_regex = QLineEdit(r"(?<!\d)(\d{4,5})(?!\d)")
-        self.edit_id_regex.setMinimumHeight(34)
+        self.edit_id_regex.setMinimumHeight(32)
+        regex_row.addWidget(self.edit_id_regex, stretch=1)
         regex_row.addWidget(QLabel("이름 정규식:"))
         self.edit_name_regex = QLineEdit(r"([가-힣]{2,4})")
-        self.edit_name_regex.setMinimumHeight(34)
-        regex_row.addWidget(QLabel("표준 파일명 과제명:"))
+        self.edit_name_regex.setMinimumHeight(32)
+        regex_row.addWidget(self.edit_name_regex, stretch=1)
+        regex_row.addWidget(QLabel("표준 과제명:"))
         self.edit_assignment_title = QLineEdit("수행평가과제")
-        self.edit_assignment_title.setMinimumHeight(34)
+        self.edit_assignment_title.setMinimumHeight(32)
         self.edit_assignment_title.textChanged.connect(self._on_assignment_title_changed)
+        regex_row.addWidget(self.edit_assignment_title, stretch=1)
+        cfg_lay.addLayout(regex_row)
 
-        self.btn_scan_analyze = QPushButton("🔍 폴더 스캔 & 명렬표 미제출자 대조 실행")
+        self.btn_scan_analyze = QPushButton("폴더 스캔 및 명렬표 미제출자 대조 실행")
         apply_qss_role(self.btn_scan_analyze, role="primary", obj_name="BtnScanAnalyze")
         self.btn_scan_analyze.setMinimumHeight(36)
         self.btn_scan_analyze.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_scan_analyze.clicked.connect(self.run_submission_analysis)
 
-        regex_row.addWidget(self.edit_id_regex, stretch=1)
-        regex_row.addWidget(self.edit_name_regex, stretch=1)
-        regex_row.addWidget(self.edit_assignment_title, stretch=1)
-        regex_row.addWidget(self.btn_scan_analyze)
-        cfg_lay.addLayout(regex_row)
+        scan_row = QHBoxLayout()
+        scan_row.addStretch()
+        scan_row.addWidget(self.btn_scan_analyze)
+        cfg_lay.addLayout(scan_row)
 
         main_lay.addWidget(self.cfg_group)
 
         summary_bar = QHBoxLayout()
         self.lbl_summary_badge = QLabel(
-            "💡 제출물 폴더를 선택하고 [폴더 스캔 & 명렬표 미제출자 대조 실행]을 클릭하세요."
+            "제출물 폴더를 선택하고 [폴더 스캔 및 명렬표 미제출자 대조 실행]을 클릭하세요."
         )
+        self.lbl_summary_badge.setWordWrap(True)
         apply_qss_role(self.lbl_summary_badge, role="infoBanner", obj_name="SubmissionSummaryBanner")
         summary_bar.addWidget(self.lbl_summary_badge, stretch=1)
         main_lay.addLayout(summary_bar)
 
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.setChildrenCollapsible(False)
+        # 좌우 가로 분할(QSplitter) 대신 상하 세로 스택: 미리보기 카드 → 미제출자 카드 (각각 너비 100%)
 
         # ---------------------------------------------------------------------
-        # 좌측 카드: 제출 파일 학번순 정렬 미리보기 (HoverZoomCard + [ ⛶ 전체화면 ] 버튼)
+        # 상단 카드: 제출 파일 학번순 정렬 미리보기
         # ---------------------------------------------------------------------
         self.left_group = HoverZoomCard(
-            title="📋 2단계: 제출 파일 학번순 정렬 및 표준 파일명 미리보기 (더블클릭하여 학번/이름 직접 수정 가능)",
-            zoom_ratio=1.12,
-            hover_delay_ms=1000,
+            title="2단계: 제출 파일 학번순 정렬 및 표준 파일명 미리보기",
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.left_group, role="hoverZoomCard", obj_name="SubmittedFilesGroup")
         self.left_group.setMinimumHeight(260)
 
-        self.btn_focus_submissions = QPushButton("⛶ 전체화면")
+        self.btn_focus_submissions = QPushButton("전체화면")
         apply_qss_role(self.btn_focus_submissions, role="cardMax", obj_name="CardMaxButton")
         self.btn_focus_submissions.setCheckable(True)
         self.btn_focus_submissions.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -942,9 +1026,9 @@ class DocOcrTab(QWidget):
 
         left_top_bar = QHBoxLayout()
         btn_check_all = QPushButton("전체 선택")
-        apply_qss_role(btn_check_all)
+        apply_qss_role(btn_check_all, role="secondary")
         btn_uncheck_all = QPushButton("전체 해제")
-        apply_qss_role(btn_uncheck_all)
+        apply_qss_role(btn_uncheck_all, role="outline")
         btn_check_all.clicked.connect(lambda: self._set_all_files_checked(True))
         btn_uncheck_all.clicked.connect(lambda: self._set_all_files_checked(False))
 
@@ -972,29 +1056,36 @@ class DocOcrTab(QWidget):
         self.table_submissions.itemChanged.connect(self._on_submission_table_item_changed)
 
         sub_header = self.table_submissions.horizontalHeader()
+        sub_header.setMinimumSectionSize(56)
+        sub_header.setStretchLastSection(False)
         sub_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         sub_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         sub_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         sub_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        sub_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        # 파일명 2개 열은 남은 폭을 균등 분할(창이 좁아지면 함께 줄어듦), 긴 경로 열은 고정 폭 + 가운데 생략
+        sub_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         sub_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         sub_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Interactive)
+        self.table_submissions.setColumnWidth(6, 160)
+        self.table_submissions.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.table_submissions.setWordWrap(True)
+        self.table_submissions.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         left_lay.addWidget(self.table_submissions, stretch=1)
-        self.splitter.addWidget(self.left_group)
+        main_lay.addWidget(self.left_group, stretch=3)
 
         # ---------------------------------------------------------------------
-        # 우측 카드: 미제출자 명단 (HoverZoomCard + [ ⛶ 전체화면 ] 버튼)
+        # 하단 카드: 미제출자 명단
         # ---------------------------------------------------------------------
         self.right_group = HoverZoomCard(
-            title="🚨 미제출자 명단 (환경설정 학생 명렬표 DB 자동 대조)",
-            zoom_ratio=1.12,
-            hover_delay_ms=1000,
+            title="명렬표 미제출자 명단 (학생 명렬표 DB 자동 대조)",
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.right_group, role="hoverZoomCard", obj_name="MissingStudentsGroup")
         self.right_group.setMinimumHeight(260)
 
-        self.btn_focus_missing = QPushButton("⛶ 전체화면")
+        self.btn_focus_missing = QPushButton("전체화면")
         apply_qss_role(self.btn_focus_missing, role="cardMax", obj_name="CardMaxButton")
         self.btn_focus_missing.setCheckable(True)
         self.btn_focus_missing.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1005,10 +1096,10 @@ class DocOcrTab(QWidget):
         right_lay = self.right_group.body_layout()
 
         missing_btn_bar = QHBoxLayout()
-        btn_copy_missing = QPushButton("📋 미제출자 명단 복사")
-        apply_qss_role(btn_copy_missing)
-        btn_export_missing = QPushButton("📤 제출/미제출 현황 엑셀(.xlsx) 저장")
-        apply_qss_role(btn_export_missing)
+        btn_copy_missing = QPushButton("명단 텍스트 복사")
+        apply_qss_role(btn_copy_missing, role="secondary")
+        btn_export_missing = QPushButton("제출/미제출 현황 엑셀(.xlsx) 저장")
+        apply_qss_role(btn_export_missing, role="secondary")
 
         btn_copy_missing.clicked.connect(self._on_copy_missing_to_clipboard)
         btn_export_missing.clicked.connect(self._on_export_submission_report_xlsx)
@@ -1034,48 +1125,54 @@ class DocOcrTab(QWidget):
         miss_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         miss_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
 
-        right_lay.addWidget(self.table_missing, stretch=1)
-        self.splitter.addWidget(self.right_group)
+        self.table_missing.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.table_missing.setWordWrap(True)
+        self.table_missing.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        self.splitter.setSizes([720, 440])
-        main_lay.addWidget(self.splitter, stretch=1)
+        right_lay.addWidget(self.table_missing, stretch=1)
+        main_lay.addWidget(self.right_group, stretch=2)
 
         self.action_group = HoverZoomCard(
-            title="🚀 3단계: 학번순 파일명 일괄 표준화 & 단일 PDF 병합 실행 (비동기 백그라운드 처리)",
+            title="3단계: 학번순 파일명 일괄 표준화 및 단일 PDF 병합 실행",
             parent=page,
-            zoom_ratio=1.10,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.action_group, role="hoverZoomCard", obj_name="BatchMergeActionGroup")
-        act_lay = QHBoxLayout()
 
         self.combo_rename_mode = QComboBox()
         self.combo_rename_mode.setMinimumHeight(34)
-        self.combo_rename_mode.addItem("안전 모드: 하위 '_정리완료' 폴더에 표준 파일명으로 복사 생성 (원본 보존)", "copy")
-        self.combo_rename_mode.addItem("직접 변경: 원본 폴더 내에서 파일명을 즉시 표준 형식으로 변경", "move")
+        install_no_scroll_wheel_filter(self.combo_rename_mode)
+        self.combo_rename_mode.addItem("안전 모드: 하위 '_정리완료' 폴더에 복사 생성 (원본 보존)", "copy")
+        self.combo_rename_mode.addItem("직접 변경: 원본 폴더 내 파일명 즉시 변경", "move")
 
-        self.btn_execute_rename = QPushButton("✏️ 학번순 표준 파일명([학번]_[이름]_과제명) 일괄 적용")
-        apply_qss_role(self.btn_execute_rename, role="teal", obj_name="BtnExecuteStandardRename")
-        self.btn_execute_rename.setMinimumHeight(38)
+        self.btn_execute_rename = QPushButton("학번순 표준 파일명 일괄 적용")
+        apply_qss_role(self.btn_execute_rename, role="secondary", obj_name="BtnExecuteStandardRename")
+        self.btn_execute_rename.setMinimumHeight(36)
         self.btn_execute_rename.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_execute_rename.clicked.connect(self.run_standard_rename)
 
-        self.chk_pdf_bookmark = QCheckBox("PDF 병합 시 학생별 책갈피(목차) 자동 삽입")
+        self.chk_pdf_bookmark = QCheckBox("PDF 병합 시 학생별 책갈피 자동 삽입")
         self.chk_pdf_bookmark.setChecked(True)
 
-        self.btn_execute_pdf_merge = QPushButton("📑 학번 순서대로 단일 PDF 병합 저장 (pypdf)")
-        apply_qss_role(self.btn_execute_pdf_merge, role="danger", obj_name="BtnExecutePdfMerge")
-        self.btn_execute_pdf_merge.setMinimumHeight(38)
+        self.btn_execute_pdf_merge = QPushButton("학번 순서대로 단일 PDF 병합 저장")
+        apply_qss_role(self.btn_execute_pdf_merge, role="primary", obj_name="BtnExecutePdfMerge")
+        self.btn_execute_pdf_merge.setMinimumHeight(36)
         self.btn_execute_pdf_merge.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_execute_pdf_merge.clicked.connect(self.run_pdf_merge)
 
-        act_lay.addWidget(self.combo_rename_mode, stretch=1)
-        act_lay.addWidget(self.btn_execute_rename)
-        act_lay.addSpacing(12)
-        act_lay.addWidget(self.chk_pdf_bookmark)
-        act_lay.addWidget(self.btn_execute_pdf_merge)
+        # 1행: 파일명 표준화 모드 + 실행 / 2행: PDF 책갈피 옵션 + 병합 실행 (한 줄 과밀 배치로 인한 가로 넘침 방지)
+        rename_row = QHBoxLayout()
+        rename_row.addWidget(self.combo_rename_mode, stretch=1)
+        rename_row.addWidget(self.btn_execute_rename)
 
-        self.action_group.body_layout().addLayout(act_lay)
+        pdf_row = QHBoxLayout()
+        pdf_row.addWidget(self.chk_pdf_bookmark)
+        pdf_row.addStretch()
+        pdf_row.addWidget(self.btn_execute_pdf_merge)
+
+        self.action_group.body_layout().addLayout(rename_row)
+        self.action_group.body_layout().addLayout(pdf_row)
         main_lay.addWidget(self.action_group)
         scroll.setWidget(page)
         return scroll
@@ -1093,10 +1190,9 @@ class DocOcrTab(QWidget):
             self.left_group.show()
             self.right_group.show()
             self.btn_focus_submissions.setChecked(False)
-            self.btn_focus_submissions.setText("⛶ 전체화면")
+            self.btn_focus_submissions.setText("전체화면")
             self.btn_focus_missing.setChecked(False)
-            self.btn_focus_missing.setText("⛶ 전체화면")
-            self.splitter.setSizes([720, 440])
+            self.btn_focus_missing.setText("전체화면")
             return
 
         self._focused_card = target
@@ -1107,18 +1203,18 @@ class DocOcrTab(QWidget):
             self.right_group.hide()
             self.action_group.show()
             self.btn_focus_submissions.setChecked(True)
-            self.btn_focus_submissions.setText("🗗 원래 크기로")
+            self.btn_focus_submissions.setText("원래 크기")
             self.btn_focus_missing.setChecked(False)
-            self.btn_focus_missing.setText("⛶ 전체화면")
+            self.btn_focus_missing.setText("전체화면")
         elif target == "missing":
             self.right_group.set_zoom_enabled(False)
             self.left_group.hide()
             self.right_group.show()
             self.action_group.hide()
             self.btn_focus_missing.setChecked(True)
-            self.btn_focus_missing.setText("🗗 원래 크기로")
+            self.btn_focus_missing.setText("원래 크기")
             self.btn_focus_submissions.setChecked(False)
-            self.btn_focus_submissions.setText("⛶ 전체화면")
+            self.btn_focus_submissions.setText("전체화면")
 
     # =========================================================================
     # [서브탭 2] 2. AI OCR 및 문서 텍스트 보정 (하단 QHBoxLayout 2버튼 나란히 배치)
@@ -1127,10 +1223,12 @@ class DocOcrTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         w = QWidget()
+        w.setMinimumWidth(0)
         w.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.MinimumExpanding
         )
         apply_qss_role(w, obj_name="SubTabAiOcr")
         lay = QVBoxLayout(w)
@@ -1138,22 +1236,22 @@ class DocOcrTab(QWidget):
         lay.setSpacing(12)
 
         grp = HoverZoomCard(
-            title="🤖 2. AI OCR 및 문서 텍스트 보정 (멀티 LLM API & 수동 프롬프트 복붙 하이브리드)",
+            title="AI OCR 및 문서 텍스트 보정 (멀티 LLM API & 수동 프롬프트 복붙 하이브리드)",
             parent=w,
-            zoom_ratio=1.10,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(grp, role="hoverZoomCard", obj_name="AiOcrHybridGroup")
         g_lay = grp.body_layout()
 
         # 상단 파일 추가 및 결과 저장 툴바
         file_toolbar = QHBoxLayout()
-        btn_add = QPushButton("+ 이미지/PDF/문서 파일 추가")
-        apply_qss_role(btn_add, obj_name="BtnAddOcrFiles")
+        btn_add = QPushButton("+ 파일 추가")
+        apply_qss_role(btn_add, role="secondary", obj_name="BtnAddOcrFiles")
         btn_clear = QPushButton("목록 비우기")
-        apply_qss_role(btn_clear, obj_name="BtnClearOcrFiles")
-        btn_save_txt = QPushButton("💾 결과 마크다운(.md) 저장")
-        apply_qss_role(btn_save_txt, obj_name="BtnSaveOcrMarkdown")
+        apply_qss_role(btn_clear, role="outline", obj_name="BtnClearOcrFiles")
+        btn_save_txt = QPushButton("결과 마크다운(.md) 저장")
+        apply_qss_role(btn_save_txt, role="outline", obj_name="BtnSaveOcrMarkdown")
 
         self.list_ocr_files = QListWidget()
         self.list_ocr_files.setMouseTracking(True)
@@ -1178,7 +1276,7 @@ class DocOcrTab(QWidget):
         self.edit_ocr_prompt = QLineEdit(
             "스캔/추출된 문서의 오탈자를 문맥에 맞게 교정하고, 핵심 3줄 요약과 후속 조치 사항을 정리해 주세요."
         )
-        self.edit_ocr_prompt.setMinimumHeight(34)
+        self.edit_ocr_prompt.setMinimumHeight(32)
         form.addRow("AI 보정/요약 지침:", self.edit_ocr_prompt)
         g_lay.addLayout(form)
 
@@ -1186,7 +1284,7 @@ class DocOcrTab(QWidget):
         self.txt_ocr_output = QTextEdit()
         apply_qss_role(self.txt_ocr_output, obj_name="WebAiInputBox")
         self.txt_ocr_output.setPlaceholderText(
-            "AI API 자동 처리 결과 또는 [📋 수동 복붙 모드 열기]에서 파싱된 JSON 변환 결과가 이곳에 표시됩니다..."
+            "AI API 자동 처리 결과 또는 [수동 복붙 모드]에서 파싱된 JSON 변환 결과가 이곳에 표시됩니다..."
         )
         g_lay.addWidget(self.txt_ocr_output, stretch=1)
 
@@ -1194,17 +1292,17 @@ class DocOcrTab(QWidget):
         exec_btn_layout = QHBoxLayout()
         exec_btn_layout.setSpacing(12)
 
-        # 1) [🤖 AI 자동 실행 (API 사용)] 버튼 (기존 워커 연결)
-        self.btn_run_ai_auto = QPushButton("🤖 AI 자동 실행 (API 사용)")
+        # 1) AI 자동 실행 버튼
+        self.btn_run_ai_auto = QPushButton("AI 자동 실행 (API 사용)")
         apply_qss_role(self.btn_run_ai_auto, role="primary", obj_name="BtnRunAiAuto")
-        self.btn_run_ai_auto.setMinimumHeight(42)
+        self.btn_run_ai_auto.setMinimumHeight(38)
         self.btn_run_ai_auto.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_run_ai_auto.clicked.connect(self._on_run_hybrid_ocr)
 
-        # 2) [📋 수동 복붙 모드 열기] 버튼 (클릭 시 ManualLlmDialog 팝업 연결)
-        self.btn_open_manual_mode = QPushButton("📋 수동 복붙 모드 열기")
-        apply_qss_role(self.btn_open_manual_mode, role="teal", obj_name="BtnOpenManualPrompt")
-        self.btn_open_manual_mode.setMinimumHeight(42)
+        # 2) 수동 복붙 모드 버튼
+        self.btn_open_manual_mode = QPushButton("수동 복붙 모드 열기")
+        apply_qss_role(self.btn_open_manual_mode, role="secondary", obj_name="BtnOpenManualPrompt")
+        self.btn_open_manual_mode.setMinimumHeight(38)
         self.btn_open_manual_mode.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_open_manual_mode.clicked.connect(self._on_open_manual_llm_dialog)
 
@@ -1223,105 +1321,168 @@ class DocOcrTab(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         w = QWidget()
+        w.setMinimumWidth(0)
+        w.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.MinimumExpanding
+        )
         apply_qss_role(w, obj_name="SubTabDocxRecordAggregator")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 22, 22)
         lay.setSpacing(14)
 
         # ---------------------------------------------------------------------
-        # 카드 1: [1단계: 학생 DOCX 과제 추출 설정]
+        # 1. 상단 3-Stage Workflow Stepper (Stitch Pipeline Indicator + 상태 칩)
         # ---------------------------------------------------------------------
+        stepper_frame = QFrame(w)
+        apply_qss_role(stepper_frame, role="stepperBar", obj_name="AggStepperBar")
+        stepper_lay = QHBoxLayout(stepper_frame)
+        stepper_lay.setContentsMargins(12, 10, 12, 10)
+        stepper_lay.setSpacing(10)
+
+        self._agg_stage_boxes: List[QFrame] = []
+        self._agg_stage_chips: List[QLabel] = []
+        stage_defs = [
+            ("1", "DOCX 일괄 파싱", "표 구조 파싱 및 엑셀 직렬화"),
+            ("2", "AI 루브릭 · NEIS 세특", "글자수 예산 및 성취기준 정렬"),
+            ("3", "검증 및 엑셀 내보내기", "학번순 정렬 및 결과 저장"),
+        ]
+        for num, title, desc in stage_defs:
+            box = QFrame()
+            apply_qss_role(box, role="stageBox")
+            box_lay = QHBoxLayout(box)
+            box_lay.setContentsMargins(10, 8, 10, 8)
+            box_lay.setSpacing(10)
+
+            lbl_num = QLabel(num)
+            lbl_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_num.setFixedSize(26, 26)
+            apply_qss_role(lbl_num, role="stageNumber")
+
+            text_col = QVBoxLayout()
+            text_col.setSpacing(1)
+            lbl_title = QLabel(title)
+            apply_qss_role(lbl_title, role="stageTitle")
+            lbl_desc = QLabel(desc)
+            lbl_desc.setWordWrap(True)
+            apply_qss_role(lbl_desc, role="mutedText")
+            text_col.addWidget(lbl_title)
+            text_col.addWidget(lbl_desc)
+
+            chip = QLabel("대기")
+            apply_qss_role(chip, role="stageBadge")
+
+            box_lay.addWidget(lbl_num, alignment=Qt.AlignmentFlag.AlignTop)
+            box_lay.addLayout(text_col, stretch=1)
+            box_lay.addWidget(chip, alignment=Qt.AlignmentFlag.AlignTop)
+
+            stepper_lay.addWidget(box, stretch=1)
+            self._agg_stage_boxes.append(box)
+            self._agg_stage_chips.append(chip)
+
+        lay.addWidget(stepper_frame)
+
+        # ---------------------------------------------------------------------
+        # 2. 세로 스택(Vertical 3-Stage): 1단계 → (선택) 가로 병합 → 2단계 → 3단계, 모든 카드 너비 100%
+        # ---------------------------------------------------------------------
+        cards_layout = QVBoxLayout()
+        cards_layout.setSpacing(14)
+
+        # [STAGE 1 CARD] DOCX Parsing & Form Schema
         self.card_agg_step1 = HoverZoomCard(
-            title="📂 1단계: 학생 DOCX 과제 제출물 파싱 및 스키마 설정",
+            title="1단계 · 과제 DOCX 추출 및 양식 스키마",
             parent=w,
-            zoom_ratio=1.05,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.card_agg_step1, role="hoverZoomCard", obj_name="AggStep1Card")
         lay_step1 = self.card_agg_step1.body_layout()
 
-        form1 = QFormLayout()
+        form1 = QVBoxLayout()
         form1.setSpacing(10)
-        form1.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         # 학생 DOCX 폴더
         box_docx_dir = QHBoxLayout()
         self.edit_agg_docx_dir = QLineEdit()
-        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx 파일들이 모여 있는 폴더를 선택하세요.")
-        self.edit_agg_docx_dir.setMinimumHeight(34)
+        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx 파일 폴더를 선택하세요.")
+        self.edit_agg_docx_dir.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_docx_dir, obj_name="EditAggDocxDir")
 
         btn_browse_docx = QPushButton("찾아보기...")
-        btn_browse_docx.setMinimumHeight(34)
-        apply_qss_role(btn_browse_docx)
+        btn_browse_docx.setMinimumHeight(32)
+        apply_qss_role(btn_browse_docx, role="secondary")
         btn_browse_docx.clicked.connect(self._on_browse_agg_docx_dir)
 
         btn_open_docx = QPushButton("폴더 열기")
-        btn_open_docx.setMinimumHeight(34)
-        apply_qss_role(btn_open_docx)
+        btn_open_docx.setMinimumHeight(32)
+        apply_qss_role(btn_open_docx, role="outline")
         btn_open_docx.clicked.connect(lambda: self._open_dir_if_exists(self.edit_agg_docx_dir.text()))
 
         box_docx_dir.addWidget(self.edit_agg_docx_dir, stretch=1)
         box_docx_dir.addWidget(btn_browse_docx)
         box_docx_dir.addWidget(btn_open_docx)
-        form1.addRow("학생 제출 폴더:", box_docx_dir)
+        form1.addLayout(self._field_block("학생 제출 폴더 (DOCX)", box_docx_dir))
 
         # 과제 양식(JSON 스키마) 선택 및 새 양식 생성 버튼
         box_schema = QHBoxLayout()
         self.combo_agg_schema = QComboBox()
-        self.combo_agg_schema.setMinimumHeight(34)
+        self.combo_agg_schema.setMinimumHeight(32)
         apply_qss_role(self.combo_agg_schema, obj_name="ComboAggSchema")
 
-        btn_create_schema = QPushButton("➕ 새 양식(DOCX)에서 스키마 생성")
-        btn_create_schema.setMinimumHeight(34)
+        btn_create_schema = QPushButton("+ 새 스키마 생성")
+        btn_create_schema.setMinimumHeight(32)
         apply_qss_role(btn_create_schema, role="secondary")
         btn_create_schema.clicked.connect(self._on_open_create_schema_dialog)
 
-        btn_refresh_schema = QPushButton("🔄 새로고침")
-        btn_refresh_schema.setMinimumHeight(34)
-        apply_qss_role(btn_refresh_schema)
+        btn_refresh_schema = QPushButton("새로고침")
+        btn_refresh_schema.setMinimumHeight(32)
+        apply_qss_role(btn_refresh_schema, role="outline")
         btn_refresh_schema.clicked.connect(self._refresh_schemas_combo)
 
         box_schema.addWidget(self.combo_agg_schema, stretch=1)
         box_schema.addWidget(btn_create_schema)
         box_schema.addWidget(btn_refresh_schema)
-        form1.addRow("과제 양식 (스키마):", box_schema)
+        form1.addLayout(self._field_block("과제 양식 템플릿 (스키마)", box_schema))
 
         lay_step1.addLayout(form1)
-        lay.addWidget(self.card_agg_step1)
 
-        # ---------------------------------------------------------------------
-        # 카드 2: [2단계: AI 채점 및 과세특 생성 설정 (멀티 LLM)]
-        # ---------------------------------------------------------------------
+        # 스키마 감지 및 PII 보호 안내 배지
+        lbl_schema_info = QLabel("양식 분석: 표(Table) 셀 자동 추출 · 학생 개인정보 자동 마스킹")
+        lbl_schema_info.setWordWrap(True)
+        apply_qss_role(lbl_schema_info, role="infoBanner", obj_name="SchemaInfoBanner")
+        lay_step1.addWidget(lbl_schema_info)
+
+        cards_layout.addWidget(self.card_agg_step1)
+
+        # [STAGE 2 CARD] AI Evaluation & NEIS Record Generation
         self.card_agg_step2 = HoverZoomCard(
-            title="🤖 2단계: AI 채점 및 과세특 생성 설정 (Gemini, GPT, Claude, OpenRouter, Ollama)",
+            title="2단계 · AI 채점 및 과세특 생성 설정",
             parent=w,
-            zoom_ratio=1.05,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.card_agg_step2, role="hoverZoomCard", obj_name="AggStep2Card")
         lay_step2 = self.card_agg_step2.body_layout()
 
         # 활성 AI 공급자 및 모델 상태 배지 바
         box_ai_badge = QHBoxLayout()
-        box_ai_badge.setContentsMargins(4, 4, 4, 8)
-        self.lbl_active_ai_badge = QLabel("🤖 활성 AI 공급자 확인 중...")
-        self.lbl_active_ai_badge.setStyleSheet(
-            "background-color: #1E293B; color: #38BDF8; font-weight: bold; font-size: 13px; "
-            "padding: 8px 14px; border-radius: 6px; border: 1px solid #334155;"
-        )
+        box_ai_badge.setContentsMargins(0, 0, 0, 4)
+        box_ai_badge.setSpacing(8)
+        self.lbl_active_ai_badge = QLabel("AI 엔진 상태 확인 중...")
+        self.lbl_active_ai_badge.setWordWrap(True)
+        apply_qss_role(self.lbl_active_ai_badge, role="engineBadge", obj_name="ActiveAiBadge")
 
-        btn_go_settings = QPushButton("⚙️ AI 설정 변경")
-        btn_go_settings.setMinimumHeight(34)
-        btn_go_settings.setToolTip("환경설정 탭으로 이동하여 AI 공급자(Gemini/OpenAI/Claude/Ollama)와 모델, API 키를 변경합니다.")
+        btn_go_settings = QPushButton("AI 설정 변경")
+        btn_go_settings.setMinimumHeight(30)
+        btn_go_settings.setToolTip("환경설정 탭으로 이동하여 AI 공급자와 모델, API 키를 변경합니다.")
         apply_qss_role(btn_go_settings, role="secondary")
         btn_go_settings.clicked.connect(self._on_go_to_settings_tab)
 
-        btn_refresh_ai = QPushButton("🔄 상태 갱신")
-        btn_refresh_ai.setMinimumHeight(34)
-        apply_qss_role(btn_refresh_ai)
+        btn_refresh_ai = QPushButton("상태 갱신")
+        btn_refresh_ai.setMinimumHeight(30)
+        apply_qss_role(btn_refresh_ai, role="outline")
         btn_refresh_ai.clicked.connect(self._update_active_ai_display)
 
         box_ai_badge.addWidget(self.lbl_active_ai_badge, stretch=1)
@@ -1329,75 +1490,74 @@ class DocOcrTab(QWidget):
         box_ai_badge.addWidget(btn_refresh_ai)
         lay_step2.addLayout(box_ai_badge)
 
-        form2 = QFormLayout()
+        form2 = QVBoxLayout()
         form2.setSpacing(10)
-        form2.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         # 대상 엑셀 파일 (1단계 추출 엑셀 또는 기존 엑셀)
         box_excel_file = QHBoxLayout()
         self.edit_agg_excel_file = QLineEdit()
-        self.edit_agg_excel_file.setPlaceholderText("학번/이름/문항별 응답이 정리된 .xlsx 파일을 선택하세요. (1단계 완료 시 자동 입력)")
-        self.edit_agg_excel_file.setMinimumHeight(34)
+        self.edit_agg_excel_file.setPlaceholderText("학번/이름/문항별 응답이 정리된 .xlsx 파일 (1단계 완료 시 자동 입력)")
+        self.edit_agg_excel_file.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_excel_file, obj_name="EditAggExcelFile")
 
         btn_browse_excel = QPushButton("찾아보기...")
-        btn_browse_excel.setMinimumHeight(34)
-        apply_qss_role(btn_browse_excel)
+        btn_browse_excel.setMinimumHeight(32)
+        apply_qss_role(btn_browse_excel, role="secondary")
         btn_browse_excel.clicked.connect(self._on_browse_agg_excel_file)
 
         btn_open_excel = QPushButton("파일 열기")
-        btn_open_excel.setMinimumHeight(34)
-        apply_qss_role(btn_open_excel)
+        btn_open_excel.setMinimumHeight(32)
+        apply_qss_role(btn_open_excel, role="outline")
         btn_open_excel.clicked.connect(lambda: self._open_file_if_exists(self.edit_agg_excel_file.text()))
 
         box_excel_file.addWidget(self.edit_agg_excel_file, stretch=1)
         box_excel_file.addWidget(btn_browse_excel)
         box_excel_file.addWidget(btn_open_excel)
-        form2.addRow("대상 엑셀 파일:", box_excel_file)
+        form2.addLayout(self._field_block("대상 엑셀 파일 (학번 · 이름 · 문항별 응답)", box_excel_file))
 
         # 프롬프트 선택 및 새 프롬프트 작성/폴더 열기 버튼
         box_prompt = QHBoxLayout()
         self.combo_agg_prompt = QComboBox()
-        self.combo_agg_prompt.setMinimumHeight(34)
+        self.combo_agg_prompt.setMinimumHeight(32)
         apply_qss_role(self.combo_agg_prompt, obj_name="ComboAggPrompt")
 
-        btn_new_prompt = QPushButton("➕ 새 프롬프트 작성")
-        btn_new_prompt.setMinimumHeight(34)
+        btn_new_prompt = QPushButton("+ 새 프롬프트")
+        btn_new_prompt.setMinimumHeight(32)
         apply_qss_role(btn_new_prompt, role="secondary")
         btn_new_prompt.clicked.connect(self._on_open_new_prompt_dialog)
 
-        btn_open_prompt_dir = QPushButton("📁 프롬프트 폴더 열기")
-        btn_open_prompt_dir.setMinimumHeight(34)
-        apply_qss_role(btn_open_prompt_dir)
+        btn_open_prompt_dir = QPushButton("폴더 열기")
+        btn_open_prompt_dir.setMinimumHeight(32)
+        apply_qss_role(btn_open_prompt_dir, role="outline")
         btn_open_prompt_dir.clicked.connect(self._on_open_prompt_dir)
 
-        btn_refresh_prompt = QPushButton("🔄 새로고침")
-        btn_refresh_prompt.setMinimumHeight(34)
-        apply_qss_role(btn_refresh_prompt)
+        btn_refresh_prompt = QPushButton("새로고침")
+        btn_refresh_prompt.setMinimumHeight(32)
+        apply_qss_role(btn_refresh_prompt, role="outline")
         btn_refresh_prompt.clicked.connect(self._refresh_prompts_combo)
 
         box_prompt.addWidget(self.combo_agg_prompt, stretch=1)
         box_prompt.addWidget(btn_new_prompt)
         box_prompt.addWidget(btn_open_prompt_dir)
         box_prompt.addWidget(btn_refresh_prompt)
-        form2.addRow("세특/채점 프롬프트:", box_prompt)
+        form2.addLayout(self._field_block("세특 · 채점 프롬프트 프리셋", box_prompt))
 
         # 참고자료 폴더
         box_ref_dir = QHBoxLayout()
         self.edit_agg_ref_dir = QLineEdit()
         self.edit_agg_ref_dir.setText(str(Path("references").resolve()) if Path("references").exists() else "references")
         self.edit_agg_ref_dir.setPlaceholderText("수업계획서, 성취기준, 루브릭 등 참고 문서 폴더 (선택 사항)")
-        self.edit_agg_ref_dir.setMinimumHeight(34)
+        self.edit_agg_ref_dir.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_ref_dir, obj_name="EditAggRefDir")
 
         btn_browse_ref = QPushButton("찾아보기...")
-        btn_browse_ref.setMinimumHeight(34)
-        apply_qss_role(btn_browse_ref)
+        btn_browse_ref.setMinimumHeight(32)
+        apply_qss_role(btn_browse_ref, role="secondary")
         btn_browse_ref.clicked.connect(self._on_browse_agg_ref_dir)
 
         box_ref_dir.addWidget(self.edit_agg_ref_dir, stretch=1)
         box_ref_dir.addWidget(btn_browse_ref)
-        form2.addRow("참고자료 폴더:", box_ref_dir)
+        form2.addLayout(self._field_block("참고자료 폴더 (수업계획서 · 성취기준 · 루브릭)", box_ref_dir))
 
         # 나이스 바이트 상한선
         box_bytes = QHBoxLayout()
@@ -1406,28 +1566,146 @@ class DocOcrTab(QWidget):
         self.spin_agg_max_bytes.setSingleStep(50)
         self.spin_agg_max_bytes.setValue(1500)
         self.spin_agg_max_bytes.setSuffix(" Byte")
-        self.spin_agg_max_bytes.setMinimumHeight(34)
+        self.spin_agg_max_bytes.setMinimumHeight(32)
         apply_qss_role(self.spin_agg_max_bytes, obj_name="SpinAggMaxBytes")
 
-        lbl_byte_tip = QLabel("ℹ️ 고등학교 나이스 교과세특 상한선은 대략 1,500 Byte (한글 500자 기준)입니다.")
-        lbl_byte_tip.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        lbl_byte_tip = QLabel("고등학교 나이스 교과세특 상한선은 약 1,500 Byte (한글 500자 기준)입니다.")
+        lbl_byte_tip.setWordWrap(True)
+        apply_qss_role(lbl_byte_tip, role="mutedText")
 
         box_bytes.addWidget(self.spin_agg_max_bytes)
-        box_bytes.addWidget(lbl_byte_tip)
-        box_bytes.addStretch()
-        form2.addRow("NEIS 바이트 상한:", box_bytes)
+        box_bytes.addWidget(lbl_byte_tip, stretch=1)
+        form2.addLayout(self._field_block("NEIS 글자수(바이트) 예산", box_bytes))
 
         lay_step2.addLayout(form2)
-        lay.addWidget(self.card_agg_step2)
 
         # ---------------------------------------------------------------------
-        # 카드 3: [실행 및 제어 툴바]
+        # [선택 단계] 다중 과제 엑셀 가로 병합 (Column Merge) 카드
+        # (1단계 추출 직후 여러 과제를 병합하여 2단계 대상 엑셀로 자동 전달)
+        # ---------------------------------------------------------------------
+        self.card_agg_merge = HoverZoomCard(
+            title="다중 과제 엑셀 가로 병합 (Column Merge) — 학번 기준 여러 과제 통합",
+            parent=w,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        apply_qss_role(self.card_agg_merge, role="hoverZoomCard", obj_name="AggMergeCard")
+        lay_merge = self.card_agg_merge.body_layout()
+
+        # 안내 배지
+        lbl_merge_tip = QLabel(
+            "여러 개의 과제 엑셀 파일(.xlsx)을 '학번' 기준으로 가로 결합(Full Outer Join)합니다. "
+            "목록 위쪽 파일의 열이 결과 엑셀의 앞쪽에 배치되며, 겹치는 열 이름은 [파일명] 접두사가 자동 부여됩니다."
+        )
+        lbl_merge_tip.setWordWrap(True)
+        apply_qss_role(lbl_merge_tip, role="infoBanner")
+        lay_merge.addWidget(lbl_merge_tip)
+
+        # 파일 목록 + 우측 컨트롤 버튼들
+        box_list_and_btns = QHBoxLayout()
+        box_list_and_btns.setSpacing(10)
+
+        self.list_merge_excels = QListWidget()
+        self.list_merge_excels.setMinimumHeight(120)
+        self.list_merge_excels.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.list_merge_excels.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        apply_qss_role(self.list_merge_excels, obj_name="ListMergeExcels")
+        box_list_and_btns.addWidget(self.list_merge_excels, stretch=1)
+
+        # 우측 버튼들 (이모지 대신 깔끔한 텍스트/기호 사용)
+        box_merge_btns = QVBoxLayout()
+        box_merge_btns.setSpacing(6)
+
+        btn_merge_add = QPushButton("+ 파일 추가")
+        btn_merge_add.setMinimumHeight(28)
+        apply_qss_role(btn_merge_add, role="secondary")
+        btn_merge_add.clicked.connect(self._on_merge_add_files)
+
+        btn_merge_del = QPushButton("- 선택 제거")
+        btn_merge_del.setMinimumHeight(28)
+        apply_qss_role(btn_merge_del, role="outline")
+        btn_merge_del.clicked.connect(self._on_merge_del_file)
+
+        btn_merge_up = QPushButton("▲ 위로")
+        btn_merge_up.setMinimumHeight(28)
+        apply_qss_role(btn_merge_up, role="outline")
+        btn_merge_up.clicked.connect(self._on_merge_move_up)
+
+        btn_merge_down = QPushButton("▼ 아래로")
+        btn_merge_down.setMinimumHeight(28)
+        apply_qss_role(btn_merge_down, role="outline")
+        btn_merge_down.clicked.connect(self._on_merge_move_down)
+
+        btn_merge_clear = QPushButton("목록 비우기")
+        btn_merge_clear.setMinimumHeight(28)
+        apply_qss_role(btn_merge_clear, role="outline")
+        btn_merge_clear.clicked.connect(self._on_merge_clear_files)
+
+        box_merge_btns.addWidget(btn_merge_add)
+        box_merge_btns.addWidget(btn_merge_del)
+        box_merge_btns.addWidget(btn_merge_up)
+        box_merge_btns.addWidget(btn_merge_down)
+        box_merge_btns.addWidget(btn_merge_clear)
+        box_merge_btns.addStretch()
+        box_list_and_btns.addLayout(box_merge_btns)
+
+        lay_merge.addLayout(box_list_and_btns)
+
+        # 출력 파일명 설정
+        box_merge_output = QHBoxLayout()
+        self.edit_merge_output = QLineEdit()
+        self.edit_merge_output.setText(f"통합과제_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+        self.edit_merge_output.setPlaceholderText("저장될 통합 엑셀 파일 경로")
+        self.edit_merge_output.setMinimumHeight(32)
+        apply_qss_role(self.edit_merge_output, obj_name="EditMergeOutput")
+
+        btn_browse_merge_output = QPushButton("저장위치 변경...")
+        btn_browse_merge_output.setMinimumHeight(32)
+        apply_qss_role(btn_browse_merge_output, role="secondary")
+        btn_browse_merge_output.clicked.connect(self._on_browse_merge_output)
+
+        box_merge_output.addWidget(self.edit_merge_output, stretch=1)
+        box_merge_output.addWidget(btn_browse_merge_output)
+        lay_merge.addLayout(self._field_block("출력 파일명", box_merge_output))
+
+        # 하단 실행 버튼 및 피드백 레이아웃
+        box_merge_action = QHBoxLayout()
+        box_merge_action.setSpacing(10)
+
+        self.btn_run_merge = QPushButton("학번 기준 다중 과제 가로 병합 실행")
+        self.btn_run_merge.setMinimumHeight(38)
+        self.btn_run_merge.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_run_merge, role="primary", obj_name="BtnRunMerge")
+        self.btn_run_merge.clicked.connect(self._on_run_column_merge)
+
+        self.lbl_merge_status = QLabel("")
+        self.lbl_merge_status.setWordWrap(True)
+        apply_qss_role(self.lbl_merge_status, role="mutedText")
+
+        self.btn_open_merged_file = QPushButton("통합 엑셀 열기")
+        self.btn_open_merged_file.setMinimumHeight(32)
+        apply_qss_role(self.btn_open_merged_file, role="success")
+        self.btn_open_merged_file.setVisible(False)
+        self.btn_open_merged_file.clicked.connect(lambda: self._open_file_if_exists(self.edit_merge_output.text()))
+
+        box_merge_action.addWidget(self.btn_run_merge, stretch=2)
+        box_merge_action.addWidget(self.lbl_merge_status, stretch=3)
+        box_merge_action.addWidget(self.btn_open_merged_file)
+        lay_merge.addLayout(box_merge_action)
+
+        # 세로 스택 배치: 상단(1단계 DOCX 추출 + 다중 과제 병합) → 중단(2단계 AI 설정) → 하단(3단계 실행 및 진행 상황)
+        cards_layout.addWidget(self.card_agg_merge)
+        cards_layout.addWidget(self.card_agg_step2)
+        lay.addLayout(cards_layout)
+
+        # ---------------------------------------------------------------------
+        # 3. 하단 카드: 3단계 · 일괄 실행 및 진행 상황
         # ---------------------------------------------------------------------
         self.card_agg_step3 = HoverZoomCard(
-            title="🚀 3단계: 파이프라인 실행 및 제어 툴바",
+            title="3단계 · 일괄 실행 및 진행 상황",
             parent=w,
-            zoom_ratio=1.03,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.card_agg_step3, role="hoverZoomCard", obj_name="AggStep3Card")
         lay_step3 = self.card_agg_step3.body_layout()
@@ -1440,14 +1718,14 @@ class DocOcrTab(QWidget):
         row_steps = QHBoxLayout()
         row_steps.setSpacing(10)
 
-        self.btn_run_docx_only = QPushButton("📄 1. DOCX -> 엑셀 추출만 실행")
-        self.btn_run_docx_only.setMinimumHeight(38)
+        self.btn_run_docx_only = QPushButton("1. DOCX -> 엑셀 추출만 실행")
+        self.btn_run_docx_only.setMinimumHeight(36)
         self.btn_run_docx_only.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(self.btn_run_docx_only, role="secondary", obj_name="BtnRunDocxOnly")
         self.btn_run_docx_only.clicked.connect(self._on_run_docx_extract)
 
-        self.btn_run_ai_only = QPushButton("🤖 2. 엑셀 -> AI 과세특 생성만 실행 (이어쓰기 지원)")
-        self.btn_run_ai_only.setMinimumHeight(38)
+        self.btn_run_ai_only = QPushButton("2. 엑셀 -> AI 과세특 생성만 실행 (이어쓰기 지원)")
+        self.btn_run_ai_only.setMinimumHeight(36)
         self.btn_run_ai_only.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(self.btn_run_ai_only, role="secondary", obj_name="BtnRunAiOnly")
         self.btn_run_ai_only.clicked.connect(self._on_run_record_generate)
@@ -1460,14 +1738,14 @@ class DocOcrTab(QWidget):
         row_main = QHBoxLayout()
         row_main.setSpacing(10)
 
-        self.btn_run_integrated = QPushButton("🚀 3. 과제 폴더에서 최종 세특 엑셀까지 원클릭 일괄 생성")
-        self.btn_run_integrated.setMinimumHeight(44)
+        self.btn_run_integrated = QPushButton("3. 원클릭 파이프라인 일괄 실행 (추출 + 평가 + 엑셀 내보내기)")
+        self.btn_run_integrated.setMinimumHeight(42)
         self.btn_run_integrated.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(self.btn_run_integrated, role="primary", obj_name="BtnRunIntegrated")
         self.btn_run_integrated.clicked.connect(self._on_run_integrated_pipeline)
 
-        self.btn_stop_agg = QPushButton("⏹️ 작업 중단")
-        self.btn_stop_agg.setMinimumHeight(44)
+        self.btn_stop_agg = QPushButton("작업 중단")
+        self.btn_stop_agg.setMinimumHeight(42)
         self.btn_stop_agg.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(self.btn_stop_agg, role="danger", obj_name="BtnStopAgg")
         self.btn_stop_agg.clicked.connect(self._on_stop_agg_task)
@@ -1482,9 +1760,10 @@ class DocOcrTab(QWidget):
         # 피드백 & 결과 열기 상태 영역
         box_feedback = QHBoxLayout()
         self.lbl_agg_status = QLabel("대기 중: 실행할 작업을 선택해 주세요.")
-        self.lbl_agg_status.setStyleSheet("color: #E2E8F0; font-weight: bold; font-size: 13px;")
+        self.lbl_agg_status.setWordWrap(True)
+        apply_qss_role(self.lbl_agg_status, role="mutedText")
 
-        self.btn_open_result_excel = QPushButton("📊 생성된 결과 엑셀 열기")
+        self.btn_open_result_excel = QPushButton("생성된 결과 엑셀 열기 (.xlsx)")
         self.btn_open_result_excel.setMinimumHeight(32)
         apply_qss_role(self.btn_open_result_excel, role="success")
         self.btn_open_result_excel.setVisible(False)
@@ -1565,13 +1844,13 @@ class DocOcrTab(QWidget):
         pdf_cnt = sum(1 for it in self._analyzed_items if it.get("ext") == ".pdf")
         if roster_cnt == 0:
             self.lbl_summary_badge.setText(
-                f"📊 분석 파일: 총 {len(self._analyzed_items)}개 (PDF {pdf_cnt}개) | "
-                f"⚠️ [탭 6: 환경설정]에 등록된 학생 명렬표가 없습니다. 명렬표를 등록하면 미제출자가 자동 표시됩니다."
+                f"분석 파일: 총 {len(self._analyzed_items)}개 (PDF {pdf_cnt}개) | "
+                f"등록된 학생 명렬표가 없습니다. 환경설정에서 명렬표를 등록하면 미제출자가 자동 대조됩니다."
             )
         else:
             self.lbl_summary_badge.setText(
-                f"📊 명렬표 총원: {roster_cnt}명  |  ✅ 제출 완료: {submitted_cnt}명  |  "
-                f"🚨 미제출: {len(self._missing_students)}명  |  📄 스캔된 제출 파일: {len(self._analyzed_items)}개 (PDF {pdf_cnt}개)"
+                f"명렬표 총원: {roster_cnt}명  |  제출 완료: {submitted_cnt}명  |  "
+                f"미제출: {len(self._missing_students)}명  |  스캔 파일: {len(self._analyzed_items)}개 (PDF {pdf_cnt}개)"
             )
 
     def _populate_submissions_table(self) -> None:
@@ -1602,10 +1881,10 @@ class DocOcrTab(QWidget):
             status_item = QTableWidgetItem(status_str)
             status_item.setFlags(status_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            if "✅" in status_str:
-                status_item.setForeground(QBrush(QColor("#15803d")))
-            elif "⚠️" in status_str:
-                status_item.setForeground(QBrush(QColor("#b45309")))
+            if "일치" in status_str or "매칭" in status_str or "완료" in status_str:
+                status_item.setForeground(QBrush(QColor("#059669")))
+            elif "동명이인" in status_str or "확인" in status_str:
+                status_item.setForeground(QBrush(QColor("#d97706")))
             else:
                 status_item.setForeground(QBrush(QColor("#dc2626")))
 
@@ -1615,14 +1894,14 @@ class DocOcrTab(QWidget):
 
             new_name_str = str(item.get("new_name", ""))
             new_name_item = QTableWidgetItem(new_name_str)
-            new_name_item.setForeground(QBrush(QColor("#1d4ed8")))
+            new_name_item.setForeground(QBrush(QColor("#2563eb")))
 
             orig_path_str = str(item.get("orig_path", ""))
             orig_path_item = QTableWidgetItem(orig_path_str)
             orig_path_item.setFlags(orig_path_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             tooltip_html = build_floating_tooltip(
-                f"📄 [{sid_str or '학번미상'}] {name_str or '이름미상'}",
+                f"[{sid_str or '학번미상'}] {name_str or '이름미상'}",
                 [
                     f"<b>명렬표 대조 상태:</b> {html.escape(status_str)}",
                     f"<b>원본 파일명:</b> {html.escape(orig_name_str)}",
@@ -1671,7 +1950,7 @@ class DocOcrTab(QWidget):
             parent_item = QTableWidgetItem(parent_str)
 
             tooltip_html = build_floating_tooltip(
-                f"🚨 미제출: [{sid_str}] {name_str}",
+                f"미제출: [{sid_str}] {name_str}",
                 [
                     f"<b>학년-반-번호:</b> {gcn}",
                     f"<b>학생 연락처:</b> {html.escape(contact_str or '-')}",
@@ -1751,7 +2030,7 @@ class DocOcrTab(QWidget):
             QMessageBox.information(self, "안내", "현재 미제출자가 없거나 아직 폴더 분석을 실행하지 않았습니다.")
             return
         title = self.edit_assignment_title.text().strip() or "과제"
-        lines = [f"[🚨 {title} 미제출자 명단 (총 {len(self._missing_students)}명)]"]
+        lines = [f"[{title} 미제출자 명단 (총 {len(self._missing_students)}명)]"]
         for s in self._missing_students:
             lines.append(f"- {s.get('student_id')} {s.get('name')}")
         text = "\n".join(lines)
@@ -1930,7 +2209,7 @@ class DocOcrTab(QWidget):
             f"병합 파일: {merged_cnt}개 (총 {total_pages}페이지)\n파일명: {Path(out_pdf).name}",
         )
 
-        skip_msg = f"\n\n⚠️ 건너뛴 파일 ({len(skipped)}건):\n" + "\n".join(skipped[:5]) if skipped else ""
+        skip_msg = f"\n\n[건너뛴 파일 ({len(skipped)}건)]:\n" + "\n".join(skipped[:5]) if skipped else ""
         ans = QMessageBox.question(
             self,
             "단일 PDF 병합 완료",
@@ -1952,11 +2231,11 @@ class DocOcrTab(QWidget):
         )
         for f in files:
             it = QListWidgetItem(f)
-            it.setToolTip(build_floating_tooltip("📄 OCR 대상 파일 경로", [html.escape(f)]))
+            it.setToolTip(build_floating_tooltip("OCR 대상 파일 경로", [html.escape(f)]))
             self.list_ocr_files.addItem(it)
 
     def _on_open_manual_llm_dialog(self) -> None:
-        """[📋 수동 복붙 모드 열기] 버튼 클릭 시 ManualLlmDialog가 팝업됩니다."""
+        """[수동 복붙 모드 열기] 버튼 클릭 시 ManualLlmDialog가 팝업됩니다."""
         files = [self.list_ocr_files.item(i).text() for i in range(self.list_ocr_files.count())]
         raw_text = extract_local_text_from_files(files) if files else self.txt_ocr_output.toPlainText().strip()
 
@@ -1976,7 +2255,7 @@ class DocOcrTab(QWidget):
 
     def _on_run_hybrid_ocr(self) -> None:
         """
-        [🤖 AI 자동 실행 (API 사용)] 버튼 클릭 시:
+        [AI 자동 실행 (API 사용)] 버튼 클릭 시:
         API 키가 설정되어 있고 수동 모드가 해제된 경우 -> 백그라운드 Worker로 자동 처리.
         API 키가 없거나 '수동 프롬프트 모드'가 체크된 경우 -> ManualLlmDialog 모달 자동 팝업.
         """
@@ -1991,7 +2270,7 @@ class DocOcrTab(QWidget):
                 self,
                 "파일 추가 또는 수동 모드 안내",
                 "자동 API 보정을 수행할 파일을 먼저 목록에 추가해 주세요.\n"
-                "(직접 텍스트를 붙여넣어 처리하려면 옆의 [📋 수동 복붙 모드 열기] 버튼을 클릭하세요.)",
+                "(직접 텍스트를 붙여넣어 처리하려면 옆의 [수동 복붙 모드 열기] 버튼을 클릭하세요.)",
             )
             return
 
@@ -2040,19 +2319,19 @@ class DocOcrTab(QWidget):
 
         if has_key:
             self.lbl_active_ai_badge.setText(
-                f"🤖 활성 AI: <b style='color:#38BDF8;'>{p_name}</b> ({model})  |  <span style='color:#10B981;'>● 정상 연결 가능</span>"
+                f"AI 엔진: <b style='color:#004ac6;'>{p_name}</b> ({model})  |  <span style='color:#059669; font-weight:600;'>[정상 연결]</span>"
             )
             self.lbl_active_ai_badge.setStyleSheet(
-                "background-color: #1E293B; color: #CBD5E1; font-size: 13px; "
-                "padding: 8px 14px; border-radius: 6px; border: 1px solid #0284C7;"
+                "background-color: #f0fdf4; color: #0f172a; font-size: 12px; "
+                "padding: 6px 12px; border-radius: 8px; border: 1px solid #bbf7d0;"
             )
         else:
             self.lbl_active_ai_badge.setText(
-                f"🤖 활성 AI: <b style='color:#F59E0B;'>{p_name}</b> ({model})  |  <span style='color:#EF4444;'>⚠️ API Key 미등록</span>"
+                f"AI 엔진: <b style='color:#d97706;'>{p_name}</b> ({model})  |  <span style='color:#dc2626; font-weight:600;'>[API Key 미등록]</span>"
             )
             self.lbl_active_ai_badge.setStyleSheet(
-                "background-color: #2D1A15; color: #FCA5A5; font-size: 13px; "
-                "padding: 8px 14px; border-radius: 6px; border: 1px solid #B91C1C;"
+                "background-color: #fef2f2; color: #0f172a; font-size: 12px; "
+                "padding: 6px 12px; border-radius: 8px; border: 1px solid #fecaca;"
             )
 
     def _on_go_to_settings_tab(self) -> None:
@@ -2082,7 +2361,7 @@ class DocOcrTab(QWidget):
             QMessageBox.information(
                 self,
                 "환경설정 안내",
-                "왼쪽 사이드바의 <b>[⚙️ 환경설정]</b> 메뉴를 클릭하여\n"
+                "왼쪽 사이드바의 <b>[환경설정]</b> 메뉴를 클릭하여\n"
                 "AI 공급자(Gemini, OpenAI, Claude, OpenRouter, Ollama)와 API Key를 설정해 주세요.",
             )
 
@@ -2119,17 +2398,17 @@ class DocOcrTab(QWidget):
         """schemas/ 폴더 내 JSON 양식 목록을 콤보박스에 로드합니다."""
         prev_data = self.combo_agg_schema.currentData()
         self.combo_agg_schema.clear()
-        self.combo_agg_schema.addItem("🔍 양식 자동 판별 (탐구계획서/보고서 등 내장 지원)", "")
+        self.combo_agg_schema.addItem("양식 자동 판별 (탐구계획서/보고서 등 내장 지원)", "")
 
         schemas_dir = Path("schemas")
         if schemas_dir.exists():
             for json_path in sorted(schemas_dir.glob("*.json")):
                 try:
                     name, _ = load_single_schema(json_path)
-                    display = f"📄 {name} ({json_path.name})"
+                    display = f"{name} ({json_path.name})"
                     self.combo_agg_schema.addItem(display, str(json_path.resolve()))
                 except Exception:
-                    self.combo_agg_schema.addItem(f"📄 {json_path.stem} ({json_path.name})", str(json_path.resolve()))
+                    self.combo_agg_schema.addItem(f"{json_path.stem} ({json_path.name})", str(json_path.resolve()))
 
         if prev_data:
             idx = self.combo_agg_schema.findData(prev_data)
@@ -2140,12 +2419,12 @@ class DocOcrTab(QWidget):
         """prompts_memory/ 디렉토리 내 .txt 프롬프트 파일 목록을 콤보박스에 로드합니다."""
         prev_data = self.combo_agg_prompt.currentData()
         self.combo_agg_prompt.clear()
-        self.combo_agg_prompt.addItem("✨ 기본 내장 과세특 프롬프트 (행동 중심 NEIS 1500B)", "")
+        self.combo_agg_prompt.addItem("기본 내장 과세특 프롬프트 (행동 중심 NEIS 1500B)", "")
 
         prompt_files = list_prompt_files(Path("prompts_memory"))
         for pf in prompt_files:
             clean_name = re.sub(r"^prompt_", "", pf.stem)
-            display = f"📝 {clean_name} ({pf.name})"
+            display = f"{clean_name} ({pf.name})"
             self.combo_agg_prompt.addItem(display, str(pf.resolve()))
 
         if prev_data:
@@ -2197,11 +2476,42 @@ class DocOcrTab(QWidget):
         """하위 호환 래퍼"""
         return self._check_ai_provider_key_or_warn()
 
+    def _update_agg_stepper(self, s1: str = "idle", s2: str = "idle", s3: str = "idle") -> None:
+        """상단 3-Stage Stepper의 각 단계 상태('idle' | 'active' | 'done')를 시각적으로 갱신합니다."""
+        if not hasattr(self, "_agg_stage_boxes") or not hasattr(self, "_agg_stage_chips"):
+            return
+        states = [s1, s2, s3]
+        for idx, state in enumerate(states):
+            if idx >= len(self._agg_stage_boxes) or idx >= len(self._agg_stage_chips):
+                break
+            box = self._agg_stage_boxes[idx]
+            chip = self._agg_stage_chips[idx]
+            if state == "active":
+                box_role = "stageBoxActive"
+                chip_role = "stageBadgeActive"
+                chip.setText("진행 중")
+            elif state == "done":
+                box_role = "stageBoxDone"
+                chip_role = "stageBadgeDone"
+                chip.setText("완료")
+            else:
+                box_role = "stageBox"
+                chip_role = "stageBadge"
+                chip.setText("대기")
+            box.setProperty("role", box_role)
+            chip.setProperty("role", chip_role)
+            box.style().unpolish(box)
+            box.style().polish(box)
+            chip.style().unpolish(chip)
+            chip.style().polish(chip)
+
     def _set_agg_controls_busy(self, busy: bool) -> None:
         """작업 진행 중 버튼 상태 토글"""
         self.btn_run_docx_only.setEnabled(not busy)
         self.btn_run_ai_only.setEnabled(not busy)
         self.btn_run_integrated.setEnabled(not busy)
+        if hasattr(self, "btn_run_merge"):
+            self.btn_run_merge.setEnabled(not busy)
         self.btn_stop_agg.setEnabled(busy)
 
     def _on_run_docx_extract(self) -> None:
@@ -2216,7 +2526,8 @@ class DocOcrTab(QWidget):
 
         worker = DocxToExcelWorker(docx_dir=folder_str, schema_path=schema_path)
         self._set_agg_controls_busy(True)
-        self.lbl_agg_status.setText("⏳ DOCX 과제 추출 진행 중...")
+        self._update_agg_stepper(s1="active", s2="idle", s3="idle")
+        self.lbl_agg_status.setText("DOCX 과제 추출 진행 중...")
         self.btn_open_result_excel.setVisible(False)
 
         def on_done(res: Dict[str, Any]):
@@ -2225,25 +2536,56 @@ class DocOcrTab(QWidget):
             if out_file:
                 self.edit_agg_excel_file.setText(out_file)
                 self.btn_open_result_excel.setVisible(True)
+
+            tot = res.get("total", 0)
+            succ = res.get("success", 0)
+            failed = res.get("failed", 0)
+            errors = res.get("errors", [])
+
+            self._update_agg_stepper(s1="done", s2="idle", s3="idle")
             self.lbl_agg_status.setText(
-                f"✅ 추출 완료: {Path(out_file).name} (성공 {res.get('success', 0)}명 / 실패 {res.get('failed', 0)}명)"
+                f"추출 완료: {Path(out_file).name} (성공 {succ}명 / 실패 {failed}명)"
             )
-            QMessageBox.information(
-                self,
-                "DOCX 추출 완료",
-                f"학생 과제 추출이 성공적으로 완료되었습니다.\n\n"
-                f"- 총 파일: {res.get('total', 0)}개\n"
-                f"- 성공 추출: {res.get('success', 0)}명\n"
-                f"- 오류 건수: {res.get('failed', 0)}건\n\n"
-                f"생성된 엑셀 경로:\n{out_file}\n\n"
-                f"2단계 대상 엑셀 파일로 자동 등록되었습니다.",
-            )
+
+            if failed > 0:
+                preview_count = min(len(errors), 8)
+                fail_summary_lines = [
+                    f"• {e.get('파일명', '알수없음')}: {e.get('오류내용', '원인 미상')}"
+                    for e in errors[:preview_count]
+                ]
+                if len(errors) > preview_count:
+                    fail_summary_lines.append(f"... 외 {len(errors) - preview_count}건 생략")
+                fail_summary_str = "\n".join(fail_summary_lines)
+
+                QMessageBox.warning(
+                    self,
+                    "DOCX 추출 완료 (일부 실패)",
+                    f"학생 과제 추출이 완료되었으나, {failed}건의 파일에서 오류가 발생했습니다.\n\n"
+                    f"- 총 파일: {tot}개\n"
+                    f"- 성공 추출: {succ}명\n"
+                    f"- 오류 건수: {failed}건\n\n"
+                    f"[오류 발생 파일 및 원인 (상위 {preview_count}건)]:\n{fail_summary_str}\n\n"
+                    f"※ 자세한 원인은 결과 엑셀의 [오류 파일] 시트 및 하단 로그 콘솔에서 확인할 수 있습니다.\n\n"
+                    f"생성된 엑셀 경로:\n{out_file}\n\n"
+                    f"2단계 대상 엑셀 파일로 자동 등록되었습니다.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "DOCX 추출 완료",
+                    f"학생 과제 추출이 성공적으로 완료되었습니다.\n\n"
+                    f"- 총 파일: {tot}개\n"
+                    f"- 성공 추출: {succ}명\n"
+                    f"- 오류 건수: 0건\n\n"
+                    f"생성된 엑셀 경로:\n{out_file}\n\n"
+                    f"2단계 대상 엑셀 파일로 자동 등록되었습니다.",
+                )
 
         self.task_runner.start_worker(
             worker,
             task_key=self.TASK_DOCX_EXTRACT,
             on_result=on_done,
-            on_error=lambda err: self.lbl_agg_status.setText(f"❌ 추출 오류: {err}"),
+            on_error=lambda err: self.lbl_agg_status.setText(f"추출 오류: {err}"),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
@@ -2275,8 +2617,9 @@ class DocOcrTab(QWidget):
             model_name=info["model"],
         )
         self._set_agg_controls_busy(True)
+        self._update_agg_stepper(s1="done", s2="active", s3="idle")
         self.lbl_agg_status.setText(
-            f"⏳ AI 과세특 생성 진행 중... (공급자: {info['provider_display']}, 모델: {info['model']}, 상한: {max_bytes}B)"
+            f"AI 과세특 생성 진행 중... (공급자: {info['provider_display']}, 모델: {info['model']}, 상한: {max_bytes}B)"
         )
         self.btn_open_result_excel.setVisible(False)
 
@@ -2285,8 +2628,9 @@ class DocOcrTab(QWidget):
             self._last_result_excel_path = out_file
             if out_file:
                 self.btn_open_result_excel.setVisible(True)
+            self._update_agg_stepper(s1="done", s2="done", s3="done")
             self.lbl_agg_status.setText(
-                f"✅ 과세특 생성 완료: {Path(out_file).name} (완료 {res.get('completed', 0)}/{res.get('total', 0)}명)"
+                f"과세특 생성 완료: {Path(out_file).name} (완료 {res.get('completed', 0)}/{res.get('total', 0)}명)"
             )
             QMessageBox.information(
                 self,
@@ -2302,7 +2646,7 @@ class DocOcrTab(QWidget):
             worker,
             task_key=self.TASK_RECORD_GEN,
             on_result=on_done,
-            on_error=lambda err: self.lbl_agg_status.setText(f"❌ 과세특 생성 오류: {err}"),
+            on_error=lambda err: self.lbl_agg_status.setText(f"과세특 생성 오류: {err}"),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
@@ -2338,8 +2682,9 @@ class DocOcrTab(QWidget):
             model_name=info["model"],
         )
         self._set_agg_controls_busy(True)
+        self._update_agg_stepper(s1="active", s2="active", s3="active")
         self.lbl_agg_status.setText(
-            f"🚀 원클릭 일괄 파이프라인 진행 중: 1단계 DOCX 추출 -> 2단계 AI 세특 ({info['provider_display']} / {info['model']})"
+            f"원클릭 파이프라인 진행 중: 1단계 DOCX 추출 -> 2단계 AI 세특 ({info['provider_display']} / {info['model']})"
         )
         self.btn_open_result_excel.setVisible(False)
 
@@ -2351,37 +2696,222 @@ class DocOcrTab(QWidget):
                 self.btn_open_result_excel.setVisible(True)
             step1 = res.get("step1", {})
             step2 = res.get("step2", {})
+
+            s1_succ = step1.get("success", 0)
+            s1_failed = step1.get("failed", 0)
+            s1_errors = step1.get("errors", [])
+            s2_comp = step2.get("completed", 0) if step2 else 0
+
+            self._update_agg_stepper(s1="done", s2="done", s3="done")
             self.lbl_agg_status.setText(
-                f"🎉 전체 일괄 생성 완료! 최종 파일: {Path(out_file).name} (과제 {step1.get('success', 0)}명, 세특 {step2.get('completed', 0)}명)"
+                f"전체 일괄 생성 완료! 최종 파일: {Path(out_file).name} (과제 {s1_succ}명, 세특 {s2_comp}명)"
             )
-            QMessageBox.information(
-                self,
-                "🎉 원클릭 일괄 생성 완료",
-                f"학생 DOCX 과제 취합부터 AI 과세특 생성까지 모두 완료되었습니다!\n\n"
-                f"- 사용된 AI: {info['provider_display']} ({info['model']})\n"
-                f"[1단계 과제 추출]: 성공 {step1.get('success', 0)}건\n"
-                f"[2단계 AI 세특]: 완료 {step2.get('completed', 0)}건\n\n"
-                f"최종 저장된 파일:\n{out_file}",
-            )
+
+            if s1_failed > 0:
+                preview_count = min(len(s1_errors), 8)
+                fail_summary_lines = [
+                    f"• {e.get('파일명', '알수없음')}: {e.get('오류내용', '원인 미상')}"
+                    for e in s1_errors[:preview_count]
+                ]
+                if len(s1_errors) > preview_count:
+                    fail_summary_lines.append(f"... 외 {len(s1_errors) - preview_count}건 생략")
+                fail_summary_str = "\n".join(fail_summary_lines)
+
+                QMessageBox.warning(
+                    self,
+                    "원클릭 일괄 생성 완료 (일부 파일 추출 실패)",
+                    f"원클릭 일괄 처리가 완료되었으나, 1단계 과제 추출 중 {s1_failed}건의 파일에서 오류가 발생했습니다.\n\n"
+                    f"- 사용된 AI: {info['provider_display']} ({info['model']})\n"
+                    f"[1단계 과제 추출]: 성공 {s1_succ}건 / 실패 {s1_failed}건\n"
+                    f"[2단계 AI 세특]: 완료 {s2_comp}건\n\n"
+                    f"[1단계 추출 실패 파일 및 원인 (상위 {preview_count}건)]:\n{fail_summary_str}\n\n"
+                    f"※ 자세한 원인은 결과 엑셀의 [오류 파일] 시트 및 하단 로그 콘솔에서 확인할 수 있습니다.\n\n"
+                    f"최종 저장된 파일:\n{out_file}",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "원클릭 일괄 생성 완료",
+                    f"학생 DOCX 과제 취합부터 AI 과세특 생성까지 모두 완료되었습니다!\n\n"
+                    f"- 사용된 AI: {info['provider_display']} ({info['model']})\n"
+                    f"[1단계 과제 추출]: 성공 {s1_succ}건\n"
+                    f"[2단계 AI 세특]: 완료 {s2_comp}건\n\n"
+                    f"최종 저장된 파일:\n{out_file}",
+                )
 
         self.task_runner.start_worker(
             worker,
             task_key=self.TASK_INTEGRATED,
             on_result=on_done,
-            on_error=lambda err: self.lbl_agg_status.setText(f"❌ 일괄 처리 오류: {err}"),
+            on_error=lambda err: self.lbl_agg_status.setText(f"일괄 처리 오류: {err}"),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
     def _on_stop_agg_task(self) -> None:
-        """진행 중인 과제 추출 또는 AI 과세특 생성 작업을 안전하게 중단합니다."""
+        """진행 중인 과제 추출, 가로 병합 또는 AI 과세특 생성 작업을 안전하게 중단합니다."""
         self.task_runner.stop_task(self.TASK_DOCX_EXTRACT)
+        self.task_runner.stop_task(self.TASK_COLUMN_MERGE)
         self.task_runner.stop_task(self.TASK_RECORD_GEN)
         self.task_runner.stop_task(self.TASK_INTEGRATED)
-        self.lbl_agg_status.setText("⏹️ 작업 중단 요청됨 (현재 학생 저장 후 안전 종료 중...)")
+        self.lbl_agg_status.setText("작업 중단 요청됨 (현재 학생 저장 후 안전 종료 중...)")
         QMessageBox.information(
             self,
             "중단 요청",
-            "작업 중단을 요청했습니다.\n현재 처리 중인 학생의 데이터까지 엑셀 파일에 안전하게 저장된 후 중단됩니다.",
+            "작업 중단을 요청했습니다.\n현재 처리 중인 작업이 안전하게 마무리된 후 중단됩니다.",
+        )
+
+    # =========================================================================
+    # [다중 과제 엑셀 가로 병합] 핸들러
+    # =========================================================================
+    def _on_merge_add_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "가로 병합할 과제 엑셀 파일 선택",
+            "",
+            "Excel 파일 (*.xlsx *.xls);;모든 파일 (*)",
+        )
+        if not files:
+            return
+
+        existing = set()
+        for i in range(self.list_merge_excels.count()):
+            existing.add(self.list_merge_excels.item(i).text())
+
+        first_dir = None
+        for f in files:
+            norm = str(Path(f).resolve())
+            if norm not in existing:
+                item = QListWidgetItem(norm)
+                item.setToolTip(norm)
+                self.list_merge_excels.addItem(item)
+                existing.add(norm)
+                if first_dir is None:
+                    first_dir = Path(norm).parent
+
+        # 출력 파일 기본 경로 자동 설정 (첫 파일의 폴더에 생성)
+        current_out = self.edit_merge_output.text().strip()
+        if first_dir and (not current_out or not ("\\" in current_out or "/" in current_out)):
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.edit_merge_output.setText(str(first_dir / f"통합과제_{ts}.xlsx"))
+
+    def _on_merge_del_file(self) -> None:
+        row = self.list_merge_excels.currentRow()
+        if row >= 0:
+            self.list_merge_excels.takeItem(row)
+
+    def _on_merge_move_up(self) -> None:
+        row = self.list_merge_excels.currentRow()
+        if row > 0:
+            item = self.list_merge_excels.takeItem(row)
+            self.list_merge_excels.insertItem(row - 1, item)
+            self.list_merge_excels.setCurrentRow(row - 1)
+
+    def _on_merge_move_down(self) -> None:
+        row = self.list_merge_excels.currentRow()
+        if 0 <= row < self.list_merge_excels.count() - 1:
+            item = self.list_merge_excels.takeItem(row)
+            self.list_merge_excels.insertItem(row + 1, item)
+            self.list_merge_excels.setCurrentRow(row + 1)
+
+    def _on_merge_clear_files(self) -> None:
+        self.list_merge_excels.clear()
+
+    def _on_browse_merge_output(self) -> None:
+        cur = self.edit_merge_output.text().strip()
+        init_path = cur if cur else str(Path("통합과제.xlsx").resolve())
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "통합 결과 엑셀 저장 위치 선택",
+            init_path,
+            "Excel 파일 (*.xlsx)",
+        )
+        if path:
+            self.edit_merge_output.setText(str(Path(path).resolve()))
+
+    def _on_run_column_merge(self) -> None:
+        count = self.list_merge_excels.count()
+        if count < 2:
+            QMessageBox.warning(
+                self,
+                "파일 확인",
+                "가로 병합을 위해 최소 2개 이상의 엑셀 파일을 목록에 추가해 주세요.",
+            )
+            return
+
+        excel_paths = [self.list_merge_excels.item(i).text() for i in range(count)]
+        output_str = self.edit_merge_output.text().strip()
+        output_path = Path(output_str) if output_str else None
+
+        worker = ExcelColumnMergeWorker(
+            excel_paths=excel_paths,
+            output_path=output_path,
+        )
+        self._set_agg_controls_busy(True)
+        self._update_agg_stepper(s1="active", s2="idle", s3="idle")
+        self.lbl_merge_status.setText(f"{count}개 엑셀 파일 가로 병합 진행 중...")
+        self.btn_open_merged_file.setVisible(False)
+
+        def on_done(res: Dict[str, Any]):
+            out_file = res.get("output_file", "")
+            tot_files = res.get("total_files", 0)
+            tot_students = res.get("total_students", 0)
+            merged_cols = res.get("merged_columns", 0)
+            rev_cnt = res.get("review_count", 0)
+            err_cnt = res.get("error_count", 0)
+
+            # 1. 2단계 AI 세특 입력창에 자동 등록
+            if out_file:
+                self.edit_agg_excel_file.setText(out_file)
+                self.btn_open_result_excel.setVisible(True)
+                self._last_result_excel_path = out_file
+                self.btn_open_merged_file.setVisible(True)
+
+            self._update_agg_stepper(s1="done", s2="idle", s3="idle")
+            self.lbl_merge_status.setText(
+                f"병합 완료: {Path(out_file).name} (학생 {tot_students}명, 열 {merged_cols}개)"
+            )
+
+            # 2. 완료 팝업 알림 (검토/오류 항목 요약 포함)
+            base_msg = (
+                f"총 {tot_files}개 파일에서 {tot_students}명의 학생이 가로 병합되었습니다.\n\n"
+                f"- 통합된 문항 열 개수: {merged_cols}개\n"
+                f"- 생성된 엑셀 경로:\n{out_file}\n\n"
+                f"하단 [2단계: AI 채점 및 과세특 생성 설정]의 대상 파일로 자동 등록되었습니다."
+            )
+
+            if rev_cnt > 0 or err_cnt > 0:
+                review_details = []
+                for r in res.get("review_records", [])[:5]:
+                    review_details.append(f"• [이름불일치] 학번 {r.get('학번')}: {r.get('상세원인')}")
+                for e in res.get("error_records", [])[:5]:
+                    review_details.append(f"• [학번오류] {e.get('파일명')}(행 {e.get('행번호')}): {e.get('상세원인')}")
+
+                detail_str = "\n".join(review_details)
+                extra_cnt = (rev_cnt + err_cnt) - len(review_details)
+                if extra_cnt > 0:
+                    detail_str += f"\n... 외 {extra_cnt}건 생략"
+
+                warn_msg = (
+                    f"총 {tot_files}개 파일에서 {tot_students}명의 학생이 가로 병합되었습니다.\n\n"
+                    f"[확인 필요 항목]:\n"
+                    f"- 이름 불일치 의심: {rev_cnt}건 (대표 이름으로 자동 병합됨)\n"
+                    f"- 학번 누락/오류 제외: {err_cnt}건 (정상 행에서 제외됨)\n\n"
+                    f"[주요 확인 대상 (상위 5~10건)]:\n{detail_str}\n\n"
+                    f"※ 상세 내역은 생성된 엑셀의 [검토_및_오류] 시트 및 하단 로그 콘솔에서 확인할 수 있습니다.\n\n"
+                    f"- 통합된 문항 열 개수: {merged_cols}개\n"
+                    f"- 생성된 엑셀 경로:\n{out_file}\n\n"
+                    f"하단 [2단계: AI 채점 및 과세특 생성 설정]의 대상 파일로 자동 등록되었습니다."
+                )
+                QMessageBox.warning(self, "다중 과제 가로 병합 완료 (검토 항목 있음)", warn_msg)
+            else:
+                QMessageBox.information(self, "다중 과제 가로 병합 완료", base_msg)
+
+        self.task_runner.start_worker(
+            worker,
+            task_key=self.TASK_COLUMN_MERGE,
+            on_result=on_done,
+            on_error=lambda err: self.lbl_merge_status.setText(f"병합 오류: {err}"),
+            on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
     def _on_open_last_result_excel(self) -> None:

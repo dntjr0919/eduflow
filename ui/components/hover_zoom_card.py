@@ -54,11 +54,11 @@ class HoverZoomCard(QFrame):
         self.header_layout.addStretch()
         self._root_layout.addLayout(self.header_layout)
 
-        # 입체감 표현을 위한 고정 Drop Shadow 효과
+        # DESIGN.md: Zero ambient shadows on canvas — subtle 1px border with minimal elevation
         self.shadow = QGraphicsDropShadowEffect(self)
-        self.shadow.setBlurRadius(14)
-        self.shadow.setColor(QColor(15, 23, 42, 38))
-        self.shadow.setOffset(0, 4)
+        self.shadow.setBlurRadius(4)
+        self.shadow.setColor(QColor(15, 23, 42, 10))
+        self.shadow.setOffset(0, 1)
         self.setGraphicsEffect(self.shadow)
 
     def setTitle(self, title: str) -> None:

@@ -67,7 +67,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("교무·행정 AI 워크스테이션 v2.0")
+        self.setWindowTitle("EduFlow — Teacher Workstation")
         self.resize(1380, 860)
         self.setMinimumSize(1040, 680)
 
@@ -86,7 +86,7 @@ class MainWindow(QMainWindow):
         self._update_ai_mode_badge()
         self.config.add_listener(lambda _: self._update_ai_mode_badge())
 
-        self.append_log("INFO", "교무·행정 AI 워크스테이션이 시작되었습니다.")
+        self.append_log("INFO", "EduFlow Workstation initialized.")
 
     # =========================================================================
     # UI 레이아웃 초기화 (QHBoxLayout: 좌측 다크 사이드바 + 우측 QStackedWidget)
@@ -112,15 +112,15 @@ class MainWindow(QMainWindow):
         self.sidebar_layout.setContentsMargins(14, 18, 14, 16)
         self.sidebar_layout.setSpacing(6)
 
-        # 사이드바 상단: 브랜드 타이틀 + [ ☰ ] 햄버거 토글 버튼
+        # 사이드바 상단: 브랜드 타이틀 + [ = ] 햄버거 토글 버튼
         brand_top_row = QHBoxLayout()
         brand_top_row.setContentsMargins(0, 0, 0, 0)
         brand_top_row.setSpacing(6)
 
-        self.brand_title = QLabel("✨ AI 교무 워크스테이션")
+        self.brand_title = QLabel("EduFlow")
         polish_widget(self.brand_title, obj_name="SidebarBrandTitle")
 
-        self.btn_sidebar_toggle = QPushButton("☰")
+        self.btn_sidebar_toggle = QPushButton("≡")
         polish_widget(self.btn_sidebar_toggle, obj_name="SidebarToggleBtn")
         self.btn_sidebar_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 접기 / 펼치기")
@@ -129,10 +129,10 @@ class MainWindow(QMainWindow):
         brand_top_row.addWidget(self.brand_title, stretch=1)
         brand_top_row.addWidget(self.btn_sidebar_toggle, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        self.brand_sub = QLabel("Smart Teacher Desktop Hub")
+        self.brand_sub = QLabel("Teacher Workstation")
         polish_widget(self.brand_sub, obj_name="SidebarBrandSubtitle")
 
-        self.nav_section_lbl = QLabel("WORKSPACE MENU")
+        self.nav_section_lbl = QLabel("NAVIGATION")
         polish_widget(self.nav_section_lbl, obj_name="SidebarSectionLabel")
 
         self.sidebar_nav = QListWidget(self.sidebar_frame)
@@ -142,7 +142,7 @@ class MainWindow(QMainWindow):
         self.sidebar_nav.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sidebar_nav.currentRowChanged.connect(self._on_sidebar_nav_changed)
 
-        self.btn_hide_tray = QPushButton("🔽  시스템 트레이로 숨기기")
+        self.btn_hide_tray = QPushButton("시스템 트레이로 최소화")
         polish_widget(self.btn_hide_tray, obj_name="SidebarTrayButton")
         self.btn_hide_tray.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_hide_tray.setToolTip("창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다.")
@@ -183,7 +183,7 @@ class MainWindow(QMainWindow):
 
         title_col = QVBoxLayout()
         title_col.setSpacing(3)
-        self.lbl_page_title = QLabel("📁 스마트 파일 분류기")
+        self.lbl_page_title = QLabel("스마트 파일 분류기")
         polish_widget(self.lbl_page_title, obj_name="PageHeaderTitle")
 
         self.lbl_page_desc = QLabel("원본 폴더 감시 및 키워드/확장자 기반 자동 폴더 생성·분류·실행취소")
@@ -192,7 +192,7 @@ class MainWindow(QMainWindow):
         title_col.addWidget(self.lbl_page_title)
         title_col.addWidget(self.lbl_page_desc)
 
-        self.lbl_ai_badge = QLabel("🤖 AI 모드: 수동 프롬프트 (No-API)")
+        self.lbl_ai_badge = QLabel("AI: 수동 프롬프트 모드")
         polish_widget(self.lbl_ai_badge, obj_name="AiModeBadge")
 
         top_header_layout.addLayout(title_col)
@@ -216,9 +216,9 @@ class MainWindow(QMainWindow):
         drawer_layout.setSpacing(6)
 
         drawer_header = QHBoxLayout()
-        drawer_title = QLabel("🖥️ 실시간 백그라운드 작업 로그 콘솔")
-        drawer_title.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 700;")
-        btn_clear_log = QPushButton("로그 지우기")
+        drawer_title = QLabel("실시간 백그라운드 작업 로그 콘솔")
+        drawer_title.setStyleSheet("color: #94a3b8; font-size: 12px; font-weight: 600;")
+        btn_clear_log = QPushButton("로그 비우기")
         polish_widget(btn_clear_log, role="slate")
         btn_clear_log.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clear_log.clicked.connect(self._on_clear_logs)
@@ -243,13 +243,13 @@ class MainWindow(QMainWindow):
         bottom_bar = QFrame(self.workspace_frame)
         polish_widget(bottom_bar, obj_name="BottomStatusContainer")
         status_layout = QHBoxLayout(bottom_bar)
-        status_layout.setContentsMargins(20, 10, 20, 10)
+        status_layout.setContentsMargins(20, 8, 20, 8)
         status_layout.setSpacing(12)
 
-        self.lbl_current_task = QLabel("⚡ 대기 중")
+        self.lbl_current_task = QLabel("대기 중")
         polish_widget(self.lbl_current_task, obj_name="StatusTaskBadge")
 
-        self.lbl_single_line_log = QLabel("최근 로그가 이곳에 한 줄로 실시간 요약 표시됩니다.")
+        self.lbl_single_line_log = QLabel("최근 작업 상태가 실시간으로 표시됩니다.")
         polish_widget(self.lbl_single_line_log, obj_name="StatusSingleLineLog")
 
         self.progress_bar = QProgressBar(bottom_bar)
@@ -259,7 +259,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setFixedWidth(210)
         self.progress_bar.setTextVisible(False)
 
-        self.btn_toggle_log = QPushButton("로그 보기 ▲")
+        self.btn_toggle_log = QPushButton("로그 콘솔 열기")
         polish_widget(self.btn_toggle_log)
         self.btn_toggle_log.setCheckable(True)
         self.btn_toggle_log.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -302,14 +302,14 @@ class MainWindow(QMainWindow):
             self.brand_sub.hide()
             self.nav_section_lbl.hide()
             self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 펼치기")
-            self.btn_hide_tray.setText("🔽")
+            self.btn_hide_tray.setText("▼")
             self.btn_hide_tray.setToolTip(
                 "<b>시스템 트레이로 숨기기</b><br/>창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다."
             )
             for idx, meta in enumerate(self._page_meta):
                 item = self.sidebar_nav.item(idx)
                 if item is not None:
-                    item.setText(meta["icon"])
+                    item.setText(meta["short"])
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setToolTip(
                         f"<div style='padding:2px 4px;'><b>{meta['title']}</b><br/>"
@@ -321,7 +321,7 @@ class MainWindow(QMainWindow):
             self.brand_sub.show()
             self.nav_section_lbl.show()
             self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 접기")
-            self.btn_hide_tray.setText("🔽  시스템 트레이로 숨기기")
+            self.btn_hide_tray.setText("시스템 트레이로 최소화")
             self.btn_hide_tray.setToolTip("창을 숨기고 시스템 트레이에서 백그라운드 감시를 계속합니다.")
             for idx, meta in enumerate(self._page_meta):
                 item = self.sidebar_nav.item(idx)
@@ -346,11 +346,10 @@ class MainWindow(QMainWindow):
     # =========================================================================
     # 모듈형 페이지 등록 (좌측 QListWidget + 우측 QStackedWidget 동시 등록)
     # =========================================================================
-    def register_tab(self, widget: QWidget, title: str, tooltip: str = "") -> int:
+    def register_tab(self, widget: QWidget, title: str, tooltip: str = "", short_code: str = "") -> int:
         polish_widget(widget)
         idx = self.stacked_widget.addWidget(widget)
-        parts = title.strip().split()
-        icon_only = parts[0] if parts else "•"
+        short = short_code or (title[:2] if len(title) >= 2 else title)
 
         item = QListWidgetItem(title)
         rich_tip = (
@@ -362,7 +361,7 @@ class MainWindow(QMainWindow):
         item.setToolTip(rich_tip)
         self.sidebar_nav.addItem(item)
         self._page_meta.append(
-            {"title": title, "icon": icon_only, "desc": tooltip}
+            {"title": title, "short": short, "desc": tooltip}
         )
         return idx
 
@@ -376,33 +375,39 @@ class MainWindow(QMainWindow):
 
         self.register_tab(
             self.tab_sorter,
-            "📁  스마트 파일 분류기",
+            "스마트 파일 자동 분류",
             "원본 폴더 실시간 감시 및 키워드/확장자 기반 자동 폴더 생성·분류·실행취소",
+            short_code="FS",
         )
         self.register_tab(
             self.tab_doc_ocr,
-            "📄  문서 처리 & AI OCR",
-            "학번/이름 기준 제출 파일 병합 · 미제출자 대조 · 멀티 AI OCR 및 수동 프롬프트 보정",
+            "문서 처리 & AI 과제 파이프라인",
+            "학번/이름 기준 제출 파일 병합 · 미제출자 대조 · 멀티 AI OCR 및 DOCX 과제 평가",
+            short_code="DOC",
         )
         self.register_tab(
             self.tab_grade,
-            "📊  성적·수업자료 관리",
+            "성적·수업자료 관리",
             "학생 명렬표 DB 연동 지필/수행평가 성적 관리 및 수업 자료 버전 관리",
+            short_code="GRD",
         )
         self.register_tab(
             self.tab_classroom,
-            "🏫  학급 경영 도구함",
+            "학급 경영 도구함",
             "학급 출결 서류 체크, 청소 당번/1인1역 랜덤 추첨기, 자리 배치 등 미니 툴",
+            short_code="CLS",
         )
         self.register_tab(
             self.tab_notify,
-            "🔔  외부 연동·알림 센터",
+            "외부 연동·알림 센터",
             "구글 시트(설문지 응답) 실시간 폴링 감시 및 카카오톡/데스크톱 토스트 알림 센터",
+            short_code="NOT",
         )
         self.register_tab(
             self.tab_settings,
-            "⚙️  환경설정·명렬표 관리",
+            "환경설정 & 명렬표",
             "멀티 LLM(Gemini/OpenAI/Claude/Ollama) 설정, 트레이 동작, 학생 명렬표 마스터 데이터 등록",
+            short_code="SET",
         )
 
         self.sidebar_nav.setCurrentRow(0)
@@ -417,10 +422,10 @@ class MainWindow(QMainWindow):
     def _update_ai_mode_badge(self) -> None:
         sec = self.config.get_section("api_and_integrations")
         if bool(sec.get("use_manual_prompt_mode", True)):
-            self.lbl_ai_badge.setText("🤖 AI 모드: 수동 프롬프트 (No-API 복붙)")
+            self.lbl_ai_badge.setText("AI: 수동 프롬프트 모드")
         else:
             prov = str(sec.get("ai_provider", "gemini")).upper()
-            self.lbl_ai_badge.setText(f"⚡ AI API 연동: {prov}")
+            self.lbl_ai_badge.setText(f"AI: {prov} Connected")
 
     # =========================================================================
     # 공통 백그라운드 워커 시그널 핸들러 & 부드러운 로그 서랍 확장
@@ -434,7 +439,7 @@ class MainWindow(QMainWindow):
         sig.task_finished.connect(self._on_worker_finished)
 
     def _on_worker_started(self, task_name: str) -> None:
-        self.lbl_current_task.setText(f"🔄 {task_name}")
+        self.lbl_current_task.setText(f"실행 중: {task_name}")
         self.progress_bar.setValue(0)
         self.append_log("INFO", f"작업 시작: {task_name}")
 
@@ -448,18 +453,18 @@ class MainWindow(QMainWindow):
         self.append_log("ERROR", err_msg)
 
     def _on_worker_finished(self, task_name: str) -> None:
-        self.lbl_current_task.setText(f"✅ 완료: {task_name}")
+        self.lbl_current_task.setText(f"완료: {task_name}")
 
     def _on_toggle_log_console(self, checked: bool) -> None:
         self._drawer_anim.stop()
         if checked:
             self._drawer_anim.setStartValue(self.log_drawer.height())
             self._drawer_anim.setEndValue(200)
-            self.btn_toggle_log.setText("로그 접기 ▼")
+            self.btn_toggle_log.setText("로그 콘솔 닫기")
         else:
             self._drawer_anim.setStartValue(self.log_drawer.height())
             self._drawer_anim.setEndValue(0)
-            self.btn_toggle_log.setText("로그 보기 ▲")
+            self.btn_toggle_log.setText("로그 콘솔 열기")
         self._drawer_anim.start()
 
     def _on_clear_logs(self) -> None:

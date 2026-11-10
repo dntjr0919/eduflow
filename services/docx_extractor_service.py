@@ -539,9 +539,19 @@ def read_docx(
         if form_name and form_name in schemas_catalog:
             schema = schemas_catalog[form_name]
         else:
-            detected_name, scores = detect_form(collect_label_candidates(root), schemas_catalog)
+            candidates = collect_label_candidates(root)
+            detected_name, scores = detect_form(candidates, schemas_catalog)
             if not detected_name:
-                raise ValueError(f"문서 양식을 자동 판별하지 못했습니다 (일치 점수: {scores}).")
+                normalized = sorted(list({normalize_heading(lbl) for lbl in candidates if normalize_heading(lbl)}))
+                scores_str = ", ".join(f"'{name}': {score}점" for name, score in scores.items()) if scores else "없음"
+                keywords_sample = ", ".join(normalized[:10]) if normalized else "감지된 항목 없음"
+                if len(normalized) > 10:
+                    keywords_sample += f" 외 {len(normalized) - 10}개"
+                raise ValueError(
+                    f"문서 양식을 자동 판별하지 못했습니다. "
+                    f"(양식별 일치 점수: [{scores_str}] / 기준: {MIN_DETECT_SCORE}점 이상 필요, "
+                    f"감지된 키워드: [{keywords_sample}])"
+                )
             form_name = detected_name
             schema = schemas_catalog[detected_name]
     else:
@@ -703,6 +713,7 @@ def extract_docx_to_excel(
     schema_path: Optional[Path] = None,
     output_path: Optional[Path] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    log_callback: Optional[Callable[[str, str], None]] = None,
     stop_checker: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """
@@ -712,6 +723,7 @@ def extract_docx_to_excel(
     :param schema_path: 특정 JSON 양식 파일 경로 (None이면 자동 판별)
     :param output_path: 저장할 엑셀 파일 경로 (None이면 docx_dir에 타임스탬프 파일명 자동 생성)
     :param progress_callback: (진행률 0~100, 상태 메시지) 콜백 함수
+    :param log_callback: (로그레벨 str, 메시지 str) 콜백 함수
     :param stop_checker: () -> bool 사용자 작업 중단 요청 확인 함수
     :return: 처리 결과 요약 딕셔너리
     """
@@ -768,6 +780,8 @@ def extract_docx_to_excel(
                 "파일명": docx_path.name,
                 "오류내용": str(exc),
             })
+            if log_callback:
+                log_callback("WARN", f"[추출 실패] {docx_path.name} -> 사유: {exc}")
 
     # 출력 경로 결정
     if output_path is None:

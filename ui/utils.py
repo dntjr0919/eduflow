@@ -2,6 +2,8 @@
 UI 공통 유틸리티 및 커스텀 위젯 모듈 (ui/utils.py)
 - NoScrollWheelFilter: 포커스가 없을 때 마우스 휠로 QComboBox/QSpinBox 값이 오변경되는 것을 방지하고
   부모 스크롤 영역으로 휠 이벤트를 전달하는 이벤트 필터
+- GlobalWheelGuard / install_global_wheel_guard: 위 필터를 QApplication 전역에 설치하여
+  모든 콤보박스/스핀박스에 StrongFocus 정책과 휠 가드를 자동 적용
 - SearchableModelComboBox: QSortFilterProxyModel + QCompleter 기반으로 중간 단어(부분 일치) 실시간 필터링이
   완벽히 동작하는 커스텀 콤보박스
 - COMBOBOX_STYLE: 드롭다운 화살표 및 팝업 리스트 뷰 QSS 스타일
@@ -15,7 +17,15 @@ from PyQt6.QtCore import (
     QStringListModel,
     Qt,
 )
-from PyQt6.QtWidgets import QComboBox, QCompleter, QListView, QSpinBox, QWidget
+from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
+    QApplication,
+    QComboBox,
+    QCompleter,
+    QListView,
+    QSpinBox,
+    QWidget,
+)
 
 
 COMBOBOX_STYLE = """
@@ -24,26 +34,26 @@ QComboBox {
     height: 34px;
     font-size: 13px;
     padding: 2px 30px 2px 10px; /* 우측 화살표 공간 확보 */
-    border: 1px solid #D0D5DD;
-    border-radius: 6px;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
     background-color: #FFFFFF;
-    color: #101828;
+    color: #0F172A;
 }
 QComboBox:focus {
-    border: 1.5px solid #4F46E5;
+    border: 1.5px solid #004AC6;
 }
 /* 우측 드롭다운 버튼 영역 */
 QComboBox::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 28px;
-    border-left: 1px solid #E4E7EC;
-    border-top-right-radius: 6px;
-    border-bottom-right-radius: 6px;
-    background-color: #F8FAFC;
+    border-left: 1px solid #E2E8F0;
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+    background-color: #F8F9FF;
 }
 QComboBox::drop-down:hover {
-    background-color: #EEF2F6;
+    background-color: #EEF3FD;
 }
 /* 화살표 아이콘 모양 (삼각형) */
 QComboBox::down-arrow {
@@ -51,16 +61,16 @@ QComboBox::down-arrow {
     height: 0;
     border-left: 5px solid transparent;
     border-right: 5px solid transparent;
-    border-top: 6px solid #475467;
+    border-top: 6px solid #475569;
     margin-right: 2px;
 }
 /* 드롭다운 펼쳐졌을 때 팝업 리스트 뷰 */
 QComboBox QAbstractItemView {
-    border: 1px solid #CBD5E1;
-    border-radius: 6px;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
     background-color: #FFFFFF;
-    selection-background-color: #EEF2F6;
-    selection-color: #1D2939;
+    selection-background-color: #EEF3FD;
+    selection-color: #004AC6;
     padding: 4px;
     outline: none;
     min-height: 120px;
@@ -73,11 +83,11 @@ QComboBox QAbstractItemView::item {
 
 COMPLETER_POPUP_STYLE = """
 QAbstractItemView {
-    border: 1px solid #CBD5E1;
-    border-radius: 6px;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
     background-color: #FFFFFF;
-    selection-background-color: #EEF2F6;
-    selection-color: #1D2939;
+    selection-background-color: #EEF3FD;
+    selection-color: #004AC6;
     padding: 4px;
     outline: none;
     font-size: 13px;
@@ -89,24 +99,100 @@ QAbstractItemView::item {
 """
 
 
+_WHEEL_GUARDED_TYPES = (QComboBox, QAbstractSpinBox)
+
+
+def _find_guarded_owner(obj: QObject) -> Optional[QWidget]:
+    """
+    휠 이벤트를 받은 객체(또는 그 상위 위젯 중)에서 보호 대상인
+    QComboBox / QAbstractSpinBox(QSpinBox, QDoubleSpinBox, QDateEdit 등)를 찾습니다.
+    (콤보박스/스핀박스 내부의 QLineEdit 자식이 휠 이벤트를 먼저 받는 경우 대응)
+    """
+    if not isinstance(obj, QWidget):
+        return None
+    w: Optional[QWidget] = obj
+    depth = 0
+    while w is not None and depth < 3:
+        if isinstance(w, _WHEEL_GUARDED_TYPES):
+            return w
+        w = w.parentWidget()
+        depth += 1
+    return None
+
+
+def _is_guarded_widget_active(owner: QWidget) -> bool:
+    """사용자가 명시적으로 활성화(클릭/Tab 포커스)했거나 드롭다운이 열린 상태인지 판정합니다."""
+    if isinstance(owner, QComboBox):
+        view = owner.view()
+        if view is not None and view.isVisible():
+            return True
+    if owner.hasFocus():
+        return True
+    focus_w = QApplication.focusWidget()
+    return focus_w is not None and owner.isAncestorOf(focus_w)
+
+
+def _enforce_strong_focus(widget: QWidget) -> None:
+    """마우스 휠만으로 포커스를 가져가지 못하도록 StrongFocus(클릭/Tab 전용)로 고정합니다."""
+    if widget.focusPolicy() != Qt.FocusPolicy.StrongFocus:
+        widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    line_edit = getattr(widget, "lineEdit", lambda: None)()
+    if isinstance(line_edit, QWidget) and line_edit.focusPolicy() != Qt.FocusPolicy.StrongFocus:
+        line_edit.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+
 class NoScrollWheelFilter(QObject):
     """
-    포커스가 없을 때 마우스 휠로 값이 변경되는 것을 방지하고
-    부모 스크롤 영역으로 이벤트를 전달하는 이벤트 필터
+    QComboBox / QSpinBox 마우스 휠 오조작 방지 이벤트 필터.
+
+    - 위젯이 클릭으로 포커스를 받았거나 드롭다운이 펼쳐진 상태가 아니면 휠 이벤트를 무시(ignore)합니다.
+    - 필터가 True를 반환하되 이벤트를 ignore 상태로 두면, Qt가 휠 이벤트를 부모 위젯으로 전파하므로
+      상위 QScrollArea가 정상적으로 스크롤됩니다.
+    - 개별 위젯에 설치해도 되고, QApplication 전체에 설치해도 동작합니다(GlobalWheelGuard 참조).
     """
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         if event.type() == QEvent.Type.Wheel:
-            is_popup_open = (
-                isinstance(obj, QComboBox)
-                and obj.view() is not None
-                and obj.view().isVisible()
-            )
-            # 포커스가 없고 드롭다운도 닫혀 있으면 휠 이벤트 무시 -> 상위 스크롤 영역이 스크롤됨
-            if not obj.hasFocus() and not is_popup_open:
+            owner = _find_guarded_owner(obj)
+            if owner is not None and not _is_guarded_widget_active(owner):
                 event.ignore()
                 return True
         return super().eventFilter(obj, event)
+
+
+class GlobalWheelGuard(NoScrollWheelFilter):
+    """
+    애플리케이션 전역 휠 가드.
+    QApplication에 한 번만 설치하면 이후 생성되는 모든 QComboBox / QAbstractSpinBox에 대해
+    1) 위젯 polish 시점에 FocusPolicy를 StrongFocus로 강제하고
+    2) 비활성 상태의 휠 이벤트를 부모 스크롤 영역으로 넘깁니다.
+    (Qt 기본값인 WheelFocus는 휠 이벤트 전달 직전에 포커스를 먼저 부여하므로 반드시 교체해야 합니다.)
+    """
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        etype = event.type()
+        if etype in (QEvent.Type.Polish, QEvent.Type.Show, QEvent.Type.Enter):
+            owner = _find_guarded_owner(obj)
+            if owner is not None:
+                _enforce_strong_focus(owner)
+            return False
+        if etype == QEvent.Type.Wheel:
+            return super().eventFilter(obj, event)
+        return False
+
+
+def install_global_wheel_guard(app: QApplication) -> GlobalWheelGuard:
+    """QApplication 전역에 휠 오조작 방지 가드를 설치하고, 이미 생성된 위젯에도 StrongFocus를 적용합니다."""
+    existing = getattr(app, "_eduflow_wheel_guard", None)
+    if isinstance(existing, GlobalWheelGuard):
+        return existing
+    guard = GlobalWheelGuard(app)
+    app.installEventFilter(guard)
+    setattr(app, "_eduflow_wheel_guard", guard)
+    for widget in app.allWidgets():
+        if isinstance(widget, _WHEEL_GUARDED_TYPES):
+            _enforce_strong_focus(widget)
+    return guard
 
 
 class SearchableModelComboBox(QComboBox):
@@ -186,8 +272,11 @@ class SearchableModelComboBox(QComboBox):
 
 
 def install_no_scroll_wheel_filter(widget: QWidget) -> None:
-    """QComboBox 또는 QSpinBox에 마우스 휠 오조작 방지 필터와 StrongFocus 정책을 적용합니다."""
-    if isinstance(widget, (QComboBox, QSpinBox)):
+    """
+    QComboBox 또는 QSpinBox(QAbstractSpinBox 계열)에 마우스 휠 오조작 방지 필터와 StrongFocus 정책을 적용합니다.
+    (main.py에서 install_global_wheel_guard()로 전역 가드를 설치하므로 하위 호환용으로 유지됩니다.)
+    """
+    if isinstance(widget, _WHEEL_GUARDED_TYPES):
         widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         if not hasattr(widget, "_wheel_filter"):
             wheel_filter = NoScrollWheelFilter(widget)

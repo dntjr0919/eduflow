@@ -13,6 +13,7 @@ from PyQt6.QtGui import QFont, QFontDatabase
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from ui.main_window import MainWindow
+from ui.utils import install_global_wheel_guard
 from utils.path_helper import get_resource_path
 
 
@@ -77,6 +78,9 @@ def main() -> int:
     app.setStyle("Fusion")
     app.setQuitOnLastWindowClosed(False)  # 시스템 트레이 상주를 위해 창이 닫혀도 앱 유지
     app.setFont(select_modern_font())
+
+    # 모든 QComboBox / QSpinBox 마우스 휠 오조작 방지 (StrongFocus 강제 + 비활성 휠 이벤트 부모 전달)
+    install_global_wheel_guard(app)
 
     qss_text = load_theme_stylesheet(app)
 
