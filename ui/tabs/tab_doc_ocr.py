@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -52,6 +53,18 @@ from PyQt6.QtWidgets import (
 from core.base_worker import BaseWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from services.docx_extractor_service import (
+    extract_docx_to_excel,
+    load_all_schemas,
+    load_single_schema,
+)
+from services.record_generator_service import (
+    generate_records_from_excel,
+    get_active_ai_info,
+    get_gemini_api_key,
+    list_prompt_files,
+    calculate_neis_bytes,
+)
 from services.llm_client import (
     MultiLlmClient,
     build_structured_prompt,
@@ -61,6 +74,8 @@ from services.llm_client import (
 from services.notifier import NotificationService
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
+from ui.dialogs.docx_schema_create_dialog import DocxSchemaCreateDialog
+from ui.dialogs.prompt_edit_dialog import PromptEditDialog
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -598,73 +613,165 @@ class OcrAndLlmWorker(BaseWorker):
         return {"count": len(results), "combined_text": "\n".join(results)}
 
 
-class ReportExcelAggregatorWorker(BaseWorker):
-    def __init__(self, file_paths: List[str], output_xlsx: str, skip_header_rows: int = 1):
-        super().__init__(task_name="다중 보고서 엑셀 취합")
-        self.file_paths = file_paths
-        self.output_xlsx = Path(output_xlsx)
-        self.skip_header_rows = max(0, int(skip_header_rows))
+class DocxToExcelWorker(BaseWorker):
+    """학생별 DOCX 과제 문서에서 학번/이름/문항별 응답을 추출해 Excel로 변환하는 백그라운드 워커."""
+
+    def __init__(
+        self,
+        docx_dir: Path | str,
+        schema_path: Optional[Path | str] = None,
+        output_xlsx: Optional[Path | str] = None,
+    ):
+        super().__init__(task_name="과제 DOCX -> 엑셀 추출")
+        self.docx_dir = Path(docx_dir)
+        self.schema_path = Path(schema_path) if schema_path else None
+        self.output_xlsx = Path(output_xlsx) if output_xlsx else None
 
     def execute(self) -> Dict[str, Any]:
-        import openpyxl
+        self.emit_log("INFO", f"학생 DOCX 과제 추출 시작 (폴더: {self.docx_dir.name})")
+        res = extract_docx_to_excel(
+            docx_dir=self.docx_dir,
+            schema_path=self.schema_path,
+            output_path=self.output_xlsx,
+            progress_callback=lambda pct, msg: self.emit_progress(pct, msg),
+            stop_checker=self.is_stop_requested,
+        )
+        if self.is_stop_requested():
+            self.emit_log("WARN", "사용자 요청으로 과제 추출 작업이 중단되었습니다.")
+            return res
 
-        wb_out = openpyxl.Workbook()
-        ws_out = wb_out.active
-        ws_out.title = "취합요약본"
+        out_path = res.get("output_file", "")
+        succ = res.get("success", 0)
+        tot = res.get("total", 0)
+        self.emit_log("SUCCESS", f"엑셀 추출 완료: {out_path} (성공 {succ}/{tot}명)")
+        self.emit_progress(100, f"추출 완료 ({succ}/{tot}명)")
+        return res
 
-        total = len(self.file_paths)
-        total_rows_added = 0
-        header_written = False
 
-        self.emit_log("INFO", f"총 {total}개의 보고서 파일을 단일 엑셀로 취합합니다.")
+class RecordGenerateWorker(BaseWorker):
+    """엑셀 파일의 응답 데이터를 기반으로 MultiLlmClient를 호출하여 AI 과세특을 생성하는 백그라운드 워커."""
 
-        for idx, fp in enumerate(self.file_paths, start=1):
-            if self.is_stop_requested():
-                break
-            p = Path(fp)
-            pct = int((idx / max(1, total)) * 100)
-            self.emit_progress(pct, f"보고서 취합 중 ({idx}/{total}): {p.name}")
+    def __init__(
+        self,
+        excel_path: Path | str,
+        output_path: Optional[Path | str] = None,
+        prompt_file: Optional[Path | str] = None,
+        reference_dir: Optional[Path | str] = None,
+        max_bytes: int = 1500,
+        provider: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        super().__init__(task_name="AI 과세특·채점 생성")
+        self.excel_path = Path(excel_path)
+        self.output_path = Path(output_path) if output_path else None
+        self.prompt_file = Path(prompt_file) if prompt_file else None
+        self.reference_dir = Path(reference_dir) if reference_dir else None
+        self.max_bytes = max_bytes
+        self.provider = provider
+        self.model_name = model_name
 
-            if not p.exists():
-                continue
+    def execute(self) -> Dict[str, Any]:
+        self.emit_log("INFO", f"AI 과세특 생성 시작 (파일: {self.excel_path.name})")
+        res = generate_records_from_excel(
+            excel_path=self.excel_path,
+            output_path=self.output_path,
+            prompt_file=self.prompt_file,
+            reference_dir=self.reference_dir,
+            max_bytes=self.max_bytes,
+            provider=self.provider,
+            model_name=self.model_name,
+            progress_callback=lambda pct, msg: self.emit_progress(pct, msg),
+            log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
+            stop_checker=self.is_stop_requested,
+        )
+        if self.is_stop_requested():
+            self.emit_log("WARN", "사용자 요청으로 과세특 생성이 안전하게 중단되었습니다.")
+            return res
 
-            try:
-                rows: List[List[Any]] = []
-                if p.suffix.lower() == ".xlsx":
-                    wb_in = openpyxl.load_workbook(str(p), data_only=True)
-                    ws_in = wb_in.active
-                    for r in ws_in.iter_rows(values_only=True):
-                        if any(c is not None for c in r):
-                            rows.append(list(r))
-                elif p.suffix.lower() == ".csv":
-                    for enc in ("utf-8-sig", "cp949", "utf-8"):
-                        try:
-                            with open(p, "r", encoding=enc, newline="") as f:
-                                rows = [row for row in csv.reader(f) if any(row)]
-                            break
-                        except UnicodeDecodeError:
-                            continue
+        out_path = res.get("output_path", "")
+        comp = res.get("completed", 0)
+        tot = res.get("total", 0)
+        self.emit_log("SUCCESS", f"과세특 생성 완료: {out_path} (완료 {comp}/{tot}명)")
+        self.emit_progress(100, f"과세특 생성 완료 ({comp}/{tot}명)")
+        return res
 
-                if not rows:
-                    continue
 
-                if not header_written and self.skip_header_rows > 0:
-                    ws_out.append(["원본파일명"] + list(rows[0]))
-                    header_written = True
+class IntegratedPipelineWorker(BaseWorker):
+    """1단계 DOCX 파싱 -> 중간 엑셀 생성 -> 2단계 AI 과세특 생성을 원클릭으로 순차 실행하는 통합 워커."""
 
-                data_rows = rows[self.skip_header_rows :] if self.skip_header_rows <= len(rows) else []
-                for dr in data_rows:
-                    ws_out.append([p.name] + list(dr))
-                    total_rows_added += 1
+    def __init__(
+        self,
+        docx_dir: Path | str,
+        schema_path: Optional[Path | str] = None,
+        prompt_file: Optional[Path | str] = None,
+        reference_dir: Optional[Path | str] = None,
+        max_bytes: int = 1500,
+        provider: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        super().__init__(task_name="과제 취합 및 AI 과세특 일괄 생성")
+        self.docx_dir = Path(docx_dir)
+        self.schema_path = Path(schema_path) if schema_path else None
+        self.prompt_file = Path(prompt_file) if prompt_file else None
+        self.reference_dir = Path(reference_dir) if reference_dir else None
+        self.max_bytes = max_bytes
+        self.provider = provider
+        self.model_name = model_name
 
-                self.emit_log("SUCCESS", f"취합 완료: {p.name} ({len(data_rows)}행 추가)")
-            except Exception as exc:
-                self.emit_log("ERROR", f"보고서 읽기 실패 ({p.name}): {exc}")
+    def execute(self) -> Dict[str, Any]:
+        # [1단계] DOCX -> 중간 엑셀
+        self.emit_log("INFO", "=== [1단계] 학생 DOCX 과제 일괄 추출 시작 ===")
+        self.emit_progress(5, "1단계: 학생 DOCX 파일 파싱 중...")
 
-        self.output_xlsx.parent.mkdir(parents=True, exist_ok=True)
-        wb_out.save(str(self.output_xlsx))
-        self.emit_progress(100, f"엑셀 취합 완료: 총 {total_rows_added}행 저장됨")
-        return {"output_xlsx": str(self.output_xlsx.resolve()), "rows_added": total_rows_added}
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        intermediate_excel = self.docx_dir / f"과제취합_{ts}.xlsx"
+
+        step1_res = extract_docx_to_excel(
+            docx_dir=self.docx_dir,
+            schema_path=self.schema_path,
+            output_path=intermediate_excel,
+            progress_callback=lambda pct, msg: self.emit_progress(int(pct * 0.4), f"1단계 DOCX 추출: {msg}"),
+            stop_checker=self.is_stop_requested,
+        )
+
+        if self.is_stop_requested():
+            self.emit_log("WARN", "1단계 진행 중 사용자에 의해 작업이 중단되었습니다.")
+            return {"step1": step1_res, "step2": None, "output_path": str(intermediate_excel)}
+
+        if step1_res.get("success", 0) == 0:
+            raise ValueError(f"1단계 DOCX 과제 추출 결과 유효한 데이터가 없습니다. (오류: {len(step1_res.get('errors', []))}건)")
+
+        self.emit_log("SUCCESS", f"1단계 완료: 중간 엑셀 생성됨 -> {step1_res.get('output_file')}")
+
+        # [2단계] 중간 엑셀 -> 최종 AI 과세특
+        self.emit_log("INFO", "=== [2단계] AI 과세특 및 채점 생성 시작 ===")
+        self.emit_progress(40, "2단계: AI 과세특 생성 준비 중...")
+
+        final_output = self.docx_dir / f"최종과세특_{ts}.xlsx"
+        step2_res = generate_records_from_excel(
+            excel_path=Path(step1_res.get("output_file")),
+            output_path=final_output,
+            prompt_file=self.prompt_file,
+            reference_dir=self.reference_dir,
+            max_bytes=self.max_bytes,
+            provider=self.provider,
+            model_name=self.model_name,
+            progress_callback=lambda pct, msg: self.emit_progress(40 + int(pct * 0.6), f"2단계 AI 생성: {msg}"),
+            log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
+            stop_checker=self.is_stop_requested,
+        )
+
+        if self.is_stop_requested():
+            self.emit_log("WARN", "2단계 진행 중 사용자에 의해 작업이 안전하게 중단되었습니다.")
+        else:
+            self.emit_progress(100, "전체 일괄 처리 완료!")
+            self.emit_log("SUCCESS", f"🎉 원클릭 일괄 파이프라인 완료! 최종 파일: {step2_res.get('output_path')}")
+
+        return {
+            "step1": step1_res,
+            "step2": step2_res,
+            "output_path": step2_res.get("output_path"),
+        }
 
 
 # =============================================================================
@@ -678,6 +785,9 @@ class DocOcrTab(QWidget):
     TASK_PDF_MERGE = "doc_tab_pdf_merge"
     TASK_OCR = "doc_tab_ai_ocr"
     TASK_EXCEL_AGG = "doc_tab_excel_agg"
+    TASK_DOCX_EXTRACT = "doc_tab_docx_extract"
+    TASK_RECORD_GEN = "doc_tab_record_gen"
+    TASK_INTEGRATED = "doc_tab_integrated_pipeline"
 
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -710,7 +820,7 @@ class DocOcrTab(QWidget):
         )
         self.sub_tabs.addTab(
             self._build_excel_aggregator_subtab(),
-            "📊 3. 다중 보고서 엑셀(.xlsx) 취합기",
+            "📝 3. 과제 취합 및 AI 과세특·채점 자동화",
         )
         layout.addWidget(self.sub_tabs)
 
@@ -1107,7 +1217,7 @@ class DocOcrTab(QWidget):
         return scroll
 
     # =========================================================================
-    # [서브탭 3] 다중 보고서 엑셀 취합기 UI
+    # [서브탭 3] 과제 취합 및 AI 과세특·채점 자동화 UI
     # =========================================================================
     def _build_excel_aggregator_subtab(self) -> QWidget:
         scroll = QScrollArea()
@@ -1115,44 +1225,286 @@ class DocOcrTab(QWidget):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
 
         w = QWidget()
-        apply_qss_role(w, obj_name="SubTabExcelAggregator")
+        apply_qss_role(w, obj_name="SubTabDocxRecordAggregator")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 22, 22)
+        lay.setSpacing(14)
 
-        grp = HoverZoomCard(
-            title="다중 엑셀(.xlsx) / CSV 보고서 파일 단일 요약본 병합기",
+        # ---------------------------------------------------------------------
+        # 카드 1: [1단계: 학생 DOCX 과제 추출 설정]
+        # ---------------------------------------------------------------------
+        self.card_agg_step1 = HoverZoomCard(
+            title="📂 1단계: 학생 DOCX 과제 제출물 파싱 및 스키마 설정",
             parent=w,
-            zoom_ratio=1.10,
+            zoom_ratio=1.05,
             hover_delay_ms=1000,
         )
-        apply_qss_role(grp, role="hoverZoomCard", obj_name="ExcelAggregatorGroup")
-        g_lay = grp.body_layout()
+        apply_qss_role(self.card_agg_step1, role="hoverZoomCard", obj_name="AggStep1Card")
+        lay_step1 = self.card_agg_step1.body_layout()
 
-        top_bar = QHBoxLayout()
-        btn_add = QPushButton("+ 취합할 엑셀/CSV 보고서 파일 추가")
-        apply_qss_role(btn_add)
-        btn_clear = QPushButton("목록 비우기")
-        apply_qss_role(btn_clear)
-        btn_run = QPushButton("📊 단일 요약 Excel(.xlsx)로 병합 실행")
-        apply_qss_role(btn_run, role="success", obj_name="BtnRunExcelAggregator")
-        btn_run.setMinimumHeight(38)
-        btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        form1 = QFormLayout()
+        form1.setSpacing(10)
+        form1.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self.list_excel_files = QListWidget()
-        self.list_excel_files.setMouseTracking(True)
-        btn_add.clicked.connect(self._on_add_excel_files)
-        btn_clear.clicked.connect(self.list_excel_files.clear)
-        btn_run.clicked.connect(self._on_run_excel_aggregator)
+        # 학생 DOCX 폴더
+        box_docx_dir = QHBoxLayout()
+        self.edit_agg_docx_dir = QLineEdit()
+        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx 파일들이 모여 있는 폴더를 선택하세요.")
+        self.edit_agg_docx_dir.setMinimumHeight(34)
+        apply_qss_role(self.edit_agg_docx_dir, obj_name="EditAggDocxDir")
 
-        top_bar.addWidget(btn_add)
-        top_bar.addWidget(btn_clear)
-        top_bar.addStretch()
-        top_bar.addWidget(btn_run)
+        btn_browse_docx = QPushButton("찾아보기...")
+        btn_browse_docx.setMinimumHeight(34)
+        apply_qss_role(btn_browse_docx)
+        btn_browse_docx.clicked.connect(self._on_browse_agg_docx_dir)
 
-        g_lay.addLayout(top_bar)
-        g_lay.addWidget(self.list_excel_files)
-        lay.addWidget(grp)
+        btn_open_docx = QPushButton("폴더 열기")
+        btn_open_docx.setMinimumHeight(34)
+        apply_qss_role(btn_open_docx)
+        btn_open_docx.clicked.connect(lambda: self._open_dir_if_exists(self.edit_agg_docx_dir.text()))
+
+        box_docx_dir.addWidget(self.edit_agg_docx_dir, stretch=1)
+        box_docx_dir.addWidget(btn_browse_docx)
+        box_docx_dir.addWidget(btn_open_docx)
+        form1.addRow("학생 제출 폴더:", box_docx_dir)
+
+        # 과제 양식(JSON 스키마) 선택 및 새 양식 생성 버튼
+        box_schema = QHBoxLayout()
+        self.combo_agg_schema = QComboBox()
+        self.combo_agg_schema.setMinimumHeight(34)
+        apply_qss_role(self.combo_agg_schema, obj_name="ComboAggSchema")
+
+        btn_create_schema = QPushButton("➕ 새 양식(DOCX)에서 스키마 생성")
+        btn_create_schema.setMinimumHeight(34)
+        apply_qss_role(btn_create_schema, role="secondary")
+        btn_create_schema.clicked.connect(self._on_open_create_schema_dialog)
+
+        btn_refresh_schema = QPushButton("🔄 새로고침")
+        btn_refresh_schema.setMinimumHeight(34)
+        apply_qss_role(btn_refresh_schema)
+        btn_refresh_schema.clicked.connect(self._refresh_schemas_combo)
+
+        box_schema.addWidget(self.combo_agg_schema, stretch=1)
+        box_schema.addWidget(btn_create_schema)
+        box_schema.addWidget(btn_refresh_schema)
+        form1.addRow("과제 양식 (스키마):", box_schema)
+
+        lay_step1.addLayout(form1)
+        lay.addWidget(self.card_agg_step1)
+
+        # ---------------------------------------------------------------------
+        # 카드 2: [2단계: AI 채점 및 과세특 생성 설정 (멀티 LLM)]
+        # ---------------------------------------------------------------------
+        self.card_agg_step2 = HoverZoomCard(
+            title="🤖 2단계: AI 채점 및 과세특 생성 설정 (Gemini, GPT, Claude, OpenRouter, Ollama)",
+            parent=w,
+            zoom_ratio=1.05,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.card_agg_step2, role="hoverZoomCard", obj_name="AggStep2Card")
+        lay_step2 = self.card_agg_step2.body_layout()
+
+        # 활성 AI 공급자 및 모델 상태 배지 바
+        box_ai_badge = QHBoxLayout()
+        box_ai_badge.setContentsMargins(4, 4, 4, 8)
+        self.lbl_active_ai_badge = QLabel("🤖 활성 AI 공급자 확인 중...")
+        self.lbl_active_ai_badge.setStyleSheet(
+            "background-color: #1E293B; color: #38BDF8; font-weight: bold; font-size: 13px; "
+            "padding: 8px 14px; border-radius: 6px; border: 1px solid #334155;"
+        )
+
+        btn_go_settings = QPushButton("⚙️ AI 설정 변경")
+        btn_go_settings.setMinimumHeight(34)
+        btn_go_settings.setToolTip("환경설정 탭으로 이동하여 AI 공급자(Gemini/OpenAI/Claude/Ollama)와 모델, API 키를 변경합니다.")
+        apply_qss_role(btn_go_settings, role="secondary")
+        btn_go_settings.clicked.connect(self._on_go_to_settings_tab)
+
+        btn_refresh_ai = QPushButton("🔄 상태 갱신")
+        btn_refresh_ai.setMinimumHeight(34)
+        apply_qss_role(btn_refresh_ai)
+        btn_refresh_ai.clicked.connect(self._update_active_ai_display)
+
+        box_ai_badge.addWidget(self.lbl_active_ai_badge, stretch=1)
+        box_ai_badge.addWidget(btn_go_settings)
+        box_ai_badge.addWidget(btn_refresh_ai)
+        lay_step2.addLayout(box_ai_badge)
+
+        form2 = QFormLayout()
+        form2.setSpacing(10)
+        form2.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # 대상 엑셀 파일 (1단계 추출 엑셀 또는 기존 엑셀)
+        box_excel_file = QHBoxLayout()
+        self.edit_agg_excel_file = QLineEdit()
+        self.edit_agg_excel_file.setPlaceholderText("학번/이름/문항별 응답이 정리된 .xlsx 파일을 선택하세요. (1단계 완료 시 자동 입력)")
+        self.edit_agg_excel_file.setMinimumHeight(34)
+        apply_qss_role(self.edit_agg_excel_file, obj_name="EditAggExcelFile")
+
+        btn_browse_excel = QPushButton("찾아보기...")
+        btn_browse_excel.setMinimumHeight(34)
+        apply_qss_role(btn_browse_excel)
+        btn_browse_excel.clicked.connect(self._on_browse_agg_excel_file)
+
+        btn_open_excel = QPushButton("파일 열기")
+        btn_open_excel.setMinimumHeight(34)
+        apply_qss_role(btn_open_excel)
+        btn_open_excel.clicked.connect(lambda: self._open_file_if_exists(self.edit_agg_excel_file.text()))
+
+        box_excel_file.addWidget(self.edit_agg_excel_file, stretch=1)
+        box_excel_file.addWidget(btn_browse_excel)
+        box_excel_file.addWidget(btn_open_excel)
+        form2.addRow("대상 엑셀 파일:", box_excel_file)
+
+        # 프롬프트 선택 및 새 프롬프트 작성/폴더 열기 버튼
+        box_prompt = QHBoxLayout()
+        self.combo_agg_prompt = QComboBox()
+        self.combo_agg_prompt.setMinimumHeight(34)
+        apply_qss_role(self.combo_agg_prompt, obj_name="ComboAggPrompt")
+
+        btn_new_prompt = QPushButton("➕ 새 프롬프트 작성")
+        btn_new_prompt.setMinimumHeight(34)
+        apply_qss_role(btn_new_prompt, role="secondary")
+        btn_new_prompt.clicked.connect(self._on_open_new_prompt_dialog)
+
+        btn_open_prompt_dir = QPushButton("📁 프롬프트 폴더 열기")
+        btn_open_prompt_dir.setMinimumHeight(34)
+        apply_qss_role(btn_open_prompt_dir)
+        btn_open_prompt_dir.clicked.connect(self._on_open_prompt_dir)
+
+        btn_refresh_prompt = QPushButton("🔄 새로고침")
+        btn_refresh_prompt.setMinimumHeight(34)
+        apply_qss_role(btn_refresh_prompt)
+        btn_refresh_prompt.clicked.connect(self._refresh_prompts_combo)
+
+        box_prompt.addWidget(self.combo_agg_prompt, stretch=1)
+        box_prompt.addWidget(btn_new_prompt)
+        box_prompt.addWidget(btn_open_prompt_dir)
+        box_prompt.addWidget(btn_refresh_prompt)
+        form2.addRow("세특/채점 프롬프트:", box_prompt)
+
+        # 참고자료 폴더
+        box_ref_dir = QHBoxLayout()
+        self.edit_agg_ref_dir = QLineEdit()
+        self.edit_agg_ref_dir.setText(str(Path("references").resolve()) if Path("references").exists() else "references")
+        self.edit_agg_ref_dir.setPlaceholderText("수업계획서, 성취기준, 루브릭 등 참고 문서 폴더 (선택 사항)")
+        self.edit_agg_ref_dir.setMinimumHeight(34)
+        apply_qss_role(self.edit_agg_ref_dir, obj_name="EditAggRefDir")
+
+        btn_browse_ref = QPushButton("찾아보기...")
+        btn_browse_ref.setMinimumHeight(34)
+        apply_qss_role(btn_browse_ref)
+        btn_browse_ref.clicked.connect(self._on_browse_agg_ref_dir)
+
+        box_ref_dir.addWidget(self.edit_agg_ref_dir, stretch=1)
+        box_ref_dir.addWidget(btn_browse_ref)
+        form2.addRow("참고자료 폴더:", box_ref_dir)
+
+        # 나이스 바이트 상한선
+        box_bytes = QHBoxLayout()
+        self.spin_agg_max_bytes = QSpinBox()
+        self.spin_agg_max_bytes.setRange(100, 3000)
+        self.spin_agg_max_bytes.setSingleStep(50)
+        self.spin_agg_max_bytes.setValue(1500)
+        self.spin_agg_max_bytes.setSuffix(" Byte")
+        self.spin_agg_max_bytes.setMinimumHeight(34)
+        apply_qss_role(self.spin_agg_max_bytes, obj_name="SpinAggMaxBytes")
+
+        lbl_byte_tip = QLabel("ℹ️ 고등학교 나이스 교과세특 상한선은 대략 1,500 Byte (한글 500자 기준)입니다.")
+        lbl_byte_tip.setStyleSheet("color: #94A3B8; font-size: 12px;")
+
+        box_bytes.addWidget(self.spin_agg_max_bytes)
+        box_bytes.addWidget(lbl_byte_tip)
+        box_bytes.addStretch()
+        form2.addRow("NEIS 바이트 상한:", box_bytes)
+
+        lay_step2.addLayout(form2)
+        lay.addWidget(self.card_agg_step2)
+
+        # ---------------------------------------------------------------------
+        # 카드 3: [실행 및 제어 툴바]
+        # ---------------------------------------------------------------------
+        self.card_agg_step3 = HoverZoomCard(
+            title="🚀 3단계: 파이프라인 실행 및 제어 툴바",
+            parent=w,
+            zoom_ratio=1.03,
+            hover_delay_ms=1000,
+        )
+        apply_qss_role(self.card_agg_step3, role="hoverZoomCard", obj_name="AggStep3Card")
+        lay_step3 = self.card_agg_step3.body_layout()
+
+        # 주요 실행 버튼 영역 (1행: 단계별 단독 실행, 2행: 원클릭 일괄 실행 + 중단)
+        grid_actions = QVBoxLayout()
+        grid_actions.setSpacing(10)
+
+        # 1행: 단계별 실행 버튼들
+        row_steps = QHBoxLayout()
+        row_steps.setSpacing(10)
+
+        self.btn_run_docx_only = QPushButton("📄 1. DOCX -> 엑셀 추출만 실행")
+        self.btn_run_docx_only.setMinimumHeight(38)
+        self.btn_run_docx_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_run_docx_only, role="secondary", obj_name="BtnRunDocxOnly")
+        self.btn_run_docx_only.clicked.connect(self._on_run_docx_extract)
+
+        self.btn_run_ai_only = QPushButton("🤖 2. 엑셀 -> AI 과세특 생성만 실행 (이어쓰기 지원)")
+        self.btn_run_ai_only.setMinimumHeight(38)
+        self.btn_run_ai_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_run_ai_only, role="secondary", obj_name="BtnRunAiOnly")
+        self.btn_run_ai_only.clicked.connect(self._on_run_record_generate)
+
+        row_steps.addWidget(self.btn_run_docx_only, stretch=1)
+        row_steps.addWidget(self.btn_run_ai_only, stretch=1)
+        grid_actions.addLayout(row_steps)
+
+        # 2행: 원클릭 일괄 실행 (Primary 대형 버튼) 및 중단 버튼
+        row_main = QHBoxLayout()
+        row_main.setSpacing(10)
+
+        self.btn_run_integrated = QPushButton("🚀 3. 과제 폴더에서 최종 세특 엑셀까지 원클릭 일괄 생성")
+        self.btn_run_integrated.setMinimumHeight(44)
+        self.btn_run_integrated.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_run_integrated, role="primary", obj_name="BtnRunIntegrated")
+        self.btn_run_integrated.clicked.connect(self._on_run_integrated_pipeline)
+
+        self.btn_stop_agg = QPushButton("⏹️ 작업 중단")
+        self.btn_stop_agg.setMinimumHeight(44)
+        self.btn_stop_agg.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_stop_agg, role="danger", obj_name="BtnStopAgg")
+        self.btn_stop_agg.clicked.connect(self._on_stop_agg_task)
+        self.btn_stop_agg.setEnabled(False)
+
+        row_main.addWidget(self.btn_run_integrated, stretch=3)
+        row_main.addWidget(self.btn_stop_agg, stretch=1)
+        grid_actions.addLayout(row_main)
+
+        lay_step3.addLayout(grid_actions)
+
+        # 피드백 & 결과 열기 상태 영역
+        box_feedback = QHBoxLayout()
+        self.lbl_agg_status = QLabel("대기 중: 실행할 작업을 선택해 주세요.")
+        self.lbl_agg_status.setStyleSheet("color: #E2E8F0; font-weight: bold; font-size: 13px;")
+
+        self.btn_open_result_excel = QPushButton("📊 생성된 결과 엑셀 열기")
+        self.btn_open_result_excel.setMinimumHeight(32)
+        apply_qss_role(self.btn_open_result_excel, role="success")
+        self.btn_open_result_excel.setVisible(False)
+        self.btn_open_result_excel.clicked.connect(self._on_open_last_result_excel)
+
+        box_feedback.addWidget(self.lbl_agg_status, stretch=1)
+        box_feedback.addWidget(self.btn_open_result_excel)
+        lay_step3.addLayout(box_feedback)
+
+        lay.addWidget(self.card_agg_step3)
+        lay.addStretch()
+
         scroll.setWidget(w)
+
+        # 초기 콤보박스 목록 및 활성 AI 상태 로드
+        self._last_result_excel_path: Optional[str] = None
+        self._refresh_schemas_combo()
+        self._refresh_prompts_combo()
+        self._update_active_ai_display()
+
         return scroll
 
     # =========================================================================
@@ -1663,34 +2015,377 @@ class DocOcrTab(QWidget):
             QMessageBox.information(self, "저장 완료", f"저장되었습니다:\n{save_path}")
 
     # =========================================================================
-    # [서브탭 3] 다중 보고서 엑셀 취합 핸들러
+    # [서브탭 3] 과제 취합 및 AI 과세특·채점 자동화 핸들러
     # =========================================================================
-    def _on_add_excel_files(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(
-            self, "취합할 보고서 선택", "", "스프레드시트 (*.xlsx *.csv);;모든 파일 (*)"
-        )
-        for f in files:
-            it = QListWidgetItem(f)
-            it.setToolTip(build_floating_tooltip("📊 취합 대상 보고서 경로", [html.escape(f)]))
-            self.list_excel_files.addItem(it)
+    def _open_dir_if_exists(self, dir_path: str) -> None:
+        p = Path(dir_path.strip()) if dir_path else None
+        if p and p.exists() and p.is_dir():
+            os.startfile(str(p.resolve()))
+        else:
+            QMessageBox.information(self, "안내", f"유효한 폴더 경로가 아닙니다:\n{dir_path}")
 
-    def _on_run_excel_aggregator(self) -> None:
-        files = [self.list_excel_files.item(i).text() for i in range(self.list_excel_files.count())]
-        if not files:
-            QMessageBox.information(self, "안내", "취합할 엑셀(.xlsx) 또는 CSV 보고서 파일을 먼저 추가해 주세요.")
-            return
-        save_path, _ = QFileDialog.getSaveFileName(
-            self, "취합 요약 엑셀 저장 경로", "다중보고서_취합요약본.xlsx", "Excel 파일 (*.xlsx)"
+    def _open_file_if_exists(self, file_path: str) -> None:
+        p = Path(file_path.strip()) if file_path else None
+        if p and p.exists() and p.is_file():
+            os.startfile(str(p.resolve()))
+        else:
+            QMessageBox.information(self, "안내", f"유효한 파일 경로가 아닙니다:\n{file_path}")
+
+    def _update_active_ai_display(self) -> None:
+        """현재 ConfigManager에 설정된 AI 공급자 및 모델 정보를 UI 배지에 반영합니다."""
+        info = get_active_ai_info()
+        p_name = info.get("provider_display", "Gemini")
+        model = info.get("model", "gemini-1.5-flash")
+        has_key = info.get("has_key", False)
+
+        if has_key:
+            self.lbl_active_ai_badge.setText(
+                f"🤖 활성 AI: <b style='color:#38BDF8;'>{p_name}</b> ({model})  |  <span style='color:#10B981;'>● 정상 연결 가능</span>"
+            )
+            self.lbl_active_ai_badge.setStyleSheet(
+                "background-color: #1E293B; color: #CBD5E1; font-size: 13px; "
+                "padding: 8px 14px; border-radius: 6px; border: 1px solid #0284C7;"
+            )
+        else:
+            self.lbl_active_ai_badge.setText(
+                f"🤖 활성 AI: <b style='color:#F59E0B;'>{p_name}</b> ({model})  |  <span style='color:#EF4444;'>⚠️ API Key 미등록</span>"
+            )
+            self.lbl_active_ai_badge.setStyleSheet(
+                "background-color: #2D1A15; color: #FCA5A5; font-size: 13px; "
+                "padding: 8px 14px; border-radius: 6px; border: 1px solid #B91C1C;"
+            )
+
+    def _on_go_to_settings_tab(self) -> None:
+        """메인 윈도우의 [탭 6: 환경설정]으로 즉시 전환합니다."""
+        curr: Optional[QWidget] = self
+        switched = False
+        while curr is not None:
+            # 1순위: MainWindow 인스턴스의 switch_tab 또는 tab_settings 호출
+            if hasattr(curr, "on_nav_btn_clicked"):
+                try:
+                    getattr(curr, "on_nav_btn_clicked")("settings")
+                    switched = True
+                    break
+                except Exception:
+                    pass
+            if hasattr(curr, "main_tabs"):
+                try:
+                    tabs = getattr(curr, "main_tabs")
+                    tabs.setCurrentIndex(tabs.count() - 1)
+                    switched = True
+                    break
+                except Exception:
+                    pass
+            curr = curr.parentWidget()
+
+        if not switched:
+            QMessageBox.information(
+                self,
+                "환경설정 안내",
+                "왼쪽 사이드바의 <b>[⚙️ 환경설정]</b> 메뉴를 클릭하여\n"
+                "AI 공급자(Gemini, OpenAI, Claude, OpenRouter, Ollama)와 API Key를 설정해 주세요.",
+            )
+
+    def _on_open_create_schema_dialog(self) -> None:
+        """새 DOCX 서식 분석 다이얼로그를 열고 생성된 스키마를 자동 선택합니다."""
+        curr_docx = self.edit_agg_docx_dir.text().strip()
+        dlg = DocxSchemaCreateDialog(self, default_docx=curr_docx)
+        if dlg.exec():
+            self._refresh_schemas_combo()
+            created_path = dlg.created_schema_path
+            if created_path:
+                idx = self.combo_agg_schema.findData(created_path)
+                if idx >= 0:
+                    self.combo_agg_schema.setCurrentIndex(idx)
+
+    def _on_open_new_prompt_dialog(self) -> None:
+        """새 프롬프트 작성 다이얼로그를 열고 생성된 프롬프트를 자동 선택합니다."""
+        dlg = PromptEditDialog(self)
+        if dlg.exec():
+            self._refresh_prompts_combo()
+            saved_path = dlg.saved_prompt_path
+            if saved_path:
+                idx = self.combo_agg_prompt.findData(saved_path)
+                if idx >= 0:
+                    self.combo_agg_prompt.setCurrentIndex(idx)
+
+    def _on_open_prompt_dir(self) -> None:
+        """prompts_memory/ 디렉토리를 윈도우 탐색기에서 엽니다."""
+        p = Path("prompts_memory").resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        os.startfile(str(p))
+
+    def _refresh_schemas_combo(self) -> None:
+        """schemas/ 폴더 내 JSON 양식 목록을 콤보박스에 로드합니다."""
+        prev_data = self.combo_agg_schema.currentData()
+        self.combo_agg_schema.clear()
+        self.combo_agg_schema.addItem("🔍 양식 자동 판별 (탐구계획서/보고서 등 내장 지원)", "")
+
+        schemas_dir = Path("schemas")
+        if schemas_dir.exists():
+            for json_path in sorted(schemas_dir.glob("*.json")):
+                try:
+                    name, _ = load_single_schema(json_path)
+                    display = f"📄 {name} ({json_path.name})"
+                    self.combo_agg_schema.addItem(display, str(json_path.resolve()))
+                except Exception:
+                    self.combo_agg_schema.addItem(f"📄 {json_path.stem} ({json_path.name})", str(json_path.resolve()))
+
+        if prev_data:
+            idx = self.combo_agg_schema.findData(prev_data)
+            if idx >= 0:
+                self.combo_agg_schema.setCurrentIndex(idx)
+
+    def _refresh_prompts_combo(self) -> None:
+        """prompts_memory/ 디렉토리 내 .txt 프롬프트 파일 목록을 콤보박스에 로드합니다."""
+        prev_data = self.combo_agg_prompt.currentData()
+        self.combo_agg_prompt.clear()
+        self.combo_agg_prompt.addItem("✨ 기본 내장 과세특 프롬프트 (행동 중심 NEIS 1500B)", "")
+
+        prompt_files = list_prompt_files(Path("prompts_memory"))
+        for pf in prompt_files:
+            clean_name = re.sub(r"^prompt_", "", pf.stem)
+            display = f"📝 {clean_name} ({pf.name})"
+            self.combo_agg_prompt.addItem(display, str(pf.resolve()))
+
+        if prev_data:
+            idx = self.combo_agg_prompt.findData(prev_data)
+            if idx >= 0:
+                self.combo_agg_prompt.setCurrentIndex(idx)
+
+    def _on_browse_agg_docx_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "학생 제출 DOCX 과제 폴더 선택")
+        if folder:
+            norm = str(Path(folder).resolve())
+            self.edit_agg_docx_dir.setText(norm)
+            self.edit_agg_docx_dir.setToolTip(norm)
+
+    def _on_browse_agg_excel_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "세특/채점 생성 대상 엑셀 파일 선택", "", "Excel 파일 (*.xlsx *.xls);;모든 파일 (*)"
         )
-        if not save_path:
+        if file_path:
+            norm = str(Path(file_path).resolve())
+            self.edit_agg_excel_file.setText(norm)
+            self.edit_agg_excel_file.setToolTip(norm)
+
+    def _on_browse_agg_ref_dir(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "참고자료 폴더 선택")
+        if folder:
+            norm = str(Path(folder).resolve())
+            self.edit_agg_ref_dir.setText(norm)
+            self.edit_agg_ref_dir.setToolTip(norm)
+
+    def _check_ai_provider_key_or_warn(self) -> bool:
+        """현재 활성 AI 공급자의 API 키 등록 여부를 확인하고 없으면 환경설정 이동을 유도합니다."""
+        info = get_active_ai_info()
+        if not info["has_key"]:
+            reply = QMessageBox.warning(
+                self,
+                f"[{info['provider_display']}] API 키 필요",
+                f"현재 선택된 AI 공급자(<b>{info['provider_display']}</b>)의 API Key가 등록되어 있지 않습니다.\n\n"
+                "지금 [환경설정] 탭으로 이동하여 API Key를 설정하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._on_go_to_settings_tab()
+            return False
+        return True
+
+    def _check_gemini_api_key_or_warn(self) -> bool:
+        """하위 호환 래퍼"""
+        return self._check_ai_provider_key_or_warn()
+
+    def _set_agg_controls_busy(self, busy: bool) -> None:
+        """작업 진행 중 버튼 상태 토글"""
+        self.btn_run_docx_only.setEnabled(not busy)
+        self.btn_run_ai_only.setEnabled(not busy)
+        self.btn_run_integrated.setEnabled(not busy)
+        self.btn_stop_agg.setEnabled(busy)
+
+    def _on_run_docx_extract(self) -> None:
+        """1단계: DOCX 과제 파일 추출만 단독 실행"""
+        folder_str = self.edit_agg_docx_dir.text().strip()
+        if not folder_str or not Path(folder_str).is_dir():
+            QMessageBox.warning(self, "입력 확인", "학생들의 .docx 파일이 들어있는 폴더를 먼저 선택해 주세요.")
             return
-        worker = ReportExcelAggregatorWorker(files, save_path, skip_header_rows=1)
+
+        schema_data = self.combo_agg_schema.currentData()
+        schema_path = Path(schema_data) if schema_data else None
+
+        worker = DocxToExcelWorker(docx_dir=folder_str, schema_path=schema_path)
+        self._set_agg_controls_busy(True)
+        self.lbl_agg_status.setText("⏳ DOCX 과제 추출 진행 중...")
+        self.btn_open_result_excel.setVisible(False)
+
+        def on_done(res: Dict[str, Any]):
+            out_file = res.get("output_file", "")
+            self._last_result_excel_path = out_file
+            if out_file:
+                self.edit_agg_excel_file.setText(out_file)
+                self.btn_open_result_excel.setVisible(True)
+            self.lbl_agg_status.setText(
+                f"✅ 추출 완료: {Path(out_file).name} (성공 {res.get('success', 0)}명 / 실패 {res.get('failed', 0)}명)"
+            )
+            QMessageBox.information(
+                self,
+                "DOCX 추출 완료",
+                f"학생 과제 추출이 성공적으로 완료되었습니다.\n\n"
+                f"- 총 파일: {res.get('total', 0)}개\n"
+                f"- 성공 추출: {res.get('success', 0)}명\n"
+                f"- 오류 건수: {res.get('failed', 0)}건\n\n"
+                f"생성된 엑셀 경로:\n{out_file}\n\n"
+                f"2단계 대상 엑셀 파일로 자동 등록되었습니다.",
+            )
+
         self.task_runner.start_worker(
             worker,
-            task_key=self.TASK_EXCEL_AGG,
-            on_result=lambda res: QMessageBox.information(
-                self,
-                "취합 완료",
-                f"총 {res.get('rows_added', 0)}행이 단일 엑셀 파일로 취합되었습니다:\n{res.get('output_xlsx')}",
-            ),
+            task_key=self.TASK_DOCX_EXTRACT,
+            on_result=on_done,
+            on_error=lambda err: self.lbl_agg_status.setText(f"❌ 추출 오류: {err}"),
+            on_finished=lambda: self._set_agg_controls_busy(False),
         )
+
+    def _on_run_record_generate(self) -> None:
+        """2단계: 엑셀 데이터를 기반으로 AI 과세특 생성만 실행 (멀티 LLM 지원)"""
+        if not self._check_ai_provider_key_or_warn():
+            return
+
+        excel_str = self.edit_agg_excel_file.text().strip()
+        if not excel_str or not Path(excel_str).is_file():
+            QMessageBox.warning(self, "입력 확인", "과세특을 생성할 대상 엑셀(.xlsx) 파일을 먼저 선택해 주세요.")
+            return
+
+        prompt_data = self.combo_agg_prompt.currentData()
+        prompt_file = Path(prompt_data) if prompt_data else None
+
+        ref_str = self.edit_agg_ref_dir.text().strip()
+        ref_dir = Path(ref_str) if ref_str and Path(ref_str).is_dir() else None
+
+        max_bytes = self.spin_agg_max_bytes.value()
+        info = get_active_ai_info()
+
+        worker = RecordGenerateWorker(
+            excel_path=excel_str,
+            prompt_file=prompt_file,
+            reference_dir=ref_dir,
+            max_bytes=max_bytes,
+            provider=info["provider"],
+            model_name=info["model"],
+        )
+        self._set_agg_controls_busy(True)
+        self.lbl_agg_status.setText(
+            f"⏳ AI 과세특 생성 진행 중... (공급자: {info['provider_display']}, 모델: {info['model']}, 상한: {max_bytes}B)"
+        )
+        self.btn_open_result_excel.setVisible(False)
+
+        def on_done(res: Dict[str, Any]):
+            out_file = res.get("output_path", "")
+            self._last_result_excel_path = out_file
+            if out_file:
+                self.btn_open_result_excel.setVisible(True)
+            self.lbl_agg_status.setText(
+                f"✅ 과세특 생성 완료: {Path(out_file).name} (완료 {res.get('completed', 0)}/{res.get('total', 0)}명)"
+            )
+            QMessageBox.information(
+                self,
+                "AI 과세특 생성 완료",
+                f"과세특 생성이 완료되었습니다.\n\n"
+                f"- 공급자: {info['provider_display']} ({info['model']})\n"
+                f"- 총원: {res.get('total', 0)}명\n"
+                f"- 완료 인원: {res.get('completed', 0)}명\n\n"
+                f"저장된 파일:\n{out_file}",
+            )
+
+        self.task_runner.start_worker(
+            worker,
+            task_key=self.TASK_RECORD_GEN,
+            on_result=on_done,
+            on_error=lambda err: self.lbl_agg_status.setText(f"❌ 과세특 생성 오류: {err}"),
+            on_finished=lambda: self._set_agg_controls_busy(False),
+        )
+
+    def _on_run_integrated_pipeline(self) -> None:
+        """3단계: 과제 폴더에서 최종 세특 엑셀까지 원클릭 일괄 생성 실행 (멀티 LLM 지원)"""
+        if not self._check_ai_provider_key_or_warn():
+            return
+
+        folder_str = self.edit_agg_docx_dir.text().strip()
+        if not folder_str or not Path(folder_str).is_dir():
+            QMessageBox.warning(self, "입력 확인", "1단계 학생 과제 폴더(.docx)를 먼저 선택해 주세요.")
+            return
+
+        schema_data = self.combo_agg_schema.currentData()
+        schema_path = Path(schema_data) if schema_data else None
+
+        prompt_data = self.combo_agg_prompt.currentData()
+        prompt_file = Path(prompt_data) if prompt_data else None
+
+        ref_str = self.edit_agg_ref_dir.text().strip()
+        ref_dir = Path(ref_str) if ref_str and Path(ref_str).is_dir() else None
+
+        max_bytes = self.spin_agg_max_bytes.value()
+        info = get_active_ai_info()
+
+        worker = IntegratedPipelineWorker(
+            docx_dir=folder_str,
+            schema_path=schema_path,
+            prompt_file=prompt_file,
+            reference_dir=ref_dir,
+            max_bytes=max_bytes,
+            provider=info["provider"],
+            model_name=info["model"],
+        )
+        self._set_agg_controls_busy(True)
+        self.lbl_agg_status.setText(
+            f"🚀 원클릭 일괄 파이프라인 진행 중: 1단계 DOCX 추출 -> 2단계 AI 세특 ({info['provider_display']} / {info['model']})"
+        )
+        self.btn_open_result_excel.setVisible(False)
+
+        def on_done(res: Dict[str, Any]):
+            out_file = res.get("output_path", "")
+            self._last_result_excel_path = out_file
+            if out_file:
+                self.edit_agg_excel_file.setText(out_file)
+                self.btn_open_result_excel.setVisible(True)
+            step1 = res.get("step1", {})
+            step2 = res.get("step2", {})
+            self.lbl_agg_status.setText(
+                f"🎉 전체 일괄 생성 완료! 최종 파일: {Path(out_file).name} (과제 {step1.get('success', 0)}명, 세특 {step2.get('completed', 0)}명)"
+            )
+            QMessageBox.information(
+                self,
+                "🎉 원클릭 일괄 생성 완료",
+                f"학생 DOCX 과제 취합부터 AI 과세특 생성까지 모두 완료되었습니다!\n\n"
+                f"- 사용된 AI: {info['provider_display']} ({info['model']})\n"
+                f"[1단계 과제 추출]: 성공 {step1.get('success', 0)}건\n"
+                f"[2단계 AI 세특]: 완료 {step2.get('completed', 0)}건\n\n"
+                f"최종 저장된 파일:\n{out_file}",
+            )
+
+        self.task_runner.start_worker(
+            worker,
+            task_key=self.TASK_INTEGRATED,
+            on_result=on_done,
+            on_error=lambda err: self.lbl_agg_status.setText(f"❌ 일괄 처리 오류: {err}"),
+            on_finished=lambda: self._set_agg_controls_busy(False),
+        )
+
+    def _on_stop_agg_task(self) -> None:
+        """진행 중인 과제 추출 또는 AI 과세특 생성 작업을 안전하게 중단합니다."""
+        self.task_runner.stop_task(self.TASK_DOCX_EXTRACT)
+        self.task_runner.stop_task(self.TASK_RECORD_GEN)
+        self.task_runner.stop_task(self.TASK_INTEGRATED)
+        self.lbl_agg_status.setText("⏹️ 작업 중단 요청됨 (현재 학생 저장 후 안전 종료 중...)")
+        QMessageBox.information(
+            self,
+            "중단 요청",
+            "작업 중단을 요청했습니다.\n현재 처리 중인 학생의 데이터까지 엑셀 파일에 안전하게 저장된 후 중단됩니다.",
+        )
+
+    def _on_open_last_result_excel(self) -> None:
+        if self._last_result_excel_path and Path(self._last_result_excel_path).exists():
+            os.startfile(self._last_result_excel_path)
+        else:
+            QMessageBox.information(self, "안내", "열 수 있는 결과 엑셀 파일이 없습니다.")
