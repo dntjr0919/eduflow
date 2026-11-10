@@ -358,14 +358,14 @@ class SettingsTab(QWidget):
         self.settings_accordion = AccordionGroup(exclusive=SETTINGS_ACCORDION_EXCLUSIVE)
 
         # ---------------------------------------------------------------------
-        # 1. 🤖 AI 및 프롬프트 설정 (기본 펼침)
+        # 1. AI 및 프롬프트 설정 (기본 펼침)
         # ---------------------------------------------------------------------
         self.ai_group = AccordionCard(
-            "🤖 AI 및 프롬프트 설정", parent=left_container, is_expanded=True
+            "AI 및 프롬프트 설정", parent=left_container, is_expanded=True
         )
         self.ai_group.setObjectName("AiPromptSettingsGroup")
 
-        self.btn_focus_left = QPushButton("⛶ 전체화면")
+        self.btn_focus_left = QPushButton("전체화면")
         apply_qss_role(self.btn_focus_left, role="cardMax", obj_name="CardMaxButton")
         self.btn_focus_left.setCheckable(True)
         self.btn_focus_left.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -446,8 +446,8 @@ class SettingsTab(QWidget):
                 "모델명 검색 또는 직접 입력 (예: gemini-1.5-flash, gpt-4o-mini, llama3.2)"
             )
 
-        self.btn_refresh_models = QPushButton("🔄 모델 목록 갱신")
-        apply_qss_role(self.btn_refresh_models, obj_name="BtnRefreshModels")
+        self.btn_refresh_models = QPushButton("모델 목록 갱신")
+        apply_qss_role(self.btn_refresh_models, role="secondary", obj_name="BtnRefreshModels")
         self.btn_refresh_models.setMinimumHeight(36)
         self.btn_refresh_models.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_refresh_models.setToolTip("선택한 공급자에서 현재 사용 가능한 모델 목록을 실시간으로 조회합니다.")
@@ -465,18 +465,18 @@ class SettingsTab(QWidget):
 
         ai_vbox.addLayout(ai_form)
 
-        # (6) [🔌 연결 테스트] 및 [📋 수동 복붙 모달 미리보기] 버튼
+        # (6) [연결 테스트] 및 [수동 복붙 모달 미리보기] 버튼
         ai_btn_row = QHBoxLayout()
         ai_btn_row.setContentsMargins(16, 0, 16, 4)
         ai_btn_row.setSpacing(10)
-        self.btn_test_connection = QPushButton("🔌 연결 테스트")
+        self.btn_test_connection = QPushButton("연결 테스트")
         apply_qss_role(self.btn_test_connection, role="teal", obj_name="BtnTestAiConnection")
         self.btn_test_connection.setMinimumHeight(38)
         self.btn_test_connection.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_test_connection.clicked.connect(self._on_test_llm_connection)
 
-        self.btn_preview_manual = QPushButton("📋 수동 복붙 모달 미리보기")
-        apply_qss_role(self.btn_preview_manual, obj_name="BtnPreviewManualDialog")
+        self.btn_preview_manual = QPushButton("수동 복붙 모달 미리보기")
+        apply_qss_role(self.btn_preview_manual, role="secondary", obj_name="BtnPreviewManualDialog")
         self.btn_preview_manual.setMinimumHeight(38)
         self.btn_preview_manual.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_preview_manual.clicked.connect(self._on_open_manual_dialog_preview)
@@ -499,10 +499,10 @@ class SettingsTab(QWidget):
         self.settings_accordion.add_card(self.ai_group)
 
         # ---------------------------------------------------------------------
-        # 2. 📁 기본 폴더 및 백그라운드 감시 설정 (기본 접힘)
+        # 2. 기본 폴더 및 백그라운드 감시 설정 (기본 접힘)
         # ---------------------------------------------------------------------
         self.folder_group = AccordionCard(
-            "📁 기본 폴더 및 백그라운드 감시 설정", parent=left_container, is_expanded=False
+            "기본 폴더 및 백그라운드 감시 설정", parent=left_container, is_expanded=False
         )
         self.folder_group.setObjectName("FolderSettingsGroup")
 
@@ -541,10 +541,10 @@ class SettingsTab(QWidget):
         self.settings_accordion.add_card(self.folder_group)
 
         # ---------------------------------------------------------------------
-        # 3. 🔔 외부 연동(Google 시트/카카오톡) 및 시스템 트레이 설정 (기본 접힘)
+        # 3. 외부 연동(Google 시트/카카오톡) 및 시스템 트레이 설정 (기본 접힘)
         # ---------------------------------------------------------------------
         self.ext_group = AccordionCard(
-            "🔔 외부 연동(Google 시트/카카오톡) 및 시스템 트레이 설정",
+            "외부 연동(Google 시트/카카오톡) 및 시스템 트레이 설정",
             parent=left_container,
             is_expanded=False,
         )
@@ -618,19 +618,19 @@ class SettingsTab(QWidget):
         # 하단 전체 저장 및 알림 테스트 버튼 바
         save_bar = QHBoxLayout()
         save_bar.setSpacing(10)
-        btn_save_cfg = QPushButton("💾 환경설정 모두 저장")
+        btn_save_cfg = QPushButton("환경설정 모두 저장")
         apply_qss_role(btn_save_cfg, role="primary", obj_name="BtnSaveAllSettings")
         btn_save_cfg.setMinimumHeight(40)
         btn_save_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save_cfg.clicked.connect(self.save_ui_to_settings)
 
-        btn_test_notify = QPushButton("🔔 알림 테스트 발송")
-        apply_qss_role(btn_test_notify, obj_name="BtnTestNotify")
+        btn_test_notify = QPushButton("알림 테스트 발송")
+        apply_qss_role(btn_test_notify, role="secondary", obj_name="BtnTestNotify")
         btn_test_notify.setMinimumHeight(40)
         btn_test_notify.clicked.connect(self._on_test_notification)
 
         btn_reset_cfg = QPushButton("초기값 복원")
-        apply_qss_role(btn_reset_cfg, obj_name="BtnResetSettings")
+        apply_qss_role(btn_reset_cfg, role="secondary", obj_name="BtnResetSettings")
         btn_reset_cfg.setMinimumHeight(40)
         btn_reset_cfg.clicked.connect(self._on_reset_config)
 
@@ -645,7 +645,7 @@ class SettingsTab(QWidget):
         self.main_splitter.addWidget(self.left_scroll)
 
         # =====================================================================
-        # 우측 패널: 학생 명렬표 (마스터 데이터) HoverZoomCard + 전체화면 버튼
+        # 우측 패널 (55%): 학생 명렬표 (마스터 데이터) 정적 카드 + 전체화면 버튼
         # =====================================================================
         self.right_widget = QWidget()
         self.right_widget.setMinimumWidth(420)
@@ -653,14 +653,14 @@ class SettingsTab(QWidget):
         right_layout.setContentsMargins(8, 8, 18, 18)
 
         self.stu_group = HoverZoomCard(
-            title="🎓 학생 명렬표 마스터 데이터 관리 (파일 취합·성적·출결 탭 공통 연동)",
+            title="학생 명렬표 마스터 데이터 관리 (파일 취합·성적·출결 탭 공통 연동)",
             parent=self.right_widget,
-            zoom_ratio=1.12,
-            hover_delay_ms=1000,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
         apply_qss_role(self.stu_group, role="hoverZoomCard", obj_name="StudentMasterGroup")
 
-        self.btn_focus_students = QPushButton("⛶ 전체화면")
+        self.btn_focus_students = QPushButton("전체화면")
         apply_qss_role(self.btn_focus_students, role="cardMax", obj_name="CardMaxButton")
         self.btn_focus_students.setCheckable(True)
         self.btn_focus_students.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -672,16 +672,16 @@ class SettingsTab(QWidget):
 
         stu_btn_bar = QHBoxLayout()
         stu_btn_bar.setSpacing(6)
-        btn_import_file = QPushButton("📥 CSV / 엑셀(.xlsx) 일괄 등록")
-        apply_qss_role(btn_import_file, role="primary", obj_name="BtnImportStudents")
-        btn_export_sample = QPushButton("📤 양식/명렬표 내보내기")
-        apply_qss_role(btn_export_sample)
         btn_add_stu = QPushButton("+ 학생 추가")
-        apply_qss_role(btn_add_stu)
+        apply_qss_role(btn_add_stu, role="primary", obj_name="BtnAddStudent")
+        btn_import_file = QPushButton("CSV/엑셀 일괄 등록")
+        apply_qss_role(btn_import_file, role="secondary", obj_name="BtnImportStudents")
+        btn_export_sample = QPushButton("양식 내보내기")
+        apply_qss_role(btn_export_sample, role="secondary", obj_name="BtnExportStudents")
         btn_del_stu = QPushButton("- 선택 삭제")
-        apply_qss_role(btn_del_stu)
-        btn_clear_stu = QPushButton("🧹 전체 삭제")
-        apply_qss_role(btn_clear_stu, role="warningOutline")
+        apply_qss_role(btn_del_stu, role="secondary", obj_name="BtnDeleteStudent")
+        btn_clear_stu = QPushButton("전체 삭제")
+        apply_qss_role(btn_clear_stu, role="warningOutline", obj_name="BtnClearStudents")
 
         btn_import_file.clicked.connect(self._on_import_students_file)
         btn_export_sample.clicked.connect(self._on_export_students_file)
@@ -689,9 +689,9 @@ class SettingsTab(QWidget):
         btn_del_stu.clicked.connect(self._on_delete_student)
         btn_clear_stu.clicked.connect(self._on_clear_students)
 
+        stu_btn_bar.addWidget(btn_add_stu)
         stu_btn_bar.addWidget(btn_import_file)
         stu_btn_bar.addWidget(btn_export_sample)
-        stu_btn_bar.addWidget(btn_add_stu)
         stu_btn_bar.addWidget(btn_del_stu)
         stu_btn_bar.addStretch()
         stu_btn_bar.addWidget(btn_clear_stu)
@@ -706,14 +706,21 @@ class SettingsTab(QWidget):
         self.table_students = QTableWidget(0, 7)
         self.table_students.setAlternatingRowColors(True)
         self.table_students.setMouseTracking(True)
+        self.table_students.setStyleSheet(
+            "QTableWidget { background-color: #FFFFFF; alternate-background-color: #F8F9FF; "
+            "selection-background-color: #EEF3FD; selection-color: #003EA8; "
+            "border: 1px solid #E2E8F0; border-radius: 8px; }"
+        )
         self.table_students.setHorizontalHeaderLabels(
             ["학번", "학년", "반", "번호", "이름", "학생 연락처", "학부모 연락처 / 비고"]
         )
         self.table_students.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_students.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_students.verticalHeader().setDefaultSectionSize(34)
+        self.table_students.verticalHeader().setVisible(False)
         self.table_students.doubleClicked.connect(self._on_edit_student)
         s_header = self.table_students.horizontalHeader()
+        s_header.setMinimumHeight(32)
         s_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         s_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         s_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -726,11 +733,13 @@ class SettingsTab(QWidget):
         right_layout.addWidget(self.stu_group)
 
         self.main_splitter.addWidget(self.right_widget)
-        self.main_splitter.setSizes([580, 560])
+        self.main_splitter.setSizes([495, 605])
+        self.main_splitter.setStretchFactor(0, 45)
+        self.main_splitter.setStretchFactor(1, 55)
         main_layout.addWidget(self.main_splitter, stretch=1)
 
     # =========================================================================
-    # 섹션 카드 전체화면 포커스 토글 ([ ⛶ 전체화면 ] <-> [ 🗗 원래 크기로 ])
+    # 섹션 카드 전체화면 포커스 토글 ([ 전체화면 ] <-> [ 원래 크기로 ])
     # =========================================================================
     def _toggle_card_focus(self, target: str) -> None:
         if self._focused_card == target:
@@ -739,10 +748,10 @@ class SettingsTab(QWidget):
             self.left_scroll.show()
             self.right_widget.show()
             self.btn_focus_left.setChecked(False)
-            self.btn_focus_left.setText("⛶ 전체화면")
+            self.btn_focus_left.setText("전체화면")
             self.btn_focus_students.setChecked(False)
-            self.btn_focus_students.setText("⛶ 전체화면")
-            self.main_splitter.setSizes([580, 560])
+            self.btn_focus_students.setText("전체화면")
+            self.main_splitter.setSizes([495, 605])
             return
 
         self._focused_card = target
@@ -751,16 +760,16 @@ class SettingsTab(QWidget):
             self.left_scroll.hide()
             self.right_widget.show()
             self.btn_focus_students.setChecked(True)
-            self.btn_focus_students.setText("🗗 원래 크기로")
+            self.btn_focus_students.setText("원래 크기로")
             self.btn_focus_left.setChecked(False)
-            self.btn_focus_left.setText("⛶ 전체화면")
+            self.btn_focus_left.setText("전체화면")
         elif target == "left":
             self.right_widget.hide()
             self.left_scroll.show()
             self.btn_focus_left.setChecked(True)
-            self.btn_focus_left.setText("🗗 원래 크기로")
+            self.btn_focus_left.setText("원래 크기로")
             self.btn_focus_students.setChecked(False)
-            self.btn_focus_students.setText("⛶ 전체화면")
+            self.btn_focus_students.setText("전체화면")
 
     # =========================================================================
     # AI 및 프롬프트 설정 실시간 즉시 저장 핸들러 (stateChanged / currentTextChanged / textChanged)
@@ -941,7 +950,7 @@ class SettingsTab(QWidget):
         self._model_fetch_running = True
         self.btn_refresh_models.setEnabled(False)
         self.btn_refresh_models.setText("탐지 중...")
-        self.lbl_model_status.setText(f"⏳ [{provider_text}] 사용 가능한 모델 목록을 조회하고 있습니다...")
+        self.lbl_model_status.setText(f"[{provider_text}] 사용 가능한 모델 목록을 조회하고 있습니다...")
         self.lbl_model_status.setVisible(True)
 
         def _job(_worker: FunctionWorker) -> Dict[str, Any]:
@@ -963,7 +972,7 @@ class SettingsTab(QWidget):
     def _on_model_fetch_finished(self) -> None:
         self._model_fetch_running = False
         self.btn_refresh_models.setEnabled(True)
-        self.btn_refresh_models.setText("🔄 모델 목록 갱신")
+        self.btn_refresh_models.setText("모델 목록 갱신")
 
     def _on_models_fetched(
         self, res: Dict[str, Any], prov_code: str, provider_text: str, interactive: bool
@@ -974,7 +983,7 @@ class SettingsTab(QWidget):
         if not res.get("ok"):
             err = str(res.get("error", "알 수 없는 오류"))
             if still_same_provider:
-                self.lbl_model_status.setText(f"⚠️ 모델 목록 조회 실패: {err.splitlines()[0]}")
+                self.lbl_model_status.setText(f"[오류] 모델 목록 조회 실패: {err.splitlines()[0]}")
                 self.lbl_model_status.setVisible(True)
             if interactive:
                 QMessageBox.warning(
@@ -995,7 +1004,7 @@ class SettingsTab(QWidget):
                 else "조회는 성공했지만 사용 가능한 텍스트 모델이 없습니다."
             )
             if still_same_provider:
-                self.lbl_model_status.setText(f"⚠️ {hint_msg}")
+                self.lbl_model_status.setText(f"[안내] {hint_msg}")
                 self.lbl_model_status.setVisible(True)
             if interactive:
                 QMessageBox.warning(
@@ -1020,7 +1029,7 @@ class SettingsTab(QWidget):
         self._populate_model_combo(models, selected)
         self._on_ai_setting_changed()
         self.lbl_model_status.setText(
-            f"✅ {len(models)}개 모델을 불러왔습니다. (선택: {selected})"
+            f"[완료] {len(models)}개 모델을 불러왔습니다. (선택: {selected})"
         )
         self.lbl_model_status.setVisible(True)
 
@@ -1280,7 +1289,7 @@ class SettingsTab(QWidget):
             pm_item = QTableWidgetItem(parent_memo)
 
             tooltip_html = build_floating_tooltip(
-                f"🎓 [{s['student_id']}] {s['name']}",
+                f"[{s['student_id']}] {s['name']}",
                 [
                     f"<b>학급 정보:</b> {s['grade']}학년 {s['class_no']}반 {s['number']}번",
                     f"<b>학생 연락처:</b> {html.escape(s['contact'] or '-')}",

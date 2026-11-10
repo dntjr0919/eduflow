@@ -871,16 +871,16 @@ class DocOcrTab(QWidget):
         self.sub_tabs = QTabWidget()
         apply_qss_role(self.sub_tabs, obj_name="DocOcrSubTabWidget")
         self.sub_tabs.addTab(
-            self._build_student_merge_subtab(),
-            "1. 파일 취합 & 명렬표 대조 & PDF 병합",
+            self._build_excel_aggregator_subtab(),
+            "1. 과제 파이프라인 (DOCX 추출 + AI 세특)",
         )
         self.sub_tabs.addTab(
             self._build_ocr_subtab(),
             "2. AI OCR 및 텍스트 보정",
         )
         self.sub_tabs.addTab(
-            self._build_excel_aggregator_subtab(),
-            "3. 과제 파이프라인 (DOCX 추출 + AI 세특)",
+            self._build_student_merge_subtab(),
+            "3. 파일 취합 & 명렬표 대조 & PDF 병합",
         )
         layout.addWidget(self.sub_tabs)
 

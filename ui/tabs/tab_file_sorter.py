@@ -1,8 +1,9 @@
 """
 [탭 1] 📁 스마트 파일 자동 분류기 (ui/tabs/tab_file_sorter.py)
-- 기존 QGroupBox를 HoverZoomCard(1초 호버 시 Z-order 최상단 부상 + OutCubic 대각선 슬라이딩 확대/축소)로 교체
-- 모든 입력 필드 최소 높이 34px 이상, verticalSpacing 12px 이상 적용
-- '자동 분류 규칙 설정' 카드 및 '최근 파일 분류 내역' 카드에 [ ⛶ 전체화면 ] / [ 🗗 원래 크기로 ] 포커스 토글 버튼 제공
+- 가로 스크롤 제거 및 창 너비 맞춤(Fluid Layout) 적용
+- 감시/원본 폴더(위) ➔ 즉시 실행 화살표 버튼(중간) ➔ 분류 기준 상위 폴더(아래)의 직관적 수직 파이프라인 구조
+- '실시간 자동 감시' 스위치 및 상태 표시를 카드 타이틀 바로 우측 헤더로 이동
+- 규칙 설정 및 이력 테이블 가로 스크롤 방지 및 반응형 컬럼 너비 최적화
 """
 
 import html
@@ -224,18 +225,25 @@ class FileSorterTab(QWidget):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
 
+        # 가로 스크롤 방지: AlwaysOff 및 위젯 크기 자동 리사이징 설정
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         content_widget = QWidget()
+        content_widget.setMinimumWidth(0)
         content_widget.setSizePolicy(
-            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.MinimumExpanding
         )
         main_layout = QVBoxLayout(content_widget)
-        main_layout.setContentsMargins(14, 14, 24, 24)
-        main_layout.setSpacing(14)
+        main_layout.setContentsMargins(16, 16, 16, 20)
+        main_layout.setSpacing(16)
 
+        # ---------------------------------------------------------------------
+        # 1. 상단 카드: 폴더 지정 및 스마트 분류 실행 옵션 (수직 파이프라인 구조)
+        # ---------------------------------------------------------------------
         self.top_group = HoverZoomCard(
             title="폴더 지정 및 스마트 분류 실행 옵션",
             parent=content_widget,
@@ -243,12 +251,27 @@ class FileSorterTab(QWidget):
             hover_delay_ms=0,
         )
         apply_qss_role(self.top_group, role="hoverZoomCard", obj_name="SorterFolderGroup")
+
+        # 카드 헤더 우측: 실시간 자동 감시 버튼 및 상태 뱃지 배치
+        self.btn_toggle_watch = QPushButton("실시간 자동 감시: OFF")
+        self.btn_toggle_watch.setMinimumHeight(28)
+        self.btn_toggle_watch.setCheckable(True)
+        self.btn_toggle_watch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_watch_button_style(False)
+        self.btn_toggle_watch.clicked.connect(lambda: self.toggle_realtime_watch())
+
+        self.lbl_watch_status = QLabel("대기 중")
+        apply_qss_role(self.lbl_watch_status, role="mutedText", obj_name="LblWatchStatus")
+
+        self.top_group.header_layout.addSpacing(14)
+        self.top_group.header_layout.addWidget(self.btn_toggle_watch)
+        self.top_group.header_layout.addSpacing(8)
+        self.top_group.header_layout.addWidget(self.lbl_watch_status)
+
         top_layout = self.top_group.body_layout()
+        top_layout.setSpacing(10)
 
-        folders_row = QHBoxLayout()
-        folders_row.setSpacing(16)
-
-        src_box = QVBoxLayout()
+        # [1-1] 상단: 감시/원본 폴더 (Source Directories)
         src_header = QHBoxLayout()
         src_lbl = QLabel("<b>감시/원본 폴더 (Source Directories)</b>")
         btn_add_src = QPushButton("+ 폴더 추가")
@@ -257,6 +280,7 @@ class FileSorterTab(QWidget):
         apply_qss_role(btn_rem_src, role="outline")
         btn_open_src = QPushButton("폴더 열기")
         apply_qss_role(btn_open_src, role="outline")
+
         btn_add_src.clicked.connect(self._on_add_source_dir)
         btn_rem_src.clicked.connect(self._on_remove_source_dir)
         btn_open_src.clicked.connect(self._on_open_source_dir)
@@ -266,34 +290,69 @@ class FileSorterTab(QWidget):
         src_header.addWidget(btn_add_src)
         src_header.addWidget(btn_rem_src)
         src_header.addWidget(btn_open_src)
+        top_layout.addLayout(src_header)
 
         self.list_source_dirs = QListWidget()
         self.list_source_dirs.setMouseTracking(True)
         self.list_source_dirs.setMinimumHeight(76)
-        src_box.addLayout(src_header)
-        src_box.addWidget(self.list_source_dirs)
-        folders_row.addLayout(src_box, stretch=3)
+        self.list_source_dirs.setMaximumHeight(105)
+        top_layout.addWidget(self.list_source_dirs)
 
-        target_box = QVBoxLayout()
+        # [1-2] 중간: 직관적인 화살표 실행 버튼 (Source ➔ Target)
+        run_row = QHBoxLayout()
+        run_row.setContentsMargins(0, 4, 0, 4)
+        run_row.setSpacing(12)
+
+        line_left = QFrame()
+        line_left.setFrameShape(QFrame.Shape.HLine)
+        line_left.setStyleSheet("color: #E2E8F0; background-color: #E2E8F0;")
+        line_right = QFrame()
+        line_right.setFrameShape(QFrame.Shape.HLine)
+        line_right.setStyleSheet("color: #E2E8F0; background-color: #E2E8F0;")
+
+        self.btn_run_once = QPushButton("▼  즉시 1회 자동 분류 실행 (Source ➔ Target)")
+        apply_qss_role(self.btn_run_once, role="primary", obj_name="BtnRunSortOnce")
+        self.btn_run_once.setMinimumHeight(38)
+        self.btn_run_once.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_run_once.setToolTip(
+            "위의 감시/원본 폴더에 있는 파일들을 규칙에 맞게 아래 분류 기준 상위 폴더로 즉시 1회 이동/정리합니다."
+        )
+        self.btn_run_once.clicked.connect(self.run_batch_sort_once)
+
+        run_row.addWidget(line_left, stretch=1)
+        run_row.addWidget(self.btn_run_once, stretch=2)
+        run_row.addWidget(line_right, stretch=1)
+        top_layout.addLayout(run_row)
+
+        # [1-3] 하단: 분류 기준 상위 폴더 (Target Base Directory) 및 실행 옵션
         target_lbl = QLabel("<b>분류 기준 상위 폴더 (Target Base Directory)</b>")
+        top_layout.addWidget(target_lbl)
+
         target_input_row = QHBoxLayout()
         self.edit_target_dir = QLineEdit()
         self.edit_target_dir.setMinimumHeight(32)
         self.edit_target_dir.setPlaceholderText("분류된 하위 폴더들이 생성될 기준 폴더 경로")
         self.edit_target_dir.editingFinished.connect(self._save_ui_to_config)
+
         btn_browse_target = QPushButton("찾아보기...")
         apply_qss_role(btn_browse_target, role="secondary")
         btn_browse_target.setMinimumHeight(32)
-        btn_open_target = QPushButton("열기")
+
+        btn_open_target = QPushButton("폴더 열기")
         apply_qss_role(btn_open_target, role="outline")
         btn_open_target.setMinimumHeight(32)
+
         btn_browse_target.clicked.connect(self._on_browse_target_dir)
         btn_open_target.clicked.connect(self._on_open_target_dir)
+
         target_input_row.addWidget(self.edit_target_dir, stretch=1)
         target_input_row.addWidget(btn_browse_target)
         target_input_row.addWidget(btn_open_target)
+        top_layout.addLayout(target_input_row)
 
+        # 세부 옵션 바
         opts_row = QHBoxLayout()
+        opts_row.setSpacing(10)
         opts_row.addWidget(QLabel("처리 방식:"))
         self.combo_action_mode = QComboBox()
         self.combo_action_mode.setMinimumHeight(32)
@@ -302,6 +361,7 @@ class FileSorterTab(QWidget):
         self.combo_action_mode.currentIndexChanged.connect(self._save_ui_to_config)
         opts_row.addWidget(self.combo_action_mode)
 
+        opts_row.addSpacing(6)
         opts_row.addWidget(QLabel("중복 파일명:"))
         self.combo_dup_policy = QComboBox()
         self.combo_dup_policy.setMinimumHeight(32)
@@ -310,48 +370,17 @@ class FileSorterTab(QWidget):
         self.combo_dup_policy.currentIndexChanged.connect(self._save_ui_to_config)
         opts_row.addWidget(self.combo_dup_policy)
 
+        opts_row.addSpacing(6)
         self.chk_unmatched = QCheckBox("미분류 파일도 '기타' 폴더로 정리")
         self.chk_unmatched.toggled.connect(self._save_ui_to_config)
         opts_row.addWidget(self.chk_unmatched)
         opts_row.addStretch()
+        top_layout.addLayout(opts_row)
 
-        target_box.addWidget(target_lbl)
-        target_box.addLayout(target_input_row)
-        target_box.addLayout(opts_row)
-        folders_row.addLayout(target_box, stretch=4)
-
-        top_layout.addLayout(folders_row)
-
-        action_bar = QHBoxLayout()
-        action_bar.setSpacing(10)
-
-        self.btn_run_once = QPushButton("즉시 1회 분류 실행")
-        apply_qss_role(self.btn_run_once, role="primary", obj_name="BtnRunSortOnce")
-        self.btn_run_once.setMinimumHeight(36)
-        self.btn_run_once.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_run_once.clicked.connect(self.run_batch_sort_once)
-
-        self.btn_toggle_watch = QPushButton("실시간 자동 감시: OFF")
-        self.btn_toggle_watch.setMinimumHeight(36)
-        self.btn_toggle_watch.setCheckable(True)
-        self.btn_toggle_watch.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._update_watch_button_style(False)
-        self.btn_toggle_watch.clicked.connect(lambda: self.toggle_realtime_watch())
-
-        self.lbl_watch_status = QLabel("대기 중 (수동 실행 또는 실시간 감시를 시작하세요)")
-        apply_qss_role(self.lbl_watch_status, role="mutedText", obj_name="LblWatchStatus")
-
-        action_bar.addWidget(self.btn_run_once)
-        action_bar.addWidget(self.btn_toggle_watch)
-        action_bar.addSpacing(8)
-        action_bar.addWidget(self.lbl_watch_status)
-        action_bar.addStretch()
-
-        top_layout.addLayout(action_bar)
         main_layout.addWidget(self.top_group)
 
         # ---------------------------------------------------------------------
-        # 카드 1: 자동 분류 규칙 설정
+        # 2. 중간 카드: 자동 분류 규칙 설정
         # ---------------------------------------------------------------------
         self.rules_group = HoverZoomCard(
             title="자동 분류 규칙 설정 (우선순위 숫자가 작을수록 먼저 매칭됩니다)",
@@ -404,14 +433,19 @@ class FileSorterTab(QWidget):
         self.table_rules.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_rules.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_rules.doubleClicked.connect(self._on_edit_rule)
+        self.table_rules.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table_rules.setTextElideMode(Qt.TextElideMode.ElideRight)
+
         r_header = self.table_rules.horizontalHeader()
+        r_header.setMinimumSectionSize(40)
+        r_header.setStretchLastSection(False)
         r_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         r_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         r_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        r_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        r_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         r_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         r_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        r_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        r_header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         r_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
         self.table_rules.hideColumn(0)
 
@@ -419,7 +453,7 @@ class FileSorterTab(QWidget):
         main_layout.addWidget(self.rules_group, stretch=1)
 
         # ---------------------------------------------------------------------
-        # 카드 2: 최근 파일 분류 내역 및 실행 취소
+        # 3. 하단 카드: 최근 파일 분류 내역 및 실행 취소
         # ---------------------------------------------------------------------
         self.history_group = HoverZoomCard(
             title="최근 파일 분류 내역 및 실행 취소 (원래 위치로 되돌리기)",
@@ -471,11 +505,16 @@ class FileSorterTab(QWidget):
         )
         self.table_history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_history.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table_history.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+
         h_header = self.table_history.horizontalHeader()
+        h_header.setMinimumSectionSize(40)
+        h_header.setStretchLastSection(False)
         h_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         h_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         h_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        h_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        h_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         h_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         h_header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         h_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
@@ -762,7 +801,7 @@ class FileSorterTab(QWidget):
                 f"총 {processed}개 파일이 자동 분류되었습니다. (미해당/건너뜀: {skipped}건)",
             )
         else:
-            self.lbl_watch_status.setText(f"최근 1회 분류 결과: 이동된 파일 없음 (검사 건너뜀 {skipped}건)")
+            self.lbl_watch_status.setText(f"1회 분류 결과: 이동 파일 없음 (건너뜀 {skipped}건)")
 
     def _update_watch_button_style(self, watching: bool) -> None:
         if watching:
@@ -780,7 +819,7 @@ class FileSorterTab(QWidget):
             self._is_watching = False
             self.btn_toggle_watch.setChecked(False)
             self._update_watch_button_style(False)
-            self.lbl_watch_status.setText("실시간 자동 감시가 중지되었습니다.")
+            self.lbl_watch_status.setText("감시 중지됨 (OFF)")
             return
 
         self._save_ui_to_config()
@@ -812,7 +851,7 @@ class FileSorterTab(QWidget):
         self.btn_toggle_watch.setChecked(True)
         self._update_watch_button_style(True)
         self.lbl_watch_status.setText(
-            f"실시간 감시 중 ({len(source_dirs)}개 원본 폴더 -> {Path(target_dir).name})"
+            f"감시 중 ({len(source_dirs)}개 폴더)"
         )
 
         self.task_runner.start_worker(
@@ -824,14 +863,14 @@ class FileSorterTab(QWidget):
     def _on_realtime_file_sorted(self, item_info: Dict[str, Any]) -> None:
         self.refresh_history_table()
         self.lbl_watch_status.setText(
-            f"자동 분류됨: {item_info['file_name']} -> {item_info['category_folder']}"
+            f"분류됨: {item_info['file_name']} -> {item_info['category_folder']}"
         )
 
     def _on_watch_error(self, err_msg: str) -> None:
         self._is_watching = False
         self.btn_toggle_watch.setChecked(False)
         self._update_watch_button_style(False)
-        self.lbl_watch_status.setText("실시간 감시 오류로 중단됨")
+        self.lbl_watch_status.setText("오류로 중단됨")
 
     def refresh_history_table(self) -> None:
         history = self.db.get_file_history(limit=200, include_undone=True)
