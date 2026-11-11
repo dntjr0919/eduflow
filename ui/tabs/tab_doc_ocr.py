@@ -2585,7 +2585,7 @@ class DocOcrTab(QWidget):
             worker,
             task_key=self.TASK_DOCX_EXTRACT,
             on_result=on_done,
-            on_error=lambda err: self.lbl_agg_status.setText(f"추출 오류: {err}"),
+            on_error=lambda err: self._handle_agg_task_error("추출 오류", err),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
@@ -2646,7 +2646,7 @@ class DocOcrTab(QWidget):
             worker,
             task_key=self.TASK_RECORD_GEN,
             on_result=on_done,
-            on_error=lambda err: self.lbl_agg_status.setText(f"과세특 생성 오류: {err}"),
+            on_error=lambda err: self._handle_agg_task_error("과세특 생성 오류", err),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
@@ -2743,21 +2743,28 @@ class DocOcrTab(QWidget):
             worker,
             task_key=self.TASK_INTEGRATED,
             on_result=on_done,
-            on_error=lambda err: self.lbl_agg_status.setText(f"일괄 처리 오류: {err}"),
+            on_error=lambda err: self._handle_agg_task_error("일괄 처리 오류", err),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 
+    def _handle_agg_task_error(self, prefix: str, err: str) -> None:
+        """태스크 오류 발생 시 상태 라벨을 빨간색으로 표시하고, 메인 윈도우의 로그 서랍을 엽니다."""
+        first_line = (err or "").strip().split("\n")[0]
+        self.lbl_agg_status.setText(f"<font color='#ef4444'><b>{prefix}: {first_line}</b></font>")
+        main_win = self.window()
+        if main_win and hasattr(main_win, "btn_toggle_log"):
+            if not main_win.btn_toggle_log.isChecked():
+                main_win.btn_toggle_log.setChecked(True)
+
     def _on_stop_agg_task(self) -> None:
         """진행 중인 과제 추출, 가로 병합 또는 AI 과세특 생성 작업을 안전하게 중단합니다."""
+        self.btn_stop_agg.setEnabled(False)
         self.task_runner.stop_task(self.TASK_DOCX_EXTRACT)
         self.task_runner.stop_task(self.TASK_COLUMN_MERGE)
         self.task_runner.stop_task(self.TASK_RECORD_GEN)
         self.task_runner.stop_task(self.TASK_INTEGRATED)
-        self.lbl_agg_status.setText("작업 중단 요청됨 (현재 학생 저장 후 안전 종료 중...)")
-        QMessageBox.information(
-            self,
-            "중단 요청",
-            "작업 중단을 요청했습니다.\n현재 처리 중인 작업이 안전하게 마무리된 후 중단됩니다.",
+        self.lbl_agg_status.setText(
+            "<font color='#d97706'><b>작업 중단 요청됨 (현재 학생 저장 후 즉시 안전 종료합니다...)</b></font>"
         )
 
     # =========================================================================
@@ -2910,7 +2917,7 @@ class DocOcrTab(QWidget):
             worker,
             task_key=self.TASK_COLUMN_MERGE,
             on_result=on_done,
-            on_error=lambda err: self.lbl_merge_status.setText(f"병합 오류: {err}"),
+            on_error=lambda err: self._handle_agg_task_error("병합 오류", err),
             on_finished=lambda: self._set_agg_controls_busy(False),
         )
 

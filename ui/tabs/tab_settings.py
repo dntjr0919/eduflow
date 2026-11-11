@@ -10,6 +10,7 @@
 
 import csv
 import html
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +37,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -52,6 +54,11 @@ from services.llm_client import (
     pick_recommended_model,
 )
 from services.notifier import NotificationService
+from services.roster_parser_service import (
+    parse_club_roster,
+    parse_homeroom_roster,
+    parse_subject_roster,
+)
 from ui.components.collapsible_card import AccordionCard, AccordionGroup
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
@@ -212,7 +219,7 @@ def build_floating_tooltip(title: str, lines: List[str]) -> str:
 
 
 class StudentAddDialog(QDialog):
-    """학생 개별 추가/수정 다이얼로그."""
+    """학생 개별 추가/수정 다이얼로그 (학번-학년/반/번호 실시간 양방향 연동)."""
 
     def __init__(self, parent: Optional[QWidget] = None, data: Optional[Dict[str, Any]] = None):
         super().__init__(parent)
@@ -221,6 +228,7 @@ class StudentAddDialog(QDialog):
         apply_qss_role(self, obj_name="StudentAddModal")
         self.setStyleSheet(INPUT_FIELD_STYLE)
         self.data = data or {}
+        self._syncing: bool = False
         self._init_ui()
 
     def _init_ui(self) -> None:
@@ -235,7 +243,7 @@ class StudentAddDialog(QDialog):
 
         self.edit_student_id = QLineEdit(str(self.data.get("student_id", "")))
         configure_input_widget(self.edit_student_id)
-        self.edit_student_id.setPlaceholderText("예: 10101 (학년반번호 5자리)")
+        self.edit_student_id.setPlaceholderText("예: 10701 (5자리 입력 시 학년·반·번호 자동 분리)")
 
         self.spin_grade = QSpinBox()
         configure_input_widget(self.spin_grade)
@@ -267,6 +275,12 @@ class StudentAddDialog(QDialog):
         self.edit_memo = QLineEdit(str(self.data.get("memo", "")))
         configure_input_widget(self.edit_memo)
 
+        # 4. 학번/학년반번호 양방향 자동 연동
+        self.edit_student_id.textChanged.connect(self._on_student_id_changed)
+        self.spin_grade.valueChanged.connect(self._on_spin_changed)
+        self.spin_class.valueChanged.connect(self._on_spin_changed)
+        self.spin_number.valueChanged.connect(self._on_spin_changed)
+
         form.addRow("학번 (고유코드):", self.edit_student_id)
         form.addRow("학년:", self.spin_grade)
         form.addRow("반:", self.spin_class)
@@ -284,6 +298,37 @@ class StudentAddDialog(QDialog):
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _on_student_id_changed(self, text: str) -> None:
+        """5자리 학번 입력 시 학년(1자리), 반(2자리), 번호(2자리) 자동 분리."""
+        if self._syncing:
+            return
+        clean = text.strip()
+        if len(clean) == 5 and clean.isdigit():
+            self._syncing = True
+            try:
+                g = int(clean[0])
+                c = int(clean[1:3])
+                n = int(clean[3:5])
+                if self.spin_grade.minimum() <= g <= self.spin_grade.maximum():
+                    self.spin_grade.setValue(g)
+                if self.spin_class.minimum() <= c <= self.spin_class.maximum():
+                    self.spin_class.setValue(c)
+                if self.spin_number.minimum() <= n <= self.spin_number.maximum():
+                    self.spin_number.setValue(n)
+            finally:
+                self._syncing = False
+
+    def _on_spin_changed(self, _val: int) -> None:
+        """학년/반/번호 스핀박스 변경 시 5자리 조합 학번 자동 갱신."""
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            sid = f"{self.spin_grade.value()}{self.spin_class.value():02d}{self.spin_number.value():02d}"
+            self.edit_student_id.setText(sid)
+        finally:
+            self._syncing = False
 
     def _on_accept(self) -> None:
         sid = self.edit_student_id.text().strip()
@@ -333,45 +378,39 @@ class SettingsTab(QWidget):
 
     def _init_ui(self) -> None:
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(14, 14, 14, 14)
-        main_layout.setSpacing(12)
-
-        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.main_splitter.setChildrenCollapsible(False)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
         # =====================================================================
-        # 좌측 패널: QScrollArea + AccordionCard 3개 (AI 설정 / 폴더 감시 / 외부 연동)
-        # - 평소엔 헤더 바 리스트로 정돈, 헤더 클릭 시에만 아래로 슬라이딩 펼침
+        # [수직 스크롤 단일 열 레이아웃]
+        # 최상단: 명렬표 마스터 데이터 관리 카드 (학급담임 | 교과 | 동아리 3탭)
+        # 하단: 기존 환경설정 아코디언 카드 (AI 설정 / 폴더 감시 / 외부 연동)
         # =====================================================================
-        self.left_scroll = QScrollArea()
-        self.left_scroll.setWidgetResizable(True)
-        self.left_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.left_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.left_scroll.setMinimumWidth(460)
+        self.main_scroll = QScrollArea(self)
+        self.main_scroll.setWidgetResizable(True)
+        self.main_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.main_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(10, 10, 10, 10)
-        left_layout.setSpacing(10)
+        scroll_container = QWidget()
+        scroll_layout = QVBoxLayout(scroll_container)
+        scroll_layout.setContentsMargins(16, 16, 16, 16)
+        scroll_layout.setSpacing(16)
 
+        # 1. 최상단: [명렬표 마스터 데이터 관리] 카드
+        self.roster_card = self._build_roster_management_card()
+        scroll_layout.addWidget(self.roster_card)
+
+        # 2. 하단 아코디언 그룹
         self.settings_accordion = AccordionGroup(exclusive=SETTINGS_ACCORDION_EXCLUSIVE)
 
         # ---------------------------------------------------------------------
-        # 1. AI 및 프롬프트 설정 (기본 펼침)
+        # 2-1. AI 및 프롬프트 설정 (기본 펼침)
         # ---------------------------------------------------------------------
         self.ai_group = AccordionCard(
-            "AI 및 프롬프트 설정", parent=left_container, is_expanded=True
+            "AI 및 프롬프트 설정", parent=scroll_container, is_expanded=True
         )
         self.ai_group.setObjectName("AiPromptSettingsGroup")
-
-        self.btn_focus_left = QPushButton("전체화면")
-        apply_qss_role(self.btn_focus_left, role="cardMax", obj_name="CardMaxButton")
-        self.btn_focus_left.setCheckable(True)
-        self.btn_focus_left.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_focus_left.setToolTip("환경설정 패널을 전체화면으로 확대하거나 원래 크기로 복원합니다.")
-        self.btn_focus_left.clicked.connect(lambda: self._toggle_card_focus("left"))
-        self.ai_group.add_header_widget(self.btn_focus_left)
 
         ai_vbox = self.ai_group.body_layout()
 
@@ -495,14 +534,14 @@ class SettingsTab(QWidget):
         self.edit_custom_base_url.textChanged.connect(self._update_provider_field_states)
         self.combo_model.currentTextChanged.connect(self._on_ai_setting_changed)
 
-        left_layout.addWidget(self.ai_group)
+        scroll_layout.addWidget(self.ai_group)
         self.settings_accordion.add_card(self.ai_group)
 
         # ---------------------------------------------------------------------
         # 2. 기본 폴더 및 백그라운드 감시 설정 (기본 접힘)
         # ---------------------------------------------------------------------
         self.folder_group = AccordionCard(
-            "기본 폴더 및 백그라운드 감시 설정", parent=left_container, is_expanded=False
+            "기본 폴더 및 백그라운드 감시 설정", parent=scroll_container, is_expanded=False
         )
         self.folder_group.setObjectName("FolderSettingsGroup")
 
@@ -537,7 +576,7 @@ class SettingsTab(QWidget):
         folder_form.addRow("", self.chk_auto_watch)
         folder_form.addRow("", self.chk_ignore_temp)
         self.folder_group.add_layout(folder_form)
-        left_layout.addWidget(self.folder_group)
+        scroll_layout.addWidget(self.folder_group)
         self.settings_accordion.add_card(self.folder_group)
 
         # ---------------------------------------------------------------------
@@ -545,7 +584,7 @@ class SettingsTab(QWidget):
         # ---------------------------------------------------------------------
         self.ext_group = AccordionCard(
             "외부 연동(Google 시트/카카오톡) 및 시스템 트레이 설정",
-            parent=left_container,
+            parent=scroll_container,
             is_expanded=False,
         )
         self.ext_group.setObjectName("ExtSettingsGroup")
@@ -606,13 +645,13 @@ class SettingsTab(QWidget):
         ext_form.addRow("", self.chk_minimize_to_tray)
         ext_form.addRow("", self.chk_tray_notify)
         self.ext_group.add_layout(ext_form)
-        left_layout.addWidget(self.ext_group)
+        scroll_layout.addWidget(self.ext_group)
         self.settings_accordion.add_card(self.ext_group)
 
         # 펼침 애니메이션 완료 시 해당 카드가 스크롤 영역 안에 보이도록 자동 스크롤
         for card in self.settings_accordion.cards():
             card.animation_finished.connect(
-                lambda expanded, c=card: expanded and self.left_scroll.ensureWidgetVisible(c, 0, 10)
+                lambda expanded, c=card: expanded and self.main_scroll.ensureWidgetVisible(c, 0, 10)
             )
 
         # 하단 전체 저장 및 알림 테스트 버튼 바
@@ -638,138 +677,14 @@ class SettingsTab(QWidget):
         save_bar.addWidget(btn_test_notify)
         save_bar.addStretch()
         save_bar.addWidget(btn_reset_cfg)
-        left_layout.addLayout(save_bar)
-        left_layout.addStretch()
+        scroll_layout.addLayout(save_bar)
+        scroll_layout.addStretch()
 
-        self.left_scroll.setWidget(left_container)
-        self.main_splitter.addWidget(self.left_scroll)
+        self.main_scroll.setWidget(scroll_container)
+        main_layout.addWidget(self.main_scroll)
 
-        # =====================================================================
-        # 우측 패널 (55%): 학생 명렬표 (마스터 데이터) 정적 카드 + 전체화면 버튼
-        # =====================================================================
-        self.right_widget = QWidget()
-        self.right_widget.setMinimumWidth(420)
-        right_layout = QVBoxLayout(self.right_widget)
-        right_layout.setContentsMargins(8, 8, 18, 18)
-
-        self.stu_group = HoverZoomCard(
-            title="학생 명렬표 마스터 데이터 관리 (파일 취합·성적·출결 탭 공통 연동)",
-            parent=self.right_widget,
-            zoom_ratio=1.0,
-            hover_delay_ms=0,
-        )
-        apply_qss_role(self.stu_group, role="hoverZoomCard", obj_name="StudentMasterGroup")
-
-        self.btn_focus_students = QPushButton("전체화면")
-        apply_qss_role(self.btn_focus_students, role="cardMax", obj_name="CardMaxButton")
-        self.btn_focus_students.setCheckable(True)
-        self.btn_focus_students.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_focus_students.setToolTip("학생 명렬표 테이블 카드를 전체화면으로 크게 보거나 원래 크기로 복원합니다.")
-        self.btn_focus_students.clicked.connect(lambda: self._toggle_card_focus("right"))
-        self.stu_group.add_header_widget(self.btn_focus_students)
-
-        stu_layout = self.stu_group.body_layout()
-
-        stu_btn_bar = QHBoxLayout()
-        stu_btn_bar.setSpacing(6)
-        btn_add_stu = QPushButton("+ 학생 추가")
-        apply_qss_role(btn_add_stu, role="primary", obj_name="BtnAddStudent")
-        btn_import_file = QPushButton("CSV/엑셀 일괄 등록")
-        apply_qss_role(btn_import_file, role="secondary", obj_name="BtnImportStudents")
-        btn_export_sample = QPushButton("양식 내보내기")
-        apply_qss_role(btn_export_sample, role="secondary", obj_name="BtnExportStudents")
-        btn_del_stu = QPushButton("- 선택 삭제")
-        apply_qss_role(btn_del_stu, role="secondary", obj_name="BtnDeleteStudent")
-        btn_clear_stu = QPushButton("전체 삭제")
-        apply_qss_role(btn_clear_stu, role="warningOutline", obj_name="BtnClearStudents")
-
-        btn_import_file.clicked.connect(self._on_import_students_file)
-        btn_export_sample.clicked.connect(self._on_export_students_file)
-        btn_add_stu.clicked.connect(self._on_add_student)
-        btn_del_stu.clicked.connect(self._on_delete_student)
-        btn_clear_stu.clicked.connect(self._on_clear_students)
-
-        stu_btn_bar.addWidget(btn_add_stu)
-        stu_btn_bar.addWidget(btn_import_file)
-        stu_btn_bar.addWidget(btn_export_sample)
-        stu_btn_bar.addWidget(btn_del_stu)
-        stu_btn_bar.addStretch()
-        stu_btn_bar.addWidget(btn_clear_stu)
-        stu_layout.addLayout(stu_btn_bar)
-
-        self.lbl_student_count = QLabel(
-            "등록된 학생: 0명 (행에 마우스를 올리면 전체 상세 정보가 플로팅 툴팁으로 표시되며, 더블클릭 시 수정됩니다)"
-        )
-        apply_qss_role(self.lbl_student_count, role="mutedText")
-        stu_layout.addWidget(self.lbl_student_count)
-
-        self.table_students = QTableWidget(0, 7)
-        self.table_students.setAlternatingRowColors(True)
-        self.table_students.setMouseTracking(True)
-        self.table_students.setStyleSheet(
-            "QTableWidget { background-color: #FFFFFF; alternate-background-color: #F8F9FF; "
-            "selection-background-color: #EEF3FD; selection-color: #003EA8; "
-            "border: 1px solid #E2E8F0; border-radius: 8px; }"
-        )
-        self.table_students.setHorizontalHeaderLabels(
-            ["학번", "학년", "반", "번호", "이름", "학생 연락처", "학부모 연락처 / 비고"]
-        )
-        self.table_students.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table_students.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table_students.verticalHeader().setDefaultSectionSize(34)
-        self.table_students.verticalHeader().setVisible(False)
-        self.table_students.doubleClicked.connect(self._on_edit_student)
-        s_header = self.table_students.horizontalHeader()
-        s_header.setMinimumHeight(32)
-        s_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        s_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        s_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        s_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        s_header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        s_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
-        s_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-
-        stu_layout.addWidget(self.table_students, stretch=1)
-        right_layout.addWidget(self.stu_group)
-
-        self.main_splitter.addWidget(self.right_widget)
-        self.main_splitter.setSizes([495, 605])
-        self.main_splitter.setStretchFactor(0, 45)
-        self.main_splitter.setStretchFactor(1, 55)
-        main_layout.addWidget(self.main_splitter, stretch=1)
-
-    # =========================================================================
-    # 섹션 카드 전체화면 포커스 토글 ([ 전체화면 ] <-> [ 원래 크기로 ])
-    # =========================================================================
     def _toggle_card_focus(self, target: str) -> None:
-        if self._focused_card == target:
-            self._focused_card = None
-            self.stu_group.set_zoom_enabled(True)
-            self.left_scroll.show()
-            self.right_widget.show()
-            self.btn_focus_left.setChecked(False)
-            self.btn_focus_left.setText("전체화면")
-            self.btn_focus_students.setChecked(False)
-            self.btn_focus_students.setText("전체화면")
-            self.main_splitter.setSizes([495, 605])
-            return
-
-        self._focused_card = target
-        if target == "right":
-            self.stu_group.set_zoom_enabled(False)
-            self.left_scroll.hide()
-            self.right_widget.show()
-            self.btn_focus_students.setChecked(True)
-            self.btn_focus_students.setText("원래 크기로")
-            self.btn_focus_left.setChecked(False)
-            self.btn_focus_left.setText("전체화면")
-        elif target == "left":
-            self.right_widget.hide()
-            self.left_scroll.show()
-            self.btn_focus_left.setChecked(True)
-            self.btn_focus_left.setText("원래 크기로")
-            self.btn_focus_students.setChecked(False)
-            self.btn_focus_students.setText("전체화면")
+        pass
 
     # =========================================================================
     # AI 및 프롬프트 설정 실시간 즉시 저장 핸들러 (stateChanged / currentTextChanged / textChanged)
@@ -1258,63 +1173,575 @@ class SettingsTab(QWidget):
             self.load_settings_to_ui()
 
     # =========================================================================
-    # 학생 명렬표 마스터 데이터 관리 (CSV / Excel 입출력 및 플로팅 툴팁)
+    # [명렬표 마스터 데이터 관리] UI 및 나이스 3종(담임/교과/동아리) 연동 로직
     # =========================================================================
-    def refresh_students_table(self) -> None:
-        students = self.db.get_students()
-        self.table_students.setRowCount(0)
-        self.lbl_student_count.setText(
-            f"등록된 학생: 총 {len(students)}명 (행 위에 마우스를 올리면 상세 정보가 플로팅 툴팁으로 표시됩니다)"
+    def _build_roster_management_card(self) -> QFrame:
+        card = QFrame()
+        apply_qss_role(card, role="instrumentCard", obj_name="RosterMasterCard")
+        c_lay = QVBoxLayout(card)
+        c_lay.setContentsMargins(16, 16, 16, 16)
+        c_lay.setSpacing(12)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        lbl_title = QLabel("명렬표 마스터 데이터 관리 (나이스 NEIS 양식 100% 호환)")
+        apply_qss_role(lbl_title, role="cardTitle")
+        lbl_badge = QLabel("NEIS SYNC")
+        apply_qss_role(lbl_badge, role="badgePrimary")
+        header_row.addWidget(lbl_title)
+        header_row.addWidget(lbl_badge)
+        header_row.addStretch()
+        c_lay.addLayout(header_row)
+
+        lbl_desc = QLabel(
+            "나이스(NEIS) 양식에 맞춰 학급담임, 교과출석부, 동아리출석부를 각각 독립 관리하며, "
+            "학급 경영 도구함(담임)과 성적·수업자료 관리(교과) 탭에 실시간 자동 바인딩됩니다."
         )
+        apply_qss_role(lbl_desc, role="mutedText")
+        c_lay.addWidget(lbl_desc)
+
+        self.roster_tab_widget = QTabWidget()
+
+        # ---------------------------------------------------------------------
+        # 탭 1: 학급담임 명렬표
+        # ---------------------------------------------------------------------
+        tab1_widget = QWidget()
+        tab1_lay = QVBoxLayout(tab1_widget)
+        tab1_lay.setContentsMargins(8, 12, 8, 8)
+        tab1_lay.setSpacing(10)
+
+        t1_top = QHBoxLayout()
+        t1_top.setSpacing(8)
+        self.lbl_homeroom_badge = QLabel("현재 등록된 담임 학급 없음")
+        apply_qss_role(self.lbl_homeroom_badge, role="badgeWarning")
+
+        btn_import_hr = QPushButton("나이스 학급명렬표 등록 (.xlsx)")
+        apply_qss_role(btn_import_hr, role="primary", obj_name="BtnImportHomeroom")
+        btn_import_hr.clicked.connect(self._on_import_homeroom_file)
+
+        btn_add_hr_stu = QPushButton("+ 학생 수동 추가")
+        apply_qss_role(btn_add_hr_stu, role="secondary", obj_name="BtnAddHomeroomStudent")
+        btn_add_hr_stu.clicked.connect(self._on_add_student)
+
+        btn_export_hr = QPushButton("양식 내보내기")
+        apply_qss_role(btn_export_hr, role="secondary", obj_name="BtnExportHomeroom")
+        btn_export_hr.clicked.connect(self._on_export_students_file)
+
+        btn_reset_hr = QPushButton("초기화")
+        apply_qss_role(btn_reset_hr, role="warningOutline", obj_name="BtnResetHomeroom")
+        btn_reset_hr.clicked.connect(self._on_reset_homeroom)
+
+        t1_top.addWidget(self.lbl_homeroom_badge)
+        t1_top.addStretch()
+        t1_top.addWidget(btn_import_hr)
+        t1_top.addWidget(btn_add_hr_stu)
+        t1_top.addWidget(btn_export_hr)
+        t1_top.addWidget(btn_reset_hr)
+        tab1_lay.addLayout(t1_top)
+
+        self.table_homeroom = QTableWidget(0, 7)
+        self.table_homeroom.setAlternatingRowColors(True)
+        self.table_homeroom.setMouseTracking(True)
+        self.table_homeroom.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_homeroom.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_homeroom.verticalHeader().setDefaultSectionSize(32)
+        self.table_homeroom.verticalHeader().setVisible(False)
+        self.table_homeroom.setMinimumHeight(320)
+        self.table_homeroom.doubleClicked.connect(self._on_edit_student)
+        tab1_lay.addWidget(self.table_homeroom)
+
+        self.table_students = self.table_homeroom
+        self.lbl_student_count = self.lbl_homeroom_badge
+
+        self.roster_tab_widget.addTab(tab1_widget, "학급담임 명렬표")
+
+        # ---------------------------------------------------------------------
+        # 탭 2: 교과 출석부 명렬표
+        # ---------------------------------------------------------------------
+        tab2_widget = QWidget()
+        tab2_lay = QVBoxLayout(tab2_widget)
+        tab2_lay.setContentsMargins(8, 12, 8, 8)
+        tab2_lay.setSpacing(10)
+
+        t2_top = QHBoxLayout()
+        t2_top.setSpacing(8)
+        lbl_sub_sel = QLabel("등록된 교과 강좌:")
+        apply_qss_role(lbl_sub_sel, role="fieldLabel")
+
+        self.combo_subject_groups = QComboBox()
+        configure_input_widget(self.combo_subject_groups)
+        self.combo_subject_groups.setMinimumWidth(240)
+        self.combo_subject_groups.currentIndexChanged.connect(self._on_subject_group_changed)
+
+        self.lbl_subject_badge = QLabel("등록된 교과 없음")
+        apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+
+        btn_import_sub = QPushButton("나이스 교과출석부 등록 (.xlsx)")
+        apply_qss_role(btn_import_sub, role="primary", obj_name="BtnImportSubject")
+        btn_import_sub.clicked.connect(self._on_import_subject_file)
+
+        btn_del_sub = QPushButton("- 선택 교과 삭제")
+        apply_qss_role(btn_del_sub, role="secondary", obj_name="BtnDeleteSubject")
+        btn_del_sub.clicked.connect(self._on_delete_subject)
+
+        t2_top.addWidget(lbl_sub_sel)
+        t2_top.addWidget(self.combo_subject_groups)
+        t2_top.addWidget(self.lbl_subject_badge)
+        t2_top.addStretch()
+        t2_top.addWidget(btn_import_sub)
+        t2_top.addWidget(btn_del_sub)
+        tab2_lay.addLayout(t2_top)
+
+        self.table_subject = QTableWidget(0, 7)
+        self.table_subject.setAlternatingRowColors(True)
+        self.table_subject.setMouseTracking(True)
+        self.table_subject.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_subject.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_subject.verticalHeader().setDefaultSectionSize(32)
+        self.table_subject.verticalHeader().setVisible(False)
+        self.table_subject.setMinimumHeight(320)
+        self.table_subject.setHorizontalHeaderLabels(["연번", "학번", "학년", "학과", "반", "번호", "성명"])
+        tab2_lay.addWidget(self.table_subject)
+
+        self.roster_tab_widget.addTab(tab2_widget, "교과 출석부 명렬표")
+
+        # ---------------------------------------------------------------------
+        # 탭 3: 동아리 출석부
+        # ---------------------------------------------------------------------
+        tab3_widget = QWidget()
+        tab3_lay = QVBoxLayout(tab3_widget)
+        tab3_lay.setContentsMargins(8, 12, 8, 8)
+        tab3_lay.setSpacing(10)
+
+        t3_top = QHBoxLayout()
+        t3_top.setSpacing(8)
+        lbl_club_sel = QLabel("등록된 동아리:")
+        apply_qss_role(lbl_club_sel, role="fieldLabel")
+
+        self.combo_club_groups = QComboBox()
+        configure_input_widget(self.combo_club_groups)
+        self.combo_club_groups.setMinimumWidth(240)
+        self.combo_club_groups.currentIndexChanged.connect(self._on_club_group_changed)
+
+        self.lbl_club_badge = QLabel("등록된 동아리 없음")
+        apply_qss_role(self.lbl_club_badge, role="badgeWarning")
+
+        btn_import_club = QPushButton("나이스 동아리출석부 등록 (.xlsx)")
+        apply_qss_role(btn_import_club, role="primary", obj_name="BtnImportClub")
+        btn_import_club.clicked.connect(self._on_import_club_file)
+
+        btn_del_club = QPushButton("- 선택 동아리 삭제")
+        apply_qss_role(btn_del_club, role="secondary", obj_name="BtnDeleteClub")
+        btn_del_club.clicked.connect(self._on_delete_club)
+
+        t3_top.addWidget(lbl_club_sel)
+        t3_top.addWidget(self.combo_club_groups)
+        t3_top.addWidget(self.lbl_club_badge)
+        t3_top.addStretch()
+        t3_top.addWidget(btn_import_club)
+        t3_top.addWidget(btn_del_club)
+        tab3_lay.addLayout(t3_top)
+
+        self.table_club = QTableWidget(0, 7)
+        self.table_club.setAlternatingRowColors(True)
+        self.table_club.setMouseTracking(True)
+        self.table_club.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_club.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_club.verticalHeader().setDefaultSectionSize(32)
+        self.table_club.verticalHeader().setVisible(False)
+        self.table_club.setMinimumHeight(320)
+        self.table_club.setHorizontalHeaderLabels(["No", "학번", "학년", "학과", "반", "번호", "성명"])
+        tab3_lay.addWidget(self.table_club)
+
+        self.roster_tab_widget.addTab(tab3_widget, "동아리 출석부")
+
+        c_lay.addWidget(self.roster_tab_widget)
+        return card
+
+    def refresh_students_table(self) -> None:
+        """기존 코드 하위 호환성을 위해 전체 명렬표 갱신을 호출합니다."""
+        self.refresh_all_rosters()
+
+    def refresh_all_rosters(self) -> None:
+        """학급담임, 교과, 동아리 명렬표를 모두 새로고침합니다."""
+        self.refresh_homeroom_tab()
+        self.refresh_subject_tab()
+        self.refresh_club_tab()
+
+    def refresh_homeroom_tab(self) -> None:
+        """나이스 학급담임 명렬표 데이터를 동적 컬럼으로 출력합니다."""
+        active_group = self.db.get_active_homeroom_group()
+        if not active_group:
+            self.lbl_homeroom_badge.setText("현재 등록된 담임 학급 없음")
+            apply_qss_role(self.lbl_homeroom_badge, role="badgeWarning")
+            self.table_homeroom.setRowCount(0)
+            self.table_homeroom.setColumnCount(7)
+            self.table_homeroom.setHorizontalHeaderLabels(
+                ["학번", "학년", "반", "번호", "이름", "학생 연락처", "학부모 연락처 / 비고"]
+            )
+            return
+
+        students = self.db.get_roster_students(active_group["id"])
+        self.lbl_homeroom_badge.setText(
+            f"현재 담임 학급: {active_group['group_name']} ({len(students)}명)"
+        )
+        apply_qss_role(self.lbl_homeroom_badge, role="badgeSuccess")
+
+        try:
+            col_list = json.loads(active_group.get("columns_json", "[]"))
+        except Exception:
+            col_list = []
+
+        if not col_list:
+            col_list = ["학번", "학년", "반", "번호", "성명", "주민등록번호", "주소", "비고"]
+        elif "학번" not in col_list:
+            col_list = ["학번"] + [c for c in col_list if c != "학번"]
+
+        self.table_homeroom.setRowCount(0)
+        self.table_homeroom.setColumnCount(len(col_list))
+        self.table_homeroom.setHorizontalHeaderLabels(col_list)
 
         for row_idx, s in enumerate(students):
-            self.table_students.insertRow(row_idx)
-            sid_item = QTableWidgetItem(str(s["student_id"]))
-            sid_item.setData(Qt.ItemDataRole.UserRole, s)
-            sid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table_homeroom.insertRow(row_idx)
+            extra = s.get("extra_data_dict", {})
 
-            g_item = QTableWidgetItem(str(s["grade"]))
-            g_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            c_item = QTableWidgetItem(str(s["class_no"]))
-            c_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            n_item = QTableWidgetItem(str(s["number"]))
-            n_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            name_item = QTableWidgetItem(s["name"])
-            name_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            contact_item = QTableWidgetItem(s["contact"])
+            for col_idx, col_name in enumerate(col_list):
+                c_clean = col_name.replace(" ", "")
+                if col_name == "학번":
+                    val_str = str(s["student_id"])
+                elif c_clean == "학년":
+                    val_str = str(s["grade"])
+                elif c_clean == "반":
+                    val_str = str(s["class_no"])
+                elif c_clean == "번호":
+                    val_str = str(s["number"])
+                elif c_clean in ("성명", "이름"):
+                    val_str = str(s["name"])
+                elif c_clean in ("비고", "메모"):
+                    val_str = str(s.get("memo", "") or extra.get(col_name, ""))
+                else:
+                    val_str = str(extra.get(col_name) or extra.get(c_clean) or "")
 
-            parent_memo = s["parent_contact"]
-            if s["memo"]:
-                parent_memo = f"{parent_memo} ({s['memo']})" if parent_memo else s["memo"]
-            pm_item = QTableWidgetItem(parent_memo)
+                it = QTableWidgetItem(val_str)
+                if col_idx == 0:
+                    it.setData(Qt.ItemDataRole.UserRole, s)
+                if col_name in ("학번", "학년", "반", "번호", "성명", "성별"):
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            tooltip_html = build_floating_tooltip(
-                f"[{s['student_id']}] {s['name']}",
-                [
-                    f"<b>학급 정보:</b> {s['grade']}학년 {s['class_no']}반 {s['number']}번",
-                    f"<b>학생 연락처:</b> {html.escape(s['contact'] or '-')}",
-                    f"<b>학부모 연락처:</b> {html.escape(s['parent_contact'] or '-')}",
-                    f"<b>비고/특기사항:</b> {html.escape(s['memo'] or '-')}",
-                ],
-            )
-
-            items = [sid_item, g_item, c_item, n_item, name_item, contact_item, pm_item]
-            for col_idx, it in enumerate(items):
+                tooltip_html = build_floating_tooltip(
+                    f"[{s['student_id']}] {s['name']}",
+                    [
+                        f"<b>학급 정보:</b> {s['grade']}학년 {s['class_no']}반 {s['number']}번",
+                        f"<b>항목({col_name}):</b> {html.escape(val_str or '-')}",
+                        f"<b>비고:</b> {html.escape(s.get('memo', '') or '-')}",
+                    ],
+                )
                 it.setToolTip(tooltip_html)
-                self.table_students.setItem(row_idx, col_idx, it)
+                self.table_homeroom.setItem(row_idx, col_idx, it)
 
+        header = self.table_homeroom.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        for i in range(1, len(col_list)):
+            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+
+    def refresh_subject_tab(self) -> None:
+        """등록된 교과 강좌 목록과 출석부를 갱신합니다."""
+        groups = self.db.get_roster_groups(group_type="subject")
+        current_id = self.combo_subject_groups.currentData()
+
+        self.combo_subject_groups.blockSignals(True)
+        self.combo_subject_groups.clear()
+        for g in groups:
+            extra = f" {g['extra_info']}".rstrip() if g.get("extra_info") else ""
+            self.combo_subject_groups.addItem(f"{g['group_name']}{extra}", g["id"])
+        self.combo_subject_groups.blockSignals(False)
+
+        if groups:
+            target_idx = 0
+            if current_id is not None:
+                found = self.combo_subject_groups.findData(current_id)
+                if found >= 0:
+                    target_idx = found
+            self.combo_subject_groups.setCurrentIndex(target_idx)
+            self._on_subject_group_changed(target_idx)
+        else:
+            self.lbl_subject_badge.setText("등록된 교과 없음")
+            apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+            self.table_subject.setRowCount(0)
+
+    def _on_subject_group_changed(self, _idx: int = 0) -> None:
+        group_id = self.combo_subject_groups.currentData()
+        if not group_id:
+            self.lbl_subject_badge.setText("선택된 교과 없음")
+            apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+            self.table_subject.setRowCount(0)
+            return
+
+        students = self.db.get_roster_students(group_id)
+        self.lbl_subject_badge.setText(f"수강 학생: {len(students)}명")
+        apply_qss_role(self.lbl_subject_badge, role="badgeSuccess")
+
+        self.table_subject.setRowCount(0)
+        for row_idx, s in enumerate(students):
+            self.table_subject.insertRow(row_idx)
+            extra = s.get("extra_data_dict", {})
+            dept = extra.get("학과", "")
+
+            items = [
+                QTableWidgetItem(str(s["seq_no"])),
+                QTableWidgetItem(str(s["student_id"])),
+                QTableWidgetItem(str(s["grade"])),
+                QTableWidgetItem(str(dept)),
+                QTableWidgetItem(str(s["class_no"])),
+                QTableWidgetItem(str(s["number"])),
+                QTableWidgetItem(str(s["name"])),
+            ]
+            for c_idx, it in enumerate(items):
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table_subject.setItem(row_idx, c_idx, it)
+
+    def refresh_club_tab(self) -> None:
+        """등록된 동아리 목록과 출석부를 갱신합니다."""
+        groups = self.db.get_roster_groups(group_type="club")
+        current_id = self.combo_club_groups.currentData()
+
+        self.combo_club_groups.blockSignals(True)
+        self.combo_club_groups.clear()
+        for g in groups:
+            extra = f" ({g['extra_info']})" if g.get("extra_info") else ""
+            self.combo_club_groups.addItem(f"{g['group_name']}{extra}", g["id"])
+        self.combo_club_groups.blockSignals(False)
+
+        if groups:
+            target_idx = 0
+            if current_id is not None:
+                found = self.combo_club_groups.findData(current_id)
+                if found >= 0:
+                    target_idx = found
+            self.combo_club_groups.setCurrentIndex(target_idx)
+            self._on_club_group_changed(target_idx)
+        else:
+            self.lbl_club_badge.setText("등록된 동아리 없음")
+            apply_qss_role(self.lbl_club_badge, role="badgeWarning")
+            self.table_club.setRowCount(0)
+
+    def _on_club_group_changed(self, _idx: int = 0) -> None:
+        group_id = self.combo_club_groups.currentData()
+        if not group_id:
+            self.lbl_club_badge.setText("선택된 동아리 없음")
+            apply_qss_role(self.lbl_club_badge, role="badgeWarning")
+            self.table_club.setRowCount(0)
+            return
+
+        students = self.db.get_roster_students(group_id)
+        self.lbl_club_badge.setText(f"부원: {len(students)}명")
+        apply_qss_role(self.lbl_club_badge, role="badgeSuccess")
+
+        self.table_club.setRowCount(0)
+        for row_idx, s in enumerate(students):
+            self.table_club.insertRow(row_idx)
+            extra = s.get("extra_data_dict", {})
+            dept = extra.get("학과", "")
+
+            items = [
+                QTableWidgetItem(str(s["seq_no"])),
+                QTableWidgetItem(str(s["student_id"])),
+                QTableWidgetItem(str(s["grade"])),
+                QTableWidgetItem(str(dept)),
+                QTableWidgetItem(str(s["class_no"])),
+                QTableWidgetItem(str(s["number"])),
+                QTableWidgetItem(str(s["name"])),
+            ]
+            for c_idx, it in enumerate(items):
+                it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table_club.setItem(row_idx, c_idx, it)
+
+    # =========================================================================
+    # 나이스 엑셀 등록 및 삭제 핸들러
+    # =========================================================================
+    def _on_import_homeroom_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "나이스 학급담임 명렬표 엑셀 파일(.xlsx) 선택",
+            "",
+            "Excel Files (*.xlsx);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            group_info, student_list = parse_homeroom_roster(file_path)
+            group_id = self.db.create_roster_group(
+                group_type=group_info["group_type"],
+                group_name=group_info["group_name"],
+                extra_info=group_info.get("extra_info", ""),
+                columns_json=group_info.get("columns_json", "[]"),
+                is_active=1,
+            )
+            self.db.add_roster_students(group_id, student_list)
+
+            for s in student_list:
+                self.db.upsert_student(
+                    student_id=s["student_id"],
+                    grade=s["grade"],
+                    class_no=s["class_no"],
+                    number=s["number"],
+                    name=s["name"],
+                    contact=s.get("contact", ""),
+                    parent_contact=s.get("parent_contact", ""),
+                    memo=s.get("memo", ""),
+                )
+
+            self.refresh_all_rosters()
+            QMessageBox.information(
+                self,
+                "학급담임 명렬표 등록 완료",
+                f"[{group_info['group_name']}] 총 {len(student_list)}명의 학생 명렬표가 등록되었습니다.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "파일 가져오기 오류", f"학급담임 명렬표를 읽는 중 오류가 발생했습니다:\n{exc}")
+
+    def _on_import_subject_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "나이스 교과출석부 엑셀 파일(.xlsx) 선택",
+            "",
+            "Excel Files (*.xlsx);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            group_info, student_list = parse_subject_roster(file_path)
+            group_id = self.db.create_roster_group(
+                group_type=group_info["group_type"],
+                group_name=group_info["group_name"],
+                extra_info=group_info.get("extra_info", ""),
+                columns_json=group_info.get("columns_json", "[]"),
+                is_active=1,
+            )
+            self.db.add_roster_students(group_id, student_list)
+
+            self.refresh_all_rosters()
+            idx = self.combo_subject_groups.findData(group_id)
+            if idx >= 0:
+                self.combo_subject_groups.setCurrentIndex(idx)
+
+            QMessageBox.information(
+                self,
+                "교과 출석부 등록 완료",
+                f"[{group_info['group_name']} {group_info.get('extra_info', '')}] 총 {len(student_list)}명의 학생이 등록되었습니다.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "파일 가져오기 오류", f"교과출석부를 읽는 중 오류가 발생했습니다:\n{exc}")
+
+    def _on_import_club_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "나이스 동아리출석부 엑셀 파일(.xlsx) 선택",
+            "",
+            "Excel Files (*.xlsx);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+
+        try:
+            group_info, student_list = parse_club_roster(file_path)
+            group_id = self.db.create_roster_group(
+                group_type=group_info["group_type"],
+                group_name=group_info["group_name"],
+                extra_info=group_info.get("extra_info", ""),
+                columns_json=group_info.get("columns_json", "[]"),
+                is_active=1,
+            )
+            self.db.add_roster_students(group_id, student_list)
+
+            self.refresh_all_rosters()
+            idx = self.combo_club_groups.findData(group_id)
+            if idx >= 0:
+                self.combo_club_groups.setCurrentIndex(idx)
+
+            QMessageBox.information(
+                self,
+                "동아리 출석부 등록 완료",
+                f"[{group_info['group_name']}] 총 {len(student_list)}명의 학생이 등록되었습니다.",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "파일 가져오기 오류", f"동아리출석부를 읽는 중 오류가 발생했습니다:\n{exc}")
+
+    def _on_reset_homeroom(self) -> None:
+        ans = QMessageBox.question(
+            self,
+            "학급담임 명렬표 초기화",
+            "등록된 학급담임 명렬표 데이터를 모두 초기화하시겠습니까?",
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self.db.clear_roster_groups(group_type="homeroom")
+            self.db.clear_students()
+            self.refresh_all_rosters()
+
+    def _on_delete_subject(self) -> None:
+        group_id = self.combo_subject_groups.currentData()
+        if not group_id:
+            QMessageBox.information(self, "안내", "삭제할 교과 강좌를 선택해 주세요.")
+            return
+        ans = QMessageBox.question(
+            self,
+            "교과 출석부 삭제",
+            f"선택한 교과 강좌([{self.combo_subject_groups.currentText()}]) 명렬표를 삭제하시겠습니까?",
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self.db.delete_roster_group(group_id)
+            self.refresh_all_rosters()
+
+    def _on_delete_club(self) -> None:
+        group_id = self.combo_club_groups.currentData()
+        if not group_id:
+            QMessageBox.information(self, "안내", "삭제할 동아리를 선택해 주세요.")
+            return
+        ans = QMessageBox.question(
+            self,
+            "동아리 출석부 삭제",
+            f"선택한 동아리([{self.combo_club_groups.currentText()}]) 명렬표를 삭제하시겠습니까?",
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self.db.delete_roster_group(group_id)
+            self.refresh_all_rosters()
+
+    # =========================================================================
+    # 학생 수동 추가/수정/삭제/내보내기
+    # =========================================================================
     def _on_add_student(self) -> None:
         dlg = StudentAddDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
+            active_group = self.db.get_active_homeroom_group()
+            if not active_group:
+                g = vals.get("grade", 1)
+                c = vals.get("class_no", 1)
+                group_id = self.db.create_roster_group(
+                    group_type="homeroom",
+                    group_name=f"{g}학년 {c}반",
+                    columns_json=json.dumps(
+                        ["학번", "학년", "반", "번호", "이름", "학생 연락처", "학부모 연락처", "비고"],
+                        ensure_ascii=False,
+                    ),
+                    is_active=1,
+                )
+            else:
+                group_id = active_group["id"]
+
+            st_record = dict(vals)
+            st_record["seq_no"] = vals.get("number", 1)
+            self.db.add_roster_students(group_id, [st_record])
             self.db.upsert_student(**vals)
-            self.refresh_students_table()
+            self.refresh_all_rosters()
 
     def _on_edit_student(self) -> None:
-        row = self.table_students.currentRow()
+        row = self.table_homeroom.currentRow()
         if row < 0:
             return
-        sid_item = self.table_students.item(row, 0)
+        sid_item = self.table_homeroom.item(row, 0)
         if not sid_item:
             return
         s_data = sid_item.data(Qt.ItemDataRole.UserRole)
@@ -1322,104 +1749,28 @@ class SettingsTab(QWidget):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             vals = dlg.get_values()
             self.db.upsert_student(**vals)
-            self.refresh_students_table()
+            active_group = self.db.get_active_homeroom_group()
+            if active_group:
+                st_record = dict(vals)
+                st_record["seq_no"] = vals.get("number", 1)
+                self.db.add_roster_students(active_group["id"], [st_record])
+            self.refresh_all_rosters()
 
     def _on_delete_student(self) -> None:
-        row = self.table_students.currentRow()
+        row = self.table_homeroom.currentRow()
         if row < 0:
             QMessageBox.information(self, "안내", "삭제할 학생을 선택해 주세요.")
             return
-        sid_item = self.table_students.item(row, 0)
+        sid_item = self.table_homeroom.item(row, 0)
         if sid_item:
             self.db.delete_student(sid_item.text())
-            self.refresh_students_table()
+            self.refresh_all_rosters()
 
     def _on_clear_students(self) -> None:
-        ans = QMessageBox.question(self, "전체 삭제", "등록된 학생 명렬표 데이터를 모두 삭제하시겠습니까?")
-        if ans == QMessageBox.StandardButton.Yes:
-            self.db.clear_students()
-            self.refresh_students_table()
+        self._on_reset_homeroom()
 
     def _on_import_students_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "학생 명렬표 CSV 또는 Excel(.xlsx) 파일 선택",
-            "",
-            "명렬표 파일 (*.csv *.xlsx);;CSV Files (*.csv);;Excel Files (*.xlsx)",
-        )
-        if not file_path:
-            return
-
-        path_obj = Path(file_path)
-        rows_loaded: List[List[Any]] = []
-
-        try:
-            if path_obj.suffix.lower() == ".xlsx":
-                import openpyxl
-                wb = openpyxl.load_workbook(file_path, data_only=True)
-                ws = wb.active
-                for row in ws.iter_rows(values_only=True):
-                    if any(cell is not None for cell in row):
-                        rows_loaded.append([str(c).strip() if c is not None else "" for c in row])
-            else:
-                content = None
-                for enc in ("utf-8-sig", "cp949", "euc-kr", "utf-8"):
-                    try:
-                        with open(file_path, "r", encoding=enc, newline="") as f:
-                            content = list(csv.reader(f))
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                if content is None:
-                    raise ValueError("CSV 파일 인코딩을 읽을 수 없습니다.")
-                rows_loaded = content
-
-            count = 0
-            for idx, r in enumerate(rows_loaded):
-                if not r or len(r) < 2:
-                    continue
-                first_col = str(r[0]).strip()
-                if idx == 0 and any(h in first_col for h in ("학번", "학년", "student", "번호", "이름")):
-                    continue
-
-                if len(r) >= 5:
-                    sid = str(r[0]).strip()
-                    grade = int(r[1]) if str(r[1]).isdigit() else 1
-                    class_no = int(r[2]) if str(r[2]).isdigit() else 1
-                    number = int(r[3]) if str(r[3]).isdigit() else (idx + 1)
-                    name = str(r[4]).strip()
-                    contact = str(r[5]).strip() if len(r) > 5 else ""
-                    parent = str(r[6]).strip() if len(r) > 6 else ""
-                    memo = str(r[7]).strip() if len(r) > 7 else ""
-                else:
-                    sid = str(r[0]).strip()
-                    name = str(r[1]).strip()
-                    grade = int(sid[0]) if len(sid) == 5 and sid.isdigit() else 1
-                    class_no = int(sid[1:3]) if len(sid) == 5 and sid.isdigit() else 1
-                    number = int(sid[3:5]) if len(sid) == 5 and sid.isdigit() else (idx + 1)
-                    contact = str(r[2]).strip() if len(r) > 2 else ""
-                    parent = str(r[3]).strip() if len(r) > 3 else ""
-                    memo = ""
-
-                if not sid:
-                    sid = f"{grade}{class_no:02d}{number:02d}"
-                if name:
-                    self.db.upsert_student(
-                        student_id=sid,
-                        grade=grade,
-                        class_no=class_no,
-                        number=number,
-                        name=name,
-                        contact=contact,
-                        parent_contact=parent,
-                        memo=memo,
-                    )
-                    count += 1
-
-            self.refresh_students_table()
-            QMessageBox.information(self, "일괄 등록 완료", f"총 {count}명의 학생 명렬표를 성공적으로 등록했습니다.")
-        except Exception as exc:
-            QMessageBox.critical(self, "파일 가져오기 오류", f"명렬표 파일을 읽는 중 오류가 발생했습니다:\n{exc}")
+        self._on_import_homeroom_file()
 
     def _on_export_students_file(self) -> None:
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1459,6 +1810,7 @@ class SettingsTab(QWidget):
         try:
             if file_path.lower().endswith(".xlsx"):
                 import openpyxl
+
                 wb = openpyxl.Workbook()
                 ws = wb.active
                 ws.title = "학생명렬표"

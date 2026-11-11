@@ -141,6 +141,7 @@ class GradeMaterialTab(QWidget):
 
         self._init_ui()
         self._populate_unit_tree()
+        self._populate_subject_combo()
         self.refresh_student_preview()
 
     def _create_kpi_card(
@@ -296,6 +297,34 @@ class GradeMaterialTab(QWidget):
 
         l_lay = self.left_group.body_layout()
 
+        # [교과 연동 바] 교과 강좌 선택 콤보박스 및 교과 연동 배지
+        subject_bar = QHBoxLayout()
+        subject_bar.setSpacing(8)
+        lbl_sub_title = QLabel("교과 강좌:")
+        apply_qss_role(lbl_sub_title, role="fieldLabel")
+
+        self.combo_subject_roster = QComboBox()
+        self.combo_subject_roster.setMinimumHeight(34)
+        self.combo_subject_roster.setMinimumWidth(220)
+        self.combo_subject_roster.currentIndexChanged.connect(self._on_subject_roster_changed)
+
+        self.lbl_subject_badge = QLabel("연동 명렬표: [교과 출석부] 등록된 교과 없음")
+        apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+
+        subject_bar.addWidget(lbl_sub_title)
+        subject_bar.addWidget(self.combo_subject_roster)
+        subject_bar.addWidget(self.lbl_subject_badge)
+        subject_bar.addStretch()
+        l_lay.addLayout(subject_bar)
+
+        # 등록된 교과 명렬표가 없을 경우 안내 배너 노출
+        self.banner_no_subject = QLabel(
+            "등록된 교과 출석부가 없습니다. [환경설정] 탭의 [교과 출석부 명렬표]에서 나이스 교과출석부(.xlsx)를 먼저 등록해 주세요."
+        )
+        apply_qss_role(self.banner_no_subject, role="infoBanner")
+        self.banner_no_subject.setVisible(False)
+        l_lay.addWidget(self.banner_no_subject)
+
         # 상단 툴바: 검색어 필터 + 명렬표 동기화 + 엑셀 내보내기
         top_bar = QHBoxLayout()
         top_bar.setSpacing(8)
@@ -309,7 +338,7 @@ class GradeMaterialTab(QWidget):
         apply_qss_role(self.btn_reload, role="primary", obj_name="BtnReloadRosterGrades")
         self.btn_reload.setMinimumHeight(34)
         self.btn_reload.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_reload.clicked.connect(self.refresh_student_preview)
+        self.btn_reload.clicked.connect(self._on_reload_clicked)
 
         self.btn_export_grades = QPushButton("성적표 내보내기 (.csv/.xlsx)")
         apply_qss_role(self.btn_export_grades, role="secondary", obj_name="BtnExportGrades")
@@ -474,9 +503,65 @@ class GradeMaterialTab(QWidget):
             self.btn_focus_left.setChecked(False)
             self.btn_focus_left.setText("전체화면")
 
+    def _populate_subject_combo(self) -> None:
+        """등록된 교과 강좌 목록을 콤보박스에 바인딩합니다."""
+        groups = self.db.get_roster_groups(group_type="subject")
+        current_id = self.combo_subject_roster.currentData()
+
+        self.combo_subject_roster.blockSignals(True)
+        self.combo_subject_roster.clear()
+        for g in groups:
+            extra = f" {g['extra_info']}".rstrip() if g.get("extra_info") else ""
+            self.combo_subject_roster.addItem(f"{g['group_name']}{extra}", g["id"])
+        self.combo_subject_roster.blockSignals(False)
+
+        if groups:
+            target_idx = 0
+            if current_id is not None:
+                found = self.combo_subject_roster.findData(current_id)
+                if found >= 0:
+                    target_idx = found
+            self.combo_subject_roster.setCurrentIndex(target_idx)
+            self.banner_no_subject.setVisible(False)
+        else:
+            self.lbl_subject_badge.setText("연동 명렬표: [교과 출석부] 등록된 교과 없음")
+            apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+            self.banner_no_subject.setVisible(True)
+
+    def _on_subject_roster_changed(self, _idx: int = 0) -> None:
+        """교과 콤보박스 변경 시 연동 배지를 업데이트하고 해당 교과 학생 목록으로 갱신합니다."""
+        group_id = self.combo_subject_roster.currentData()
+        if not group_id:
+            self.lbl_subject_badge.setText("연동 명렬표: [교과 출석부] 등록된 교과 없음")
+            apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+            self.banner_no_subject.setVisible(True)
+        else:
+            subject_name = self.combo_subject_roster.currentText()
+            self.lbl_subject_badge.setText(f"연동 명렬표: [교과 출석부] {subject_name}")
+            apply_qss_role(self.lbl_subject_badge, role="badgeSuccess")
+            self.banner_no_subject.setVisible(False)
+
+        self.refresh_student_preview()
+
+    def _on_reload_clicked(self) -> None:
+        self._populate_subject_combo()
+        self.refresh_student_preview()
+
     def refresh_student_preview(self) -> None:
-        """DatabaseManager.get_students()에서 명렬표를 읽어 성적표 그리드와 상단 KPI 카드를 갱신합니다."""
-        students = self.db.get_students()
+        """선택된 교과 출석부에서 학생 명단을 연번 순으로 읽어 성적표 그리드와 상단 KPI 카드를 갱신합니다."""
+        group_id = self.combo_subject_roster.currentData()
+        if group_id:
+            students = self.db.get_roster_students(group_id)
+            subject_name = self.combo_subject_roster.currentText()
+            self.lbl_subject_badge.setText(f"연동 명렬표: [교과 출석부] {subject_name}")
+            apply_qss_role(self.lbl_subject_badge, role="badgeSuccess")
+            self.banner_no_subject.setVisible(False)
+        else:
+            students = []
+            self.lbl_subject_badge.setText("연동 명렬표: [교과 출석부] 등록된 교과 없음")
+            apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
+            self.banner_no_subject.setVisible(True)
+
         self._updating_table = True
         tabular_font = QFont("JetBrains Mono", 10)
         tabular_font.setStyleHint(QFont.StyleHint.Monospace)
@@ -486,6 +571,7 @@ class GradeMaterialTab(QWidget):
             for idx, s in enumerate(students):
                 self.table_grades.insertRow(idx)
                 sid_str = str(s["student_id"])
+                seq_no = s.get("seq_no", idx + 1)
                 cached = self._grade_cache.get(sid_str, {})
 
                 m1_val = cached.get("m1", "-")
@@ -512,7 +598,7 @@ class GradeMaterialTab(QWidget):
                 memo_it = QTableWidgetItem(memo_val)
 
                 tip = (
-                    f"<div style='padding:2px 4px;'><b>[{html.escape(sid_str)}] {html.escape(s['name'])}</b><br/>"
+                    f"<div style='padding:2px 4px;'><b>[연번 {seq_no}] [{html.escape(sid_str)}] {html.escape(s['name'])}</b><br/>"
                     f"1차 지필: {html.escape(m1_val)} / 수행평가: {html.escape(perf_val)}<br/>"
                     f"비고: {html.escape(memo_val or '-')}</div>"
                 )

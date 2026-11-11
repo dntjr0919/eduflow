@@ -463,19 +463,25 @@ def generate_single_student_record(
                     prompt=current_prompt,
                     system_prompt="당신은 대한민국 중·고등학교 교사를 지원하는 NEIS 학교생활기록부 작성 전문 AI이다.",
                 )
+                if stop_checker and stop_checker():
+                    return "사용자에 의해 작업 중단됨"
+
                 if response and response.strip():
                     return response.strip()
                 raise ValueError("AI 응답이 비어 있습니다.")
             except Exception as exc:
+                if stop_checker and stop_checker():
+                    return "사용자에 의해 작업 중단됨"
+
                 err_str = str(exc)
                 if "429" in err_str or "rate limit" in err_str.lower():
                     wait_sec = extract_retry_seconds(err_str, default_seconds=15)
                     if log_callback:
                         log_callback("WARN", f"API 요청 한도(429/RateLimit) 도달. {wait_sec}초 대기 후 재시도합니다...")
-                    for _ in range(wait_sec * 2):
+                    for _ in range(int(wait_sec * 10)):
                         if stop_checker and stop_checker():
                             return "사용자에 의해 작업 중단됨"
-                        time.sleep(0.5)
+                        time.sleep(0.1)
                     attempt += 1
                     continue
                 else:
@@ -484,7 +490,13 @@ def generate_single_student_record(
                     return f"생성 실패: {err_str}"
         return f"생성 실패: API 최대 재시도 초과 ({max_retries}회)"
 
+    if stop_checker and stop_checker():
+        return "사용자에 의해 작업 중단됨", 0
+
     initial_output = send_prompt(prompt_text)
+    if stop_checker and stop_checker():
+        return "사용자에 의해 작업 중단됨", 0
+
     if not length_policy.enabled or not initial_output or initial_output.startswith("생성 실패"):
         return initial_output, calculate_neis_bytes(initial_output)
 
@@ -493,6 +505,9 @@ def generate_single_student_record(
     max_b = length_policy.max_bytes or 1500
 
     if current_bytes > max_b and length_policy.max_retries > 0:
+        if stop_checker and stop_checker():
+            return "사용자에 의해 작업 중단됨", 0
+
         shorten_prompt = build_shorten_prompt(
             original_text=answers_text,
             current_output=current_output,
@@ -500,6 +515,9 @@ def generate_single_student_record(
             max_bytes=max_b,
         )
         corrected = send_prompt(shorten_prompt)
+        if stop_checker and stop_checker():
+            return "사용자에 의해 작업 중단됨", 0
+
         if corrected and not corrected.startswith("생성 실패"):
             current_output = corrected
             current_bytes = calculate_neis_bytes(current_output)
@@ -624,6 +642,8 @@ def generate_records_from_excel(
 
     success_cnt = already_done
     actual_saved_path = output_path
+    consecutive_errors = 0
+    max_consecutive_errors = 3
 
     for idx in range(total_count):
         if stop_checker and stop_checker():
@@ -681,19 +701,33 @@ def generate_records_from_excel(
         actual_saved_path = safe_save_excel(df, output_path)
 
         if res_text.startswith("생성 실패"):
+            consecutive_errors += 1
+            err_str = res_text[len("생성 실패:"):].strip() if "생성 실패:" in res_text else res_text
             if log_callback:
-                log_callback("ERROR", f"[{sid} {sname}] 생성 실패: {res_text}")
+                log_callback("ERROR", f"[{sid} {sname}] 생성 실패 원인: {err_str}")
+            if consecutive_errors >= max_consecutive_errors:
+                if log_callback:
+                    log_callback(
+                        "ERROR",
+                        f"연속 {consecutive_errors}회 AI API 호출 실패로 작업을 자동 일시 중단합니다. (최근 원인: {err_str}) "
+                        "API Key 유효성, 크레딧 잔액 또는 공급자 모델 상태를 확인해 주세요.",
+                    )
+                break
         elif res_text == "사용자에 의해 작업 중단됨":
             break
         else:
+            consecutive_errors = 0
             success_cnt += 1
             if log_callback:
                 log_callback("SUCCESS", f"[{sid} {sname}] 생성 완료 ({res_bytes}B)")
             if progress_callback:
                 progress_callback(pct, f"{sid} {sname} 처리 완료 ({res_bytes}B)")
 
-        # RPM 속도 제어 (1초 대기)
-        time.sleep(1.0)
+        # RPM 속도 제어 (1초 대기 -> 0.1초 슬라이스 루프로 즉각 중단 반영)
+        for _ in range(10):
+            if stop_checker and stop_checker():
+                break
+            time.sleep(0.1)
 
     return {
         "total": total_count,

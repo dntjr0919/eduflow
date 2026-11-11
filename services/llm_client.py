@@ -16,6 +16,7 @@ import abc
 import base64
 import json
 import re
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -312,17 +313,85 @@ class GeminiProvider(BaseLlmProvider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Gemini API HTTP {e.code} 오류: {err_body}") from e
+            friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
+            raise RuntimeError(friendly_msg) from e
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
+            raise RuntimeError(friendly_msg) from e
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
+            raise RuntimeError(friendly_msg) from e
 
         candidates = data.get("candidates", [])
         if not candidates:
             return ""
         parts_out = candidates[0].get("content", {}).get("parts", [])
         return "\n".join(p.get("text", "") for p in parts_out if "text" in p)
+
+
+def _diagnose_llm_error(e: Exception, provider: Optional[str] = None) -> str:
+    """
+    LLM API 호출 예외(SDK, HTTPError, Timeout 등)를 분석하여
+    모든 AI 모델(Gemini, OpenAI, Claude, OpenRouter, Ollama 등)에 호환되는
+    사용자 친화적 한글 안내 메시지를 반환합니다.
+    """
+    code = getattr(e, "status_code", None) or getattr(e, "code", None)
+    err_str = str(e)
+    err_lower = err_str.lower()
+    exc_type_name = type(e).__name__.lower()
+
+    # 공급자 명칭 레이블 구성
+    p_label = ""
+    if provider:
+        p_clean = provider.strip()
+        p_lower = p_clean.lower()
+        if "openrouter" in p_lower:
+            p_label = "OpenRouter"
+        elif "gemini" in p_lower:
+            p_label = "Google Gemini"
+        elif "openai" in p_lower:
+            p_label = "OpenAI"
+        elif "claude" in p_lower or "anthropic" in p_lower:
+            p_label = "Anthropic Claude"
+        elif "ollama" in p_lower:
+            p_label = "Ollama"
+        else:
+            p_label = p_clean
+    prefix = f"[{p_label}] " if p_label else ""
+
+    if (
+        isinstance(e, (TimeoutError, socket.timeout))
+        or "timeout" in exc_type_name
+        or "timeout" in err_lower
+        or "timed out" in err_lower
+        or code in (502, 503, 504)
+        or "502" in err_str
+        or "503" in err_str
+        or "504" in err_str
+        or "bad gateway" in err_lower
+        or "service unavailable" in err_lower
+    ):
+        return (
+            f"{prefix}서버 응답 시간 초과(30초) 또는 AI 서비스 점검 중입니다. "
+            "네트워크 연결을 확인하거나 일시적 대기열 지연일 수 있으니 다른 AI 모델(Gemini, OpenAI, Claude 등)로 변경하거나 잠시 후 다시 시도해 주세요."
+        )
+
+    if code == 401 or "401" in err_str or "unauthorized" in err_lower or "authentication" in err_lower:
+        return f"{prefix}인증 실패 (401): API Key가 유효하지 않거나 만료되었습니다. [환경설정] 탭의 [API & 연동 설정]에서 API Key를 확인해 주세요."
+
+    if code == 402 or "402" in err_str or "insufficient" in err_lower or "credit" in err_lower:
+        return f"{prefix}크레딧/잔여량 부족 (402): 계정의 유료 잔액 또는 토큰 크레딧이 소진되었습니다. 결제 수단 및 충전 상태를 확인해 주세요."
+
+    if code == 429 or "429" in err_str or "rate limit" in err_lower or "quota" in err_lower or "too many requests" in err_lower:
+        return f"{prefix}요청 한도 도달 (Rate Limit / 429): 분당 요청 제한(RPM) 또는 사용 할당량을 초과했습니다. 잠시 후 재시도하거나 다른 모델로 전환해 주세요."
+
+    if code == 404 or "404" in err_str or "not found" in err_lower:
+        return f"{prefix}모델 조회 실패 (404): 지정된 AI 모델을 찾을 수 없거나 접근 권한이 없습니다. 모델명을 확인해 주세요."
+
+    return f"{prefix}AI API 호출 오류: {err_str}"
 
 
 class OpenAiCompatibleProvider(BaseLlmProvider):
@@ -338,6 +407,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
         model_name: str = "gpt-4o",
         base_url: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
+        provider_name: Optional[str] = None,
     ):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip() or "gpt-4o"
@@ -346,6 +416,16 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             raw_base = f"{raw_base}/v1"
         self.base_url = raw_base
         self.extra_headers = dict(extra_headers or {})
+        if provider_name:
+            self.provider_name = provider_name
+        elif "openrouter" in raw_base.lower():
+            self.provider_name = "OpenRouter"
+        elif "openai" in raw_base.lower():
+            self.provider_name = "OpenAI"
+        elif "11434" in raw_base.lower() or "ollama" in raw_base.lower():
+            self.provider_name = "Ollama"
+        else:
+            self.provider_name = "AI"
 
     def generate(
         self,
@@ -383,14 +463,19 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
                 api_key=self.api_key or "ollama",
                 base_url=self.base_url,
                 default_headers=self.extra_headers or None,
+                timeout=30.0,
             )
             completion = client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,  # type: ignore
+                timeout=30.0,
             )
             return completion.choices[0].message.content or ""
         except ImportError:
             pass
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider=self.provider_name)
+            raise RuntimeError(friendly_msg) from e
 
         # 2) REST API 직접 호출
         endpoint = f"{self.base_url}/chat/completions"
@@ -409,11 +494,17 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI/Custom API HTTP {e.code} 오류: {err_body}") from e
+            friendly_msg = _diagnose_llm_error(e, provider=self.provider_name)
+            raise RuntimeError(friendly_msg) from e
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            friendly_msg = _diagnose_llm_error(e, provider=self.provider_name)
+            raise RuntimeError(friendly_msg) from e
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider=self.provider_name)
+            raise RuntimeError(friendly_msg) from e
 
         choices = data.get("choices", [])
         if not choices:
@@ -475,6 +566,9 @@ class AnthropicClaudeProvider(BaseLlmProvider):
             )
         except ImportError:
             pass
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Anthropic Claude")
+            raise RuntimeError(friendly_msg) from e
 
         # 2) REST API 직접 호출
         url = "https://api.anthropic.com/v1/messages"
@@ -498,11 +592,17 @@ class AnthropicClaudeProvider(BaseLlmProvider):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Anthropic API HTTP {e.code} 오류: {err_body}") from e
+            friendly_msg = _diagnose_llm_error(e, provider="Anthropic Claude")
+            raise RuntimeError(friendly_msg) from e
+        except (urllib.error.URLError, TimeoutError, socket.timeout) as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Anthropic Claude")
+            raise RuntimeError(friendly_msg) from e
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Anthropic Claude")
+            raise RuntimeError(friendly_msg) from e
 
         content_blocks = data.get("content", [])
         return "\n".join(
@@ -605,6 +705,7 @@ class MultiLlmClient:
                 api_key=self.api_key,
                 model_name=self.model_name,
                 base_url="https://api.openai.com/v1",
+                provider_name="OpenAI",
             )
         elif self.provider == "claude":
             return AnthropicClaudeProvider(
@@ -621,12 +722,14 @@ class MultiLlmClient:
                     "X-Title": "EduFlow",
                     "User-Agent": "EduFlow-Client/2.0",
                 },
+                provider_name="OpenRouter",
             )
         elif self.provider in ("ollama", "custom"):
             return OpenAiCompatibleProvider(
                 api_key=self.api_key,
                 model_name=self.model_name,
                 base_url=self.base_url or "http://localhost:11434/v1",
+                provider_name="Ollama" if self.provider == "ollama" else "AI",
             )
         else:
             raise ValueError(f"지원하지 않는 AI 공급자입니다: {self.provider}")

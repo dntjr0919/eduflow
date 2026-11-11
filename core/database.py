@@ -6,6 +6,7 @@
 - 시스템 작업 로그(app_logs)
 """
 
+import json
 import sqlite3
 import threading
 from datetime import datetime
@@ -117,6 +118,43 @@ class DatabaseManager:
                         created_at TEXT NOT NULL
                     )
                     """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS roster_groups (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_type TEXT NOT NULL,
+                        group_name TEXT NOT NULL,
+                        extra_info TEXT NOT NULL DEFAULT '',
+                        columns_json TEXT NOT NULL DEFAULT '[]',
+                        is_active INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS roster_students (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        group_id INTEGER NOT NULL,
+                        seq_no INTEGER NOT NULL DEFAULT 0,
+                        student_id TEXT NOT NULL,
+                        grade INTEGER NOT NULL DEFAULT 1,
+                        class_no INTEGER NOT NULL DEFAULT 1,
+                        number INTEGER NOT NULL DEFAULT 1,
+                        name TEXT NOT NULL,
+                        extra_data TEXT NOT NULL DEFAULT '{}',
+                        memo TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(group_id) REFERENCES roster_groups(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_roster_groups_type ON roster_groups(group_type, is_active)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_roster_students_group ON roster_students(group_id, seq_no, student_id)"
                 )
                 conn.commit()
             finally:
@@ -337,11 +375,224 @@ class DatabaseManager:
             finally:
                 conn.close()
 
-    def get_students(self) -> List[Dict[str, Any]]:
+    def create_roster_group(
+        self,
+        group_type: str,
+        group_name: str,
+        extra_info: str = "",
+        columns_json: str = "[]",
+        is_active: int = 1,
+    ) -> int:
         with self._lock:
             conn = self._get_connection()
             try:
                 cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if group_type == "homeroom" and is_active == 1:
+                    cur.execute(
+                        "UPDATE roster_groups SET is_active = 0 WHERE group_type = 'homeroom'"
+                    )
+                col_str = (
+                    columns_json
+                    if isinstance(columns_json, str)
+                    else json.dumps(columns_json, ensure_ascii=False)
+                )
+                cur.execute(
+                    """
+                    INSERT INTO roster_groups (group_type, group_name, extra_info, columns_json, is_active, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        group_type.strip(),
+                        group_name.strip(),
+                        extra_info.strip(),
+                        col_str,
+                        int(is_active),
+                        now_str,
+                    ),
+                )
+                conn.commit()
+                return int(cur.lastrowid)
+            finally:
+                conn.close()
+
+    def get_roster_groups(self, group_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if group_type:
+                    cur.execute(
+                        "SELECT * FROM roster_groups WHERE group_type = ? ORDER BY id DESC",
+                        (group_type,),
+                    )
+                else:
+                    cur.execute("SELECT * FROM roster_groups ORDER BY id DESC")
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def get_roster_group(self, group_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM roster_groups WHERE id = ?", (group_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def delete_roster_group(self, group_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM roster_students WHERE group_id = ?", (group_id,))
+                cur.execute("DELETE FROM roster_groups WHERE id = ?", (group_id,))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def clear_roster_groups(self, group_type: Optional[str] = None) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if group_type:
+                    cur.execute(
+                        "DELETE FROM roster_students WHERE group_id IN (SELECT id FROM roster_groups WHERE group_type = ?)",
+                        (group_type,),
+                    )
+                    cur.execute("DELETE FROM roster_groups WHERE group_type = ?", (group_type,))
+                else:
+                    cur.execute("DELETE FROM roster_students")
+                    cur.execute("DELETE FROM roster_groups")
+                conn.commit()
+            finally:
+                conn.close()
+
+    def add_roster_students(self, group_id: int, students_list: List[Dict[str, Any]]) -> int:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                rows_to_insert = []
+                for s in students_list:
+                    extra = s.get("extra_data", {})
+                    extra_str = (
+                        json.dumps(extra, ensure_ascii=False)
+                        if isinstance(extra, dict)
+                        else str(extra or "{}")
+                    )
+                    rows_to_insert.append(
+                        (
+                            group_id,
+                            int(s.get("seq_no", 0)),
+                            str(s.get("student_id", "")).strip(),
+                            int(s.get("grade", 1)),
+                            int(s.get("class_no", 1)),
+                            int(s.get("number", 1)),
+                            str(s.get("name", "")).strip(),
+                            extra_str,
+                            str(s.get("memo", "")).strip(),
+                            now_str,
+                        )
+                    )
+                cur.executemany(
+                    """
+                    INSERT INTO roster_students
+                    (group_id, seq_no, student_id, grade, class_no, number, name, extra_data, memo, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows_to_insert,
+                )
+                conn.commit()
+                return len(rows_to_insert)
+            finally:
+                conn.close()
+
+    def get_roster_students(self, group_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM roster_students WHERE group_id = ? ORDER BY seq_no ASC, student_id ASC",
+                    (group_id,),
+                )
+                results = []
+                for r in cur.fetchall():
+                    item = dict(r)
+                    extra_raw = item.get("extra_data", "{}")
+                    try:
+                        extra_dict = (
+                            json.loads(extra_raw)
+                            if isinstance(extra_raw, str)
+                            else dict(extra_raw or {})
+                        )
+                    except Exception:
+                        extra_dict = {}
+                    item["extra_data_dict"] = extra_dict
+                    if "contact" not in item:
+                        item["contact"] = (
+                            extra_dict.get("연락처")
+                            or extra_dict.get("학생연락처")
+                            or extra_dict.get("contact")
+                            or ""
+                        )
+                    if "parent_contact" not in item:
+                        item["parent_contact"] = (
+                            extra_dict.get("학부모연락처")
+                            or extra_dict.get("parent_contact")
+                            or ""
+                        )
+                    results.append(item)
+                return results
+            finally:
+                conn.close()
+
+    def get_active_homeroom_group(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM roster_groups WHERE group_type = 'homeroom' AND is_active = 1 ORDER BY id DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def get_active_homeroom_students(self) -> List[Dict[str, Any]]:
+        hr_group = self.get_active_homeroom_group()
+        if hr_group:
+            return self.get_roster_students(hr_group["id"])
+        return []
+
+    def get_students(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            # 1. 활성화된 학급담임 명렬표 우선 반환
+            hr_students = self.get_active_homeroom_students()
+            if hr_students:
+                return hr_students
+
+            # 2. 담임 명렬표가 없으면 첫 번째 교과 명렬표 반환
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id FROM roster_groups WHERE group_type = 'subject' ORDER BY id ASC LIMIT 1"
+                )
+                sub_row = cur.fetchone()
+                if sub_row:
+                    sub_students = self.get_roster_students(sub_row["id"])
+                    if sub_students:
+                        return sub_students
+
+                # 3. 하위 호환성을 위해 기존 students 테이블 조회
                 cur.execute(
                     "SELECT * FROM students ORDER BY grade ASC, class_no ASC, number ASC, student_id ASC"
                 )

@@ -106,7 +106,7 @@ class ClassroomToolsTab(QWidget):
         self._on_random_assign()
 
     def _get_active_roster(self) -> List[Tuple[str, str]]:
-        students = self.db.get_students()
+        students = self.db.get_active_homeroom_students()
         if students:
             return [(str(s["student_id"]), str(s["name"])) for s in students]
         return list(SAMPLE_ROSTER)
@@ -165,6 +165,10 @@ class ClassroomToolsTab(QWidget):
         lbl_mode_chip = QLabel("HOMEROOM INSTRUMENT GRID")
         apply_qss_role(lbl_mode_chip, role="badgePrimary")
 
+        self.lbl_roster_status_badge = QLabel("연동 명렬표: [담임 학급] 등록된 담임 학급 없음")
+        apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
+        self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
+
         btn_sync_roster = QPushButton("명렬표 연동 새로고침")
         apply_qss_role(btn_sync_roster, role="secondary", obj_name="BtnSyncClassroomRoster")
         btn_sync_roster.setMinimumHeight(30)
@@ -173,6 +177,7 @@ class ClassroomToolsTab(QWidget):
 
         hb_lay.addWidget(lbl_station_title)
         hb_lay.addWidget(lbl_mode_chip)
+        hb_lay.addWidget(self.lbl_roster_status_badge)
         hb_lay.addStretch()
         hb_lay.addWidget(btn_sync_roster)
         layout.addWidget(header_bar)
@@ -501,6 +506,26 @@ class ClassroomToolsTab(QWidget):
                 self.table_attendance.setItem(idx, c, it)
 
     def _refresh_roster_dependent_views(self) -> None:
+        hr_group = self.db.get_active_homeroom_group()
+        homeroom_students = self.db.get_active_homeroom_students()
+
+        if hr_group and homeroom_students:
+            self.lbl_roster_status_badge.setText(
+                f"연동 명렬표: [담임 학급] {hr_group['group_name']} ({len(homeroom_students)}명)"
+            )
+            apply_qss_role(self.lbl_roster_status_badge, role="badgeSuccess")
+            self.lbl_roster_status_badge.setToolTip("나이스 학급담임 명렬표와 정상 연동되었습니다.")
+        elif hr_group:
+            self.lbl_roster_status_badge.setText(
+                f"연동 명렬표: [담임 학급] {hr_group['group_name']} (0명)"
+            )
+            apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
+            self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
+        else:
+            self.lbl_roster_status_badge.setText("연동 명렬표: [담임 학급] 등록된 담임 학급 없음")
+            apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
+            self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
+
         roster = self._get_active_roster()
         total = len(roster)
         present = max(0, total - 3) if total >= 3 else total
@@ -513,6 +538,7 @@ class ClassroomToolsTab(QWidget):
         self.combo_counsel_student.blockSignals(False)
 
         self._on_randomize_seats(initial=True)
+        self._on_random_assign()
 
     def _on_create_absence_form(self) -> None:
         row = self.table_attendance.currentRow()
@@ -570,7 +596,7 @@ class ClassroomToolsTab(QWidget):
 
     def _on_random_assign(self) -> None:
         """등록된 학생 명렬표(또는 샘플 명렬표)를 무작위로 섞어 당번 테이블과 텍스트 버퍼를 갱신합니다."""
-        students = self.db.get_students()
+        students = self.db.get_active_homeroom_students()
         if not students:
             roster_pairs = [
                 ("10101", "김민준(샘플)"),

@@ -191,8 +191,9 @@ class TaskRunner(QObject):
         worker.request_stop()
         if thread.isRunning():
             thread.quit()
-            thread.wait(wait_ms)
-        self._active_tasks.pop(task_key, None)
+            # 메인 스레드를 블로킹하는 thread.wait()을 직접 호출하지 않고
+            # worker의 stop_checker에 의해 자발적으로 execute() 루프가 끝나도록 유도
+        # 태스크 딕셔너리 정리는 thread.finished 시그널에 연결된 _cleanup_task에서 수행
 
     def stop_all(self, wait_ms: int = 2000) -> None:
         keys = list(self._active_tasks.keys())
