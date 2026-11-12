@@ -252,18 +252,20 @@ class SearchableModelComboBox(QComboBox):
         self._proxy_model.setFilterFixedString("")
 
     def set_model_list(self, models: List[str], default_model: str = "") -> None:
-        """새로운 모델 리스트를 등록하고 기본값 선택"""
+        """새로운 모델 리스트를 등록하고 기본값 선택 (목록에 없는 사용자 지정 모델도 보존)"""
         self.blockSignals(True)
         self.clear()
 
-        items = list(models) if models else ([default_model] if default_model else [])
+        items = list(models) if models else []
+        if default_model and default_model not in items:
+            items.insert(0, default_model)
 
         # 콤보박스 자체 목록 및 자동완성 소스 모델 갱신
         self.addItems(items)
         self._source_model.setStringList(items)
         self._proxy_model.setFilterFixedString("")
 
-        if default_model and default_model in items:
+        if default_model:
             self.setCurrentText(default_model)
         elif items:
             self.setCurrentText(items[0])

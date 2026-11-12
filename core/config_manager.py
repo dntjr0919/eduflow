@@ -45,6 +45,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "custom_base_url": "http://localhost:11434",
         "custom_api_key": "",
         "custom_model": "llama3.2",
+        "last_tested_provider": "",
+        "last_tested_requested_model": "",
+        "last_tested_responded_model": "",
+        "last_tested_ok": False,
         # Google Sheets & 카카오톡 외부 연동 설정
         "google_credentials_path": "",
         "google_sheet_url": "",

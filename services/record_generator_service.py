@@ -404,11 +404,24 @@ def get_active_ai_info() -> Dict[str, Any]:
         model = cfg.get("gemini_model", "gemini-1.5-flash")
         has_key = bool(cfg.get("gemini_api_key", "").strip() or os.getenv("GEMINI_API_KEY", "").strip())
 
+    tested_prov = str(cfg.get("last_tested_provider", "") or "").strip()
+    tested_req = str(cfg.get("last_tested_requested_model", "") or "").strip()
+    tested_resp = str(cfg.get("last_tested_responded_model", "") or "").strip()
+    tested_ok = bool(cfg.get("last_tested_ok", False))
+
+    same_target = bool(tested_prov and tested_prov == code and tested_req == str(model).strip())
+    connection_verified = bool(same_target and tested_ok and tested_resp)
+    connection_failed = bool(same_target and not tested_ok)
+    responded_model = tested_resp if connection_verified else ""
+
     return {
         "provider": code,
         "provider_display": provider,
         "model": model,
         "has_key": has_key,
+        "responded_model": responded_model,
+        "connection_verified": connection_verified,
+        "connection_failed": connection_failed,
     }
 
 

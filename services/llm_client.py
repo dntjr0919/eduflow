@@ -211,6 +211,8 @@ def format_parsed_json_to_readable_text(data: Dict[str, Any]) -> str:
 class BaseLlmProvider(abc.ABC):
     """모든 LLM 공급자가 구현해야 하는 추상 기본 클래스."""
 
+    last_responded_model: str = ""
+
     @abc.abstractmethod
     def generate(
         self,
@@ -233,6 +235,7 @@ class GeminiProvider(BaseLlmProvider):
     def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip() or "gemini-1.5-flash"
+        self.last_responded_model = ""
 
     def generate(
         self,
@@ -263,9 +266,13 @@ class GeminiProvider(BaseLlmProvider):
                 contents=contents,
                 config=cfg,
             )
+            self.last_responded_model = str(getattr(resp, "model_version", None) or self.model_name)
             return resp.text or ""
         except ImportError:
             pass
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
+            raise RuntimeError(friendly_msg) from e
 
         # 2) 레거시 google-generativeai SDK 시도
         try:
@@ -280,9 +287,13 @@ class GeminiProvider(BaseLlmProvider):
             if image_bytes is not None:
                 parts.append({"mime_type": mime_type, "data": image_bytes})
             resp = model.generate_content(parts)
+            self.last_responded_model = str(getattr(resp, "model_version", None) or self.model_name)
             return resp.text or ""
         except ImportError:
             pass
+        except Exception as e:
+            friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
+            raise RuntimeError(friendly_msg) from e
 
         # 3) REST API 직접 호출 (SDK 미설치 환경 완벽 호환)
         url = (
@@ -325,6 +336,7 @@ class GeminiProvider(BaseLlmProvider):
             friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
             raise RuntimeError(friendly_msg) from e
 
+        self.last_responded_model = str(data.get("modelVersion") or self.model_name)
         candidates = data.get("candidates", [])
         if not candidates:
             return ""
@@ -470,6 +482,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
                 messages=messages,  # type: ignore
                 timeout=30.0,
             )
+            self.last_responded_model = str(getattr(completion, "model", None) or self.model_name)
             return completion.choices[0].message.content or ""
         except ImportError:
             pass
@@ -506,6 +519,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             friendly_msg = _diagnose_llm_error(e, provider=self.provider_name)
             raise RuntimeError(friendly_msg) from e
 
+        self.last_responded_model = str(data.get("model") or self.model_name)
         choices = data.get("choices", [])
         if not choices:
             return ""
@@ -561,6 +575,7 @@ class AnthropicClaudeProvider(BaseLlmProvider):
             if system_prompt:
                 kwargs["system"] = system_prompt
             msg = client.messages.create(**kwargs)
+            self.last_responded_model = str(getattr(msg, "model", None) or self.model_name)
             return "\n".join(
                 block.text for block in msg.content if hasattr(block, "text")
             )
@@ -604,6 +619,7 @@ class AnthropicClaudeProvider(BaseLlmProvider):
             friendly_msg = _diagnose_llm_error(e, provider="Anthropic Claude")
             raise RuntimeError(friendly_msg) from e
 
+        self.last_responded_model = str(data.get("model") or self.model_name)
         content_blocks = data.get("content", [])
         return "\n".join(
             b.get("text", "") for b in content_blocks if b.get("type") == "text"
@@ -634,6 +650,7 @@ class MultiLlmClient:
         self.api_key, self.model_name, self.base_url = self._resolve_credentials(
             sec, self.provider, api_key, model_name, base_url
         )
+        self.last_responded_model: str = ""
 
     @staticmethod
     def _resolve_credentials(
@@ -743,12 +760,16 @@ class MultiLlmClient:
     ) -> str:
         """모든 공급자에 대해 동일한 시그니처로 텍스트/멀티모달 생성을 수행합니다."""
         engine = self._create_provider_instance()
-        return engine.generate(
+        text = engine.generate(
             prompt=prompt,
             system_prompt=system_prompt,
             image_bytes=image_bytes,
             mime_type=mime_type,
         )
+        self.last_responded_model = str(
+            getattr(engine, "last_responded_model", "") or self.model_name
+        ).strip()
+        return text
 
     def test_connection(self) -> Tuple[bool, str]:
         """환경설정 탭의 [연결 테스트] 버튼에서 호출하는 빠른 상태 점검 메서드."""
@@ -757,8 +778,13 @@ class MultiLlmClient:
                 prompt="연결 테스트입니다. 오직 'OK' 두 글자만 출력하세요.",
                 system_prompt="You are a connection tester. Reply with OK.",
             )
+            responded = (self.last_responded_model or self.model_name).strip()
             preview = reply.strip()[:80]
-            return True, f"✅ [{self.provider.upper()} / {self.model_name}] 연결 성공!\n응답: {preview}"
+            if responded and responded != self.model_name:
+                model_desc = f"{self.model_name} (실제 응답 모델: {responded})"
+            else:
+                model_desc = responded or self.model_name
+            return True, f"✅ [{self.provider.upper()} / {model_desc}] 연결 성공!\n응답: {preview}"
         except Exception as exc:
             return False, f"❌ [{self.provider.upper()} / {self.model_name}] 연결 실패:\n{exc}"
 

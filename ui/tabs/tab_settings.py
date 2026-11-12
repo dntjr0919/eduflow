@@ -718,10 +718,10 @@ class SettingsTab(QWidget):
 
         model_field = model_field_map.get(prov_code, "gemini_model")
         default_model = PROVIDER_DEFAULT_MODELS.get(prov_code, "gemini-1.5-flash")
-        saved_model = str(api_sec.get(model_field, "") or "")
+        saved_model = str(api_sec.get(model_field, "") or "").strip()
         if prov_code == "ollama" and not saved_model:
-            saved_model = str(api_sec.get("custom_model", "") or default_model)
-        if not saved_model or "2.5-flash" in saved_model:
+            saved_model = str(api_sec.get("custom_model", "") or default_model).strip()
+        if not saved_model:
             saved_model = default_model
 
         if prov_code == "openrouter":
@@ -934,26 +934,36 @@ class SettingsTab(QWidget):
         if not still_same_provider:
             return
 
-        # 수동 갱신: 추천 모델 자동 선택 / 자동 갱신: 기존 선택이 목록에 있으면 유지 (단, 2.5 폐기 모델은 자동 전환)
+        # 현재 선택된 모델이 비어있거나(미설정), 기본 placeholder 모델인데 조회 목록에 없을 때만 추천 모델 사용
+        # (사용자가 직접 지정한 모델명 및 2.5 시리즈 등은 그대로 보존)
         current = self._current_model_name()
-        if interactive or current not in models or "2.5" in current:
+        default_model = PROVIDER_DEFAULT_MODELS.get(prov_code, "")
+        if not current or (current == default_model and current not in models):
             selected = recommended or pick_recommended_model(prov_code, models)
         else:
             selected = current
 
         self._populate_model_combo(models, selected)
         self._on_ai_setting_changed()
-        self.lbl_model_status.setText(
-            f"[완료] {len(models)}개 모델을 불러왔습니다. (선택: {selected})"
-        )
-        self.lbl_model_status.setVisible(True)
+        self._update_model_status_label(prov_code, selected)
 
         if interactive:
             QMessageBox.information(
                 self,
                 "조회 완료",
-                f"[{provider_text}] 사용 가능한 {len(models)}개 모델을 불러왔습니다.\n기본 선택: {selected}",
+                f"[{provider_text}] 사용 가능한 {len(models)}개 모델을 불러왔습니다.\n현재 적용 모델: {selected}",
             )
+
+    def _update_model_status_label(self, prov_code: str, model_name: str) -> None:
+        """현재 선택 및 저장된 모델명을 사용할 모델명 아래 상태 라벨에 실시간 반영합니다."""
+        cached = self._model_cache.get(prov_code)
+        if cached:
+            self.lbl_model_status.setText(
+                f"[완료] {len(cached)}개 모델을 불러왔습니다. (선택: {model_name})"
+            )
+        else:
+            self.lbl_model_status.setText(f"선택: {model_name}")
+        self.lbl_model_status.setVisible(True)
 
     def _on_ai_setting_changed(self, *_args: Any) -> None:
         """
@@ -992,6 +1002,7 @@ class SettingsTab(QWidget):
             updates["custom_base_url"] = custom_url or PROVIDER_DEFAULT_BASE_URLS["ollama"]
 
         self.config.update_section("api_and_integrations", updates, auto_save=True)
+        self._update_model_status_label(prov_code, model_name)
 
     def _on_test_llm_connection(self) -> None:
         """[🔌 연결 테스트] 버튼 클릭 시 현재 입력된 AI 설정으로 즉시 연결을 테스트합니다."""
@@ -1019,8 +1030,30 @@ class SettingsTab(QWidget):
             QApplication.restoreOverrideCursor()
 
         if ok:
+            responded_model = (client.last_responded_model or model_name).strip()
+            self.config.update_section(
+                "api_and_integrations",
+                {
+                    "last_tested_provider": prov_code,
+                    "last_tested_requested_model": model_name,
+                    "last_tested_responded_model": responded_model,
+                    "last_tested_ok": True,
+                },
+                auto_save=True,
+            )
+            self._update_model_status_label(prov_code, model_name)
             QMessageBox.information(self, "AI API 연결 테스트 성공", msg)
         else:
+            self.config.update_section(
+                "api_and_integrations",
+                {
+                    "last_tested_provider": prov_code,
+                    "last_tested_requested_model": model_name,
+                    "last_tested_responded_model": "",
+                    "last_tested_ok": False,
+                },
+                auto_save=True,
+            )
             QMessageBox.warning(self, "AI API 연결 테스트 실패", msg)
 
     def _on_open_manual_dialog_preview(self) -> None:
@@ -1099,6 +1132,10 @@ class SettingsTab(QWidget):
         finally:
             self._loading_ui = False
         self._update_provider_field_states()
+        self._update_model_status_label(
+            prov_code,
+            self._current_model_name() or PROVIDER_DEFAULT_MODELS.get(prov_code, "gemini-1.5-flash"),
+        )
 
         # 초기 로드 시 현재 공급자 모델 목록 자동 조회 (Ollama 또는 API Key가 설정된 공급자)
         if prov_code == "ollama" or bool(self.edit_api_key.text().strip()):

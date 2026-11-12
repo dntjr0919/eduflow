@@ -36,6 +36,7 @@ from core.base_worker import TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
 from services.notifier import NotificationService
+from services.record_generator_service import get_active_ai_info
 
 # 독립된 각 기능 탭(페이지) 위젯 import
 from ui.tabs.tab_classroom_tools import ClassroomToolsTab
@@ -423,9 +424,36 @@ class MainWindow(QMainWindow):
         sec = self.config.get_section("api_and_integrations")
         if bool(sec.get("use_manual_prompt_mode", True)):
             self.lbl_ai_badge.setText("AI: 수동 프롬프트 모드")
+            self.lbl_ai_badge.setToolTip("수동 프롬프트 복사/붙여넣기 모드가 활성화되어 있습니다.")
+            return
+
+        info = get_active_ai_info()
+        prov = str(info.get("provider", "gemini")).upper()
+        active_model = str(info.get("model", "")).strip()
+        responded_model = str(info.get("responded_model", "")).strip()
+        verified = bool(info.get("connection_verified", False))
+        failed = bool(info.get("connection_failed", False))
+
+        if verified and responded_model:
+            self.lbl_ai_badge.setText(f"AI: {prov} · {responded_model} (연결됨)")
+            if responded_model != active_model:
+                self.lbl_ai_badge.setToolTip(
+                    f"연결 테스트 응답 확인 완료\n공급자: {prov}\n설정 모델: {active_model}\n실제 응답 모델: {responded_model}"
+                )
+            else:
+                self.lbl_ai_badge.setToolTip(
+                    f"연결 테스트 응답 확인 완료\n공급자: {prov}\n응답 모델: {responded_model}"
+                )
+        elif failed:
+            self.lbl_ai_badge.setText(f"AI: {prov} · {active_model} (연결 실패)")
+            self.lbl_ai_badge.setToolTip(
+                f"최근 연결 테스트 실패\n공급자: {prov}\n설정 모델: {active_model}\n환경설정에서 API Key 또는 모델을 확인해 주세요."
+            )
         else:
-            prov = str(sec.get("ai_provider", "gemini")).upper()
-            self.lbl_ai_badge.setText(f"AI: {prov} Connected")
+            self.lbl_ai_badge.setText(f"AI: {prov} · {active_model}")
+            self.lbl_ai_badge.setToolTip(
+                f"현재 설정된 모델: {active_model}\n(환경설정에서 [연결 테스트]를 실행하면 실제 응답 모델이 표시됩니다.)"
+            )
 
     # =========================================================================
     # 공통 백그라운드 워커 시그널 핸들러 & 부드러운 로그 서랍 확장

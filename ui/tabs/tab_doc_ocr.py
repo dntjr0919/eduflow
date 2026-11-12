@@ -2315,11 +2315,16 @@ class DocOcrTab(QWidget):
         info = get_active_ai_info()
         p_name = info.get("provider_display", "Gemini")
         model = info.get("model", "gemini-1.5-flash")
+        responded = info.get("responded_model", "")
+        verified = info.get("connection_verified", False)
         has_key = info.get("has_key", False)
 
+        model_disp = f"{model} → {responded}" if (verified and responded and responded != model) else model
+
         if has_key:
+            status_tag = "[연결 확인됨]" if verified else "[정상 연결]"
             self.lbl_active_ai_badge.setText(
-                f"AI 엔진: <b style='color:#004ac6;'>{p_name}</b> ({model})  |  <span style='color:#059669; font-weight:600;'>[정상 연결]</span>"
+                f"AI 엔진: <b style='color:#004ac6;'>{p_name}</b> ({model_disp})  |  <span style='color:#059669; font-weight:600;'>{status_tag}</span>"
             )
             self.lbl_active_ai_badge.setStyleSheet(
                 "background-color: #f0fdf4; color: #0f172a; font-size: 12px; "
@@ -2327,7 +2332,7 @@ class DocOcrTab(QWidget):
             )
         else:
             self.lbl_active_ai_badge.setText(
-                f"AI 엔진: <b style='color:#d97706;'>{p_name}</b> ({model})  |  <span style='color:#dc2626; font-weight:600;'>[API Key 미등록]</span>"
+                f"AI 엔진: <b style='color:#d97706;'>{p_name}</b> ({model_disp})  |  <span style='color:#dc2626; font-weight:600;'>[API Key 미등록]</span>"
             )
             self.lbl_active_ai_badge.setStyleSheet(
                 "background-color: #fef2f2; color: #0f172a; font-size: 12px; "
