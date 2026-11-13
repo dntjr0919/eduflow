@@ -1,12 +1,12 @@
 """
-[탭 2] 📄 문서 처리 & AI OCR / 파일 병합 (ui/tabs/tab_doc_ocr.py)
+[탭 2] 문서 처리 & AI OCR / 파일 병합 (ui/tabs/tab_doc_ocr.py)
 - 기존 QGroupBox를 HoverZoomCard(1초 호버 시 Z-order 최상단 부상 + OutCubic 대각선 슬라이딩 확대/축소)로 교체
 - 1순위 핵심 구현: [학번/이름 기준 제출 파일 분석 · 미제출자 대조 · 표준 파일명 일괄 변경 · 학번순 단일 PDF 병합]
 - 2순위 구현: [2. AI OCR 및 문서 텍스트 보정] 서브탭 하단 실행 영역에 QHBoxLayout으로
-  1) [🤖 AI 자동 실행 (API 사용)] 버튼 (기존 워커 연결)
-  2) [📋 수동 복붙 모드 열기] 버튼 (클릭 시 ManualLlmDialog 팝업 연결)
+  1) [AI 자동 실행 (API 사용)] 버튼 (기존 워커 연결)
+  2) [수동 복붙 모드 열기] 버튼 (클릭 시 ManualLlmDialog 팝업 연결)
   을 나란히 배치
-- '제출 파일 학번순 정렬 미리보기' 카드 및 '미제출자 명단' 카드에 [ ⛶ 전체화면 ] / [ 🗗 원래 크기로 ] 포커스 토글 버튼 제공
+- '제출 파일 학번순 정렬 미리보기' 카드 및 '미제출자 명단' 카드에 [전체화면] / [원래 크기] 포커스 토글 버튼 제공
 """
 
 import csv
@@ -74,6 +74,7 @@ from services.llm_client import (
 )
 from services.notifier import NotificationService
 from ui.components.hover_zoom_card import HoverZoomCard
+from ui.dialogs.batch_manual_prompt_dialog import BatchManualPromptDialog
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
 from ui.dialogs.docx_schema_create_dialog import DocxSchemaCreateDialog
 from ui.dialogs.prompt_edit_dialog import PromptEditDialog
@@ -1178,7 +1179,7 @@ class DocOcrTab(QWidget):
         return scroll
 
     # =========================================================================
-    # 섹션 카드 전체화면 포커스 토글 ([ ⛶ 전체화면 ] <-> [ 🗗 원래 크기로 ])
+    # 섹션 카드 전체화면 포커스 토글 ([전체화면] <-> [원래 크기])
     # =========================================================================
     def _toggle_card_focus(self, target: str) -> None:
         if self._focused_card == target:
@@ -1480,12 +1481,22 @@ class DocOcrTab(QWidget):
         apply_qss_role(btn_go_settings, role="secondary")
         btn_go_settings.clicked.connect(self._on_go_to_settings_tab)
 
-        btn_refresh_ai = QPushButton("상태 갱신")
+        btn_refresh_ai = QPushButton("↻ 상태 갱신")
         btn_refresh_ai.setMinimumHeight(30)
-        apply_qss_role(btn_refresh_ai, role="outline")
+        apply_qss_role(btn_refresh_ai, role="subtle")
         btn_refresh_ai.clicked.connect(self._update_active_ai_display)
 
+        self.btn_open_batch_manual = QPushButton("▸ 수동 프롬프트 배치 모드 (웹 AI 복붙)")
+        self.btn_open_batch_manual.setMinimumHeight(30)
+        self.btn_open_batch_manual.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_batch_manual.setToolTip(
+            "API 키 없이도 선택한 엑셀 파일을 토큰 단위로 분할해 웹 AI(Gemini/ChatGPT/Claude)에 복사·붙여넣기로 처리합니다."
+        )
+        apply_qss_role(self.btn_open_batch_manual, role="secondary", obj_name="BtnOpenBatchManualMode")
+        self.btn_open_batch_manual.clicked.connect(self._on_open_batch_manual_dialog)
+
         box_ai_badge.addWidget(self.lbl_active_ai_badge, stretch=1)
+        box_ai_badge.addWidget(self.btn_open_batch_manual)
         box_ai_badge.addWidget(btn_go_settings)
         box_ai_badge.addWidget(btn_refresh_ai)
         lay_step2.addLayout(box_ai_badge)
@@ -2319,24 +2330,62 @@ class DocOcrTab(QWidget):
         verified = info.get("connection_verified", False)
         has_key = info.get("has_key", False)
 
-        model_disp = f"{model} → {responded}" if (verified and responded and responded != model) else model
+        model_disp = f"{model} -> {responded}" if (verified and responded and responded != model) else model
 
         if has_key:
-            status_tag = "[연결 확인됨]" if verified else "[정상 연결]"
+            status_tag = "✓ 연결 확인됨" if verified else "✓ 정상 연결"
             self.lbl_active_ai_badge.setText(
-                f"AI 엔진: <b style='color:#004ac6;'>{p_name}</b> ({model_disp})  |  <span style='color:#059669; font-weight:600;'>{status_tag}</span>"
+                f"AI 엔진: <b>{p_name}</b> ({model_disp})  |  <b>{status_tag}</b>"
             )
             self.lbl_active_ai_badge.setStyleSheet(
-                "background-color: #f0fdf4; color: #0f172a; font-size: 12px; "
-                "padding: 6px 12px; border-radius: 8px; border: 1px solid #bbf7d0;"
+                "background-color: #EFF6FF; color: #1E3A8A; font-size: 12px; "
+                "padding: 6px 12px; border-radius: 8px; border: 1px solid #93C5FD;"
             )
         else:
             self.lbl_active_ai_badge.setText(
-                f"AI 엔진: <b style='color:#d97706;'>{p_name}</b> ({model_disp})  |  <span style='color:#dc2626; font-weight:600;'>[API Key 미등록]</span>"
+                f"AI 엔진: <b>{p_name}</b> ({model_disp})  |  <b>[!] API Key 미등록 (수동 배치 모드 사용 가능)</b>"
             )
             self.lbl_active_ai_badge.setStyleSheet(
-                "background-color: #fef2f2; color: #0f172a; font-size: 12px; "
-                "padding: 6px 12px; border-radius: 8px; border: 1px solid #fecaca;"
+                "background-color: #F8FAFC; color: #334155; font-size: 12px; "
+                "padding: 6px 12px; border-radius: 8px; border: 1px solid #CBD5E1;"
+            )
+
+    def _on_open_batch_manual_dialog(self) -> None:
+        """[수동 프롬프트 배치 모드 (웹 AI 복붙)] 모달을 엽니다."""
+        excel_str = self.edit_agg_excel_file.text().strip()
+        if not excel_str or not Path(excel_str).is_file():
+            QMessageBox.warning(
+                self,
+                "대상 엑셀 파일 확인",
+                "수동 배치 모드를 실행하려면 먼저 [대상 엑셀 파일]을 선택해 주세요.\n"
+                "(1단계 DOCX 추출 완료 시 자동으로 입력됩니다.)",
+            )
+            return
+
+        prompt_data = self.combo_agg_prompt.currentData()
+        prompt_file = Path(prompt_data) if prompt_data else None
+
+        ref_str = self.edit_agg_ref_dir.text().strip()
+        ref_dir = Path(ref_str) if ref_str and Path(ref_str).is_dir() else None
+
+        max_bytes = self.spin_agg_max_bytes.value()
+
+        dlg = BatchManualPromptDialog(
+            excel_path=excel_str,
+            prompt_file=prompt_file,
+            reference_dir=ref_dir,
+            max_bytes=max_bytes,
+            parent=self,
+            task_runner=self.task_runner,
+        )
+        dlg.exec()
+
+        if dlg.last_saved_excel_path:
+            self._last_result_excel_path = dlg.last_saved_excel_path
+            self.btn_open_result_excel.setVisible(True)
+            self._update_agg_stepper(s1="done", s2="done", s3="done")
+            self.lbl_agg_status.setText(
+                f"✓ 수동 배치 반영 완료: {Path(dlg.last_saved_excel_path).name} (누적 {dlg.total_saved_count}명 저장)"
             )
 
     def _on_go_to_settings_tab(self) -> None:

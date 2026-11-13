@@ -23,11 +23,13 @@ from PyQt6.QtWidgets import (
 )
 
 from services.docx_extractor_service import analyze_docx_schema, save_schema_json
+from ui.utils import install_no_scroll_wheel_filter
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     """위젯에 objectName 및 role 속성을 부여하고 style().polish()를 즉시 호출합니다."""
     widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    install_no_scroll_wheel_filter(widget)
     if obj_name:
         widget.setObjectName(obj_name)
     if role:
@@ -44,7 +46,7 @@ class DocxSchemaCreateDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None, default_docx: str = ""):
         super().__init__(parent)
         apply_qss_role(self, obj_name="DocxSchemaCreateModal")
-        self.setWindowTitle("➕ 새 과제 양식(DOCX)에서 스키마 자동 생성")
+        self.setWindowTitle("+ 새 과제 양식(DOCX)에서 스키마 자동 생성")
         self.resize(720, 600)
         self.setMinimumSize(600, 500)
 
@@ -61,13 +63,11 @@ class DocxSchemaCreateDialog(QDialog):
 
         # 상단 안내 배너
         lbl_banner = QLabel(
-            "📋 <b>서식 DOCX 파일 자동 분석기</b><br>"
+            "[!] <b>서식 DOCX 파일 자동 분석기</b><br>"
             "질문 번호(Q1, Q2, ...)와 답변 표(셀)의 레이아웃을 스캔하여 엑셀 변환용 JSON 스키마를 생성합니다."
         )
-        lbl_banner.setStyleSheet(
-            "background-color: #1E293B; color: #CBD5E1; padding: 10px 14px; "
-            "border-radius: 8px; border-left: 4px solid #38BDF8; font-size: 13px;"
-        )
+        lbl_banner.setWordWrap(True)
+        apply_qss_role(lbl_banner, role="infoBanner", obj_name="SchemaCreateInfoBanner")
         layout.addWidget(lbl_banner)
 
         # 폼 레이아웃
@@ -86,7 +86,8 @@ class DocxSchemaCreateDialog(QDialog):
 
         btn_browse = QPushButton("찾아보기...")
         btn_browse.setMinimumHeight(34)
-        apply_qss_role(btn_browse)
+        btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(btn_browse, role="secondary")
         btn_browse.clicked.connect(self._on_browse_docx)
 
         box_file.addWidget(self.edit_docx_path, stretch=1)
@@ -105,7 +106,7 @@ class DocxSchemaCreateDialog(QDialog):
         layout.addLayout(form)
 
         # 분석 실행 버튼
-        btn_analyze = QPushButton("🔍 양식 구조 분석 및 미리보기")
+        btn_analyze = QPushButton("▸ 양식 구조 분석 및 미리보기")
         btn_analyze.setMinimumHeight(38)
         btn_analyze.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(btn_analyze, role="secondary")
@@ -114,7 +115,7 @@ class DocxSchemaCreateDialog(QDialog):
 
         # 분석 결과 미리보기 영역
         lbl_preview = QLabel("분석 결과 미리보기:")
-        lbl_preview.setStyleSheet("color: #94A3B8; font-weight: bold;")
+        apply_qss_role(lbl_preview, role="fieldLabel")
         layout.addWidget(lbl_preview)
 
         self.txt_preview = QTextEdit()
@@ -122,17 +123,14 @@ class DocxSchemaCreateDialog(QDialog):
         self.txt_preview.setPlaceholderText(
             "위의 '양식 구조 분석 및 미리보기' 버튼을 누르면 탐지된 필드 목록과 스키마 규칙이 표시됩니다."
         )
-        self.txt_preview.setStyleSheet(
-            "background-color: #0F172A; color: #E2E8F0; font-family: 'Consolas', monospace; "
-            "border: 1px solid #334155; border-radius: 6px; padding: 8px;"
-        )
+        apply_qss_role(self.txt_preview, obj_name="PromptCodeBox")
         layout.addWidget(self.txt_preview, stretch=1)
 
         # 하단 버튼 영역
         box_bottom = QHBoxLayout()
         box_bottom.setSpacing(10)
 
-        self.btn_save = QPushButton("💾 schemas/ 폴더에 스키마 저장")
+        self.btn_save = QPushButton("▸ schemas/ 폴더에 스키마 저장")
         self.btn_save.setMinimumHeight(40)
         self.btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_save.setEnabled(False)
@@ -141,7 +139,8 @@ class DocxSchemaCreateDialog(QDialog):
 
         btn_cancel = QPushButton("닫기")
         btn_cancel.setMinimumHeight(40)
-        apply_qss_role(btn_cancel)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(btn_cancel, role="subtle")
         btn_cancel.clicked.connect(self.reject)
 
         box_bottom.addStretch()
@@ -180,14 +179,14 @@ class DocxSchemaCreateDialog(QDialog):
 
             lines = [
                 f"=== [양식 분석 보고서: {form_name}] ===",
-                f"📄 소스 파일: {report['source_file']}",
-                f"🏷️ 판별 키워드: {', '.join(keywords) if keywords else '(없음)'}",
-                f"📊 추출 필드 수: 총 {len(fields)}개",
+                f"▪ 소스 파일: {report['source_file']}",
+                f"▪ 판별 키워드: {', '.join(keywords) if keywords else '(없음)'}",
+                f"▪ 추출 필드 수: 총 {len(fields)}개",
                 "",
                 "[감지된 필드 및 별칭 목록]",
             ]
             for f_name, aliases in fields.items():
-                lines.append(f"  • {f_name}: {aliases}")
+                lines.append(f"  ▪ {f_name}: {aliases}")
 
             lines.append("")
             lines.append("[추출 규칙 (Extraction Rules)]")
@@ -195,15 +194,15 @@ class DocxSchemaCreateDialog(QDialog):
                 r_type = loc.get("reader", "unknown")
                 f_target = loc.get("field", "")
                 if r_type == "question_then_table":
-                    lines.append(f"  • {f_target} -> [질문 다음 첫 표 전체 읽기] (질문 블록 #{loc.get('question_block')})")
+                    lines.append(f"  ▪ {f_target} -> [질문 다음 첫 표 전체 읽기] (질문 블록 #{loc.get('question_block')})")
                 else:
-                    lines.append(f"  • {f_target} -> [표 행 내 인접 셀 읽기] (블록 #{loc.get('table_block')}, 행 #{loc.get('row_index')})")
+                    lines.append(f"  ▪ {f_target} -> [표 행 내 인접 셀 읽기] (블록 #{loc.get('table_block')}, 행 #{loc.get('row_index')})")
 
             if warnings:
                 lines.append("")
                 lines.append("[확인 및 유의 사항]")
                 for w in warnings:
-                    lines.append(f"  ⚠️ {w}")
+                    lines.append(f"  [!] {w}")
 
             self.txt_preview.setText("\n".join(lines))
             self.btn_save.setEnabled(True)

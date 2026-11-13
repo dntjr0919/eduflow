@@ -374,9 +374,19 @@ QPushButton#CardMaxButton:checked, QPushButton[role="cardMax"]:checked {
 
 /* Banners & Status Callouts */
 QLabel[role="infoBanner"] {
-    background-color: #EEF3FD;
-    color: #00338A;
-    border: 1px solid #DDE7FA;
+    background-color: #EFF6FF;
+    color: #1E3A8A;
+    border: 1px solid #93C5FD;
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+QLabel[role="statusBanner"] {
+    background-color: #F8FAFC;
+    color: #334155;
+    border: 1px solid #CBD5E1;
     border-radius: 8px;
     padding: 8px 12px;
     font-size: 12px;
@@ -443,9 +453,9 @@ QLabel[role="fieldLabel"] {
 }
 
 QLabel[role="engineBadge"] {
-    background-color: #F8F9FF;
-    color: #0F172A;
-    border: 1px solid #E2E8F0;
+    background-color: #F8FAFC;
+    color: #334155;
+    border: 1px solid #CBD5E1;
     border-radius: 6px;
     padding: 6px 12px;
     font-size: 12px;
@@ -549,10 +559,11 @@ QTabBar::tab:selected {
    6. Buttons & Interactive Controls (Precision Button Hierarchy)
    ---------------------------------------------------------------------------- */
 /* Default / Subtle Button */
-QPushButton {
+QPushButton,
+QPushButton[role="subtle"] {
     background-color: #FFFFFF;
-    color: #0F172A;
-    border: 1px solid #CBD5E1;
+    color: #1E293B;
+    border: 1px solid #E2E8F0;
     border-radius: 6px;
     padding: 5px 12px;
     font-size: 12px;
@@ -560,17 +571,20 @@ QPushButton {
     min-height: 24px;
 }
 
-QPushButton:hover {
+QPushButton:hover,
+QPushButton[role="subtle"]:hover {
     background-color: #F8FAFC;
-    border-color: #94A3B8;
+    border-color: #CBD5E1;
     color: #0F172A;
 }
 
-QPushButton:pressed {
+QPushButton:pressed,
+QPushButton[role="subtle"]:pressed {
     background-color: #F1F5F9;
 }
 
-QPushButton:disabled {
+QPushButton:disabled,
+QPushButton[role="subtle"]:disabled {
     background-color: #F8FAFC;
     color: #94A3B8;
     border-color: #E2E8F0;
@@ -586,8 +600,8 @@ QPushButton[role="primary"] {
 }
 
 QPushButton[role="primary"]:hover {
-    background-color: #2563EB;
-    border-color: #004AC6;
+    background-color: #1D4ED8;
+    border-color: #1E40AF;
 }
 
 QPushButton[role="primary"]:pressed {
@@ -602,35 +616,37 @@ QPushButton[role="primary"]:disabled {
 
 /* Secondary Button */
 QPushButton[role="secondary"] {
-    background-color: #FFFFFF;
-    color: #0F172A;
+    background-color: #F1F5F9;
+    color: #334155;
     border: 1px solid #CBD5E1;
     border-radius: 6px;
-    font-weight: 500;
+    font-weight: 600;
 }
 
 QPushButton[role="secondary"]:hover {
-    background-color: #F8FAFC;
+    background-color: #E2E8F0;
     border-color: #94A3B8;
+    color: #0F172A;
 }
 
 QPushButton[role="secondary"]:pressed {
-    background-color: #F1F5F9;
+    background-color: #CBD5E1;
+    color: #0F172A;
 }
 
 /* Outline / Subtle Ghost Button */
 QPushButton[role="outline"] {
-    background-color: transparent;
-    color: #475569;
-    border: 1px solid #CBD5E1;
+    background-color: #FFFFFF;
+    color: #334155;
+    border: 1px solid #E2E8F0;
     border-radius: 6px;
     font-weight: 500;
 }
 
 QPushButton[role="outline"]:hover {
-    background-color: #F1F5F9;
+    background-color: #F8FAFC;
     color: #0F172A;
-    border-color: #94A3B8;
+    border-color: #CBD5E1;
 }
 
 /* Teal / Tertiary Action Button (#006242) */
@@ -986,8 +1002,12 @@ QTextEdit[role="terminalLog"] {
 /* ----------------------------------------------------------------------------
    10. Modals & Dialogs
    ---------------------------------------------------------------------------- */
-QDialog#ManualLlmModal, QDialog#RuleEditModal {
-    background-color: #F8FAFC;
+QDialog#ManualLlmModal,
+QDialog#BatchManualPromptModal,
+QDialog#PromptEditModal,
+QDialog#DocxSchemaCreateModal,
+QDialog#RuleEditModal {
+    background-color: #F8F9FF;
 }
 
 QFrame#ModalHeaderCard {
@@ -1020,9 +1040,9 @@ QTextEdit#WebAiInputBox:focus {
 }
 
 QTextEdit#ParsedPreviewBox {
-    background-color: #F0FDF4;
-    color: #14532D;
-    border: 1px solid #BBF7D0;
+    background-color: #F8FAFC;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
     border-radius: 8px;
     padding: 10px;
     font-size: 12px;

@@ -23,9 +23,13 @@ from PyQt6.QtWidgets import (
 )
 
 
+from ui.utils import install_no_scroll_wheel_filter
+
+
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     """위젯에 objectName 및 role 속성을 부여하고 style().polish()를 즉시 호출합니다."""
     widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    install_no_scroll_wheel_filter(widget)
     if obj_name:
         widget.setObjectName(obj_name)
     if role:
@@ -139,7 +143,7 @@ class PromptEditDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None, default_title: str = ""):
         super().__init__(parent)
         apply_qss_role(self, obj_name="PromptEditModal")
-        self.setWindowTitle("➕ 새 AI 세특/채점 프롬프트 작성")
+        self.setWindowTitle("+ 새 AI 세특/채점 프롬프트 작성")
         self.resize(780, 680)
         self.setMinimumSize(640, 520)
 
@@ -153,17 +157,15 @@ class PromptEditDialog(QDialog):
 
         # 상단 안내 배너 (치환 변수 가이드)
         lbl_banner = QLabel(
-            "📌 <b>프롬프트 작성 및 동적 치환 변수 안내</b><br>"
+            "[!] <b>프롬프트 작성 및 동적 치환 변수 안내</b><br>"
             "AI가 학생별로 치환하여 처리할 변수들을 본문에 포함할 수 있습니다:<br>"
-            "• <code>{answers_text}</code> : 학생의 문항별 응답 내용 (<b>필수</b>)<br>"
-            "• <code>{student_name}</code> : 학생 이름<br>"
-            "• <code>{reference_context}</code> : 참고자료 폴더 문서 내용<br>"
-            "• <code>{max_bytes}</code> : 나이스 바이트 상한선 숫자"
+            "▪ <code>{answers_text}</code> : 학생의 문항별 응답 내용 (<b>필수</b>)<br>"
+            "▪ <code>{student_name}</code> : 학생 이름<br>"
+            "▪ <code>{reference_context}</code> : 참고자료 폴더 문서 내용<br>"
+            "▪ <code>{max_bytes}</code> : 나이스 바이트 상한선 숫자"
         )
-        lbl_banner.setStyleSheet(
-            "background-color: #1E293B; color: #CBD5E1; padding: 12px 14px; "
-            "border-radius: 8px; border-left: 4px solid #10B981; font-size: 13px;"
-        )
+        lbl_banner.setWordWrap(True)
+        apply_qss_role(lbl_banner, role="infoBanner", obj_name="PromptEditInfoBanner")
         layout.addWidget(lbl_banner)
 
         # 상단 설정 영역 (파일명 및 템플릿 불러오기)
@@ -180,9 +182,9 @@ class PromptEditDialog(QDialog):
         apply_qss_role(self.edit_prompt_name)
 
         lbl_prefix = QLabel("저장 파일명: prompts_memory/prompt_")
-        lbl_prefix.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        apply_qss_role(lbl_prefix, role="mutedText")
         lbl_ext = QLabel(".txt")
-        lbl_ext.setStyleSheet("color: #94A3B8; font-size: 12px;")
+        apply_qss_role(lbl_ext, role="mutedText")
 
         box_name.addWidget(lbl_prefix)
         box_name.addWidget(self.edit_prompt_name, stretch=1)
@@ -193,15 +195,16 @@ class PromptEditDialog(QDialog):
         box_tpl = QHBoxLayout()
         self.combo_tpl = QComboBox()
         self.combo_tpl.setMinimumHeight(34)
-        self.combo_tpl.addItem("📋 추천 템플릿 선택하여 채우기...", "")
+        self.combo_tpl.addItem("▸ 추천 템플릿 선택하여 채우기...", "")
         for tpl_name in PROMPT_TEMPLATES_CATALOG:
             self.combo_tpl.addItem(tpl_name, tpl_name)
         apply_qss_role(self.combo_tpl)
         self.combo_tpl.currentIndexChanged.connect(self._on_template_selected)
 
-        btn_import = QPushButton("📂 외부 .txt 가져오기")
+        btn_import = QPushButton("↗ 외부 .txt 가져오기")
         btn_import.setMinimumHeight(34)
-        apply_qss_role(btn_import)
+        btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(btn_import, role="secondary")
         btn_import.clicked.connect(self._on_import_txt)
 
         box_tpl.addWidget(self.combo_tpl, stretch=1)
@@ -212,15 +215,12 @@ class PromptEditDialog(QDialog):
 
         # 프롬프트 에디터
         lbl_editor = QLabel("프롬프트 본문:")
-        lbl_editor.setStyleSheet("color: #94A3B8; font-weight: bold;")
+        apply_qss_role(lbl_editor, role="fieldLabel")
         layout.addWidget(lbl_editor)
 
         self.txt_content = QTextEdit()
         self.txt_content.setPlaceholderText("여기에 프롬프트 내용을 작성하세요. 반드시 {answers_text}가 포함되어야 합니다.")
-        self.txt_content.setStyleSheet(
-            "background-color: #0F172A; color: #F8FAFC; font-family: 'Consolas', 'D2Coding', monospace; "
-            "font-size: 13px; line-height: 1.5; border: 1px solid #334155; border-radius: 6px; padding: 10px;"
-        )
+        apply_qss_role(self.txt_content, obj_name="PromptCodeBox")
         layout.addWidget(self.txt_content, stretch=1)
 
         # 기본 템플릿 하나 자동 로드
@@ -231,7 +231,7 @@ class PromptEditDialog(QDialog):
         box_bottom = QHBoxLayout()
         box_bottom.setSpacing(10)
 
-        btn_save = QPushButton("💾 prompts_memory/에 저장")
+        btn_save = QPushButton("▸ prompts_memory/에 저장")
         btn_save.setMinimumHeight(40)
         btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(btn_save, role="primary")
@@ -239,7 +239,8 @@ class PromptEditDialog(QDialog):
 
         btn_cancel = QPushButton("취소")
         btn_cancel.setMinimumHeight(40)
-        apply_qss_role(btn_cancel)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(btn_cancel, role="subtle")
         btn_cancel.clicked.connect(self.reject)
 
         box_bottom.addStretch()

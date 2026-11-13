@@ -167,7 +167,7 @@ def format_parsed_json_to_readable_text(data: Dict[str, Any]) -> str:
 
     title = data.get("document_title")
     if title:
-        lines.append(f"# 📄 {title}\n")
+        lines.append(f"# ▪ {title}\n")
 
     sender = data.get("sender_or_dept")
     due = data.get("due_date")
@@ -181,21 +181,21 @@ def format_parsed_json_to_readable_text(data: Dict[str, Any]) -> str:
 
     summary_list = data.get("summary_3lines")
     if isinstance(summary_list, list) and summary_list:
-        lines.append("## 📌 핵심 3줄 요약")
+        lines.append("## ▪ 핵심 3줄 요약")
         for s in summary_list:
             lines.append(f"- {s}")
         lines.append("")
 
     actions = data.get("action_items")
     if isinstance(actions, list) and actions:
-        lines.append("## ✅ 후속 조치 사항")
+        lines.append("## ✓ 후속 조치 사항")
         for a in actions:
             lines.append(f"- [ ] {a}")
         lines.append("")
 
     corrected = data.get("corrected_text")
     if corrected:
-        lines.append("## 📝 보정 및 정리된 본문")
+        lines.append("## ▪ 보정 및 정리된 본문")
         lines.append(str(corrected).strip())
         lines.append("")
 

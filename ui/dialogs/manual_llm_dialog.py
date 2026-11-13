@@ -31,11 +31,13 @@ from services.llm_client import (
     extract_json_from_llm_response,
     format_parsed_json_to_readable_text,
 )
+from ui.utils import install_no_scroll_wheel_filter
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     """위젯에 objectName 및 role 속성을 부여하고 style().polish()를 즉시 호출합니다."""
     widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    install_no_scroll_wheel_filter(widget)
     if obj_name:
         widget.setObjectName(obj_name)
     if role:
@@ -58,7 +60,7 @@ class ManualLlmDialog(QDialog):
     ):
         super().__init__(parent)
         apply_qss_role(self, obj_name="ManualLlmModal")
-        self.setWindowTitle("✨ 수동 프롬프트 어시스턴트 (No-API 외부 웹 AI 연동)")
+        self.setWindowTitle("수동 프롬프트 어시스턴트 (No-API 외부 웹 AI 연동)")
         self.resize(1120, 800)
         self.setMinimumSize(920, 660)
 
@@ -85,9 +87,9 @@ class ManualLlmDialog(QDialog):
         header_lay.setSpacing(10)
 
         banner = QLabel(
-            "💡 <b>API 키 없이 무료 웹 AI(ChatGPT, Claude, Gemini)를 활용하는 하이브리드 워크플로우</b><br>"
-            "① 좌측 <b>[클립보드에 프롬프트 복사]</b> 클릭 → ② 웹 AI에 붙여넣기 후 응답 복사 → "
-            "③ 우측 입력창에 붙여넣고 <b>[파싱 결과 워크스테이션에 적용]</b>을 클릭하세요."
+            "[!] <b>API 키 없이 무료 웹 AI(ChatGPT, Claude, Gemini)를 활용하는 하이브리드 워크플로우</b><br>"
+            "1. 좌측 <b>[클립보드에 프롬프트 복사]</b> 클릭 -> 2. 웹 AI에 붙여넣기 후 응답 복사 -> "
+            "3. 우측 입력창에 붙여넣고 <b>[파싱 결과 워크스테이션에 적용]</b>을 클릭하세요."
         )
         apply_qss_role(banner, role="infoBanner", obj_name="ModalInfoBanner")
         header_lay.addWidget(banner)
@@ -96,6 +98,7 @@ class ManualLlmDialog(QDialog):
         tpl_bar.setSpacing(10)
         tpl_bar.addWidget(QLabel("<b>작업 템플릿:</b>"))
         self.combo_task = QComboBox()
+        install_no_scroll_wheel_filter(self.combo_task)
         for k, meta in PROMPT_TEMPLATES.items():
             self.combo_task.addItem(meta["title"], k)
         idx = self.combo_task.findData(self._initial_task_key)
@@ -120,7 +123,7 @@ class ManualLlmDialog(QDialog):
         # =====================================================================
         # 좌측 [1단계: 프롬프트 생성 및 클립보드 복사]
         # =====================================================================
-        step1_group = QGroupBox("1️⃣  구조화 JSON 프롬프트 생성 및 복사")
+        step1_group = QGroupBox("1. 구조화 JSON 프롬프트 생성 및 복사")
         apply_qss_role(step1_group, obj_name="Step1PromptGroup")
         step1_lay = QVBoxLayout(step1_group)
         step1_lay.setContentsMargins(15, 15, 15, 15)
@@ -144,17 +147,17 @@ class ManualLlmDialog(QDialog):
 
         copy_btn_row = QHBoxLayout()
         copy_btn_row.setSpacing(8)
-        self.btn_copy_prompt = QPushButton("📋 클립보드에 프롬프트 전체 복사")
+        self.btn_copy_prompt = QPushButton("▸ 클립보드에 프롬프트 전체 복사")
         apply_qss_role(self.btn_copy_prompt, role="primary", obj_name="BtnCopyPrompt")
         self.btn_copy_prompt.setMinimumHeight(40)
         self.btn_copy_prompt.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_copy_prompt.clicked.connect(self._on_copy_prompt)
 
-        btn_open_chatgpt = QPushButton("🌐 ChatGPT")
-        btn_open_claude = QPushButton("🌐 Claude")
-        btn_open_gemini = QPushButton("🌐 Gemini")
+        btn_open_chatgpt = QPushButton("↗ ChatGPT")
+        btn_open_claude = QPushButton("↗ Claude")
+        btn_open_gemini = QPushButton("↗ Gemini")
         for b in (btn_open_chatgpt, btn_open_claude, btn_open_gemini):
-            apply_qss_role(b)
+            apply_qss_role(b, role="subtle")
             b.setMinimumHeight(40)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -173,7 +176,7 @@ class ManualLlmDialog(QDialog):
         # =====================================================================
         # 우측 [2단계: 외부 LLM 응답 붙여넣기 & 3단계: 안전한 JSON 파싱]
         # =====================================================================
-        step2_group = QGroupBox("2️⃣  외부 LLM 응답 붙여넣기 & 순수 JSON 정규식 추출")
+        step2_group = QGroupBox("2. 외부 LLM 응답 붙여넣기 · 순수 JSON 정규식 추출")
         apply_qss_role(step2_group, obj_name="Step2ResponseGroup")
         step2_lay = QVBoxLayout(step2_group)
         step2_lay.setContentsMargins(15, 15, 15, 15)
@@ -182,13 +185,13 @@ class ManualLlmDialog(QDialog):
         paste_header = QHBoxLayout()
         paste_header.addWidget(QLabel("<b>외부 LLM 응답 붙여넣기 (인사말 자동 제거):</b>"))
         paste_header.addStretch()
-        btn_paste_clip = QPushButton("📥 클립보드 바로 붙여넣기")
-        apply_qss_role(btn_paste_clip)
+        btn_paste_clip = QPushButton("↓ 클립보드 바로 붙여넣기")
+        apply_qss_role(btn_paste_clip, role="secondary")
         btn_paste_clip.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_paste_clip.clicked.connect(self._on_paste_from_clipboard)
 
-        btn_sample_resp = QPushButton("🧪 샘플 응답 채우기")
-        apply_qss_role(btn_sample_resp)
+        btn_sample_resp = QPushButton("▪ 샘플 응답 채우기")
+        apply_qss_role(btn_sample_resp, role="subtle")
         btn_sample_resp.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_sample_resp.clicked.connect(self._on_fill_sample_response)
 
@@ -206,19 +209,19 @@ class ManualLlmDialog(QDialog):
         step2_lay.addWidget(self.txt_llm_response, stretch=1)
 
         parse_bar = QHBoxLayout()
-        btn_preview_parse = QPushButton("🔍 JSON 추출 검증 및 미리보기")
-        apply_qss_role(btn_preview_parse, role="teal", obj_name="BtnPreviewJsonParse")
+        btn_preview_parse = QPushButton("▸ JSON 추출 검증 및 미리보기")
+        apply_qss_role(btn_preview_parse, role="secondary", obj_name="BtnPreviewJsonParse")
         btn_preview_parse.setMinimumHeight(36)
         btn_preview_parse.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_preview_parse.clicked.connect(self._on_preview_parse)
 
-        self.lbl_parse_status = QLabel("대기 중")
-        apply_qss_role(self.lbl_parse_status, role="mutedText")
+        self.lbl_parse_status = QLabel("▪ 대기 중")
+        apply_qss_role(self.lbl_parse_status, role="statusBanner")
         parse_bar.addWidget(btn_preview_parse)
         parse_bar.addWidget(self.lbl_parse_status, stretch=1)
         step2_lay.addLayout(parse_bar)
 
-        step2_lay.addWidget(QLabel("<b>3️⃣ 파싱 및 마크다운 변환 미리보기:</b>"))
+        step2_lay.addWidget(QLabel("<b>3. 파싱 및 마크다운 변환 미리보기:</b>"))
         self.txt_parsed_preview = QTextEdit()
         apply_qss_role(self.txt_parsed_preview, obj_name="ParsedPreviewBox")
         self.txt_parsed_preview.setMaximumHeight(185)
@@ -234,14 +237,14 @@ class ManualLlmDialog(QDialog):
         bottom_bar.addStretch()
 
         btn_cancel = QPushButton("닫기")
-        apply_qss_role(btn_cancel)
+        apply_qss_role(btn_cancel, role="subtle")
         btn_cancel.setMinimumHeight(40)
         btn_cancel.setMinimumWidth(90)
         btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_cancel.clicked.connect(self.reject)
 
-        self.btn_apply = QPushButton("✅ 파싱 결과 워크스테이션에 적용")
-        apply_qss_role(self.btn_apply, role="success", obj_name="BtnApplyParsedJson")
+        self.btn_apply = QPushButton("✓ 파싱 결과 워크스테이션에 적용")
+        apply_qss_role(self.btn_apply, role="primary", obj_name="BtnApplyParsedJson")
         self.btn_apply.setMinimumHeight(40)
         self.btn_apply.setMinimumWidth(240)
         self.btn_apply.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -272,7 +275,7 @@ class ManualLlmDialog(QDialog):
         if not prompt_text:
             return
         QApplication.clipboard().setText(prompt_text)
-        self.btn_copy_prompt.setText("✅ 클립보드에 복사 완료! (웹 AI에 Ctrl+V 하세요)")
+        self.btn_copy_prompt.setText("✓ 클립보드에 복사 완료 (웹 AI에 Ctrl+V 하세요)")
 
     def _on_paste_from_clipboard(self) -> None:
         clip_text = QApplication.clipboard().text()
@@ -306,7 +309,7 @@ class ManualLlmDialog(QDialog):
     def _on_preview_parse(self) -> bool:
         raw_resp = self.txt_llm_response.toPlainText().strip()
         if not raw_resp:
-            self.lbl_parse_status.setText("⚠️ 응답 텍스트를 먼저 붙여넣어 주세요.")
+            self.lbl_parse_status.setText("[!] 응답 텍스트를 먼저 붙여넣어 주세요.")
             return False
 
         try:
@@ -316,11 +319,11 @@ class ManualLlmDialog(QDialog):
             self.formatted_text = formatted
             self.txt_parsed_preview.setPlainText(formatted)
             self.lbl_parse_status.setText(
-                f"✅ 순수 JSON 추출 및 파싱 성공! (추출된 키: {', '.join(parsed.keys())})"
+                f"✓ 순수 JSON 추출 및 파싱 성공 (추출된 키: {', '.join(parsed.keys())})"
             )
             return True
         except Exception as exc:
-            self.lbl_parse_status.setText(f"❌ JSON 추출 오류: {exc}")
+            self.lbl_parse_status.setText(f"✕ JSON 추출 오류: {exc}")
             self.txt_parsed_preview.setPlainText(str(exc))
             return False
 
