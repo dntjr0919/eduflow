@@ -180,13 +180,13 @@ def extract_text_from_hwpx(file_path: Path) -> str:
 
 
 def load_all_references(ref_dir: Path | str) -> str:
-    """지정된 폴더 내의 모든 참고자료 문서를 파싱하여 하나의 텍스트 컨텍스트로 반환합니다."""
+    """지정된 폴더의 최상위 루트에 직접 위치한 참고자료 문서만 파싱하여 하나의 텍스트 컨텍스트로 반환합니다 (하위 폴더 제외)."""
     ref_path = Path(ref_dir)
-    if not ref_path.exists():
+    if not ref_path.exists() or not ref_path.is_dir():
         return ""
 
     files = [
-        f for f in ref_path.rglob("*")
+        f for f in ref_path.glob("*")
         if f.is_file() and not f.name.startswith("~$") and not f.name.startswith(".")
     ]
 
@@ -640,8 +640,18 @@ def generate_records_from_excel(
     reference_context = ""
     if reference_dir:
         reference_context = load_all_references(reference_dir)
-        if reference_context and log_callback:
-            log_callback("INFO", f"참고자료 {len(reference_context):,}자를 로드하여 프롬프트에 주입합니다.")
+        if reference_context:
+            file_count = reference_context.count("=== [참고자료:")
+            char_count = len(reference_context)
+            est_tokens = char_count // 2
+            if log_callback:
+                log_callback(
+                    "INFO",
+                    f"참고자료 {file_count}개 파일(약 {char_count:,}자, 예상 {est_tokens:,}토큰)을 로드했습니다.",
+                )
+        else:
+            if log_callback:
+                log_callback("INFO", "참고자료 루트 폴더가 비어 있어 참고자료 없이 실행합니다.")
 
     total_count = len(df)
     already_done = sum(1 for v in df["생성된_과세특"] if not is_blank_or_failed(v))
