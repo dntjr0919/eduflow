@@ -76,7 +76,10 @@ LENGTH_POLICIES: Dict[str, LengthPolicy] = {
 
 
 def get_length_policy(prompt_file: Optional[Path | str], custom_max_bytes: Optional[int] = None) -> LengthPolicy:
-    """프롬프트 파일에 따른 길이 정책을 반환합니다. custom_max_bytes가 지정되면 이를 우선 적용합니다."""
+    """프롬프트 파일에 따른 길이 정책을 반환합니다. 채점 프롬프트는 길이 제한을 적용하지 않습니다."""
+    if prompt_file is not None and "채점" in Path(prompt_file).name:
+        return NO_LENGTH_POLICY
+
     if custom_max_bytes is not None and custom_max_bytes > 0:
         target_min = int(custom_max_bytes * 0.85)
         hard_min = int(custom_max_bytes * 0.75)
@@ -474,7 +477,7 @@ def generate_single_student_record(
             try:
                 response = llm_client.generate(
                     prompt=current_prompt,
-                    system_prompt="당신은 대한민국 중·고등학교 교사를 지원하는 NEIS 학교생활기록부 작성 전문 AI이다.",
+                    system_prompt=None,
                 )
                 if stop_checker and stop_checker():
                     return "사용자에 의해 작업 중단됨"
@@ -600,9 +603,13 @@ def generate_records_from_excel(
             "[환경설정] 탭의 [API & 연동 설정]에서 API Key를 등록하거나 시스템 환경변수를 확인해 주세요."
         )
 
+    is_grading = bool(prompt_file is not None and "채점" in Path(prompt_file).name)
+    output_col = "AI_채점결과" if is_grading else "생성된_과세특"
+    file_prefix = "채점완료_" if is_grading else "과세특완료_"
+
     # 결과 파일 경로 결정
     if output_path is None:
-        output_path = excel_path.parent / f"과세특완료_{excel_path.name}"
+        output_path = excel_path.parent / f"{file_prefix}{excel_path.name}"
     else:
         output_path = Path(output_path)
 
@@ -617,20 +624,31 @@ def generate_records_from_excel(
         return {"total": 0, "completed": 0, "output_path": str(output_path), "records": []}
 
     # 열 표준화
-    if "생성된_과세특" not in df.columns:
-        df["생성된_과세특"] = ""
-    if "과세특_바이트" not in df.columns:
-        df["과세특_바이트"] = 0
+    if output_col not in df.columns:
+        df[output_col] = ""
+    df[output_col] = df[output_col].apply(lambda x: "" if is_blank_or_failed(x) else str(x))
 
-    df["생성된_과세특"] = df["생성된_과세특"].apply(lambda x: "" if is_blank_or_failed(x) else str(x))
-    df["과세특_바이트"] = pd.to_numeric(df["과세특_바이트"], errors="coerce").fillna(0).astype(int)
+    if not is_grading:
+        if "과세특_바이트" not in df.columns:
+            df["과세특_바이트"] = 0
+        df["과세특_바이트"] = pd.to_numeric(df["과세특_바이트"], errors="coerce").fillna(0).astype(int)
 
     # 학생 정보 열 판별
     cols = list(df.columns)
     id_col = cols[0]
     name_col = cols[1] if len(cols) > 1 else cols[0]
-    # 응답 열들 ('생성된_과세특', '과세특_바이트', '누락 항목', '양식', '원본파일명' 제외)
-    meta_cols = {"생성된_과세특", "과세특_바이트", "누락 항목", "양식", "원본파일명", id_col, name_col}
+    # 응답 열들 (결과/메타 열 제외)
+    meta_cols = {
+        "AI_채점결과",
+        "생성된_과세특",
+        "과세특_바이트",
+        "누락 항목",
+        "누락항목",
+        "양식",
+        "원본파일명",
+        id_col,
+        name_col,
+    }
     response_cols = [c for c in cols if c not in meta_cols]
 
     # 프롬프트 및 참고자료 로드
@@ -654,7 +672,7 @@ def generate_records_from_excel(
                 log_callback("INFO", "참고자료 루트 폴더가 비어 있어 참고자료 없이 실행합니다.")
 
     total_count = len(df)
-    already_done = sum(1 for v in df["생성된_과세특"] if not is_blank_or_failed(v))
+    already_done = sum(1 for v in df[output_col] if not is_blank_or_failed(v))
 
     if log_callback:
         log_callback(
@@ -674,7 +692,7 @@ def generate_records_from_excel(
                 log_callback("WARN", "사용자 요청으로 과세특 생성을 안전하게 일시 중단합니다.")
             break
 
-        current_val = df.at[idx, "생성된_과세특"]
+        current_val = df.at[idx, output_col]
         sid = str(df.at[idx, id_col])
         sname = str(df.at[idx, name_col])
 
@@ -695,8 +713,9 @@ def generate_records_from_excel(
 
         combined_answers = "\n".join(valid_answers)
         if not combined_answers.strip():
-            df.at[idx, "생성된_과세특"] = "응답 내용 없음"
-            df.at[idx, "과세특_바이트"] = 0
+            df.at[idx, output_col] = "응답 내용 없음"
+            if not is_grading:
+                df.at[idx, "과세특_바이트"] = 0
             actual_saved_path = safe_save_excel(df, output_path)
             if log_callback:
                 log_callback("INFO", f"[{sid} {sname}] 응답 내용 없음 (건너뜀)")
@@ -719,8 +738,9 @@ def generate_records_from_excel(
             stop_checker=stop_checker,
         )
 
-        df.at[idx, "생성된_과세특"] = res_text
-        df.at[idx, "과세특_바이트"] = res_bytes
+        df.at[idx, output_col] = res_text
+        if not is_grading:
+            df.at[idx, "과세특_바이트"] = res_bytes
         actual_saved_path = safe_save_excel(df, output_path)
 
         if res_text.startswith("생성 실패"):
