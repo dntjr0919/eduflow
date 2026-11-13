@@ -502,6 +502,22 @@ class SettingsTab(QWidget):
         self.lbl_model_status.setVisible(False)
         ai_form.addRow("", self.lbl_model_status)
 
+        # (5-1) 최대 출력 토큰 (Max Output Tokens)
+        self.spin_max_output_tokens = QSpinBox()
+        configure_input_widget(self.spin_max_output_tokens)
+        self.spin_max_output_tokens.setRange(256, 32768)
+        self.spin_max_output_tokens.setSingleStep(256)
+        self.spin_max_output_tokens.setValue(2048)
+        ai_form.addRow("최대 출력 토큰 (Max Output Tokens):", self.spin_max_output_tokens)
+
+        # (5-2) Gemini 추론 강도 (Thinking)
+        self.combo_thinking_budget = QComboBox()
+        configure_input_widget(self.combo_thinking_budget)
+        self.combo_thinking_budget.addItem("최소 (채점·세특 권장 / 빠름)", "low")
+        self.combo_thinking_budget.addItem("끄기 (최저 비용)", "off")
+        self.combo_thinking_budget.addItem("자동 (심층 추론)", "auto")
+        ai_form.addRow("Gemini 추론 강도 (Thinking):", self.combo_thinking_budget)
+
         ai_vbox.addLayout(ai_form)
 
         # (6) [연결 테스트] 및 [수동 복붙 모달 미리보기] 버튼
@@ -533,6 +549,8 @@ class SettingsTab(QWidget):
         self.edit_custom_base_url.textChanged.connect(self._on_ai_setting_changed)
         self.edit_custom_base_url.textChanged.connect(self._update_provider_field_states)
         self.combo_model.currentTextChanged.connect(self._on_ai_setting_changed)
+        self.spin_max_output_tokens.valueChanged.connect(self._on_ai_setting_changed)
+        self.combo_thinking_budget.currentIndexChanged.connect(self._on_ai_setting_changed)
 
         scroll_layout.addWidget(self.ai_group)
         self.settings_accordion.add_card(self.ai_group)
@@ -981,6 +999,8 @@ class SettingsTab(QWidget):
         updates: Dict[str, Any] = {
             "use_manual_prompt_mode": self.chk_manual_prompt_mode.isChecked(),
             "ai_provider": prov_code,
+            "max_output_tokens": int(self.spin_max_output_tokens.value()),
+            "thinking_budget_mode": str(self.combo_thinking_budget.currentData() or "low"),
         }
         if prov_code == "gemini":
             updates["gemini_api_key"] = api_key
@@ -1101,6 +1121,22 @@ class SettingsTab(QWidget):
                 self._model_cache.get(prov_code, []),
                 saved_model,
             )
+
+            raw_max_tokens = api.get("max_output_tokens", 2048)
+            try:
+                max_tokens_val = int(raw_max_tokens)
+            except (TypeError, ValueError):
+                max_tokens_val = 2048
+            max_tokens_val = max(
+                self.spin_max_output_tokens.minimum(),
+                min(self.spin_max_output_tokens.maximum(), max_tokens_val),
+            )
+            self.spin_max_output_tokens.setValue(max_tokens_val)
+
+            t_idx = self.combo_thinking_budget.findData(
+                str(api.get("thinking_budget_mode", "low") or "low").strip().lower()
+            )
+            self.combo_thinking_budget.setCurrentIndex(t_idx if t_idx >= 0 else 0)
 
             # 2) 폴더 및 감시 설정 로드
             self.edit_default_target.setText(fs.get("target_base_dir", ""))

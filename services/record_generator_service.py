@@ -732,7 +732,16 @@ def generate_records_from_excel(
             consecutive_errors = 0
             success_cnt += 1
             if log_callback:
-                log_callback("SUCCESS", f"[{sid} {sname}] 생성 완료 ({res_bytes}B)")
+                usage = getattr(llm_client, "last_token_usage", None)
+                if isinstance(usage, dict) and ("input" in usage or "output" in usage):
+                    in_tok = int(usage.get("input", 0) or 0)
+                    out_tok = int(usage.get("output", 0) or 0)
+                    log_callback(
+                        "SUCCESS",
+                        f"[{sid} {sname}] 생성 완료 ({res_bytes:,}B | 토큰: 입력 {in_tok:,} / 출력 {out_tok:,})",
+                    )
+                else:
+                    log_callback("SUCCESS", f"[{sid} {sname}] 생성 완료 ({res_bytes:,}B)")
             if progress_callback:
                 progress_callback(pct, f"{sid} {sname} 처리 완료 ({res_bytes}B)")
 

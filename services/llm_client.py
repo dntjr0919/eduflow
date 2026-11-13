@@ -208,10 +208,70 @@ def format_parsed_json_to_readable_text(data: Dict[str, Any]) -> str:
 # =============================================================================
 # 2. 멀티 LLM 공급자 추상 인터페이스 및 구현체
 # =============================================================================
+_THINKING_BUDGET_MAP: Dict[str, Optional[int]] = {
+    "off": 0,
+    "low": 512,
+    "auto": None,
+}
+
+
+def _resolve_generation_options(
+    max_output_tokens: Optional[int] = None,
+    thinking_budget_mode: Optional[str] = None,
+) -> Tuple[int, str]:
+    """ConfigManager 또는 명시적 인자에서 (max_output_tokens, thinking_budget_mode)를 결정합니다."""
+    sec: Dict[str, Any] = {}
+    if max_output_tokens is None or thinking_budget_mode is None:
+        sec = ConfigManager().get_section("api_and_integrations")
+
+    raw_tokens = max_output_tokens if max_output_tokens is not None else sec.get("max_output_tokens", 2048)
+    try:
+        resolved_tokens = max(1, int(raw_tokens))
+    except (TypeError, ValueError):
+        resolved_tokens = 2048
+
+    raw_mode = thinking_budget_mode if thinking_budget_mode is not None else sec.get("thinking_budget_mode", "low")
+    resolved_mode = str(raw_mode or "low").strip().lower()
+    if resolved_mode not in _THINKING_BUDGET_MAP:
+        resolved_mode = "low"
+
+    return resolved_tokens, resolved_mode
+
+
+def _extract_token_usage(usage_obj: Any) -> Optional[Dict[str, int]]:
+    """SDK 객체 또는 REST 응답의 usage 메타데이터에서 입력/출력 토큰 수를 추출합니다."""
+    if usage_obj is None:
+        return None
+
+    def _pick(keys: Tuple[str, ...]) -> Optional[int]:
+        for key in keys:
+            val = usage_obj.get(key) if isinstance(usage_obj, dict) else getattr(usage_obj, key, None)
+            if val is not None:
+                try:
+                    return int(val)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    input_tokens = _pick(
+        ("prompt_token_count", "promptTokenCount", "prompt_tokens", "input_tokens", "inputTokens", "input")
+    )
+    output_tokens = _pick(
+        ("candidates_token_count", "candidatesTokenCount", "completion_tokens", "output_tokens", "outputTokens", "output")
+    )
+    if input_tokens is None and output_tokens is None:
+        return None
+    return {
+        "input": input_tokens if input_tokens is not None else 0,
+        "output": output_tokens if output_tokens is not None else 0,
+    }
+
+
 class BaseLlmProvider(abc.ABC):
     """모든 LLM 공급자가 구현해야 하는 추상 기본 클래스."""
 
     last_responded_model: str = ""
+    last_token_usage: Optional[Dict[str, int]] = None
 
     @abc.abstractmethod
     def generate(
@@ -232,10 +292,19 @@ class GeminiProvider(BaseLlmProvider):
     3순위: 표준 REST API (설치된 SDK가 없어도 즉시 동작)
     """
 
-    def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "gemini-1.5-flash",
+        max_output_tokens: Optional[int] = None,
+        thinking_budget_mode: Optional[str] = None,
+    ):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip() or "gemini-1.5-flash"
+        self.max_output_tokens = max_output_tokens
+        self.thinking_budget_mode = thinking_budget_mode
         self.last_responded_model = ""
+        self.last_token_usage: Optional[Dict[str, int]] = None
 
     def generate(
         self,
@@ -246,6 +315,12 @@ class GeminiProvider(BaseLlmProvider):
     ) -> str:
         if not self.api_key:
             raise ValueError("Google Gemini API Key가 설정되지 않았습니다.")
+
+        self.last_token_usage = None
+        max_tokens, thinking_mode = _resolve_generation_options(
+            self.max_output_tokens, self.thinking_budget_mode
+        )
+        thinking_budget = _THINKING_BUDGET_MAP.get(thinking_mode)
 
         # 1) 최신 google-genai SDK 시도
         try:
@@ -258,15 +333,43 @@ class GeminiProvider(BaseLlmProvider):
                 contents.append(
                     types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
                 )
-            cfg = types.GenerateContentConfig(
-                system_instruction=system_prompt if system_prompt else None
-            )
-            resp = client.models.generate_content(
-                model=self.model_name,
-                contents=contents,
-                config=cfg,
-            )
+
+            def _build_genai_config(include_thinking: bool) -> Any:
+                cfg_kwargs: Dict[str, Any] = {
+                    "system_instruction": system_prompt if system_prompt else None,
+                    "max_output_tokens": max_tokens,
+                }
+                if include_thinking and thinking_budget is not None:
+                    if hasattr(types, "ThinkingConfig"):
+                        cfg_kwargs["thinking_config"] = types.ThinkingConfig(
+                            thinking_budget=thinking_budget
+                        )
+                    else:
+                        cfg_kwargs["thinking_config"] = {"thinking_budget": thinking_budget}
+                return types.GenerateContentConfig(**cfg_kwargs)
+
+            if thinking_budget is not None:
+                try:
+                    resp = client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=_build_genai_config(include_thinking=True),
+                    )
+                except Exception:
+                    resp = client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=_build_genai_config(include_thinking=False),
+                    )
+            else:
+                resp = client.models.generate_content(
+                    model=self.model_name,
+                    contents=contents,
+                    config=_build_genai_config(include_thinking=False),
+                )
+
             self.last_responded_model = str(getattr(resp, "model_version", None) or self.model_name)
+            self.last_token_usage = _extract_token_usage(getattr(resp, "usage_metadata", None))
             return resp.text or ""
         except ImportError:
             pass
@@ -286,8 +389,12 @@ class GeminiProvider(BaseLlmProvider):
             parts: List[Any] = [prompt]
             if image_bytes is not None:
                 parts.append({"mime_type": mime_type, "data": image_bytes})
-            resp = model.generate_content(parts)
+            resp = model.generate_content(
+                parts,
+                generation_config={"max_output_tokens": max_tokens},
+            )
             self.last_responded_model = str(getattr(resp, "model_version", None) or self.model_name)
+            self.last_token_usage = _extract_token_usage(getattr(resp, "usage_metadata", None))
             return resp.text or ""
         except ImportError:
             pass
@@ -311,21 +418,36 @@ class GeminiProvider(BaseLlmProvider):
                 }
             )
 
-        payload: Dict[str, Any] = {
-            "contents": [{"role": "user", "parts": user_parts}]
-        }
-        if system_prompt:
-            payload["system_instruction"] = {"parts": [{"text": system_prompt}]}
+        def _build_rest_payload(include_thinking: bool) -> Dict[str, Any]:
+            gen_cfg: Dict[str, Any] = {"maxOutputTokens": max_tokens}
+            if include_thinking and thinking_budget is not None:
+                gen_cfg["thinkingConfig"] = {"thinkingBudget": thinking_budget}
+            body: Dict[str, Any] = {
+                "contents": [{"role": "user", "parts": user_parts}],
+                "generationConfig": gen_cfg,
+            }
+            if system_prompt:
+                body["system_instruction"] = {"parts": [{"text": system_prompt}]}
+            return body
 
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json; charset=utf-8"},
-            method="POST",
-        )
-        try:
+        def _post_rest(body: Dict[str, Any]) -> Dict[str, Any]:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json; charset=utf-8"},
+                method="POST",
+            )
             with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+                return json.loads(resp.read().decode("utf-8"))
+
+        try:
+            if thinking_budget is not None:
+                try:
+                    data = _post_rest(_build_rest_payload(include_thinking=True))
+                except Exception:
+                    data = _post_rest(_build_rest_payload(include_thinking=False))
+            else:
+                data = _post_rest(_build_rest_payload(include_thinking=False))
         except urllib.error.HTTPError as e:
             friendly_msg = _diagnose_llm_error(e, provider="Google Gemini")
             raise RuntimeError(friendly_msg) from e
@@ -337,6 +459,9 @@ class GeminiProvider(BaseLlmProvider):
             raise RuntimeError(friendly_msg) from e
 
         self.last_responded_model = str(data.get("modelVersion") or self.model_name)
+        self.last_token_usage = _extract_token_usage(
+            data.get("usageMetadata") or data.get("usage_metadata") or data.get("usage")
+        )
         candidates = data.get("candidates", [])
         if not candidates:
             return ""
@@ -420,6 +545,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
         base_url: Optional[str] = None,
         extra_headers: Optional[Dict[str, str]] = None,
         provider_name: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
     ):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip() or "gpt-4o"
@@ -428,6 +554,9 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             raw_base = f"{raw_base}/v1"
         self.base_url = raw_base
         self.extra_headers = dict(extra_headers or {})
+        self.max_output_tokens = max_output_tokens
+        self.last_responded_model = ""
+        self.last_token_usage: Optional[Dict[str, int]] = None
         if provider_name:
             self.provider_name = provider_name
         elif "openrouter" in raw_base.lower():
@@ -446,6 +575,9 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
         image_bytes: Optional[bytes] = None,
         mime_type: str = "image/png",
     ) -> str:
+        self.last_token_usage = None
+        max_tokens, _ = _resolve_generation_options(self.max_output_tokens, None)
+
         messages: List[Dict[str, Any]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -480,9 +612,11 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             completion = client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,  # type: ignore
+                max_tokens=max_tokens,
                 timeout=30.0,
             )
             self.last_responded_model = str(getattr(completion, "model", None) or self.model_name)
+            self.last_token_usage = _extract_token_usage(getattr(completion, "usage", None))
             return completion.choices[0].message.content or ""
         except ImportError:
             pass
@@ -499,6 +633,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
         payload = {
             "model": self.model_name,
             "messages": messages,
+            "max_tokens": max_tokens,
         }
         req = urllib.request.Request(
             endpoint,
@@ -520,6 +655,7 @@ class OpenAiCompatibleProvider(BaseLlmProvider):
             raise RuntimeError(friendly_msg) from e
 
         self.last_responded_model = str(data.get("model") or self.model_name)
+        self.last_token_usage = _extract_token_usage(data.get("usage"))
         choices = data.get("choices", [])
         if not choices:
             return ""
@@ -533,9 +669,17 @@ class AnthropicClaudeProvider(BaseLlmProvider):
     2순위: 표준 HTTP REST 호출
     """
 
-    def __init__(self, api_key: str, model_name: str = "claude-3-7-sonnet-latest"):
+    def __init__(
+        self,
+        api_key: str,
+        model_name: str = "claude-3-7-sonnet-latest",
+        max_output_tokens: Optional[int] = None,
+    ):
         self.api_key = api_key.strip()
         self.model_name = model_name.strip() or "claude-3-7-sonnet-latest"
+        self.max_output_tokens = max_output_tokens
+        self.last_responded_model = ""
+        self.last_token_usage: Optional[Dict[str, int]] = None
 
     def generate(
         self,
@@ -546,6 +690,9 @@ class AnthropicClaudeProvider(BaseLlmProvider):
     ) -> str:
         if not self.api_key:
             raise ValueError("Anthropic (Claude) API Key가 설정되지 않았습니다.")
+
+        self.last_token_usage = None
+        max_tokens, _ = _resolve_generation_options(self.max_output_tokens, None)
 
         user_content: List[Dict[str, Any]] = []
         if image_bytes is not None:
@@ -569,13 +716,14 @@ class AnthropicClaudeProvider(BaseLlmProvider):
             client = anthropic.Anthropic(api_key=self.api_key)
             kwargs: Dict[str, Any] = {
                 "model": self.model_name,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": user_content}],
             }
             if system_prompt:
                 kwargs["system"] = system_prompt
             msg = client.messages.create(**kwargs)
             self.last_responded_model = str(getattr(msg, "model", None) or self.model_name)
+            self.last_token_usage = _extract_token_usage(getattr(msg, "usage", None))
             return "\n".join(
                 block.text for block in msg.content if hasattr(block, "text")
             )
@@ -594,7 +742,7 @@ class AnthropicClaudeProvider(BaseLlmProvider):
         }
         payload: Dict[str, Any] = {
             "model": self.model_name,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": user_content}],
         }
         if system_prompt:
@@ -620,6 +768,7 @@ class AnthropicClaudeProvider(BaseLlmProvider):
             raise RuntimeError(friendly_msg) from e
 
         self.last_responded_model = str(data.get("model") or self.model_name)
+        self.last_token_usage = _extract_token_usage(data.get("usage"))
         content_blocks = data.get("content", [])
         return "\n".join(
             b.get("text", "") for b in content_blocks if b.get("type") == "text"
@@ -641,6 +790,8 @@ class MultiLlmClient:
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
         base_url: Optional[str] = None,
+        max_output_tokens: Optional[int] = None,
+        thinking_budget_mode: Optional[str] = None,
     ):
         self.config = ConfigManager()
         sec = self.config.get_section("api_and_integrations")
@@ -650,7 +801,10 @@ class MultiLlmClient:
         self.api_key, self.model_name, self.base_url = self._resolve_credentials(
             sec, self.provider, api_key, model_name, base_url
         )
+        self.max_output_tokens = max_output_tokens
+        self.thinking_budget_mode = thinking_budget_mode
         self.last_responded_model: str = ""
+        self.last_token_usage: Optional[Dict[str, int]] = None
 
     @staticmethod
     def _resolve_credentials(
@@ -715,19 +869,29 @@ class MultiLlmClient:
         return not bool(self.api_key)
 
     def _create_provider_instance(self) -> BaseLlmProvider:
+        max_tokens, thinking_mode = _resolve_generation_options(
+            self.max_output_tokens, self.thinking_budget_mode
+        )
         if self.provider == "gemini":
-            return GeminiProvider(api_key=self.api_key, model_name=self.model_name)
+            return GeminiProvider(
+                api_key=self.api_key,
+                model_name=self.model_name,
+                max_output_tokens=max_tokens,
+                thinking_budget_mode=thinking_mode,
+            )
         elif self.provider == "openai":
             return OpenAiCompatibleProvider(
                 api_key=self.api_key,
                 model_name=self.model_name,
                 base_url="https://api.openai.com/v1",
                 provider_name="OpenAI",
+                max_output_tokens=max_tokens,
             )
         elif self.provider == "claude":
             return AnthropicClaudeProvider(
                 api_key=self.api_key,
                 model_name=self.model_name,
+                max_output_tokens=max_tokens,
             )
         elif self.provider == "openrouter":
             return OpenAiCompatibleProvider(
@@ -740,6 +904,7 @@ class MultiLlmClient:
                     "User-Agent": "EduFlow-Client/2.0",
                 },
                 provider_name="OpenRouter",
+                max_output_tokens=max_tokens,
             )
         elif self.provider in ("ollama", "custom"):
             return OpenAiCompatibleProvider(
@@ -747,6 +912,7 @@ class MultiLlmClient:
                 model_name=self.model_name,
                 base_url=self.base_url or "http://localhost:11434/v1",
                 provider_name="Ollama" if self.provider == "ollama" else "AI",
+                max_output_tokens=max_tokens,
             )
         else:
             raise ValueError(f"지원하지 않는 AI 공급자입니다: {self.provider}")
@@ -759,6 +925,7 @@ class MultiLlmClient:
         mime_type: str = "image/png",
     ) -> str:
         """모든 공급자에 대해 동일한 시그니처로 텍스트/멀티모달 생성을 수행합니다."""
+        self.last_token_usage = None
         engine = self._create_provider_instance()
         text = engine.generate(
             prompt=prompt,
@@ -769,6 +936,7 @@ class MultiLlmClient:
         self.last_responded_model = str(
             getattr(engine, "last_responded_model", "") or self.model_name
         ).strip()
+        self.last_token_usage = getattr(engine, "last_token_usage", None)
         return text
 
     def test_connection(self) -> Tuple[bool, str]:

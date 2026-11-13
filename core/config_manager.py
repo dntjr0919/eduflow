@@ -49,6 +49,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "last_tested_requested_model": "",
         "last_tested_responded_model": "",
         "last_tested_ok": False,
+        "max_output_tokens": 2048,
+        "thinking_budget_mode": "low",    # "off"(추론 끄기), "low"(최소 추론 - 채점/세특 권장), "auto"(모델 기본값)
         # Google Sheets & 카카오톡 외부 연동 설정
         "google_credentials_path": "",
         "google_sheet_url": "",
