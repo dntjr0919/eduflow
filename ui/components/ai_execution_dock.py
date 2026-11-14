@@ -407,6 +407,7 @@ class AiExecutionDock(QFrame):
     target_changed = pyqtSignal(str)
     go_to_settings_requested = pyqtSignal()
     execution_completed = pyqtSignal(str, dict)
+    ai_mode_changed = pyqtSignal()
 
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1074,12 +1075,59 @@ class AiExecutionDock(QFrame):
     def active_target_id(self) -> str:
         return self._active_target_id
 
+    def current_mode_index(self) -> int:
+        return int(self.mode_stack.currentIndex())
+
+    @staticmethod
+    def get_web_provider_label(provider_key: str, custom_url: str = "") -> str:
+        key = str(provider_key or "gemini").strip().lower()
+        mapping = {
+            "gemini": "Gemini",
+            "chatgpt": "ChatGPT",
+            "claude": "Claude",
+        }
+        if key in mapping:
+            return mapping[key]
+        if key == "custom":
+            url_str = str(custom_url or "").strip()
+            if url_str:
+                from urllib.parse import urlparse
+
+                parsed = urlparse(url_str if "://" in url_str else f"https://{url_str}")
+                host = (parsed.netloc or "").strip()
+                if host:
+                    return host[:24]
+            return "직접 URL"
+        return key.upper() if key else "Gemini"
+
+    def manual_provider_display(self) -> str:
+        custom_url = (
+            self.edit_manual_custom_url.text().strip()
+            if hasattr(self, "edit_manual_custom_url")
+            else ""
+        )
+        return self.get_web_provider_label(self._manual_provider, custom_url)
+
+    def playwright_provider_display(self) -> str:
+        custom_url = (
+            self.edit_pw_custom_url.text().strip()
+            if hasattr(self, "edit_pw_custom_url")
+            else ""
+        )
+        return self.get_web_provider_label(self._pw_provider, custom_url)
+
+    def playwright_exec_mode_display(self) -> str:
+        if hasattr(self, "combo_pw_exec_mode") and self.combo_pw_exec_mode.currentData() == "auto":
+            return "완전 자동"
+        return "반자동"
+
     def set_mode_index(self, index: int) -> None:
         if 0 <= index < self.mode_stack.count():
             self.mode_stack.setCurrentIndex(index)
             btn = self.mode_btn_group.button(index)
             if btn is not None:
                 btn.setChecked(True)
+            self.ai_mode_changed.emit()
 
     def reset_target_state(self) -> None:
         """타겟 전환 또는 새 문서 열기 시 이전 타겟의 응답창·첨부파일·배치·결과 캐시를 즉시 초기화합니다."""
@@ -1196,6 +1244,7 @@ class AiExecutionDock(QFrame):
     def _on_mode_segment_clicked(self, mode_idx: int) -> None:
         self.mode_stack.setCurrentIndex(mode_idx)
         self.sync_from_context(self._fetch_fresh_context())
+        self.ai_mode_changed.emit()
 
     def _fetch_fresh_context(self, target_id: Optional[str] = None) -> Dict[str, Any]:
         tid = target_id or self._active_target_id
@@ -1352,6 +1401,7 @@ class AiExecutionDock(QFrame):
             self.lbl_api_model_badge.setText(f"{p_name} · {model_disp} ({tag})")
         else:
             self.lbl_api_model_badge.setText(f"{p_name} · {model_disp} (API Key 미등록)")
+        self.ai_mode_changed.emit()
 
     # =========================================================================
     # API 모드 실행
@@ -1508,12 +1558,14 @@ class AiExecutionDock(QFrame):
         self.edit_manual_custom_url.setEnabled(is_custom)
         if is_custom:
             self.edit_manual_custom_url.setFocus()
+        self.ai_mode_changed.emit()
 
     def _on_manual_custom_url_changed(self, text: str) -> None:
         if text.strip() and not self.manual_provider_chips["custom"].isChecked():
             self.manual_provider_chips["custom"].setChecked(True)
             self._manual_provider = "custom"
             self.edit_manual_custom_url.setEnabled(True)
+        self.ai_mode_changed.emit()
 
     def _resolve_target_web_url(self, provider: str, custom_url_edit: QLineEdit) -> str:
         if provider == "custom":
@@ -2082,6 +2134,7 @@ class AiExecutionDock(QFrame):
         self.edit_pw_custom_url.setEnabled(is_custom)
         if is_custom:
             self.edit_pw_custom_url.setFocus()
+        self.ai_mode_changed.emit()
 
     def _set_pw_running_state(self, running: bool) -> None:
         for chip in self.pw_provider_chips.values():

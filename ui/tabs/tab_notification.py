@@ -11,17 +11,22 @@ from datetime import datetime
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -29,6 +34,7 @@ from PyQt6.QtWidgets import (
 
 from core.base_worker import PeriodicWorker, TaskRunner
 from core.config_manager import ConfigManager
+from core.database import DatabaseManager
 from services.notifier import NotificationService
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.utils import install_no_scroll_wheel_filter
@@ -78,19 +84,29 @@ class NotificationCenterTab(QWidget):
     """[탭 5] 외부 연동 및 자동 알림 센터 탭 위젯."""
 
     new_sheet_row_signal = pyqtSignal(dict)
+    unread_changed = pyqtSignal()
     SHEET_WATCH_KEY = "google_sheet_watcher"
 
-    def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        task_runner: TaskRunner,
+        parent: Optional[QWidget] = None,
+        db: Optional[DatabaseManager] = None,
+        config: Optional[ConfigManager] = None,
+        notifier: Optional[NotificationService] = None,
+    ):
         super().__init__(parent)
         apply_qss_role(self, obj_name="NotificationCenterTabPage")
         self.task_runner = task_runner
-        self.config = ConfigManager()
-        self.notifier = NotificationService()
+        self.db = db or DatabaseManager()
+        self.config = config or ConfigManager()
+        self.notifier = notifier or NotificationService()
         self._watching_sheet = False
 
         self.new_sheet_row_signal.connect(self._on_new_sheet_row)
         self._init_ui()
         self._refresh_channel_status_chips()
+        self.refresh_notifications_inbox()
         self.config.add_listener(lambda _cfg: self._refresh_channel_status_chips())
 
     def _init_ui(self) -> None:
@@ -262,6 +278,69 @@ class NotificationCenterTab(QWidget):
         layout.addWidget(self.notify_group)
 
         # -----------------------------------------------------------------
+        # 3.5 외부 연동 및 알림 수신함 (Incoming Notifications & History)
+        # -----------------------------------------------------------------
+        self.inbox_group = HoverZoomCard(
+            title="외부 연동 및 알림 수신함 (Incoming Notifications & History)",
+            parent=container,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        apply_qss_role(self.inbox_group, role="hoverZoomCard", obj_name="NotificationInboxGroup")
+        in_lay = self.inbox_group.body_layout()
+
+        inbox_hdr = QHBoxLayout()
+        inbox_hdr.setSpacing(8)
+        self.lbl_inbox_unread = QLabel("미확인 알림 0건")
+        apply_qss_role(self.lbl_inbox_unread, role="badgeNeutral", obj_name="InboxUnreadBadge")
+
+        lbl_inbox_hint = QLabel("항목을 클릭하거나 [확인]을 누르면 읽음 처리됩니다. (탭 열기만으로는 읽음 처리되지 않음)")
+        apply_qss_role(lbl_inbox_hint, role="mutedText")
+
+        self.btn_refresh_inbox = QPushButton("새로고침")
+        apply_qss_role(self.btn_refresh_inbox, role="secondary", obj_name="BtnRefreshInbox")
+        self.btn_refresh_inbox.setMinimumHeight(28)
+        self.btn_refresh_inbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_refresh_inbox.clicked.connect(self.refresh_notifications_inbox)
+
+        self.btn_mark_all_noti_read = QPushButton("모두 읽음")
+        apply_qss_role(self.btn_mark_all_noti_read, role="secondary", obj_name="BtnMarkAllNotiRead")
+        self.btn_mark_all_noti_read.setMinimumHeight(28)
+        self.btn_mark_all_noti_read.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mark_all_noti_read.clicked.connect(self.mark_all_read)
+
+        inbox_hdr.addWidget(self.lbl_inbox_unread)
+        inbox_hdr.addWidget(lbl_inbox_hint)
+        inbox_hdr.addStretch()
+        inbox_hdr.addWidget(self.btn_refresh_inbox)
+        inbox_hdr.addWidget(self.btn_mark_all_noti_read)
+        in_lay.addLayout(inbox_hdr)
+
+        self.table_notifications = QTableWidget(0, 6)
+        self.table_notifications.setHorizontalHeaderLabels(
+            ["상태", "채널", "제목", "내용", "수신 시각", "작업"]
+        )
+        self.table_notifications.verticalHeader().setVisible(False)
+        self.table_notifications.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_notifications.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_notifications.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table_notifications.setAlternatingRowColors(True)
+        self.table_notifications.setMinimumHeight(190)
+        hdr = self.table_notifications.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.table_notifications.setColumnWidth(2, 180)
+        self.table_notifications.setColumnWidth(5, 84)
+        self.table_notifications.cellClicked.connect(self._on_notification_cell_clicked)
+        in_lay.addWidget(self.table_notifications)
+
+        layout.addWidget(self.inbox_group)
+
+        # -----------------------------------------------------------------
         # 4. 실시간 터미널 이벤트 로그 드로어 (Live Terminal Log Drawer)
         # -----------------------------------------------------------------
         log_card = QFrame()
@@ -374,9 +453,21 @@ class NotificationCenterTab(QWidget):
         self.new_sheet_row_signal.emit(sample)
 
     def _on_new_sheet_row(self, row_data: dict) -> None:
-        msg = f"신규 시트 응답 감지: {row_data.get('student')} - {row_data.get('type')}"
+        title = "구글 설문/시트 새 응답"
+        msg = f"신규 시트 응답 감지: {row_data.get('student', '')} - {row_data.get('type', '')}"
+        remote_id = str(row_data.get("remote_id", "")).strip() or None
+        self.db.add_notification(
+            title=title,
+            message=msg,
+            channel="google_sheets",
+            sender=str(row_data.get("student", "")).strip(),
+            remote_id=remote_id,
+            is_read=0,
+        )
         self._append_log(msg)
-        self.notifier.notify("구글 설문/시트 새 응답", msg)
+        self.notifier.notify(title, msg)
+        self.refresh_notifications_inbox()
+        self.unread_changed.emit()
 
     def _on_send_manual_notification(self) -> None:
         title = self.edit_notify_title.text().strip() or "알림"
@@ -390,10 +481,106 @@ class NotificationCenterTab(QWidget):
             selected_channels.append("Webhook")
 
         results = self.notifier.notify(title, body, force_external=True)
-        ch_summary = ", ".join(selected_channels) if selected_channels else " 기본채널"
+        ch_summary = ", ".join(selected_channels) if selected_channels else "기본채널"
+        self.db.add_notification(
+            title=title,
+            message=body,
+            channel=ch_summary,
+            sender="manual",
+            is_read=1,
+        )
         self._append_log(
             f"[즉시 발송 | 채널: {ch_summary}] {title}: {body} -> {', '.join(results)}"
         )
+        self.refresh_notifications_inbox()
+
+    def refresh_notifications_inbox(self) -> None:
+        """SQLite notifications 테이블을 읽어 수신함 테이블과 미확인 배지를 갱신합니다."""
+        unread_cnt = self.db.get_notification_unread_count()
+        self.lbl_inbox_unread.setText(f"미확인 알림 {unread_cnt}건")
+        role = "badgeWarning" if unread_cnt > 0 else "badgeNeutral"
+        apply_qss_role(self.lbl_inbox_unread, role=role, obj_name="InboxUnreadBadge")
+        self.btn_mark_all_noti_read.setEnabled(unread_cnt > 0)
+
+        rows = self.db.get_notifications(limit=100, unread_only=False)
+        self.table_notifications.setRowCount(0)
+        for row_idx, item in enumerate(rows):
+            self.table_notifications.insertRow(row_idx)
+            noti_id = int(item["id"])
+            is_read = bool(item.get("is_read", 0))
+
+            status_item = QTableWidgetItem("읽음" if is_read else "● 미확인")
+            status_item.setData(Qt.ItemDataRole.UserRole, noti_id)
+            status_item.setData(Qt.ItemDataRole.UserRole + 1, 1 if is_read else 0)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if not is_read:
+                status_item.setForeground(QColor("#EF4444"))
+                f = status_item.font()
+                f.setBold(True)
+                status_item.setFont(f)
+            else:
+                status_item.setForeground(QColor("#64748B"))
+
+            channel_item = QTableWidgetItem(str(item.get("channel") or "system"))
+            channel_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            title_item = QTableWidgetItem(str(item.get("title") or ""))
+            msg_item = QTableWidgetItem(str(item.get("message") or ""))
+            ts_item = QTableWidgetItem(str(item.get("created_at") or ""))
+            ts_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            if not is_read:
+                for cell in (title_item, msg_item):
+                    f = cell.font()
+                    f.setBold(True)
+                    cell.setFont(f)
+                    cell.setBackground(QColor("#FEF2F2"))
+                status_item.setBackground(QColor("#FEF2F2"))
+                channel_item.setBackground(QColor("#FEF2F2"))
+                ts_item.setBackground(QColor("#FEF2F2"))
+
+            self.table_notifications.setItem(row_idx, 0, status_item)
+            self.table_notifications.setItem(row_idx, 1, channel_item)
+            self.table_notifications.setItem(row_idx, 2, title_item)
+            self.table_notifications.setItem(row_idx, 3, msg_item)
+            self.table_notifications.setItem(row_idx, 4, ts_item)
+
+            if not is_read:
+                btn_ack = QPushButton("확인")
+                apply_qss_role(btn_ack, role="primary", obj_name="BtnAckNotification")
+                btn_ack.setMinimumHeight(24)
+                btn_ack.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_ack.clicked.connect(
+                    lambda _checked=False, nid=noti_id: self.mark_notification_read(nid)
+                )
+                self.table_notifications.setCellWidget(row_idx, 5, btn_ack)
+            else:
+                done_lbl = QLabel("확인됨")
+                done_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                apply_qss_role(done_lbl, role="mutedText")
+                self.table_notifications.setCellWidget(row_idx, 5, done_lbl)
+
+    def _on_notification_cell_clicked(self, row: int, _col: int) -> None:
+        item = self.table_notifications.item(row, 0)
+        if item is None:
+            return
+        noti_id = item.data(Qt.ItemDataRole.UserRole)
+        is_read = item.data(Qt.ItemDataRole.UserRole + 1)
+        if noti_id is not None and not bool(is_read):
+            self.mark_notification_read(int(noti_id))
+
+    def mark_notification_read(self, notification_id: int) -> None:
+        """개별 알림 항목을 읽음(is_read=1) 처리하고 사이드바 배지 갱신을 알립니다."""
+        self.db.mark_notification_read(int(notification_id))
+        self.refresh_notifications_inbox()
+        self.unread_changed.emit()
+
+    def mark_all_read(self) -> None:
+        """수신함의 모든 미확인 알림을 일괄 읽음 처리합니다."""
+        changed = self.db.mark_all_notifications_read()
+        self._append_log(f"알림 수신함 모두 읽음 처리 완료 ({changed}건)")
+        self.refresh_notifications_inbox()
+        self.unread_changed.emit()
 
     def _append_log(self, text: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")

@@ -48,6 +48,7 @@ from services.file_sorter_service import (
     RealtimeFolderWatchWorker,
 )
 from services.notifier import NotificationService
+from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 
 
@@ -274,20 +275,20 @@ class FileSorterTab(QWidget):
         # [1-1] 상단: 감시/원본 폴더 (Source Directories)
         src_header = QHBoxLayout()
         src_lbl = QLabel("<b>감시/원본 폴더 (Source Directories)</b>")
-        btn_add_src = QPushButton("+ 폴더 추가")
-        apply_qss_role(btn_add_src, role="secondary")
+        self.btn_add_src = QPushButton("+ 폴더 추가")
+        apply_qss_role(self.btn_add_src, role="secondary")
         btn_rem_src = QPushButton("- 선택 제거")
         apply_qss_role(btn_rem_src, role="outline")
         btn_open_src = QPushButton("폴더 열기")
         apply_qss_role(btn_open_src, role="outline")
 
-        btn_add_src.clicked.connect(self._on_add_source_dir)
+        self.btn_add_src.clicked.connect(self._on_add_source_dir)
         btn_rem_src.clicked.connect(self._on_remove_source_dir)
         btn_open_src.clicked.connect(self._on_open_source_dir)
 
         src_header.addWidget(src_lbl)
         src_header.addStretch()
-        src_header.addWidget(btn_add_src)
+        src_header.addWidget(self.btn_add_src)
         src_header.addWidget(btn_rem_src)
         src_header.addWidget(btn_open_src)
         top_layout.addLayout(src_header)
@@ -296,7 +297,25 @@ class FileSorterTab(QWidget):
         self.list_source_dirs.setMouseTracking(True)
         self.list_source_dirs.setMinimumHeight(76)
         self.list_source_dirs.setMaximumHeight(105)
+        self.list_source_dirs.setToolTip("감시할 폴더를 이 영역 또는 [+ 폴더 추가] 버튼에 드래그앤 드롭할 수 있습니다.")
         top_layout.addWidget(self.list_source_dirs)
+
+        enable_file_drop(
+            self.list_source_dirs,
+            allow_dirs=True,
+            allow_files=False,
+            multiple=True,
+            on_files_dropped=self.add_source_dirs,
+            context_label="감시 소스 폴더",
+        )
+        enable_file_drop(
+            self.btn_add_src,
+            allow_dirs=True,
+            allow_files=False,
+            multiple=True,
+            on_files_dropped=self.add_source_dirs,
+            context_label="감시 소스 폴더",
+        )
 
         # [1-2] 중간: 직관적인 화살표 실행 버튼 (Source ➔ Target)
         run_row = QHBoxLayout()
@@ -331,24 +350,41 @@ class FileSorterTab(QWidget):
         target_input_row = QHBoxLayout()
         self.edit_target_dir = QLineEdit()
         self.edit_target_dir.setMinimumHeight(32)
-        self.edit_target_dir.setPlaceholderText("분류된 하위 폴더들이 생성될 기준 폴더 경로")
+        self.edit_target_dir.setPlaceholderText("분류된 하위 폴더들이 생성될 기준 폴더 경로 (폴더 드래그 가능)")
         self.edit_target_dir.editingFinished.connect(self._save_ui_to_config)
 
-        btn_browse_target = QPushButton("찾아보기...")
-        apply_qss_role(btn_browse_target, role="secondary")
-        btn_browse_target.setMinimumHeight(32)
+        self.btn_browse_target = QPushButton("찾아보기...")
+        apply_qss_role(self.btn_browse_target, role="secondary")
+        self.btn_browse_target.setMinimumHeight(32)
 
         btn_open_target = QPushButton("폴더 열기")
         apply_qss_role(btn_open_target, role="outline")
         btn_open_target.setMinimumHeight(32)
 
-        btn_browse_target.clicked.connect(self._on_browse_target_dir)
+        self.btn_browse_target.clicked.connect(self._on_browse_target_dir)
         btn_open_target.clicked.connect(self._on_open_target_dir)
 
         target_input_row.addWidget(self.edit_target_dir, stretch=1)
-        target_input_row.addWidget(btn_browse_target)
+        target_input_row.addWidget(self.btn_browse_target)
         target_input_row.addWidget(btn_open_target)
         top_layout.addLayout(target_input_row)
+
+        enable_file_drop(
+            self.edit_target_dir,
+            allow_dirs=True,
+            allow_files=False,
+            multiple=False,
+            on_files_dropped=lambda paths: self.set_target_dir(paths[0]),
+            context_label="기본 대상 폴더",
+        )
+        enable_file_drop(
+            self.btn_browse_target,
+            allow_dirs=True,
+            allow_files=False,
+            multiple=False,
+            on_files_dropped=lambda paths: self.set_target_dir(paths[0]),
+            context_label="기본 대상 폴더",
+        )
 
         # 세부 옵션 바
         opts_row = QHBoxLayout()
@@ -613,17 +649,28 @@ class FileSorterTab(QWidget):
             auto_save=True,
         )
 
+    def add_source_dirs(self, folders: List[str]) -> int:
+        existing = {
+            self.list_source_dirs.item(i).text()
+            for i in range(self.list_source_dirs.count())
+        }
+        added = 0
+        for folder in folders:
+            if not folder:
+                continue
+            norm = str(Path(folder).resolve())
+            if norm not in existing:
+                self._add_source_dir_item(norm)
+                existing.add(norm)
+                added += 1
+        if added > 0:
+            self._save_ui_to_config()
+        return added
+
     def _on_add_source_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "감시/원본 폴더 선택")
         if folder:
-            norm = str(Path(folder).resolve())
-            existing = [
-                self.list_source_dirs.item(i).text()
-                for i in range(self.list_source_dirs.count())
-            ]
-            if norm not in existing:
-                self._add_source_dir_item(norm)
-                self._save_ui_to_config()
+            self.add_source_dirs([folder])
 
     def _on_remove_source_dir(self) -> None:
         row = self.list_source_dirs.currentRow()
@@ -642,11 +689,16 @@ class FileSorterTab(QWidget):
             else:
                 QMessageBox.warning(self, "폴더 없음", f"경로가 존재하지 않습니다:\n{path_str}")
 
+    def set_target_dir(self, folder: str) -> None:
+        if not folder:
+            return
+        self.edit_target_dir.setText(str(Path(folder).resolve()))
+        self._save_ui_to_config()
+
     def _on_browse_target_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "분류 기준 상위 폴더(Target Base Directory) 선택")
         if folder:
-            self.edit_target_dir.setText(str(Path(folder).resolve()))
-            self._save_ui_to_config()
+            self.set_target_dir(folder)
 
     def _on_open_target_dir(self) -> None:
         target = self.edit_target_dir.text().strip()

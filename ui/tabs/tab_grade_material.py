@@ -47,6 +47,7 @@ from PyQt6.QtWidgets import (
 
 from core.base_worker import TaskRunner
 from core.database import DatabaseManager
+from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.utils import install_no_scroll_wheel_filter
 
@@ -669,9 +670,9 @@ class GradeMaterialTab(QWidget):
         r_lay = self.right_group.body_layout()
 
         # 1) 과목별 연결 폴더 바
-        folder_card = QFrame()
-        apply_qss_role(folder_card, role="subCard")
-        folder_lay = QHBoxLayout(folder_card)
+        self.folder_card = QFrame()
+        apply_qss_role(self.folder_card, role="subCard")
+        folder_lay = QHBoxLayout(self.folder_card)
         folder_lay.setContentsMargins(10, 8, 10, 8)
         folder_lay.setSpacing(8)
 
@@ -685,8 +686,18 @@ class GradeMaterialTab(QWidget):
         apply_qss_role(self.btn_link_folder, role="primary", obj_name="BtnLinkMaterialFolder")
         self.btn_link_folder.setMinimumHeight(32)
         self.btn_link_folder.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_link_folder.setToolTip("내 PC에서 실제로 사용하는 과목별 수업 자료 폴더를 연결합니다.")
+        self.btn_link_folder.setToolTip("내 PC에서 실제로 사용하는 과목별 수업 자료 폴더를 선택하거나 드래그앤 드롭하세요.")
         self.btn_link_folder.clicked.connect(self._on_select_material_folder)
+
+        for drop_w in (self.folder_card, self.btn_link_folder):
+            enable_file_drop(
+                drop_w,
+                allow_dirs=True,
+                allow_files=False,
+                multiple=False,
+                on_files_dropped=lambda paths: self.link_subject_material_folder(paths[0]),
+                context_label="과목 수업 자료 폴더",
+            )
 
         self.btn_refresh_materials = QPushButton("새로고침")
         apply_qss_role(self.btn_refresh_materials, role="subtle", obj_name="BtnRefreshMaterials")
@@ -698,7 +709,7 @@ class GradeMaterialTab(QWidget):
         folder_lay.addWidget(self.lbl_linked_folder, stretch=1)
         folder_lay.addWidget(self.btn_link_folder)
         folder_lay.addWidget(self.btn_refresh_materials)
-        r_lay.addWidget(folder_card)
+        r_lay.addWidget(self.folder_card)
 
         # 2) 단원 폴더 필터 & 검색어 입력 바
         filter_row = QHBoxLayout()
@@ -796,8 +807,23 @@ class GradeMaterialTab(QWidget):
         apply_qss_role(self.btn_upload_material, role="secondary", obj_name="BtnUploadMaterial")
         self.btn_upload_material.setMinimumHeight(34)
         self.btn_upload_material.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_upload_material.setToolTip("외부 수업 자료 파일을 현재 선택한 단원 폴더로 복사합니다.")
+        self.btn_upload_material.setToolTip("외부 수업 자료 파일을 현재 선택한 단원 폴더로 복사합니다 (드래그앤 드롭 가능).")
         self.btn_upload_material.clicked.connect(self._on_upload_material)
+
+        material_drop_exts = [
+            ".pptx", ".ppt", ".docx", ".doc", ".pdf", ".hwp", ".hwpx",
+            ".xlsx", ".xls", ".csv", ".txt", ".md", ".zip", ".png", ".jpg", ".jpeg",
+        ]
+        for drop_w in (self.tree_materials, self.btn_upload_material):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=material_drop_exts,
+                allow_dirs=True,
+                allow_files=True,
+                multiple=True,
+                on_files_dropped=self._on_materials_dropped,
+                context_label="수업 자료 파일",
+            )
 
         self.btn_make_version = QPushButton("버전 사본 생성")
         apply_qss_role(self.btn_make_version, role="secondary", obj_name="BtnDuplicateMaterialVersion")
@@ -1215,8 +1241,11 @@ class GradeMaterialTab(QWidget):
         saved = self.db.get_subject_material_folder(self._current_subject_key())
         if saved:
             cand = Path(saved)
-            if cand.exists() and cand.is_dir():
-                return cand.resolve(), "custom"
+            try:
+                if cand.exists() and cand.is_dir():
+                    return cand.resolve(), "custom"
+            except OSError:
+                return self._default_subject_material_dir(), "missing"
             return self._default_subject_material_dir(), "missing"
         return self._default_subject_material_dir(), "default"
 
@@ -1575,13 +1604,7 @@ class GradeMaterialTab(QWidget):
             preserve_rel_path=rel_key,
         )
 
-    def _on_select_material_folder(self) -> None:
-        start_dir = str(self._current_material_root) if self._current_material_root.exists() else ""
-        chosen = QFileDialog.getExistingDirectory(
-            self,
-            "과목 수업 자료 로컬 폴더 선택",
-            start_dir,
-        )
+    def link_subject_material_folder(self, chosen: str) -> None:
         if not chosen:
             return
         chosen_path = str(Path(chosen).resolve())
@@ -1590,6 +1613,16 @@ class GradeMaterialTab(QWidget):
         self.combo_unit_filter.setCurrentIndex(0)
         self.combo_unit_filter.blockSignals(False)
         self._refresh_material_panel_for_subject()
+
+    def _on_select_material_folder(self) -> None:
+        start_dir = str(self._current_material_root) if self._current_material_root.exists() else ""
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "과목 수업 자료 로컬 폴더 선택",
+            start_dir,
+        )
+        if chosen:
+            self.link_subject_material_folder(chosen)
 
     def _on_material_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
         kind = str(item.data(0, self.ROLE_NODE_KIND) or "")
@@ -1665,15 +1698,18 @@ class GradeMaterialTab(QWidget):
         except Exception:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target_dir)))
 
-    def _on_upload_material(self) -> None:
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "단원 수업자료 파일 추가",
-            "",
-            "수업자료 파일 (*.pptx *.ppt *.docx *.doc *.pdf *.hwp *.hwpx *.xlsx *.xls *.csv *.txt *.md *.zip);;모든 파일 (*)",
-        )
-        if not files:
+    def _on_materials_dropped(self, paths: List[str]) -> None:
+        files = [p for p in paths if Path(p).is_file()]
+        dirs = [p for p in paths if Path(p).is_dir()]
+        if dirs and not files:
+            self.link_subject_material_folder(dirs[0])
             return
+        if files:
+            self.upload_material_files(files)
+
+    def upload_material_files(self, files: List[str]) -> int:
+        if not files:
+            return 0
 
         target_dir = self._selected_target_directory()
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -1700,6 +1736,17 @@ class GradeMaterialTab(QWidget):
                 "자료 추가 완료",
                 f"'{target_dir.name}' 폴더에 {copied}개 자료를 추가했습니다.",
             )
+        return copied
+
+    def _on_upload_material(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "단원 수업자료 파일 추가",
+            "",
+            "수업자료 파일 (*.pptx *.ppt *.docx *.doc *.pdf *.hwp *.hwpx *.xlsx *.xls *.csv *.txt *.md *.zip);;모든 파일 (*)",
+        )
+        if files:
+            self.upload_material_files(files)
 
     def _on_duplicate_material_version(self) -> None:
         curr = self.tree_materials.currentItem()

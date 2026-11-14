@@ -7,9 +7,11 @@
 """
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from utils.path_helper import get_data_path
 
@@ -43,6 +45,11 @@ class DatabaseManager:
     _lock = threading.RLock()
 
     def __new__(cls, *args, **kwargs):
+        db_rel_path = kwargs.get("db_rel_path", args[0] if args else "data/workstation.db")
+        if db_rel_path and str(db_rel_path) != "data/workstation.db":
+            inst = super().__new__(cls)
+            inst._initialized = False
+            return inst
         with cls._lock:
             if cls._instance is None:
                 cls._instance = super().__new__(cls)
@@ -52,7 +59,13 @@ class DatabaseManager:
     def __init__(self, db_rel_path: str = "data/workstation.db"):
         if getattr(self, "_initialized", False):
             return
-        self.db_path: str = get_data_path(db_rel_path, ensure_parent=True)
+        raw_path = str(db_rel_path or "data/workstation.db")
+        if os.path.isabs(raw_path):
+            p = Path(raw_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            self.db_path: str = str(p)
+        else:
+            self.db_path: str = get_data_path(raw_path, ensure_parent=True)
         self._init_schema()
         self._seed_default_rules()
         self._initialized = True
@@ -270,6 +283,105 @@ class DatabaseManager:
                 )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_classroom_obs_hr ON classroom_observation_logs(homeroom_key, id DESC)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS sync_state (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_id TEXT NOT NULL UNIQUE,
+                        item_type TEXT NOT NULL DEFAULT 'mobile_task',
+                        is_read INTEGER NOT NULL DEFAULT 0,
+                        exec_status TEXT NOT NULL DEFAULT 'pending',
+                        last_synced_at TEXT NOT NULL,
+                        meta_json TEXT NOT NULL DEFAULT '{}'
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sync_state_type ON sync_state(item_type, exec_status, is_read)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS schedules (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_id TEXT UNIQUE,
+                        title TEXT NOT NULL,
+                        category TEXT NOT NULL DEFAULT '학사일정',
+                        start_date TEXT NOT NULL,
+                        end_date TEXT NOT NULL,
+                        start_time TEXT NOT NULL DEFAULT '',
+                        reminder_type TEXT NOT NULL DEFAULT 'none',
+                        reminder_sent INTEGER NOT NULL DEFAULT 0,
+                        memo TEXT NOT NULL DEFAULT '',
+                        is_read INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_schedules_dates ON schedules(start_date, end_date)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS todos (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_id TEXT UNIQUE,
+                        title TEXT NOT NULL,
+                        due_date TEXT NOT NULL DEFAULT '',
+                        priority TEXT NOT NULL DEFAULT 'normal',
+                        is_done INTEGER NOT NULL DEFAULT 0,
+                        completed_at TEXT NOT NULL DEFAULT '',
+                        memo TEXT NOT NULL DEFAULT '',
+                        is_read INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_todos_done_due ON todos(is_done, due_date)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS mobile_tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_id TEXT NOT NULL UNIQUE,
+                        title TEXT NOT NULL,
+                        task_type TEXT NOT NULL DEFAULT 'general',
+                        scheduled_time TEXT NOT NULL DEFAULT '',
+                        target_info TEXT NOT NULL DEFAULT '',
+                        action_payload TEXT NOT NULL DEFAULT '{}',
+                        memo TEXT NOT NULL DEFAULT '',
+                        is_read INTEGER NOT NULL DEFAULT 0,
+                        exec_status TEXT NOT NULL DEFAULT 'pending',
+                        executed_at TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mobile_tasks_status ON mobile_tasks(exec_status, is_read)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS notifications (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_id TEXT UNIQUE,
+                        channel TEXT NOT NULL DEFAULT 'system',
+                        sender TEXT NOT NULL DEFAULT '',
+                        title TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        is_read INTEGER NOT NULL DEFAULT 0,
+                        exec_status TEXT NOT NULL DEFAULT 'pending',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(is_read, id DESC)"
                 )
                 conn.commit()
             finally:
@@ -1490,3 +1602,1313 @@ class DatabaseManager:
                 conn.commit()
             finally:
                 conn.close()
+
+    # =========================================================================
+    # 캘린더 일정(schedules) · 할일(todos) · 모바일 예약 작업(mobile_tasks)
+    # 동기화 상태(sync_state) · 알림 수신함(notifications) 관리
+    # =========================================================================
+    @staticmethod
+    def _now_str() -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    @staticmethod
+    def _clean_remote_id(remote_id: Optional[str]) -> Optional[str]:
+        val = str(remote_id or "").strip()
+        return val if val else None
+
+    @staticmethod
+    def _upsert_sync_state_row(
+        cur: sqlite3.Cursor,
+        *,
+        remote_id: str,
+        item_type: str,
+        is_read: int,
+        exec_status: str,
+        now_str: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        meta_str = json.dumps(meta or {}, ensure_ascii=False)
+        cur.execute(
+            """
+            INSERT INTO sync_state (remote_id, item_type, is_read, exec_status, last_synced_at, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(remote_id) DO UPDATE SET
+                item_type = excluded.item_type,
+                is_read = excluded.is_read,
+                exec_status = excluded.exec_status,
+                last_synced_at = excluded.last_synced_at,
+                meta_json = excluded.meta_json
+            """,
+            (remote_id, item_type, int(is_read), exec_status, now_str, meta_str),
+        )
+
+    def get_sync_state(self, remote_id: str) -> Optional[Dict[str, Any]]:
+        rid = self._clean_remote_id(remote_id)
+        if not rid:
+            return None
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM sync_state WHERE remote_id = ?", (rid,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    # -------------------------------------------------------------------------
+    # Schedules CRUD & Reminder Helpers
+    # -------------------------------------------------------------------------
+    def add_schedule(
+        self,
+        title: str,
+        category: str = "학사일정",
+        start_date: str = "",
+        end_date: str = "",
+        start_time: str = "",
+        reminder_type: str = "none",
+        memo: str = "",
+        remote_id: Optional[str] = None,
+        is_read: int = 1,
+    ) -> int:
+        s_date = str(start_date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+        e_date = str(end_date or "").strip() or s_date
+        if e_date < s_date:
+            e_date = s_date
+        rid = self._clean_remote_id(remote_id)
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO schedules (
+                        remote_id, title, category, start_date, end_date, start_time,
+                        reminder_type, reminder_sent, memo, is_read, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        rid,
+                        str(title or "").strip() or "제목 없음",
+                        str(category or "학사일정").strip() or "학사일정",
+                        s_date,
+                        e_date,
+                        str(start_time or "").strip(),
+                        str(reminder_type or "none").strip() or "none",
+                        str(memo or "").strip(),
+                        1 if is_read else 0,
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                if rid:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=rid,
+                        item_type="schedule",
+                        is_read=1 if is_read else 0,
+                        exec_status="acknowledged" if is_read else "pending",
+                        now_str=now_str,
+                    )
+                conn.commit()
+                return new_id
+            finally:
+                conn.close()
+
+    def bulk_add_schedules(self, items: List[Dict[str, Any]], is_read: int = 1) -> int:
+        if not items:
+            return 0
+        now_str = self._now_str()
+        rows_inserted = 0
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                for item in items:
+                    title = str(item.get("title", "")).strip()
+                    s_date = str(item.get("start_date", "")).strip()
+                    if not title or not s_date:
+                        continue
+                    e_date = str(item.get("end_date", "")).strip() or s_date
+                    if e_date < s_date:
+                        e_date = s_date
+                    rid = self._clean_remote_id(item.get("remote_id"))
+                    if rid:
+                        cur.execute("SELECT id FROM schedules WHERE remote_id = ?", (rid,))
+                        if cur.fetchone() is not None:
+                            continue
+                    cur.execute(
+                        """
+                        INSERT INTO schedules (
+                            remote_id, title, category, start_date, end_date, start_time,
+                            reminder_type, reminder_sent, memo, is_read, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                        """,
+                        (
+                            rid,
+                            title,
+                            str(item.get("category", "학사일정") or "학사일정").strip(),
+                            s_date,
+                            e_date,
+                            str(item.get("start_time", "") or "").strip(),
+                            str(item.get("reminder_type", "none") or "none").strip(),
+                            str(item.get("memo", "") or "").strip(),
+                            1 if is_read else 0,
+                            now_str,
+                            now_str,
+                        ),
+                    )
+                    rows_inserted += 1
+                    if rid:
+                        self._upsert_sync_state_row(
+                            cur,
+                            remote_id=rid,
+                            item_type="schedule",
+                            is_read=1 if is_read else 0,
+                            exec_status="acknowledged" if is_read else "pending",
+                            now_str=now_str,
+                        )
+                conn.commit()
+                return rows_inserted
+            finally:
+                conn.close()
+
+    def update_schedule(
+        self,
+        schedule_id: int,
+        *,
+        title: str,
+        category: str,
+        start_date: str,
+        end_date: str,
+        start_time: str = "",
+        reminder_type: str = "none",
+        memo: str = "",
+        reset_reminder_if_changed: bool = True,
+    ) -> None:
+        s_date = str(start_date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+        e_date = str(end_date or "").strip() or s_date
+        if e_date < s_date:
+            e_date = s_date
+        s_time = str(start_time or "").strip()
+        r_type = str(reminder_type or "none").strip() or "none"
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT start_date, start_time, reminder_type, reminder_sent FROM schedules WHERE id = ?",
+                    (int(schedule_id),),
+                )
+                prev = cur.fetchone()
+                reminder_sent = int(prev["reminder_sent"]) if prev else 0
+                if reset_reminder_if_changed and prev is not None:
+                    if (
+                        str(prev["start_date"]) != s_date
+                        or str(prev["start_time"]) != s_time
+                        or str(prev["reminder_type"]) != r_type
+                    ):
+                        reminder_sent = 0
+                cur.execute(
+                    """
+                    UPDATE schedules
+                    SET title = ?, category = ?, start_date = ?, end_date = ?,
+                        start_time = ?, reminder_type = ?, reminder_sent = ?,
+                        memo = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(title or "").strip() or "제목 없음",
+                        str(category or "학사일정").strip() or "학사일정",
+                        s_date,
+                        e_date,
+                        s_time,
+                        r_type,
+                        reminder_sent,
+                        str(memo or "").strip(),
+                        now_str,
+                        int(schedule_id),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM schedules WHERE id = ?", (int(schedule_id),))
+                row = cur.fetchone()
+                if row and row["remote_id"]:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=str(row["remote_id"]),
+                        item_type="schedule",
+                        is_read=1,
+                        exec_status="acknowledged",
+                        now_str=self._now_str(),
+                    )
+                cur.execute("DELETE FROM schedules WHERE id = ?", (int(schedule_id),))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_schedule(self, schedule_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM schedules WHERE id = ?", (int(schedule_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def get_schedules(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                clauses: List[str] = []
+                params: List[Any] = []
+                if start_date and end_date:
+                    clauses.append("end_date >= ? AND start_date <= ?")
+                    params.extend([str(start_date).strip(), str(end_date).strip()])
+                elif start_date:
+                    clauses.append("end_date >= ?")
+                    params.append(str(start_date).strip())
+                elif end_date:
+                    clauses.append("start_date <= ?")
+                    params.append(str(end_date).strip())
+                if category and category != "전체":
+                    clauses.append("category = ?")
+                    params.append(str(category).strip())
+                where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                cur.execute(
+                    f"""
+                    SELECT * FROM schedules
+                    {where_sql}
+                    ORDER BY start_date ASC, start_time ASC, id ASC
+                    """,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def mark_schedule_read(self, schedule_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM schedules WHERE id = ?", (int(schedule_id),))
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE schedules SET is_read = 1, updated_at = ? WHERE id = ?",
+                    (now_str, int(schedule_id)),
+                )
+                if row and row["remote_id"]:
+                    cur.execute(
+                        """
+                        UPDATE sync_state
+                        SET is_read = 1,
+                            exec_status = CASE WHEN exec_status = 'pending' THEN 'acknowledged' ELSE exec_status END
+                        WHERE remote_id = ?
+                        """,
+                        (str(row["remote_id"]),),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def mark_schedule_reminder_sent(self, schedule_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE schedules SET reminder_sent = 1, updated_at = ? WHERE id = ?",
+                    (now_str, int(schedule_id)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_pending_reminder_schedules(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT * FROM schedules
+                    WHERE reminder_sent = 0 AND reminder_type != 'none' AND reminder_type != ''
+                    ORDER BY start_date ASC, start_time ASC, id ASC
+                    """
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    # -------------------------------------------------------------------------
+    # Todos CRUD
+    # -------------------------------------------------------------------------
+    def add_todo(
+        self,
+        title: str,
+        due_date: str = "",
+        priority: str = "normal",
+        memo: str = "",
+        remote_id: Optional[str] = None,
+        is_read: int = 1,
+    ) -> int:
+        rid = self._clean_remote_id(remote_id)
+        now_str = self._now_str()
+        prio = str(priority or "normal").strip().lower()
+        if prio not in ("high", "normal", "low"):
+            prio = "normal"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO todos (
+                        remote_id, title, due_date, priority, is_done, completed_at,
+                        memo, is_read, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, 0, '', ?, ?, ?, ?)
+                    """,
+                    (
+                        rid,
+                        str(title or "").strip() or "할일",
+                        str(due_date or "").strip(),
+                        prio,
+                        str(memo or "").strip(),
+                        1 if is_read else 0,
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                if rid:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=rid,
+                        item_type="todo",
+                        is_read=1 if is_read else 0,
+                        exec_status="acknowledged" if is_read else "pending",
+                        now_str=now_str,
+                    )
+                conn.commit()
+                return new_id
+            finally:
+                conn.close()
+
+    def update_todo(
+        self,
+        todo_id: int,
+        *,
+        title: str,
+        due_date: str = "",
+        priority: str = "normal",
+        memo: str = "",
+        is_done: Optional[bool] = None,
+    ) -> None:
+        prio = str(priority or "normal").strip().lower()
+        if prio not in ("high", "normal", "low"):
+            prio = "normal"
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if is_done is None:
+                    cur.execute(
+                        """
+                        UPDATE todos
+                        SET title = ?, due_date = ?, priority = ?, memo = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(title or "").strip() or "할일",
+                            str(due_date or "").strip(),
+                            prio,
+                            str(memo or "").strip(),
+                            now_str,
+                            int(todo_id),
+                        ),
+                    )
+                else:
+                    done_int = 1 if is_done else 0
+                    comp_at = now_str if is_done else ""
+                    cur.execute(
+                        """
+                        UPDATE todos
+                        SET title = ?, due_date = ?, priority = ?, memo = ?,
+                            is_done = ?, completed_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(title or "").strip() or "할일",
+                            str(due_date or "").strip(),
+                            prio,
+                            str(memo or "").strip(),
+                            done_int,
+                            comp_at,
+                            now_str,
+                            int(todo_id),
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def set_todo_done(self, todo_id: int, is_done: bool) -> None:
+        now_str = self._now_str()
+        done_int = 1 if is_done else 0
+        comp_at = now_str if is_done else ""
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM todos WHERE id = ?", (int(todo_id),))
+                row = cur.fetchone()
+                cur.execute(
+                    """
+                    UPDATE todos
+                    SET is_done = ?, completed_at = ?, is_read = 1, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (done_int, comp_at, now_str, int(todo_id)),
+                )
+                if row and row["remote_id"]:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=str(row["remote_id"]),
+                        item_type="todo",
+                        is_read=1,
+                        exec_status="done" if is_done else "acknowledged",
+                        now_str=now_str,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_todo(self, todo_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM todos WHERE id = ?", (int(todo_id),))
+                row = cur.fetchone()
+                if row and row["remote_id"]:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=str(row["remote_id"]),
+                        item_type="todo",
+                        is_read=1,
+                        exec_status="acknowledged",
+                        now_str=self._now_str(),
+                    )
+                cur.execute("DELETE FROM todos WHERE id = ?", (int(todo_id),))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_todo(self, todo_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM todos WHERE id = ?", (int(todo_id),))
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def get_todos(self, include_done: bool = True) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                where_sql = "" if include_done else "WHERE is_done = 0"
+                cur.execute(
+                    f"""
+                    SELECT * FROM todos
+                    {where_sql}
+                    ORDER BY
+                        is_done ASC,
+                        CASE WHEN due_date = '' THEN 1 ELSE 0 END ASC,
+                        due_date ASC,
+                        CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END ASC,
+                        id DESC
+                    """
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def mark_todo_read(self, todo_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM todos WHERE id = ?", (int(todo_id),))
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE todos SET is_read = 1, updated_at = ? WHERE id = ?",
+                    (now_str, int(todo_id)),
+                )
+                if row and row["remote_id"]:
+                    cur.execute(
+                        """
+                        UPDATE sync_state
+                        SET is_read = 1,
+                            exec_status = CASE WHEN exec_status = 'pending' THEN 'acknowledged' ELSE exec_status END
+                        WHERE remote_id = ?
+                        """,
+                        (str(row["remote_id"]),),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    # -------------------------------------------------------------------------
+    # Remote Upserts & Mobile Tasks (Deduplication + Preserved Exec/Read State)
+    # -------------------------------------------------------------------------
+    def upsert_remote_mobile_task(
+        self,
+        remote_id: str,
+        title: str,
+        task_type: str = "general",
+        scheduled_time: str = "",
+        target_info: str = "",
+        action_payload: Any = None,
+        memo: str = "",
+    ) -> Tuple[int, bool]:
+        rid = self._clean_remote_id(remote_id)
+        if not rid:
+            raise ValueError("remote_id is required for mobile tasks")
+        now_str = self._now_str()
+        payload_str = (
+            json.dumps(action_payload, ensure_ascii=False)
+            if isinstance(action_payload, (dict, list))
+            else str(action_payload or "{}")
+        )
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, is_read, exec_status FROM mobile_tasks WHERE remote_id = ?",
+                    (rid,),
+                )
+                existing_task = cur.fetchone()
+                cur.execute(
+                    "SELECT is_read, exec_status FROM sync_state WHERE remote_id = ?",
+                    (rid,),
+                )
+                existing_sync = cur.fetchone()
+
+                if existing_task is not None:
+                    task_id = int(existing_task["id"])
+                    cur.execute(
+                        """
+                        UPDATE mobile_tasks
+                        SET title = ?, task_type = ?, scheduled_time = ?,
+                            target_info = ?, action_payload = ?, memo = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(title or "").strip() or "예약 작업",
+                            str(task_type or "general").strip() or "general",
+                            str(scheduled_time or "").strip(),
+                            str(target_info or "").strip(),
+                            payload_str,
+                            str(memo or "").strip(),
+                            now_str,
+                            task_id,
+                        ),
+                    )
+                    cur.execute(
+                        "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                        (now_str, rid),
+                    )
+                    conn.commit()
+                    return task_id, False
+
+                if existing_sync is not None:
+                    # 이미 삭제되었거나 sync_state에 기록이 남아있는 경우 중복 재생성/재팝업 방지
+                    cur.execute(
+                        "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                        (now_str, rid),
+                    )
+                    conn.commit()
+                    return 0, False
+
+                cur.execute(
+                    """
+                    INSERT INTO mobile_tasks (
+                        remote_id, title, task_type, scheduled_time, target_info,
+                        action_payload, memo, is_read, exec_status, executed_at,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, 'pending', '', ?, ?)
+                    """,
+                    (
+                        rid,
+                        str(title or "").strip() or "예약 작업",
+                        str(task_type or "general").strip() or "general",
+                        str(scheduled_time or "").strip(),
+                        str(target_info or "").strip(),
+                        payload_str,
+                        str(memo or "").strip(),
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                self._upsert_sync_state_row(
+                    cur,
+                    remote_id=rid,
+                    item_type="mobile_task",
+                    is_read=0,
+                    exec_status="pending",
+                    now_str=now_str,
+                )
+                conn.commit()
+                return new_id, True
+            finally:
+                conn.close()
+
+    def upsert_remote_schedule(
+        self,
+        remote_id: str,
+        title: str,
+        category: str = "학사일정",
+        start_date: str = "",
+        end_date: str = "",
+        start_time: str = "",
+        reminder_type: str = "none",
+        memo: str = "",
+    ) -> Tuple[int, bool]:
+        rid = self._clean_remote_id(remote_id)
+        if not rid:
+            new_id = self.add_schedule(
+                title=title,
+                category=category,
+                start_date=start_date,
+                end_date=end_date,
+                start_time=start_time,
+                reminder_type=reminder_type,
+                memo=memo,
+                is_read=0,
+            )
+            return new_id, True
+        s_date = str(start_date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+        e_date = str(end_date or "").strip() or s_date
+        if e_date < s_date:
+            e_date = s_date
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM schedules WHERE remote_id = ?", (rid,))
+                existing = cur.fetchone()
+                cur.execute("SELECT id FROM sync_state WHERE remote_id = ?", (rid,))
+                existing_sync = cur.fetchone()
+                if existing is not None:
+                    sid = int(existing["id"])
+                    cur.execute(
+                        """
+                        UPDATE schedules
+                        SET title = ?, category = ?, start_date = ?, end_date = ?,
+                            start_time = ?, reminder_type = ?, memo = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(title or "").strip() or "일정",
+                            str(category or "학사일정").strip() or "학사일정",
+                            s_date,
+                            e_date,
+                            str(start_time or "").strip(),
+                            str(reminder_type or "none").strip() or "none",
+                            str(memo or "").strip(),
+                            now_str,
+                            sid,
+                        ),
+                    )
+                    cur.execute(
+                        "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                        (now_str, rid),
+                    )
+                    conn.commit()
+                    return sid, False
+                if existing_sync is not None:
+                    cur.execute(
+                        "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                        (now_str, rid),
+                    )
+                    conn.commit()
+                    return 0, False
+
+                cur.execute(
+                    """
+                    INSERT INTO schedules (
+                        remote_id, title, category, start_date, end_date, start_time,
+                        reminder_type, reminder_sent, memo, is_read, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, ?)
+                    """,
+                    (
+                        rid,
+                        str(title or "").strip() or "일정",
+                        str(category or "학사일정").strip() or "학사일정",
+                        s_date,
+                        e_date,
+                        str(start_time or "").strip(),
+                        str(reminder_type or "none").strip() or "none",
+                        str(memo or "").strip(),
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                self._upsert_sync_state_row(
+                    cur,
+                    remote_id=rid,
+                    item_type="schedule",
+                    is_read=0,
+                    exec_status="pending",
+                    now_str=now_str,
+                )
+                conn.commit()
+                return new_id, True
+            finally:
+                conn.close()
+
+    def upsert_remote_todo(
+        self,
+        remote_id: str,
+        title: str,
+        due_date: str = "",
+        priority: str = "normal",
+        memo: str = "",
+        is_done: bool = False,
+    ) -> Tuple[int, bool]:
+        rid = self._clean_remote_id(remote_id)
+        if not rid:
+            new_id = self.add_todo(
+                title=title, due_date=due_date, priority=priority, memo=memo, is_read=0
+            )
+            return new_id, True
+        prio = str(priority or "normal").strip().lower()
+        if prio not in ("high", "normal", "low"):
+            prio = "normal"
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM todos WHERE remote_id = ?", (rid,))
+                existing = cur.fetchone()
+                cur.execute("SELECT id FROM sync_state WHERE remote_id = ?", (rid,))
+                existing_sync = cur.fetchone()
+                if existing is not None:
+                    tid = int(existing["id"])
+                    cur.execute(
+                        """
+                        UPDATE todos
+                        SET title = ?, due_date = ?, priority = ?, memo = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(title or "").strip() or "할일",
+                            str(due_date or "").strip(),
+                            prio,
+                            str(memo or "").strip(),
+                            now_str,
+                            tid,
+                        ),
+                    )
+                    cur.execute(
+                        "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                        (now_str, rid),
+                    )
+                    conn.commit()
+                    return tid, False
+                if existing_sync is not None:
+                    cur.execute(
+                        "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                        (now_str, rid),
+                    )
+                    conn.commit()
+                    return 0, False
+
+                done_int = 1 if is_done else 0
+                comp_at = now_str if is_done else ""
+                cur.execute(
+                    """
+                    INSERT INTO todos (
+                        remote_id, title, due_date, priority, is_done, completed_at,
+                        memo, is_read, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                    """,
+                    (
+                        rid,
+                        str(title or "").strip() or "할일",
+                        str(due_date or "").strip(),
+                        prio,
+                        done_int,
+                        comp_at,
+                        str(memo or "").strip(),
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                self._upsert_sync_state_row(
+                    cur,
+                    remote_id=rid,
+                    item_type="todo",
+                    is_read=0,
+                    exec_status="done" if is_done else "pending",
+                    now_str=now_str,
+                )
+                conn.commit()
+                return new_id, True
+            finally:
+                conn.close()
+
+    def get_mobile_task(self, task_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM mobile_tasks WHERE id = ?", (int(task_id),))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                item = dict(row)
+                try:
+                    item["action_payload_dict"] = json.loads(item.get("action_payload") or "{}")
+                except Exception:
+                    item["action_payload_dict"] = {}
+                return item
+            finally:
+                conn.close()
+
+    def get_mobile_tasks(
+        self, status_filter: Optional[str] = None, pending_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if pending_only:
+                    cur.execute(
+                        "SELECT * FROM mobile_tasks WHERE exec_status = 'pending' ORDER BY id DESC"
+                    )
+                elif status_filter:
+                    cur.execute(
+                        "SELECT * FROM mobile_tasks WHERE exec_status = ? ORDER BY id DESC",
+                        (str(status_filter).strip(),),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT * FROM mobile_tasks
+                        ORDER BY
+                            CASE exec_status WHEN 'pending' THEN 0 WHEN 'acknowledged' THEN 1 ELSE 2 END ASC,
+                            id DESC
+                        """
+                    )
+                results: List[Dict[str, Any]] = []
+                for r in cur.fetchall():
+                    item = dict(r)
+                    try:
+                        parsed = json.loads(item.get("action_payload") or "{}")
+                        item["action_payload_dict"] = parsed if isinstance(parsed, dict) else {}
+                    except Exception:
+                        item["action_payload_dict"] = {}
+                    results.append(item)
+                return results
+            finally:
+                conn.close()
+
+    def acknowledge_mobile_task(self, task_id: int) -> Optional[str]:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM mobile_tasks WHERE id = ?", (int(task_id),))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                rid = str(row["remote_id"])
+                cur.execute(
+                    """
+                    UPDATE mobile_tasks
+                    SET is_read = 1,
+                        exec_status = CASE WHEN exec_status = 'done' THEN 'done' ELSE 'acknowledged' END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_str, int(task_id)),
+                )
+                cur.execute(
+                    """
+                    UPDATE sync_state
+                    SET is_read = 1,
+                        exec_status = CASE WHEN exec_status = 'done' THEN 'done' ELSE 'acknowledged' END
+                    WHERE remote_id = ?
+                    """,
+                    (rid,),
+                )
+                conn.commit()
+                return rid
+            finally:
+                conn.close()
+
+    def complete_mobile_task(self, task_id: int) -> Optional[str]:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM mobile_tasks WHERE id = ?", (int(task_id),))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                rid = str(row["remote_id"])
+                cur.execute(
+                    """
+                    UPDATE mobile_tasks
+                    SET is_read = 1, exec_status = 'done', executed_at = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_str, now_str, int(task_id)),
+                )
+                self._upsert_sync_state_row(
+                    cur,
+                    remote_id=rid,
+                    item_type="mobile_task",
+                    is_read=1,
+                    exec_status="done",
+                    now_str=now_str,
+                )
+                conn.commit()
+                return rid
+            finally:
+                conn.close()
+
+    def mark_mobile_task_read(self, task_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM mobile_tasks WHERE id = ?", (int(task_id),))
+                row = cur.fetchone()
+                cur.execute(
+                    "UPDATE mobile_tasks SET is_read = 1, updated_at = ? WHERE id = ?",
+                    (now_str, int(task_id)),
+                )
+                if row and row["remote_id"]:
+                    cur.execute(
+                        "UPDATE sync_state SET is_read = 1 WHERE remote_id = ?",
+                        (str(row["remote_id"]),),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_mobile_task(self, task_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT remote_id FROM mobile_tasks WHERE id = ?", (int(task_id),))
+                row = cur.fetchone()
+                if row and row["remote_id"]:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=str(row["remote_id"]),
+                        item_type="mobile_task",
+                        is_read=1,
+                        exec_status="acknowledged",
+                        now_str=now_str,
+                    )
+                cur.execute("DELETE FROM mobile_tasks WHERE id = ?", (int(task_id),))
+                conn.commit()
+            finally:
+                conn.close()
+
+    # -------------------------------------------------------------------------
+    # Notifications Inbox & Unread Counters
+    # -------------------------------------------------------------------------
+    def add_notification(
+        self,
+        title: str,
+        message: str,
+        channel: str = "system",
+        sender: str = "",
+        remote_id: Optional[str] = None,
+        is_read: int = 0,
+    ) -> Tuple[int, bool]:
+        rid = self._clean_remote_id(remote_id)
+        now_str = self._now_str()
+        read_flag = 1 if is_read else 0
+        exec_st = "acknowledged" if read_flag else "pending"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if rid:
+                    cur.execute(
+                        "SELECT id FROM notifications WHERE remote_id = ?",
+                        (rid,),
+                    )
+                    existing = cur.fetchone()
+                    cur.execute(
+                        "SELECT id FROM sync_state WHERE remote_id = ?",
+                        (rid,),
+                    )
+                    existing_sync = cur.fetchone()
+                    if existing is not None:
+                        cur.execute(
+                            "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                            (now_str, rid),
+                        )
+                        conn.commit()
+                        return int(existing["id"]), False
+                    if existing_sync is not None:
+                        cur.execute(
+                            "UPDATE sync_state SET last_synced_at = ? WHERE remote_id = ?",
+                            (now_str, rid),
+                        )
+                        conn.commit()
+                        return 0, False
+
+                cur.execute(
+                    """
+                    INSERT INTO notifications (
+                        remote_id, channel, sender, title, message,
+                        is_read, exec_status, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        rid,
+                        str(channel or "system").strip() or "system",
+                        str(sender or "").strip(),
+                        str(title or "").strip() or "알림",
+                        str(message or "").strip(),
+                        read_flag,
+                        exec_st,
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                if rid:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=rid,
+                        item_type="notification",
+                        is_read=read_flag,
+                        exec_status=exec_st,
+                        now_str=now_str,
+                    )
+                conn.commit()
+                return new_id, True
+            finally:
+                conn.close()
+
+    def get_notifications(
+        self, limit: int = 100, unread_only: bool = False
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if unread_only:
+                    cur.execute(
+                        "SELECT * FROM notifications WHERE is_read = 0 ORDER BY id DESC LIMIT ?",
+                        (int(limit),),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT * FROM notifications ORDER BY id DESC LIMIT ?",
+                        (int(limit),),
+                    )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def mark_notification_read(self, notification_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT remote_id FROM notifications WHERE id = ?",
+                    (int(notification_id),),
+                )
+                row = cur.fetchone()
+                cur.execute(
+                    """
+                    UPDATE notifications
+                    SET is_read = 1, exec_status = 'acknowledged', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now_str, int(notification_id)),
+                )
+                if row and row["remote_id"]:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=str(row["remote_id"]),
+                        item_type="notification",
+                        is_read=1,
+                        exec_status="acknowledged",
+                        now_str=now_str,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def mark_all_notifications_read(self) -> int:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE notifications
+                    SET is_read = 1,
+                        exec_status = CASE WHEN exec_status = 'pending' THEN 'acknowledged' ELSE exec_status END,
+                        updated_at = ?
+                    WHERE is_read = 0
+                    """,
+                    (now_str,),
+                )
+                affected = int(cur.rowcount or 0)
+                cur.execute(
+                    """
+                    UPDATE sync_state
+                    SET is_read = 1,
+                        exec_status = CASE WHEN exec_status = 'pending' THEN 'acknowledged' ELSE exec_status END
+                    WHERE item_type = 'notification' AND is_read = 0
+                    """
+                )
+                conn.commit()
+                return affected
+            finally:
+                conn.close()
+
+    def delete_notification(self, notification_id: int) -> None:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT remote_id FROM notifications WHERE id = ?",
+                    (int(notification_id),),
+                )
+                row = cur.fetchone()
+                if row and row["remote_id"]:
+                    self._upsert_sync_state_row(
+                        cur,
+                        remote_id=str(row["remote_id"]),
+                        item_type="notification",
+                        is_read=1,
+                        exec_status="acknowledged",
+                        now_str=now_str,
+                    )
+                cur.execute("DELETE FROM notifications WHERE id = ?", (int(notification_id),))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_calendar_todo_unread_count(self) -> int:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                total = 0
+                for tbl in ("mobile_tasks", "schedules", "todos"):
+                    cur.execute(f"SELECT COUNT(*) AS cnt FROM {tbl} WHERE is_read = 0")
+                    row = cur.fetchone()
+                    total += int(row["cnt"] or 0) if row else 0
+                return total
+            finally:
+                conn.close()
+
+    def get_notification_unread_count(self) -> int:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) AS cnt FROM notifications WHERE is_read = 0")
+                row = cur.fetchone()
+                return int(row["cnt"] or 0) if row else 0
+            finally:
+                conn.close()
+
+    def mark_all_calendar_todo_read(self) -> int:
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                total = 0
+                cur.execute(
+                    "UPDATE mobile_tasks SET is_read = 1, updated_at = ? WHERE is_read = 0",
+                    (now_str,),
+                )
+                total += int(cur.rowcount or 0)
+                cur.execute(
+                    "UPDATE schedules SET is_read = 1, updated_at = ? WHERE is_read = 0",
+                    (now_str,),
+                )
+                total += int(cur.rowcount or 0)
+                cur.execute(
+                    "UPDATE todos SET is_read = 1, updated_at = ? WHERE is_read = 0",
+                    (now_str,),
+                )
+                total += int(cur.rowcount or 0)
+                cur.execute(
+                    """
+                    UPDATE sync_state
+                    SET is_read = 1
+                    WHERE item_type IN ('mobile_task', 'schedule', 'todo') AND is_read = 0
+                    """
+                )
+                conn.commit()
+                return total
+            finally:
+                conn.close()
+

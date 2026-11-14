@@ -60,3 +60,50 @@ def ensure_dir(dir_path: str) -> str:
     path_obj = Path(dir_path).resolve()
     path_obj.mkdir(parents=True, exist_ok=True)
     return str(path_obj)
+
+
+def get_default_workspace_dir() -> Path:
+    """
+    사용자 작업 결과물(문서 처리, HWPX, 병합, 분류 출력 등) 기본 폴더를 반환합니다.
+    .exe 실행 파일 폴더와 섞이지 않도록 Documents/EduFlow 를 기본값으로 사용합니다.
+    """
+    try:
+        docs_dir = Path.home() / "Documents" / "EduFlow"
+        docs_dir.mkdir(parents=True, exist_ok=True)
+        return docs_dir.resolve()
+    except Exception:
+        fallback = get_app_dir() / "EduFlow_Output"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback.resolve()
+
+
+def get_active_workspace_dir(config=None) -> Path:
+    """
+    환경설정(file_sorter.target_base_dir)에 지정된 폴더가 있으면 해당 경로를 생성·반환하고,
+    비어 있거나 사용할 수 없으면 Documents/EduFlow 기본 작업 폴더를 반환합니다.
+    """
+    cfg = config
+    if cfg is None:
+        try:
+            from core.config_manager import ConfigManager
+
+            cfg = ConfigManager()
+        except Exception:
+            cfg = None
+
+    target_dir = ""
+    if cfg is not None:
+        try:
+            target_dir = str(cfg.get("file_sorter", "target_base_dir", "") or "").strip()
+        except Exception:
+            target_dir = ""
+
+    if target_dir:
+        try:
+            resolved = Path(target_dir).expanduser().resolve()
+            resolved.mkdir(parents=True, exist_ok=True)
+            return resolved
+        except Exception:
+            pass
+
+    return get_default_workspace_dir()

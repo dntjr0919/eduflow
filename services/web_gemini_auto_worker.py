@@ -864,18 +864,12 @@ class WebGeminiAutoWorker(BaseWorker):
 
         # 무한 리다이렉트 루프 방지를 위해 쿨다운 적용
         now = time.monotonic()
-        last_bypass = getattr(self, "_last_programmatic_bypass_ts", 0.0)
+        last_bypass = self.__dict__.get("_last_programmatic_bypass_ts", 0.0)
         if (now - last_bypass) < 6.0:
             return False
         self._last_programmatic_bypass_ts = now
 
-        from urllib.parse import quote
-
-        target_continue = self.provider_config.get("url") or "https://google.com"
-        encoded_continue = quote(target_continue, safe="")
-        safe_login_url = (
-            f"https://google.com{encoded_continue}"
-        )
+        safe_login_url = "https://accounts.google.com"
         self.emit_log(
             "WARN",
             "Chrome 동기화 로그인(programmatic_auth) 무한 로딩이 감지되어 표준 웹 로그인 페이지로 자동 전환합니다.",
@@ -3392,7 +3386,7 @@ class WebGeminiAutoWorker(BaseWorker):
                 stderr=subprocess.DEVNULL,
             )
             try:
-                cdp_url = self._wait_for_cdp_endpoint(port, timeout_sec=12.0, proc=proc)
+                cdp_url = self._wait_for_cdp_endpoint(port, timeout_sec=10.0, proc=proc)
                 browser = playwright_obj.chromium.connect_over_cdp(cdp_url)
                 contexts = getattr(browser, "contexts", None) or []
                 context = (
@@ -3518,7 +3512,7 @@ class WebGeminiAutoWorker(BaseWorker):
         is_cdp_mode = browser_process is not None
 
         if is_cdp_mode:
-            # 1) 크롬 프로세스에 정상 종료(쿠키 디스크 저장) 명령 먼저 전달
+            # 1) 크롬 프로세스에 정상 종료(쿠키 디스크 저장) 명령 먼저 전달 후 연결 해제
             if browser is not None:
                 try:
                     if hasattr(browser, "new_browser_cdp_session"):
@@ -3526,25 +3520,31 @@ class WebGeminiAutoWorker(BaseWorker):
                         cdp_session.send("Browser.close")
                 except Exception:
                     pass
-
-            # 2) 크롬이 쿠키/세션을 디스크에 쓰고 스스로 닫힐 때까지 먼저 대기
-            try:
-                if browser_process.poll() is None:
-                    browser_process.wait(timeout=timeout_sec)
-            except Exception:
                 try:
-                    if browser_process.poll() is None:
-                        browser_process.terminate()
-                        browser_process.wait(timeout=1.5)
+                    browser.close()
                 except Exception:
                     pass
 
-            # 3) Playwright 드라이버 정리 (이미 닫힌 소켓 EPIPE 예외 완전 무시)
+            # 2) Playwright 드라이버 정리 (browser 종료 이후 안전 정리)
             if playwright_obj is not None:
                 try:
                     playwright_obj.stop()
                 except Exception:
                     pass
+
+            # 3) 크롬이 쿠키/세션을 디스크에 쓰고 스스로 닫힐 때까지 대기
+            if browser_process is not None:
+                try:
+                    if browser_process.poll() is None:
+                        browser_process.wait(timeout=timeout_sec)
+                except Exception:
+                    try:
+                        if browser_process.poll() is None:
+                            browser_process.terminate()
+                            browser_process.wait(timeout=1.5)
+                    except Exception:
+                        pass
+            return
         else:
             if page is not None:
                 try:
@@ -3556,7 +3556,7 @@ class WebGeminiAutoWorker(BaseWorker):
                     context.close()
                 except Exception:
                     pass
-                time.sleep(0.4)
+                time.sleep(0.5)
             if browser is not None:
                 try:
                     browser.close()

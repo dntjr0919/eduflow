@@ -9,14 +9,20 @@ UI 공통 유틸리티 및 커스텀 위젯 모듈 (ui/utils.py)
 - COMBOBOX_STYLE: 드롭다운 화살표 및 팝업 리스트 뷰 QSS 스타일
 """
 
+from pathlib import Path
 from typing import List, Optional
 from PyQt6.QtCore import (
+    QByteArray,
     QEvent,
     QObject,
+    QRectF,
+    QSize,
     QSortFilterProxyModel,
     QStringListModel,
     Qt,
 )
+from PyQt6.QtGui import QIcon, QPainter, QPixmap
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -26,6 +32,8 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QWidget,
 )
+
+from utils.path_helper import get_resource_path
 
 
 COMBOBOX_STYLE = """
@@ -289,3 +297,51 @@ def install_no_scroll_wheel_filter(widget: QWidget) -> None:
         if isinstance(widget, QComboBox) and widget.lineEdit() is not None:
             widget.lineEdit().setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             widget.lineEdit().installEventFilter(wheel_filter)
+
+
+def load_svg_pixmap(
+    icon_name: str, color_hex: Optional[str] = None, size: int = 16
+) -> QPixmap:
+    """`ui/assets/icons/<icon_name>.svg`를 로드해 지정 크기 QPixmap으로 렌더링한다."""
+    icon_path = Path(get_resource_path(f"ui/assets/icons/{icon_name}.svg"))
+    if not icon_path.exists():
+        return QPixmap()
+
+    svg_text = icon_path.read_text(encoding="utf-8")
+    if color_hex:
+        svg_text = svg_text.replace("currentColor", color_hex)
+
+    renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+    if not renderer.isValid():
+        return QPixmap()
+
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    renderer.render(painter, QRectF(0, 0, size, size))
+    painter.end()
+    return pixmap
+
+
+def load_svg_icon(
+    icon_name: str, color_hex: Optional[str] = None, size: int = 16
+) -> QIcon:
+    """단색 또는 멀티컬러 SVG 파일을 다중 해상도 QIcon으로 생성한다."""
+    icon = QIcon()
+    for target_size in sorted({size, max(16, size * 2)}):
+        pixmap = load_svg_pixmap(icon_name, color_hex=color_hex, size=target_size)
+        if not pixmap.isNull():
+            icon.addPixmap(pixmap)
+    return icon
+
+
+def create_eduflow_app_icon() -> QIcon:
+    """EduFlow 블루 배지(`E` 로고) 앱·트레이 공용 아이콘을 반환한다."""
+    icon = QIcon()
+    for size in (16, 24, 32, 48, 64):
+        pixmap = load_svg_pixmap("eduflow_app", color_hex=None, size=size)
+        if not pixmap.isNull():
+            icon.addPixmap(pixmap)
+    return icon
+

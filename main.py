@@ -9,11 +9,11 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from PyQt6.QtGui import QFont, QFontDatabase
+from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from ui.main_window import MainWindow
-from ui.utils import install_global_wheel_guard
+from ui.utils import create_eduflow_app_icon, install_global_wheel_guard
 from utils.path_helper import get_resource_path
 
 
@@ -71,11 +71,45 @@ def load_theme_stylesheet(app: QApplication) -> str:
     return ""
 
 
+def apply_light_palette(app: QApplication) -> None:
+    """Windows 다크모드 영향으로 QDateEdit/QTimeEdit 등이 검게 렌더링되지 않도록 라이트 팔레트를 고정 적용합니다."""
+    palette = QPalette()
+    active_colors = {
+        QPalette.ColorRole.Window: QColor("#F8F9FF"),
+        QPalette.ColorRole.WindowText: QColor("#0F172A"),
+        QPalette.ColorRole.Base: QColor("#FFFFFF"),
+        QPalette.ColorRole.AlternateBase: QColor("#F8FAFC"),
+        QPalette.ColorRole.ToolTipBase: QColor("#0F172A"),
+        QPalette.ColorRole.ToolTipText: QColor("#FFFFFF"),
+        QPalette.ColorRole.Text: QColor("#0F172A"),
+        QPalette.ColorRole.Button: QColor("#FFFFFF"),
+        QPalette.ColorRole.ButtonText: QColor("#0F172A"),
+        QPalette.ColorRole.BrightText: QColor("#FFFFFF"),
+        QPalette.ColorRole.Highlight: QColor("#2563EB"),
+        QPalette.ColorRole.HighlightedText: QColor("#FFFFFF"),
+        QPalette.ColorRole.PlaceholderText: QColor("#94A3B8"),
+    }
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        for role, color in active_colors.items():
+            palette.setColor(group, role, color)
+
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor("#94A3B8"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#94A3B8"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#94A3B8"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Base, QColor("#F1F5F9"))
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Button, QColor("#F1F5F9"))
+    app.setPalette(palette)
+
+
 def main() -> int:
     install_exception_hook()
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    apply_light_palette(app)
+    app_icon = create_eduflow_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     app.setQuitOnLastWindowClosed(False)  # 시스템 트레이 상주를 위해 창이 닫혀도 앱 유지
     app.setFont(select_modern_font())
 

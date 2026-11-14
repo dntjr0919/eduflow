@@ -11,9 +11,12 @@ from contextlib import contextmanager
 import html
 import io
 import json
+import os
 import re
+import stat
 import sys
 import threading
+import uuid
 import zipfile
 from copy import deepcopy
 from pathlib import Path
@@ -717,6 +720,8 @@ def _normalize_hwp_equation_script(script: str) -> str:
         return ""
 
     s = _replace_latex_frac_and_sqrt(s)
+    # \text{...}, \mathrm{...} -> rm {...}
+    s = re.sub(r"\\(?:text|mathrm)\s*\{([^{}]*)\}", r"rm {\1}", s)
 
     # LaTeX 백슬래시 명령어 -> 한글 수식 키워드
     latex_replacements = [
@@ -784,12 +789,13 @@ def _find_template_equation(
 
 
 def _estimate_equation_size(eq_script: str) -> Tuple[int, int]:
-    """수식 스크립트의 보이는 문자 수 및 분수/적분 포함 여부 기준으로 인라인 (width, height) HWPUNIT 크기를 계산합니다."""
     is_tall = bool(re.search(r"\b(over|int|dint|oint|sum|lim)\b", eq_script))
-    visible = re.sub(r"\b(rm|it|bold|over|sqrt|left|right|times|cdot)\b", "", eq_script)
+    # 서식 키워드만 제거하고 times/cdot 등 실제 렌더링되는 기호는 2글자 폭으로 치환
+    visible = re.sub(r"\b(rm|it|bold|over|sqrt|left|right)\b", "", eq_script)
+    visible = re.sub(r"\b(times|cdot|div|pm|le|ge)\b", "XX", visible)
     visible = re.sub(r"[{}\s]", "", visible)
     vis_len = max(1, len(visible))
-    width = max(1400, vis_len * 650 + 500)
+    width = max(1600, vis_len * 750 + 900)
     height = 2200 if is_tall else 1100
     return width, height
 
@@ -2379,12 +2385,16 @@ def apply_single_hwpx_operation(
                 touched_ids.append(new_id)
 
     elif op == "insert_exam_question":
-        anchor_entry = id_map.get(target_id)
-        if anchor_entry is None:
-            p_keys = [k for k in id_map if k.startswith("p_")]
-            if p_keys:
-                anchor_entry = id_map[p_keys[-1]]
-                target_id = p_keys[-1]
+        # target_id가 생략되거나 "END"이면 문서 맨 끝에 순차 추가 (폴백 생략)
+        if not target_id or target_id.upper() == "END":
+            anchor_entry = None
+        else:
+            anchor_entry = id_map.get(target_id)
+            if anchor_entry is None:
+                p_keys = [k for k in id_map if k.startswith("p_")]
+                if p_keys:
+                    anchor_entry = id_map[p_keys[-1]]
+                    target_id = p_keys[-1]
 
         placeholder_stem: Optional[Any] = None
         if anchor_entry is not None:
@@ -2645,14 +2655,18 @@ def apply_hwpx_patch(
 
 def export_exam_answers_hwpx(doc: HwpxDocument, out_path: Path | str) -> Path:
     """insert_exam_question으로 수집된 정답·해설을 별도의 HWPX 파일로 저장합니다."""
-    ans_doc = create_minimal_hwpx_document(title="정답 및 해설")
-    ops: List[Dict[str, Any]] = []
-    anchor = "p_0"
-    for item in doc.exam_answers:
+    ans_doc = create_minimal_hwpx_document(title="정답 및 해설", empty=True)
+    ops: List[Dict[str, Any]] = [
+        {"op": "append_paragraph", "text": "정답 및 해설", "bold": True, "font_size_pt": 14.0, "align": "CENTER"}
+    ]
+    sorted_answers = sorted(
+        doc.exam_answers,
+        key=lambda x: int(x["number"]) if str(x.get("number", "")).isdigit() else 9999,
+    )
+    for item in sorted_answers:
         line = f"{item['number']}번 정답: {item['answer']} | 해설: {item['explanation']}"
-        ops.append({"op": "insert_paragraph_after", "target_id": anchor, "text": line})
-    if ops:
-        apply_hwpx_operations(ans_doc, ops, record_undo=False)
+        ops.append({"op": "append_paragraph", "text": line})
+    apply_hwpx_operations(ans_doc, ops, record_undo=False)
     return ans_doc.save(out_path)
 
 
@@ -3309,9 +3323,24 @@ def _bring_hwp_security_popup_to_front(
         return
 
 
+_HWP_FILE_LOCKED_MSG = (
+    "다른 한글 창에서 해당 파일이 열려 있어 저장할 수 없습니다. "
+    "한글 창을 닫거나 다른 이름으로 저장해 주세요."
+)
+
+
+def _ensure_writable_if_exists(path: Path) -> None:
+    """대상 파일이 존재하면 읽기 전용 속성을 해제해 쓰기 가능 상태로 만듭니다."""
+    if path.exists():
+        try:
+            os.chmod(path, stat.S_IWRITE)
+        except OSError:
+            pass
+
+
 @contextmanager
 def _hwp_security_popup_watcher(interval_sec: float = 0.15) -> Iterator[None]:
-    """hwp.Open(...) 호출 동안 보안 경고창 최상위 노출 데몬 스레드를 실행합니다."""
+    """hwp.Open(...) 및 SaveAs(...) 호출 동안 보안 경고창 최상위 노출 데몬 스레드를 실행합니다."""
     if sys.platform != "win32":
         yield
         return
@@ -3355,6 +3384,10 @@ def _convert_via_hwp_com(
         raise RuntimeError(_HWP_COM_UNAVAILABLE_MSG) from exc
 
     dst.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_writable_if_exists(dst)
+    temp_dst = dst.parent / f".~eduflow_tmp_{uuid.uuid4().hex[:8]}_{dst.name}"
+    temp_resolved_str = str(temp_dst.resolve())
+
     hwp = None
     co_initialized = False
     try:
@@ -3380,12 +3413,15 @@ def _convert_via_hwp_com(
 
         with _hwp_security_popup_watcher():
             hwp.Open(str(src.resolve()), src_fmt, "forceopen:true")
-        saved_ok = hwp.SaveAs(str(dst.resolve()), dst_fmt, "")
-        if saved_ok is False or not dst.is_file():
-            hwp.HAction.GetDefault("FileSaveAs_S", hwp.HParameterSet.HFileOpenSave.HSet)
-            hwp.HParameterSet.HFileOpenSave.filename = str(dst.resolve())
-            hwp.HParameterSet.HFileOpenSave.Format = dst_fmt
-            hwp.HAction.Execute("FileSaveAs_S", hwp.HParameterSet.HFileOpenSave.HSet)
+            saved_ok = hwp.SaveAs(temp_resolved_str, dst_fmt, "")
+            if saved_ok is False or not temp_dst.is_file():
+                hwp.HAction.GetDefault("FileSaveAs_S", hwp.HParameterSet.HFileOpenSave.HSet)
+                hwp.HParameterSet.HFileOpenSave.filename = temp_resolved_str
+                hwp.HParameterSet.HFileOpenSave.Format = dst_fmt
+                hwp.HAction.Execute("FileSaveAs_S", hwp.HParameterSet.HFileOpenSave.HSet)
+    except Exception:
+        temp_dst.unlink(missing_ok=True)
+        raise
     finally:
         if hwp is not None:
             try:
@@ -3401,6 +3437,19 @@ def _convert_via_hwp_com(
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+
+    if not temp_dst.is_file():
+        if dst.exists():
+            raise PermissionError(_HWP_FILE_LOCKED_MSG)
+        raise RuntimeError(f"한글 COM 변환 결과 파일이 생성되지 않았습니다: {dst}")
+
+    _ensure_writable_if_exists(temp_dst)
+    _ensure_writable_if_exists(dst)
+    try:
+        os.replace(temp_dst, dst)
+    except (PermissionError, OSError) as exc:
+        temp_dst.unlink(missing_ok=True)
+        raise PermissionError(_HWP_FILE_LOCKED_MSG) from exc
 
     if not dst.is_file():
         raise RuntimeError(f"한글 COM 변환 결과 파일이 생성되지 않았습니다: {dst}")

@@ -18,7 +18,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "source_dirs": [
             str(Path.home() / "Downloads")
         ],
-        "target_base_dir": str(Path.home() / "Documents" / "교무업무_자동분류함"),
+        "target_base_dir": str(Path.home() / "Documents" / "EduFlow"),
         "action_mode": "move",            # "move" (이동) 또는 "copy" (복사)
         "duplicate_policy": "number",     # "number" (파일명_(1).ext) 또는 "date" (파일명_YYYYMMDD_HHMMSS.ext)
         "include_unmatched": False,       # 규칙 미일치 파일을 '기타_미분류' 폴더로 이동할지 여부
@@ -52,10 +52,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_output_tokens": 2048,
         "thinking_budget_mode": "low",    # "off"(추론 끄기), "low"(최소 추론 - 채점/세특 권장), "auto"(모델 기본값)
         "custom_web_selectors": {},       # 도메인별 학습된 커스텀 웹 AI 입력창 CSS 셀렉터 캐시
-        # Google Sheets & 카카오톡 외부 연동 설정
+        # Google Sheets & Apps Script & 카카오톡 외부 연동 설정
         "google_credentials_path": "",
         "google_sheet_url": "",
+        "google_apps_script_url": "",
         "google_sheet_poll_interval_sec": 30,
+        "sync_on_startup": True,
         "kakao_notify_mode": "toast_only",  # "toast_only", "pc_macro", "webhook"
         "kakao_target_room_name": "",
         "kakao_webhook_url": ""

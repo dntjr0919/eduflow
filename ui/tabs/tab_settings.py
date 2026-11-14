@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from PyQt6.QtCore import QEvent, QObject, Qt
+from PyQt6.QtCore import QEvent, QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListView,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -49,6 +50,10 @@ from PyQt6.QtWidgets import (
 from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
+from services.google_sheets_sync_service import (
+    GoogleSheetsSyncService,
+    GoogleSheetsSyncWorker,
+)
 from services.llm_client import (
     MultiLlmClient,
     fetch_available_models,
@@ -62,6 +67,7 @@ from services.roster_parser_service import (
     parse_subject_roster,
 )
 from ui.components.collapsible_card import AccordionCard, AccordionGroup
+from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
 from ui.utils import (
@@ -70,13 +76,14 @@ from ui.utils import (
     SearchableModelComboBox,
     install_no_scroll_wheel_filter,
 )
+from utils.path_helper import get_resource_path
 
 
 # 좌측 환경설정 아코디언: True = 한 번에 하나만 펼침(단일 모드), False = 여러 개 동시 펼침(다중 모드)
 SETTINGS_ACCORDION_EXCLUSIVE = True
 
 INPUT_FIELD_STYLE = """
-QLineEdit, QComboBox, QSpinBox, QKeySequenceEdit {
+QLineEdit, QComboBox, QSpinBox, QKeySequenceEdit, QDateEdit, QTimeEdit, QDateTimeEdit {
     min-height: 34px;
     height: 34px;
     font-size: 13px;
@@ -97,11 +104,12 @@ QComboBox {
     padding: 2px 30px 2px 10px;
     color: #101828;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QKeySequenceEdit:focus {
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QKeySequenceEdit:focus,
+QDateEdit:focus, QTimeEdit:focus, QDateTimeEdit:focus {
     border: 1.5px solid #4F46E5;
     background-color: #FFFFFF;
 }
-QComboBox::drop-down {
+QComboBox::drop-down, QDateEdit::drop-down, QTimeEdit::drop-down, QDateTimeEdit::drop-down {
     subcontrol-origin: padding;
     subcontrol-position: top right;
     width: 28px;
@@ -110,10 +118,10 @@ QComboBox::drop-down {
     border-bottom-right-radius: 6px;
     background-color: #F8FAFC;
 }
-QComboBox::drop-down:hover {
+QComboBox::drop-down:hover, QDateEdit::drop-down:hover, QTimeEdit::drop-down:hover, QDateTimeEdit::drop-down:hover {
     background-color: #EEF2F6;
 }
-QComboBox::down-arrow {
+QComboBox::down-arrow, QDateEdit::down-arrow, QTimeEdit::down-arrow, QDateTimeEdit::down-arrow {
     width: 0;
     height: 0;
     border-left: 5px solid transparent;
@@ -134,6 +142,29 @@ QComboBox QAbstractItemView {
 QComboBox QAbstractItemView::item {
     min-height: 28px;
     padding: 4px 8px;
+}
+QHeaderView {
+    background-color: #F8FAFC;
+    border: none;
+    border-bottom: 1px solid #E2E8F0;
+}
+QHeaderView::section {
+    background-color: #F8FAFC;
+    color: #64748B;
+    font-size: 11px;
+    font-weight: 600;
+    min-height: 32px;
+    height: 32px;
+    border: none;
+    border-bottom: 1px solid #E2E8F0;
+    border-right: 1px solid #F1F5F9;
+    padding: 0px 8px;
+}
+QTableCornerButton::section {
+    background-color: #F8FAFC;
+    border: none;
+    border-bottom: 1px solid #E2E8F0;
+    border-right: 1px solid #F1F5F9;
 }
 """
 
@@ -398,12 +429,19 @@ class StudentAddDialog(QDialog):
 class SettingsTab(QWidget):
     """[탭 6] 환경설정 및 마스터 데이터 관리 탭 위젯."""
 
-    def __init__(self, parent: Optional[QWidget] = None):
+    sync_completed = pyqtSignal(dict)
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        db: Optional[DatabaseManager] = None,
+        config: Optional[ConfigManager] = None,
+    ):
         super().__init__(parent)
         apply_qss_role(self, obj_name="SettingsTabPage")
         self.setStyleSheet(INPUT_FIELD_STYLE)
-        self.config = ConfigManager()
-        self.db = DatabaseManager()
+        self.config = config or ConfigManager()
+        self.db = db or DatabaseManager()
         self.notifier = NotificationService()
         self._loading_ui: bool = False
         self._focused_card: Optional[str] = None
@@ -613,12 +651,27 @@ class SettingsTab(QWidget):
         target_row.setSpacing(8)
         self.edit_default_target = QLineEdit()
         configure_input_widget(self.edit_default_target)
-        btn_target_browse = QPushButton("변경...")
-        apply_qss_role(btn_target_browse)
-        btn_target_browse.setMinimumHeight(36)
-        btn_target_browse.clicked.connect(self._browse_target_dir)
+        self.edit_default_target.setPlaceholderText(
+            "미지정 시 기본 경로 사용 (Documents\\EduFlow) · 폴더 드래그 가능"
+        )
+        self.edit_default_target.setToolTip(
+            "자동 분류 출력, 문서 처리(HWPX·과제 병합) 기본 저장 위치 및 좌측 하단 [EduFlow 폴더 열기] 경로로 함께 사용됩니다."
+        )
+        self.btn_target_browse = QPushButton("변경...")
+        apply_qss_role(self.btn_target_browse)
+        self.btn_target_browse.setMinimumHeight(36)
+        self.btn_target_browse.clicked.connect(self._browse_target_dir)
+        for drop_w in (self.edit_default_target, self.btn_target_browse):
+            enable_file_drop(
+                drop_w,
+                allow_dirs=True,
+                allow_files=False,
+                multiple=False,
+                on_files_dropped=lambda paths: self._set_default_target_dir(paths[0]),
+                context_label="기본 작업 폴더",
+            )
         target_row.addWidget(self.edit_default_target, stretch=1)
-        target_row.addWidget(btn_target_browse)
+        target_row.addWidget(self.btn_target_browse)
 
         self.spin_watch_interval = QSpinBox()
         configure_input_widget(self.spin_watch_interval)
@@ -657,17 +710,67 @@ class SettingsTab(QWidget):
         cred_row.setSpacing(8)
         self.edit_google_cred = QLineEdit()
         configure_input_widget(self.edit_google_cred)
-        self.edit_google_cred.setPlaceholderText("Google API credentials.json 파일 경로")
-        btn_cred_browse = QPushButton("찾아보기...")
-        apply_qss_role(btn_cred_browse)
-        btn_cred_browse.setMinimumHeight(36)
-        btn_cred_browse.clicked.connect(self._browse_credentials_json)
+        self.edit_google_cred.setPlaceholderText("Google API credentials.json 파일 경로 (.json 드래그 가능)")
+        self.btn_cred_browse = QPushButton("찾아보기...")
+        apply_qss_role(self.btn_cred_browse)
+        self.btn_cred_browse.setMinimumHeight(36)
+        self.btn_cred_browse.clicked.connect(self._browse_credentials_json)
+        for drop_w in (self.edit_google_cred, self.btn_cred_browse):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".json"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self._set_credentials_json_path(paths[0]),
+                context_label="credentials.json 파일",
+            )
         cred_row.addWidget(self.edit_google_cred, stretch=1)
-        cred_row.addWidget(btn_cred_browse)
+        cred_row.addWidget(self.btn_cred_browse)
 
         self.edit_sheet_url = QLineEdit()
         configure_input_widget(self.edit_sheet_url)
         self.edit_sheet_url.setPlaceholderText("감시할 Google 스프레드시트 URL 또는 문서 ID")
+
+        self.edit_apps_script_url = QLineEdit()
+        configure_input_widget(self.edit_apps_script_url)
+        self.edit_apps_script_url.setPlaceholderText(
+            "https://script.google.com/macros/s/.../exec (Apps Script 웹 앱 URL)"
+        )
+
+        gas_btn_container = QWidget()
+        gas_btn_row = QHBoxLayout(gas_btn_container)
+        gas_btn_row.setContentsMargins(0, 0, 0, 0)
+        gas_btn_row.setSpacing(8)
+
+        self.btn_test_gas_conn = QPushButton("연결 테스트")
+        apply_qss_role(self.btn_test_gas_conn, role="secondary", obj_name="BtnTestGasConn")
+        self.btn_test_gas_conn.setMinimumHeight(34)
+        self.btn_test_gas_conn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_test_gas_conn.clicked.connect(self._on_test_gas_connection)
+
+        self.btn_sync_gas_now = QPushButton("지금 동기화")
+        apply_qss_role(self.btn_sync_gas_now, role="primary", obj_name="BtnSyncGasNow")
+        self.btn_sync_gas_now.setMinimumHeight(34)
+        self.btn_sync_gas_now.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_gas_now.clicked.connect(self._on_sync_gas_now)
+
+        self.btn_view_gas_template = QPushButton("Apps Script 템플릿 보기")
+        apply_qss_role(self.btn_view_gas_template, role="secondary", obj_name="BtnViewGasTemplate")
+        self.btn_view_gas_template.setMinimumHeight(34)
+        self.btn_view_gas_template.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_view_gas_template.clicked.connect(self._on_view_gas_template)
+
+        self.lbl_gas_status = QLabel("연동 대기")
+        apply_qss_role(self.lbl_gas_status, role="mutedText", obj_name="LblGasStatus")
+
+        gas_btn_row.addWidget(self.btn_test_gas_conn)
+        gas_btn_row.addWidget(self.btn_sync_gas_now)
+        gas_btn_row.addWidget(self.btn_view_gas_template)
+        gas_btn_row.addWidget(self.lbl_gas_status, stretch=1)
+
+        self.chk_sync_on_startup = QCheckBox("앱 시작 시 Google Sheets 자동 동기화 실행")
+        self.chk_sync_on_startup.setMinimumHeight(28)
 
         self.spin_sheet_interval = QSpinBox()
         configure_input_widget(self.spin_sheet_interval)
@@ -697,6 +800,9 @@ class SettingsTab(QWidget):
 
         ext_form.addRow("credentials.json:", cred_container)
         ext_form.addRow("Google 시트 URL:", self.edit_sheet_url)
+        ext_form.addRow("Apps Script 웹 앱 URL:", self.edit_apps_script_url)
+        ext_form.addRow("Apps Script 동기화:", gas_btn_container)
+        ext_form.addRow("", self.chk_sync_on_startup)
         ext_form.addRow("구글 시트 감시 주기:", self.spin_sheet_interval)
         ext_form.addRow("알림/카톡 연동 방식:", self.combo_kakao_mode)
         ext_form.addRow("PC 카톡 채팅방명:", self.edit_kakao_room)
@@ -1392,6 +1498,8 @@ class SettingsTab(QWidget):
             # 3) 외부 연동 및 트레이 설정 로드
             self.edit_google_cred.setText(api.get("google_credentials_path", ""))
             self.edit_sheet_url.setText(api.get("google_sheet_url", ""))
+            self.edit_apps_script_url.setText(api.get("google_apps_script_url", ""))
+            self.chk_sync_on_startup.setChecked(bool(api.get("sync_on_startup", True)))
             self.spin_sheet_interval.setValue(
                 int(api.get("google_sheet_poll_interval_sec", 30))
             )
@@ -1453,6 +1561,8 @@ class SettingsTab(QWidget):
             {
                 "google_credentials_path": self.edit_google_cred.text().strip(),
                 "google_sheet_url": self.edit_sheet_url.text().strip(),
+                "google_apps_script_url": self.edit_apps_script_url.text().strip(),
+                "sync_on_startup": self.chk_sync_on_startup.isChecked(),
                 "google_sheet_poll_interval_sec": self.spin_sheet_interval.value(),
                 "kakao_notify_mode": self.combo_kakao_mode.currentData(),
                 "kakao_target_room_name": self.edit_kakao_room.text().strip(),
@@ -1478,17 +1588,196 @@ class SettingsTab(QWidget):
         self._persist_settings_silently()
         QMessageBox.information(self, "저장 완료", "환경설정이 config.json에 안전하게 저장되었습니다.")
 
+    def _set_default_target_dir(self, folder: str) -> None:
+        if not folder:
+            return
+        self.edit_default_target.setText(str(Path(folder).resolve()))
+        self._persist_settings_silently()
+
     def _browse_target_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "분류 기준 상위 폴더 선택")
         if folder:
-            self.edit_default_target.setText(str(Path(folder).resolve()))
+            self._set_default_target_dir(folder)
+
+    def _set_credentials_json_path(self, file_path: str) -> None:
+        if not file_path:
+            return
+        self.edit_google_cred.setText(str(Path(file_path).resolve()))
+        self._persist_settings_silently()
 
     def _browse_credentials_json(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Google API credentials.json 선택", "", "JSON Files (*.json);;All Files (*)"
         )
         if file_path:
-            self.edit_google_cred.setText(str(Path(file_path).resolve()))
+            self._set_credentials_json_path(file_path)
+
+    def _on_test_gas_connection(self) -> None:
+        self._persist_settings_silently()
+        apps_script_url = self.edit_apps_script_url.text().strip()
+        sheet_url = self.edit_sheet_url.text().strip()
+        if not apps_script_url:
+            QMessageBox.warning(
+                self,
+                "연결 테스트",
+                "Apps Script 웹 앱 URL을 먼저 입력하세요.",
+            )
+            return
+
+        self.btn_test_gas_conn.setEnabled(False)
+        self.lbl_gas_status.setText("연결 확인 중...")
+        apply_qss_role(self.lbl_gas_status, role="badgeNeutral", obj_name="LblGasStatus")
+
+        def _run_test(_worker: Any) -> tuple:
+            svc = GoogleSheetsSyncService(db=self.db, config=self.config)
+            return svc.test_connection(apps_script_url=apps_script_url, sheet_url=sheet_url)
+
+        def _on_result(res: Any) -> None:
+            ok, msg, _data = res if isinstance(res, tuple) and len(res) >= 3 else (False, str(res), {})
+            self.lbl_gas_status.setText("연결 성공" if ok else "연결 실패")
+            apply_qss_role(
+                self.lbl_gas_status,
+                role="badgeSuccess" if ok else "badgeWarning",
+                obj_name="LblGasStatus",
+            )
+            if ok:
+                QMessageBox.information(self, "Apps Script 연결 성공", msg)
+            else:
+                QMessageBox.warning(self, "Apps Script 연결 실패", msg)
+
+        def _on_error(err: str) -> None:
+            self.lbl_gas_status.setText("연결 오류")
+            apply_qss_role(self.lbl_gas_status, role="badgeWarning", obj_name="LblGasStatus")
+            QMessageBox.critical(self, "연결 테스트 오류", err)
+
+        worker = FunctionWorker("Apps Script 연결 테스트", _run_test)
+        self.task_runner.start_worker(
+            worker,
+            task_key="settings_gas_conn_test",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=lambda: self.btn_test_gas_conn.setEnabled(True),
+        )
+
+    def _on_sync_gas_now(self) -> None:
+        self._persist_settings_silently()
+        apps_script_url = self.edit_apps_script_url.text().strip()
+        sheet_url = self.edit_sheet_url.text().strip()
+        if not apps_script_url:
+            QMessageBox.warning(
+                self,
+                "지금 동기화",
+                "Apps Script 웹 앱 URL을 먼저 입력하세요.",
+            )
+            return
+
+        self.btn_sync_gas_now.setEnabled(False)
+        self.lbl_gas_status.setText("동기화 중...")
+        apply_qss_role(self.lbl_gas_status, role="badgePrimary", obj_name="LblGasStatus")
+
+        svc = GoogleSheetsSyncService(db=self.db, config=self.config)
+        worker = GoogleSheetsSyncWorker(
+            sync_service=svc,
+            apps_script_url=apps_script_url,
+            sheet_url=sheet_url,
+        )
+
+        def _on_result(result: Any) -> None:
+            data = result if isinstance(result, dict) else {"ok": False, "error": str(result)}
+            if data.get("ok"):
+                summary = (
+                    f"일정 +{data.get('schedules_added', 0)} / "
+                    f"할일 +{data.get('todos_added', 0)} / "
+                    f"예약작업 +{data.get('mobile_tasks_added', 0)} / "
+                    f"알림 +{data.get('notifications_added', 0)}"
+                )
+                self.lbl_gas_status.setText("동기화 완료")
+                apply_qss_role(self.lbl_gas_status, role="badgeSuccess", obj_name="LblGasStatus")
+                self.sync_completed.emit(data)
+                QMessageBox.information(
+                    self,
+                    "Google Sheets 동기화 완료",
+                    f"로컬 SQLite 동기화가 완료되었습니다.\n{summary}",
+                )
+            else:
+                err_msg = str(data.get("error") or "동기화에 실패했습니다.")
+                self.lbl_gas_status.setText("동기화 실패")
+                apply_qss_role(self.lbl_gas_status, role="badgeWarning", obj_name="LblGasStatus")
+                QMessageBox.warning(self, "Google Sheets 동기화 실패", err_msg)
+
+        def _on_error(err: str) -> None:
+            self.lbl_gas_status.setText("동기화 오류")
+            apply_qss_role(self.lbl_gas_status, role="badgeWarning", obj_name="LblGasStatus")
+            QMessageBox.critical(self, "동기화 오류", err)
+
+        self.task_runner.start_worker(
+            worker,
+            task_key="settings_gas_sync_now",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=lambda: self.btn_sync_gas_now.setEnabled(True),
+        )
+
+    def _on_view_gas_template(self) -> None:
+        tpl_path = Path(get_resource_path("docs/apps_script_template.gs"))
+        if not tpl_path.exists():
+            tpl_path = Path(__file__).resolve().parents[2] / "docs" / "apps_script_template.gs"
+        if not tpl_path.exists():
+            QMessageBox.warning(
+                self,
+                "템플릿 없음",
+                f"Apps Script 템플릿 파일을 찾을 수 없습니다:\n{tpl_path}",
+            )
+            return
+
+        script_text = tpl_path.read_text(encoding="utf-8")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Google Apps Script 웹 앱 템플릿 (docs/apps_script_template.gs)")
+        dlg.resize(780, 560)
+        v_lay = QVBoxLayout(dlg)
+        v_lay.setContentsMargins(16, 16, 16, 16)
+        v_lay.setSpacing(10)
+
+        lbl_guide = QLabel(
+            "Google Sheets 메뉴 [확장 프로그램] -> [Apps Script]에 아래 코드를 붙여넣고 웹 앱으로 배포하세요.\n"
+            "(Schedules / Tasks / Notifications 3개 시트 탭을 자동 생성·조회·갱신합니다)"
+        )
+        apply_qss_role(lbl_guide, role="mutedText")
+        lbl_guide.setWordWrap(True)
+        v_lay.addWidget(lbl_guide)
+
+        txt_code = QPlainTextEdit()
+        txt_code.setReadOnly(True)
+        txt_code.setPlainText(script_text)
+        txt_code.setStyleSheet(
+            "QPlainTextEdit { background: #0F172A; color: #E2E8F0; "
+            "font-family: 'Consolas', 'JetBrains Mono', monospace; font-size: 12px; "
+            "border: 1px solid #334155; border-radius: 8px; padding: 10px; }"
+        )
+        v_lay.addWidget(txt_code, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_copy = QPushButton("클립보드에 복사")
+        apply_qss_role(btn_copy, role="primary", obj_name="BtnCopyGasTemplate")
+        btn_copy.setMinimumHeight(34)
+
+        def _copy_all() -> None:
+            cb = QApplication.clipboard()
+            if cb is not None:
+                cb.setText(script_text)
+            QMessageBox.information(dlg, "복사 완료", "Apps Script 템플릿 코드가 클립보드에 복사되었습니다.")
+
+        btn_copy.clicked.connect(_copy_all)
+        btn_close = QPushButton("닫기")
+        apply_qss_role(btn_close, role="secondary")
+        btn_close.setMinimumHeight(34)
+        btn_close.clicked.connect(dlg.accept)
+
+        btn_row.addStretch()
+        btn_row.addWidget(btn_copy)
+        btn_row.addWidget(btn_close)
+        v_lay.addLayout(btn_row)
+        dlg.exec()
 
     def _on_test_notification(self) -> None:
         self._persist_settings_silently()
@@ -1552,9 +1841,9 @@ class SettingsTab(QWidget):
         self.lbl_homeroom_badge = QLabel("현재 등록된 담임 학급 없음")
         apply_qss_role(self.lbl_homeroom_badge, role="badgeWarning")
 
-        btn_import_hr = QPushButton("나이스 학급명렬표 등록 (.xlsx)")
-        apply_qss_role(btn_import_hr, role="primary", obj_name="BtnImportHomeroom")
-        btn_import_hr.clicked.connect(self._on_import_homeroom_file)
+        self.btn_import_hr = QPushButton("나이스 학급명렬표 등록 (.xlsx)")
+        apply_qss_role(self.btn_import_hr, role="primary", obj_name="BtnImportHomeroom")
+        self.btn_import_hr.clicked.connect(self._on_import_homeroom_file)
 
         btn_add_hr_stu = QPushButton("+ 학생 수동 추가")
         apply_qss_role(btn_add_hr_stu, role="secondary", obj_name="BtnAddHomeroomStudent")
@@ -1570,7 +1859,7 @@ class SettingsTab(QWidget):
 
         t1_top.addWidget(self.lbl_homeroom_badge)
         t1_top.addStretch()
-        t1_top.addWidget(btn_import_hr)
+        t1_top.addWidget(self.btn_import_hr)
         t1_top.addWidget(btn_add_hr_stu)
         t1_top.addWidget(btn_export_hr)
         t1_top.addWidget(btn_reset_hr)
@@ -1583,8 +1872,22 @@ class SettingsTab(QWidget):
         self.table_homeroom.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table_homeroom.verticalHeader().setDefaultSectionSize(32)
         self.table_homeroom.verticalHeader().setVisible(False)
+        hh_homeroom = self.table_homeroom.horizontalHeader()
+        hh_homeroom.setStretchLastSection(True)
+        hh_homeroom.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table_homeroom.setMinimumHeight(320)
+        self.table_homeroom.setToolTip("행 더블클릭: 학생 수정 · 나이스 학급명렬표(.xlsx) 파일을 여기에 드래그하여 바로 등록 가능")
         self.table_homeroom.doubleClicked.connect(self._on_edit_student)
+        for drop_w in (self.table_homeroom, self.btn_import_hr):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.import_homeroom_roster_file(paths[0]),
+                context_label="학급담임 명렬표 (.xlsx)",
+            )
         tab1_lay.addWidget(self.table_homeroom)
 
         self.table_students = self.table_homeroom
@@ -1613,9 +1916,9 @@ class SettingsTab(QWidget):
         self.lbl_subject_badge = QLabel("등록된 교과 없음")
         apply_qss_role(self.lbl_subject_badge, role="badgeWarning")
 
-        btn_import_sub = QPushButton("나이스 교과출석부 등록 (.xlsx)")
-        apply_qss_role(btn_import_sub, role="primary", obj_name="BtnImportSubject")
-        btn_import_sub.clicked.connect(self._on_import_subject_file)
+        self.btn_import_sub = QPushButton("나이스 교과출석부 등록 (.xlsx)")
+        apply_qss_role(self.btn_import_sub, role="primary", obj_name="BtnImportSubject")
+        self.btn_import_sub.clicked.connect(self._on_import_subject_file)
 
         btn_del_sub = QPushButton("- 선택 교과 삭제")
         apply_qss_role(btn_del_sub, role="secondary", obj_name="BtnDeleteSubject")
@@ -1625,7 +1928,7 @@ class SettingsTab(QWidget):
         t2_top.addWidget(self.combo_subject_groups)
         t2_top.addWidget(self.lbl_subject_badge)
         t2_top.addStretch()
-        t2_top.addWidget(btn_import_sub)
+        t2_top.addWidget(self.btn_import_sub)
         t2_top.addWidget(btn_del_sub)
         tab2_lay.addLayout(t2_top)
 
@@ -1638,6 +1941,20 @@ class SettingsTab(QWidget):
         self.table_subject.verticalHeader().setVisible(False)
         self.table_subject.setMinimumHeight(320)
         self.table_subject.setHorizontalHeaderLabels(["연번", "학번", "학년", "학과", "반", "번호", "성명"])
+        self.table_subject.setToolTip("나이스 교과출석부(.xlsx) 파일을 여기에 드래그하여 바로 등록 가능")
+        hh_subject = self.table_subject.horizontalHeader()
+        hh_subject.setStretchLastSection(True)
+        hh_subject.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for drop_w in (self.table_subject, self.btn_import_sub):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.import_subject_roster_file(paths[0]),
+                context_label="교과 출석부 명렬표 (.xlsx)",
+            )
         tab2_lay.addWidget(self.table_subject)
 
         self.roster_tab_widget.addTab(tab2_widget, "교과 출석부 명렬표")
@@ -1663,9 +1980,9 @@ class SettingsTab(QWidget):
         self.lbl_club_badge = QLabel("등록된 동아리 없음")
         apply_qss_role(self.lbl_club_badge, role="badgeWarning")
 
-        btn_import_club = QPushButton("나이스 동아리출석부 등록 (.xlsx)")
-        apply_qss_role(btn_import_club, role="primary", obj_name="BtnImportClub")
-        btn_import_club.clicked.connect(self._on_import_club_file)
+        self.btn_import_club = QPushButton("나이스 동아리출석부 등록 (.xlsx)")
+        apply_qss_role(self.btn_import_club, role="primary", obj_name="BtnImportClub")
+        self.btn_import_club.clicked.connect(self._on_import_club_file)
 
         btn_del_club = QPushButton("- 선택 동아리 삭제")
         apply_qss_role(btn_del_club, role="secondary", obj_name="BtnDeleteClub")
@@ -1675,7 +1992,7 @@ class SettingsTab(QWidget):
         t3_top.addWidget(self.combo_club_groups)
         t3_top.addWidget(self.lbl_club_badge)
         t3_top.addStretch()
-        t3_top.addWidget(btn_import_club)
+        t3_top.addWidget(self.btn_import_club)
         t3_top.addWidget(btn_del_club)
         tab3_lay.addLayout(t3_top)
 
@@ -1688,6 +2005,20 @@ class SettingsTab(QWidget):
         self.table_club.verticalHeader().setVisible(False)
         self.table_club.setMinimumHeight(320)
         self.table_club.setHorizontalHeaderLabels(["No", "학번", "학년", "학과", "반", "번호", "성명"])
+        self.table_club.setToolTip("나이스 동아리출석부(.xlsx) 파일을 여기에 드래그하여 바로 등록 가능")
+        hh_club = self.table_club.horizontalHeader()
+        hh_club.setStretchLastSection(True)
+        hh_club.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for drop_w in (self.table_club, self.btn_import_club):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.import_club_roster_file(paths[0]),
+                context_label="동아리 출석부 명렬표 (.xlsx)",
+            )
         tab3_lay.addWidget(self.table_club)
 
         self.roster_tab_widget.addTab(tab3_widget, "동아리 출석부")
@@ -1716,6 +2047,9 @@ class SettingsTab(QWidget):
             self.table_homeroom.setHorizontalHeaderLabels(
                 ["학번", "학년", "반", "번호", "이름", "학생 연락처", "학부모 연락처 / 비고"]
             )
+            header = self.table_homeroom.horizontalHeader()
+            header.setStretchLastSection(True)
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             return
 
         students = self.db.get_roster_students(active_group["id"])
@@ -1777,9 +2111,14 @@ class SettingsTab(QWidget):
                 self.table_homeroom.setItem(row_idx, col_idx, it)
 
         header = self.table_homeroom.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        for i in range(1, len(col_list)):
-            header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(True)
+        if len(col_list) <= 8:
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        else:
+            header.setMinimumSectionSize(70)
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            for i in range(1, len(col_list)):
+                header.setSectionResizeMode(i, QHeaderView.ResizeMode.Interactive)
 
     def refresh_subject_tab(self) -> None:
         """등록된 교과 강좌 목록과 출석부를 갱신합니다."""
@@ -1896,16 +2235,9 @@ class SettingsTab(QWidget):
     # =========================================================================
     # 나이스 엑셀 등록 및 삭제 핸들러
     # =========================================================================
-    def _on_import_homeroom_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "나이스 학급담임 명렬표 엑셀 파일(.xlsx) 선택",
-            "",
-            "Excel Files (*.xlsx);;All Files (*.*)",
-        )
+    def import_homeroom_roster_file(self, file_path: str) -> int:
         if not file_path:
-            return
-
+            return 0
         try:
             group_info, student_list = parse_homeroom_roster(file_path)
             group_id = self.db.create_roster_group(
@@ -1935,19 +2267,24 @@ class SettingsTab(QWidget):
                 "학급담임 명렬표 등록 완료",
                 f"[{group_info['group_name']}] 총 {len(student_list)}명의 학생 명렬표가 등록되었습니다.",
             )
+            return len(student_list)
         except Exception as exc:
             QMessageBox.critical(self, "파일 가져오기 오류", f"학급담임 명렬표를 읽는 중 오류가 발생했습니다:\n{exc}")
+            return 0
 
-    def _on_import_subject_file(self) -> None:
+    def _on_import_homeroom_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "나이스 교과출석부 엑셀 파일(.xlsx) 선택",
+            "나이스 학급담임 명렬표 엑셀 파일(.xlsx) 선택",
             "",
             "Excel Files (*.xlsx);;All Files (*.*)",
         )
-        if not file_path:
-            return
+        if file_path:
+            self.import_homeroom_roster_file(file_path)
 
+    def import_subject_roster_file(self, file_path: str) -> int:
+        if not file_path:
+            return 0
         try:
             group_info, student_list = parse_subject_roster(file_path)
             group_id = self.db.create_roster_group(
@@ -1969,19 +2306,24 @@ class SettingsTab(QWidget):
                 "교과 출석부 등록 완료",
                 f"[{group_info['group_name']} {group_info.get('extra_info', '')}] 총 {len(student_list)}명의 학생이 등록되었습니다.",
             )
+            return len(student_list)
         except Exception as exc:
             QMessageBox.critical(self, "파일 가져오기 오류", f"교과출석부를 읽는 중 오류가 발생했습니다:\n{exc}")
+            return 0
 
-    def _on_import_club_file(self) -> None:
+    def _on_import_subject_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "나이스 동아리출석부 엑셀 파일(.xlsx) 선택",
+            "나이스 교과출석부 엑셀 파일(.xlsx) 선택",
             "",
             "Excel Files (*.xlsx);;All Files (*.*)",
         )
-        if not file_path:
-            return
+        if file_path:
+            self.import_subject_roster_file(file_path)
 
+    def import_club_roster_file(self, file_path: str) -> int:
+        if not file_path:
+            return 0
         try:
             group_info, student_list = parse_club_roster(file_path)
             group_id = self.db.create_roster_group(
@@ -2003,8 +2345,20 @@ class SettingsTab(QWidget):
                 "동아리 출석부 등록 완료",
                 f"[{group_info['group_name']}] 총 {len(student_list)}명의 학생이 등록되었습니다.",
             )
+            return len(student_list)
         except Exception as exc:
             QMessageBox.critical(self, "파일 가져오기 오류", f"동아리출석부를 읽는 중 오류가 발생했습니다:\n{exc}")
+            return 0
+
+    def _on_import_club_file(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "나이스 동아리출석부 엑셀 파일(.xlsx) 선택",
+            "",
+            "Excel Files (*.xlsx);;All Files (*.*)",
+        )
+        if file_path:
+            self.import_club_roster_file(file_path)
 
     def _on_reset_homeroom(self) -> None:
         ans = QMessageBox.question(

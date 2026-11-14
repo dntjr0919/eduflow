@@ -15,6 +15,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +94,7 @@ from services.llm_client import (
     format_parsed_json_to_readable_text,
 )
 from services.notifier import NotificationService
+from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.batch_manual_prompt_dialog import BatchManualPromptDialog
 from ui.dialogs.extraction_review_dialog import OcrReviewDialog
@@ -100,6 +102,7 @@ from ui.dialogs.manual_llm_dialog import ManualLlmDialog
 from ui.dialogs.docx_schema_create_dialog import DocxSchemaCreateDialog
 from ui.dialogs.prompt_edit_dialog import PromptEditDialog
 from ui.utils import install_no_scroll_wheel_filter
+from utils.path_helper import get_active_workspace_dir
 
 try:
     from pypdf import PdfReader, PdfWriter
@@ -945,6 +948,13 @@ class DocOcrTab(QWidget):
         self._wire_ai_context_sync()
         self.set_active_ai_target("agg_step2")
 
+    def _get_default_save_path(self, default_filename: str = "") -> str:
+        """환경설정 기본 출력 폴더(미지정 시 Documents/EduFlow) 기준 기본 저장 경로를 반환합니다."""
+        base_dir = get_active_workspace_dir(getattr(self, "config", None))
+        if default_filename:
+            return str(base_dir / default_filename)
+        return str(base_dir)
+
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -952,6 +962,8 @@ class DocOcrTab(QWidget):
 
         self.sub_tabs = QTabWidget()
         apply_qss_role(self.sub_tabs, obj_name="DocOcrSubTabWidget")
+        self.sub_tabs.setUsesScrollButtons(True)
+        self.sub_tabs.setMinimumWidth(0)
         self.sub_tabs.addTab(
             self._build_excel_aggregator_subtab(),
             "1. 과제 파이프라인 (문서 추출 + AI 세특)",
@@ -1016,16 +1028,31 @@ class DocOcrTab(QWidget):
         self.edit_submission_dir = QLineEdit()
         self.edit_submission_dir.setMinimumHeight(32)
         self.edit_submission_dir.setPlaceholderText(
-            "학생들이 제출한 파일(PDF, HWP, DOCX, XLSX 등)이 들어있는 폴더를 선택하세요..."
+            "학생들이 제출한 파일(PDF, HWP, DOCX, XLSX 등) 폴더나 파일을 드래그하거나 선택하세요..."
         )
-        btn_browse_sub = QPushButton("폴더 찾아보기...")
-        apply_qss_role(btn_browse_sub, role="secondary")
-        btn_browse_sub.setMinimumHeight(32)
-        btn_browse_sub.clicked.connect(self._on_browse_submission_dir)
+        self.btn_browse_sub = QPushButton("폴더 찾아보기...")
+        apply_qss_role(self.btn_browse_sub, role="secondary")
+        self.btn_browse_sub.setMinimumHeight(32)
+        self.btn_browse_sub.clicked.connect(self._on_browse_submission_dir)
         btn_open_sub = QPushButton("폴더 열기")
         apply_qss_role(btn_open_sub, role="outline")
         btn_open_sub.setMinimumHeight(32)
         btn_open_sub.clicked.connect(self._on_open_submission_dir)
+
+        sub_drop_exts = [
+            ".pdf", ".hwp", ".hwpx", ".docx", ".doc", ".xlsx", ".xls",
+            ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".txt", ".zip",
+        ]
+        for drop_w in (self.edit_submission_dir, self.btn_browse_sub):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=sub_drop_exts,
+                allow_dirs=True,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.set_submission_dir(paths[0]),
+                context_label="제출물 폴더/파일",
+            )
 
         self.chk_recursive = QCheckBox("하위 폴더까지 포함 검색")
         self.combo_ext_filter = QComboBox()
@@ -1037,7 +1064,7 @@ class DocOcrTab(QWidget):
         self.combo_ext_filter.addItem("워드/엑셀 파일만 (.docx, .xlsx 등)", "word_excel")
 
         folder_row.addWidget(self.edit_submission_dir, stretch=1)
-        folder_row.addWidget(btn_browse_sub)
+        folder_row.addWidget(self.btn_browse_sub)
         folder_row.addWidget(btn_open_sub)
         cfg_lay.addLayout(folder_row)
 
@@ -1157,6 +1184,18 @@ class DocOcrTab(QWidget):
         self.table_submissions.setTextElideMode(Qt.TextElideMode.ElideMiddle)
         self.table_submissions.setWordWrap(True)
         self.table_submissions.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        enable_file_drop(
+            self.table_submissions,
+            allowed_exts=[
+                ".pdf", ".hwp", ".hwpx", ".docx", ".doc", ".xlsx", ".xls",
+                ".pptx", ".ppt", ".png", ".jpg", ".jpeg", ".txt", ".zip",
+            ],
+            allow_dirs=True,
+            allow_files=True,
+            multiple=False,
+            on_files_dropped=lambda paths: self.set_submission_dir(paths[0]),
+            context_label="제출물 폴더/파일",
+        )
 
         left_lay.addWidget(self.table_submissions, stretch=1)
         main_lay.addWidget(self.left_group, stretch=3)
@@ -1338,8 +1377,8 @@ class DocOcrTab(QWidget):
 
         # 상단 파일 추가 및 결과 저장 툴바
         file_toolbar = QHBoxLayout()
-        btn_add = QPushButton("+ 파일 추가")
-        apply_qss_role(btn_add, role="secondary", obj_name="BtnAddOcrFiles")
+        self.btn_add_ocr_files = QPushButton("+ 파일 추가")
+        apply_qss_role(self.btn_add_ocr_files, role="secondary", obj_name="BtnAddOcrFiles")
         btn_clear = QPushButton("목록 비우기")
         apply_qss_role(btn_clear, role="outline", obj_name="BtnClearOcrFiles")
         btn_save_txt = QPushButton("결과 마크다운(.md) 저장")
@@ -1348,12 +1387,28 @@ class DocOcrTab(QWidget):
         self.list_ocr_files = QListWidget()
         self.list_ocr_files.setMouseTracking(True)
         self.list_ocr_files.setMinimumHeight(90)
+        self.list_ocr_files.setToolTip("이미지/PDF/문서 파일을 드래그앤 드롭하여 목록에 추가할 수 있습니다.")
 
-        btn_add.clicked.connect(self._on_add_ocr_files)
+        self.btn_add_ocr_files.clicked.connect(self._on_add_ocr_files)
         btn_clear.clicked.connect(self.list_ocr_files.clear)
         btn_save_txt.clicked.connect(self._on_save_ocr_result)
 
-        file_toolbar.addWidget(btn_add)
+        ocr_drop_exts = [
+            ".png", ".jpg", ".jpeg", ".pdf", ".txt", ".md", ".csv",
+            ".tif", ".tiff", ".bmp", ".webp", ".docx", ".hwpx", ".hwp",
+        ]
+        for drop_w in (self.list_ocr_files, self.btn_add_ocr_files):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=ocr_drop_exts,
+                allow_dirs=False,
+                allow_files=True,
+                multiple=True,
+                on_files_dropped=self.add_ocr_files,
+                context_label="AI OCR 대상 파일",
+            )
+
+        file_toolbar.addWidget(self.btn_add_ocr_files)
         file_toolbar.addWidget(btn_clear)
         file_toolbar.addStretch()
         file_toolbar.addWidget(btn_save_txt)
@@ -1409,19 +1464,30 @@ class DocOcrTab(QWidget):
         # 1) 스캔 PDF 파일 선택 + 총 페이지 표시
         box_split_pdf = QHBoxLayout()
         self.edit_split_pdf_path = QLineEdit()
-        self.edit_split_pdf_path.setPlaceholderText("학생 여러 명의 과제가 하나로 스캔된 일괄 PDF 파일을 선택하세요.")
+        self.edit_split_pdf_path.setPlaceholderText("일괄 스캔된 PDF 파일을 드래그하거나 선택하세요.")
         self.edit_split_pdf_path.setMinimumHeight(32)
-        btn_browse_split_pdf = QPushButton("스캔 PDF 찾기...")
-        btn_browse_split_pdf.setMinimumHeight(32)
-        apply_qss_role(btn_browse_split_pdf, role="secondary")
-        btn_browse_split_pdf.clicked.connect(self._on_browse_split_pdf)
+        self.btn_browse_split_pdf = QPushButton("스캔 PDF 찾기...")
+        self.btn_browse_split_pdf.setMinimumHeight(32)
+        apply_qss_role(self.btn_browse_split_pdf, role="secondary")
+        self.btn_browse_split_pdf.clicked.connect(self._on_browse_split_pdf)
+
+        for drop_w in (self.edit_split_pdf_path, self.btn_browse_split_pdf):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".pdf"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.load_split_pdf_file(paths[0]),
+                context_label="일괄 스캔 PDF",
+            )
 
         self.lbl_split_pdf_pages = QLabel("총 페이지: -")
         self.lbl_split_pdf_pages.setMinimumWidth(100)
         apply_qss_role(self.lbl_split_pdf_pages, role="codeMeta")
 
         box_split_pdf.addWidget(self.edit_split_pdf_path, stretch=1)
-        box_split_pdf.addWidget(btn_browse_split_pdf)
+        box_split_pdf.addWidget(self.btn_browse_split_pdf)
         box_split_pdf.addWidget(self.lbl_split_pdf_pages)
         split_lay.addLayout(self._field_block("일괄 스캔 PDF 파일", box_split_pdf))
 
@@ -1442,14 +1508,14 @@ class DocOcrTab(QWidget):
         apply_qss_role(btn_load_db_roster, role="secondary")
         btn_load_db_roster.clicked.connect(self._on_load_db_roster)
 
-        btn_upload_ext_roster = QPushButton("외부 명단(.xlsx/.csv) 업로드")
-        btn_upload_ext_roster.setMinimumHeight(32)
-        apply_qss_role(btn_upload_ext_roster, role="outline")
-        btn_upload_ext_roster.clicked.connect(self._on_upload_external_roster)
+        self.btn_upload_ext_roster = QPushButton("외부 명단(.xlsx/.csv) 업로드")
+        self.btn_upload_ext_roster.setMinimumHeight(32)
+        apply_qss_role(self.btn_upload_ext_roster, role="outline")
+        self.btn_upload_ext_roster.clicked.connect(self._on_upload_external_roster)
 
         box_split_roster.addWidget(self.combo_split_roster, stretch=1)
         box_split_roster.addWidget(btn_load_db_roster)
-        box_split_roster.addWidget(btn_upload_ext_roster)
+        box_split_roster.addWidget(self.btn_upload_ext_roster)
         split_lay.addLayout(self._field_block("명렬표 선택 (학급담임 · 교과 · 동아리 / 외부 파일)", box_split_roster))
 
         # 4) 기본 학생당 페이지 수 + 전체 일괄 적용 + 할당 합계 vs PDF 총 페이지
@@ -1493,6 +1559,16 @@ class DocOcrTab(QWidget):
             h_s.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
             h_s.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
             h_s.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        for drop_w in (self.btn_upload_ext_roster, self.table_split_roster):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx", ".xls", ".csv"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.load_external_roster_file(paths[0]),
+                context_label="외부 명렬표 파일",
+            )
         split_lay.addWidget(self.table_split_roster)
 
         # 6) 실행 및 1번 서브탭 연동 버튼 바
@@ -1552,7 +1628,14 @@ class DocOcrTab(QWidget):
         self._hwpx_patch_timer.setInterval(260)
         self._hwpx_patch_timer.timeout.connect(self._step_hwpx_patch_timer)
 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
         w = QWidget()
+        w.setMinimumWidth(520)
         apply_qss_role(w, obj_name="SubTabHwpxAgent")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(8, 8, 12, 12)
@@ -1648,6 +1731,18 @@ class DocOcrTab(QWidget):
         self.lbl_hwpx_ref_summary = QLabel("참고 문서 없음 (지시사항 단독 생성)")
         self.lbl_hwpx_ref_summary.setStyleSheet("color: #475569; font-size: 12px;")
 
+        hwpx_ref_exts = [".hwp", ".hwpx", ".docx", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".csv"]
+        for drop_w in (self.btn_hwpx_add_ref, self.lbl_hwpx_ref_summary):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=hwpx_ref_exts,
+                allow_dirs=False,
+                allow_files=True,
+                multiple=True,
+                on_files_dropped=self.add_hwpx_ref_files,
+                context_label="HWPX 에이전트 참고 파일",
+            )
+
         ref_bar.addWidget(self.btn_hwpx_add_ref)
         ref_bar.addWidget(self.btn_hwpx_clear_ref)
         ref_bar.addWidget(self.lbl_hwpx_ref_summary, 1)
@@ -1699,18 +1794,30 @@ class DocOcrTab(QWidget):
         )
         self.browser_hwpx_preview.setHtml(
             "<html><body style='font-family:\"Malgun Gothic\",sans-serif;color:#64748B;padding:24px;'>"
-            "<p>열린 문서가 없습니다. 상단의 [HWP / HWPX 열기] 버튼을 눌러 HWP 또는 HWPX 문서를 불러오세요.</p>"
+            "<p>열린 문서가 없습니다. 상단의 [HWP / HWPX 열기] 버튼을 누르거나 .hwp/.hwpx 파일을 여기에 드래그하여 열어보세요.</p>"
             "</body></html>"
         )
+        for drop_w in (self.browser_hwpx_preview, self.btn_hwpx_open):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".hwp", ".hwpx"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.open_hwpx_or_hwp_path(paths[0]),
+                context_label="HWP / HWPX 문서",
+            )
         self._hwpx_quote_timer = QTimer(self)
         self._hwpx_quote_timer.setSingleShot(True)
         self._hwpx_quote_timer.setInterval(120)
         self._hwpx_quote_timer.timeout.connect(self._emit_hwpx_preview_quote)
         self.browser_hwpx_preview.selectionChanged.connect(lambda: self._hwpx_quote_timer.start())
+        self.browser_hwpx_preview.setMinimumHeight(340)
         body.addWidget(self.browser_hwpx_preview, stretch=1)
 
         lay.addWidget(self.card_hwpx_agent, stretch=1)
-        return w
+        scroll.setWidget(w)
+        return scroll
 
     # =========================================================================
     # [서브탭 3] 과제 취합 및 AI 과세특·채점 자동화 UI
@@ -1804,14 +1911,25 @@ class DocOcrTab(QWidget):
         # 학생 제출 폴더
         box_docx_dir = QHBoxLayout()
         self.edit_agg_docx_dir = QLineEdit()
-        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx, .hwpx, .hwp, .pdf 파일 폴더를 선택하세요.")
+        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx, .hwpx, .hwp, .pdf 파일이나 폴더를 드래그하거나 선택하세요.")
         self.edit_agg_docx_dir.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_docx_dir, obj_name="EditAggDocxDir")
 
-        btn_browse_docx = QPushButton("찾아보기...")
-        btn_browse_docx.setMinimumHeight(32)
-        apply_qss_role(btn_browse_docx, role="secondary")
-        btn_browse_docx.clicked.connect(self._on_browse_agg_docx_dir)
+        self.btn_browse_docx = QPushButton("찾아보기...")
+        self.btn_browse_docx.setMinimumHeight(32)
+        apply_qss_role(self.btn_browse_docx, role="secondary")
+        self.btn_browse_docx.clicked.connect(self._on_browse_agg_docx_dir)
+
+        for drop_w in (self.edit_agg_docx_dir, self.btn_browse_docx):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".docx", ".hwpx", ".hwp", ".pdf"],
+                allow_dirs=True,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.set_agg_docx_dir(paths[0]),
+                context_label="학생 제출 과제 폴더/파일",
+            )
 
         btn_open_docx = QPushButton("폴더 열기")
         btn_open_docx.setMinimumHeight(32)
@@ -1819,7 +1937,7 @@ class DocOcrTab(QWidget):
         btn_open_docx.clicked.connect(lambda: self._open_dir_if_exists(self.edit_agg_docx_dir.text()))
 
         box_docx_dir.addWidget(self.edit_agg_docx_dir, stretch=1)
-        box_docx_dir.addWidget(btn_browse_docx)
+        box_docx_dir.addWidget(self.btn_browse_docx)
         box_docx_dir.addWidget(btn_open_docx)
         form1.addLayout(self._field_block("학생 제출 폴더 (DOCX / HWPX / HWP / PDF)", box_docx_dir))
 
@@ -1974,14 +2092,25 @@ class DocOcrTab(QWidget):
         # 대상 엑셀 파일 (1단계 추출 엑셀 또는 기존 엑셀)
         box_excel_file = QHBoxLayout()
         self.edit_agg_excel_file = QLineEdit()
-        self.edit_agg_excel_file.setPlaceholderText("학번/이름/문항별 응답이 정리된 .xlsx 파일 (1단계 완료 시 자동 입력)")
+        self.edit_agg_excel_file.setPlaceholderText("학번/이름/문항별 응답이 정리된 .xlsx 파일 (드래그 가능 · 1단계 완료 시 자동 입력)")
         self.edit_agg_excel_file.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_excel_file, obj_name="EditAggExcelFile")
 
-        btn_browse_excel = QPushButton("찾아보기...")
-        btn_browse_excel.setMinimumHeight(32)
-        apply_qss_role(btn_browse_excel, role="secondary")
-        btn_browse_excel.clicked.connect(self._on_browse_agg_excel_file)
+        self.btn_browse_excel = QPushButton("찾아보기...")
+        self.btn_browse_excel.setMinimumHeight(32)
+        apply_qss_role(self.btn_browse_excel, role="secondary")
+        self.btn_browse_excel.clicked.connect(self._on_browse_agg_excel_file)
+
+        for drop_w in (self.edit_agg_excel_file, self.btn_browse_excel):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx", ".xls"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.set_agg_excel_file(paths[0]),
+                context_label="대상 엑셀 파일",
+            )
 
         btn_open_excel = QPushButton("파일 열기")
         btn_open_excel.setMinimumHeight(32)
@@ -1989,7 +2118,7 @@ class DocOcrTab(QWidget):
         btn_open_excel.clicked.connect(lambda: self._open_file_if_exists(self.edit_agg_excel_file.text()))
 
         box_excel_file.addWidget(self.edit_agg_excel_file, stretch=1)
-        box_excel_file.addWidget(btn_browse_excel)
+        box_excel_file.addWidget(self.btn_browse_excel)
         box_excel_file.addWidget(btn_open_excel)
         form2.addLayout(self._field_block("대상 엑셀 파일 (학번 · 이름 · 문항별 응답)", box_excel_file))
 
@@ -2020,21 +2149,32 @@ class DocOcrTab(QWidget):
         box_prompt.addWidget(btn_refresh_prompt)
         form2.addLayout(self._field_block("세특 · 채점 프롬프트 프리셋", box_prompt))
 
-        # 참고자료 폴더
+        # 참고자료 폴더 (기준 루브릭 파일/폴더)
         box_ref_dir = QHBoxLayout()
         self.edit_agg_ref_dir = QLineEdit()
         self.edit_agg_ref_dir.setText(str(Path("references").resolve()) if Path("references").exists() else "references")
-        self.edit_agg_ref_dir.setPlaceholderText("수업계획서, 성취기준, 루브릭 등 참고 문서 폴더 (선택 사항)")
+        self.edit_agg_ref_dir.setPlaceholderText("수업계획서, 성취기준, 기준 루브릭 파일 또는 폴더를 드래그하거나 선택하세요 (선택 사항)")
         self.edit_agg_ref_dir.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_ref_dir, obj_name="EditAggRefDir")
 
-        btn_browse_ref = QPushButton("찾아보기...")
-        btn_browse_ref.setMinimumHeight(32)
-        apply_qss_role(btn_browse_ref, role="secondary")
-        btn_browse_ref.clicked.connect(self._on_browse_agg_ref_dir)
+        self.btn_browse_ref = QPushButton("찾아보기...")
+        self.btn_browse_ref.setMinimumHeight(32)
+        apply_qss_role(self.btn_browse_ref, role="secondary")
+        self.btn_browse_ref.clicked.connect(self._on_browse_agg_ref_dir)
+
+        for drop_w in (self.edit_agg_ref_dir, self.btn_browse_ref):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".hwp", ".hwpx", ".docx", ".xlsx", ".xls", ".pdf", ".txt", ".md", ".csv"],
+                allow_dirs=True,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.set_agg_ref_path(paths[0]),
+                context_label="기준 루브릭 · 참고자료",
+            )
 
         box_ref_dir.addWidget(self.edit_agg_ref_dir, stretch=1)
-        box_ref_dir.addWidget(btn_browse_ref)
+        box_ref_dir.addWidget(self.btn_browse_ref)
         form2.addLayout(self._field_block("참고자료 폴더 (수업계획서 · 성취기준 · 루브릭)", box_ref_dir))
 
         # 나이스 바이트 상한선
@@ -2087,6 +2227,7 @@ class DocOcrTab(QWidget):
         self.list_merge_excels.setMinimumHeight(120)
         self.list_merge_excels.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.list_merge_excels.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.list_merge_excels.setToolTip("가로 병합할 .xlsx/.xls/.csv 파일을 이 영역에 드래그앤 드롭할 수 있습니다.")
         apply_qss_role(self.list_merge_excels, obj_name="ListMergeExcels")
         box_list_and_btns.addWidget(self.list_merge_excels, stretch=1)
 
@@ -2094,10 +2235,21 @@ class DocOcrTab(QWidget):
         box_merge_btns = QVBoxLayout()
         box_merge_btns.setSpacing(6)
 
-        btn_merge_add = QPushButton("+ 파일 추가")
-        btn_merge_add.setMinimumHeight(28)
-        apply_qss_role(btn_merge_add, role="secondary")
-        btn_merge_add.clicked.connect(self._on_merge_add_files)
+        self.btn_merge_add = QPushButton("+ 파일 추가")
+        self.btn_merge_add.setMinimumHeight(28)
+        apply_qss_role(self.btn_merge_add, role="secondary")
+        self.btn_merge_add.clicked.connect(self._on_merge_add_files)
+
+        for drop_w in (self.list_merge_excels, self.btn_merge_add):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx", ".xls", ".csv"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=True,
+                on_files_dropped=self.add_merge_excel_files,
+                context_label="가로 병합 엑셀 파일",
+            )
 
         btn_merge_del = QPushButton("- 선택 제거")
         btn_merge_del.setMinimumHeight(28)
@@ -2119,7 +2271,7 @@ class DocOcrTab(QWidget):
         apply_qss_role(btn_merge_clear, role="outline")
         btn_merge_clear.clicked.connect(self._on_merge_clear_files)
 
-        box_merge_btns.addWidget(btn_merge_add)
+        box_merge_btns.addWidget(self.btn_merge_add)
         box_merge_btns.addWidget(btn_merge_del)
         box_merge_btns.addWidget(btn_merge_up)
         box_merge_btns.addWidget(btn_merge_down)
@@ -2268,16 +2420,23 @@ class DocOcrTab(QWidget):
     # =========================================================================
     # [서브탭 1] 핸들러
     # =========================================================================
+    def set_submission_dir(self, path_str: str) -> None:
+        if not path_str:
+            return
+        p = Path(path_str).resolve()
+        if p.is_file():
+            p = p.parent
+        norm = str(p)
+        self.edit_submission_dir.setText(norm)
+        self.edit_submission_dir.setToolTip(norm)
+        if p.name:
+            self.edit_assignment_title.setText(p.name)
+        self.run_submission_analysis()
+
     def _on_browse_submission_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "학생 제출물 폴더 선택")
         if folder:
-            norm = str(Path(folder).resolve())
-            self.edit_submission_dir.setText(norm)
-            self.edit_submission_dir.setToolTip(norm)
-            folder_name = Path(norm).name
-            if folder_name:
-                self.edit_assignment_title.setText(folder_name)
-            self.run_submission_analysis()
+            self.set_submission_dir(folder)
 
     def _on_open_submission_dir(self) -> None:
         folder = self.edit_submission_dir.text().strip()
@@ -2528,7 +2687,10 @@ class DocOcrTab(QWidget):
 
         default_name = f"제출현황_{self.edit_assignment_title.text().strip() or '과제'}_{datetime.now().strftime('%Y%m%d')}.xlsx"
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "제출/미제출 현황 엑셀 저장", default_name, "Excel 파일 (*.xlsx)"
+            self,
+            "제출/미제출 현황 엑셀 저장",
+            self._get_default_save_path(default_name),
+            "Excel 파일 (*.xlsx)",
         )
         if not save_path:
             return
@@ -2579,7 +2741,8 @@ class DocOcrTab(QWidget):
             QMessageBox.warning(self, "선택 확인", "표준 파일명으로 변경할 항목을 먼저 스캔하고 선택해 주세요.")
             return
 
-        base_folder = Path(self.edit_submission_dir.text().strip())
+        sub_dir_text = self.edit_submission_dir.text().strip()
+        base_folder = Path(sub_dir_text) if sub_dir_text else Path(self._get_default_save_path())
         copy_mode = self.combo_rename_mode.currentData() == "copy"
         title = self.edit_assignment_title.text().strip() or "과제"
 
@@ -2652,7 +2815,8 @@ class DocOcrTab(QWidget):
             return
 
         title = self.edit_assignment_title.text().strip() or "과제"
-        base_folder = Path(self.edit_submission_dir.text().strip() or ".")
+        sub_dir_text = self.edit_submission_dir.text().strip()
+        base_folder = Path(sub_dir_text) if sub_dir_text else get_active_workspace_dir(self.config)
         default_pdf = str(base_folder / f"[통합본]_{title}_학번순병합({len(pdf_items)}명).pdf")
 
         save_pdf_path, _ = QFileDialog.getSaveFileName(
@@ -2701,6 +2865,22 @@ class DocOcrTab(QWidget):
     # =========================================================================
     # [서브탭 2] 하이브리드 AI OCR / 텍스트 보정 핸들러
     # =========================================================================
+    def add_ocr_files(self, files: List[str]) -> int:
+        existing = {
+            self.list_ocr_files.item(i).text()
+            for i in range(self.list_ocr_files.count())
+        }
+        added = 0
+        for f in files:
+            if not f or f in existing:
+                continue
+            it = QListWidgetItem(f)
+            it.setToolTip(build_floating_tooltip("OCR 대상 파일 경로", [html.escape(f)]))
+            self.list_ocr_files.addItem(it)
+            existing.add(f)
+            added += 1
+        return added
+
     def _on_add_ocr_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
@@ -2708,10 +2888,8 @@ class DocOcrTab(QWidget):
             "",
             "문서 및 이미지 (*.png *.jpg *.jpeg *.pdf *.txt *.md *.csv *.tif *.bmp *.webp);;모든 파일 (*)",
         )
-        for f in files:
-            it = QListWidgetItem(f)
-            it.setToolTip(build_floating_tooltip("OCR 대상 파일 경로", [html.escape(f)]))
-            self.list_ocr_files.addItem(it)
+        if files:
+            self.add_ocr_files(files)
 
     def _on_open_manual_llm_dialog(self) -> None:
         """[수동 복붙 모드 열기] 버튼 클릭 시 ManualLlmDialog가 팝업됩니다."""
@@ -2766,7 +2944,10 @@ class DocOcrTab(QWidget):
             QMessageBox.information(self, "안내", "저장할 결과 텍스트가 없습니다.")
             return
         save_path, _ = QFileDialog.getSaveFileName(
-            self, "AI 보정 결과 저장", "AI_문서보정결과.md", "Markdown (*.md);;텍스트 파일 (*.txt)"
+            self,
+            "AI 보정 결과 저장",
+            self._get_default_save_path("AI_문서보정결과.md"),
+            "Markdown (*.md);;텍스트 파일 (*.txt)",
         )
         if save_path:
             Path(save_path).write_text(text, encoding="utf-8")
@@ -2804,10 +2985,7 @@ class DocOcrTab(QWidget):
             if idx >= 0:
                 self.combo_split_roster.setCurrentIndex(idx)
 
-    def _on_browse_split_pdf(self) -> None:
-        fpath, _ = QFileDialog.getOpenFileName(
-            self, "일괄 스캔 PDF 파일 선택", "", "PDF 파일 (*.pdf)"
-        )
+    def load_split_pdf_file(self, fpath: str) -> None:
         if not fpath:
             return
         self.edit_split_pdf_path.setText(fpath)
@@ -2819,6 +2997,13 @@ class DocOcrTab(QWidget):
         self._split_pdf_total_pages = total_pages
         self.lbl_split_pdf_pages.setText(f"총 페이지: {total_pages}쪽")
         self._recalculate_split_page_ranges()
+
+    def _on_browse_split_pdf(self) -> None:
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "일괄 스캔 PDF 파일 선택", "", "PDF 파일 (*.pdf)"
+        )
+        if fpath:
+            self.load_split_pdf_file(fpath)
 
     def _on_load_db_roster(self) -> None:
         self._refresh_split_roster_groups()
@@ -2837,10 +3022,7 @@ class DocOcrTab(QWidget):
             return
         self._populate_split_roster_table(students)
 
-    def _on_upload_external_roster(self) -> None:
-        fpath, _ = QFileDialog.getOpenFileName(
-            self, "외부 명단 업로드", "", "엑셀/CSV 파일 (*.xlsx *.xls *.csv)"
-        )
+    def load_external_roster_file(self, fpath: str) -> None:
         if not fpath:
             return
         try:
@@ -2864,6 +3046,13 @@ class DocOcrTab(QWidget):
             self._populate_split_roster_table(students)
         except Exception as exc:
             QMessageBox.warning(self, "업로드 오류", f"외부 명단을 읽는 중 오류가 발생했습니다:\n{exc}")
+
+    def _on_upload_external_roster(self) -> None:
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "외부 명단 업로드", "", "엑셀/CSV 파일 (*.xlsx *.xls *.csv)"
+        )
+        if fpath:
+            self.load_external_roster_file(fpath)
 
     def _populate_split_roster_table(self, students: List[Dict[str, Any]]) -> None:
         default_pages = self.spin_split_default_pages.value()
@@ -3302,28 +3491,49 @@ class DocOcrTab(QWidget):
             if idx >= 0:
                 self.combo_agg_prompt.setCurrentIndex(idx)
 
+    def set_agg_docx_dir(self, path_str: str) -> None:
+        if not path_str:
+            return
+        p = Path(path_str).resolve()
+        if p.is_file():
+            p = p.parent
+        norm = str(p)
+        self.edit_agg_docx_dir.setText(norm)
+        self.edit_agg_docx_dir.setToolTip(norm)
+
     def _on_browse_agg_docx_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "학생 제출 DOCX 과제 폴더 선택")
         if folder:
-            norm = str(Path(folder).resolve())
-            self.edit_agg_docx_dir.setText(norm)
-            self.edit_agg_docx_dir.setToolTip(norm)
+            self.set_agg_docx_dir(folder)
+
+    def set_agg_excel_file(self, file_path: str) -> None:
+        if not file_path:
+            return
+        norm = str(Path(file_path).resolve())
+        self.edit_agg_excel_file.setText(norm)
+        self.edit_agg_excel_file.setToolTip(norm)
 
     def _on_browse_agg_excel_file(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self, "세특/채점 생성 대상 엑셀 파일 선택", "", "Excel 파일 (*.xlsx *.xls);;모든 파일 (*)"
         )
         if file_path:
-            norm = str(Path(file_path).resolve())
-            self.edit_agg_excel_file.setText(norm)
-            self.edit_agg_excel_file.setToolTip(norm)
+            self.set_agg_excel_file(file_path)
+
+    def set_agg_ref_path(self, path_str: str) -> None:
+        if not path_str:
+            return
+        p = Path(path_str).resolve()
+        if p.is_file():
+            p = p.parent
+        norm = str(p)
+        self.edit_agg_ref_dir.setText(norm)
+        self.edit_agg_ref_dir.setToolTip(norm)
 
     def _on_browse_agg_ref_dir(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "참고자료 폴더 선택")
         if folder:
-            norm = str(Path(folder).resolve())
-            self.edit_agg_ref_dir.setText(norm)
-            self.edit_agg_ref_dir.setToolTip(norm)
+            self.set_agg_ref_path(folder)
 
     def _check_ai_provider_key_or_warn(self) -> bool:
         """현재 활성 AI 공급자의 API 키 등록 여부를 확인하고 없으면 환경설정 이동을 유도합니다."""
@@ -3718,6 +3928,33 @@ class DocOcrTab(QWidget):
     # =========================================================================
     # [다중 과제 엑셀 가로 병합] 핸들러
     # =========================================================================
+    def add_merge_excel_files(self, files: List[str]) -> int:
+        if not files:
+            return 0
+        existing = {
+            self.list_merge_excels.item(i).text()
+            for i in range(self.list_merge_excels.count())
+        }
+        added = 0
+        for f in files:
+            if not f:
+                continue
+            norm = str(Path(f).resolve())
+            if norm not in existing:
+                item = QListWidgetItem(norm)
+                item.setToolTip(norm)
+                self.list_merge_excels.addItem(item)
+                existing.add(norm)
+                added += 1
+
+        if added > 0:
+            # 출력 파일 기본 경로 자동 설정 (EduFlow 작업 폴더에 생성)
+            current_out = self.edit_merge_output.text().strip()
+            if not current_out or not ("\\" in current_out or "/" in current_out):
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.edit_merge_output.setText(self._get_default_save_path(f"통합과제_{ts}.xlsx"))
+        return added
+
     def _on_merge_add_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
@@ -3725,29 +3962,8 @@ class DocOcrTab(QWidget):
             "",
             "Excel 파일 (*.xlsx *.xls);;모든 파일 (*)",
         )
-        if not files:
-            return
-
-        existing = set()
-        for i in range(self.list_merge_excels.count()):
-            existing.add(self.list_merge_excels.item(i).text())
-
-        first_dir = None
-        for f in files:
-            norm = str(Path(f).resolve())
-            if norm not in existing:
-                item = QListWidgetItem(norm)
-                item.setToolTip(norm)
-                self.list_merge_excels.addItem(item)
-                existing.add(norm)
-                if first_dir is None:
-                    first_dir = Path(norm).parent
-
-        # 출력 파일 기본 경로 자동 설정 (첫 파일의 폴더에 생성)
-        current_out = self.edit_merge_output.text().strip()
-        if first_dir and (not current_out or not ("\\" in current_out or "/" in current_out)):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.edit_merge_output.setText(str(first_dir / f"통합과제_{ts}.xlsx"))
+        if files:
+            self.add_merge_excel_files(files)
 
     def _on_merge_del_file(self) -> None:
         row = self.list_merge_excels.currentRow()
@@ -3773,7 +3989,7 @@ class DocOcrTab(QWidget):
 
     def _on_browse_merge_output(self) -> None:
         cur = self.edit_merge_output.text().strip()
-        init_path = cur if cur else str(Path("통합과제.xlsx").resolve())
+        init_path = cur if cur else self._get_default_save_path("통합과제.xlsx")
         path, _ = QFileDialog.getSaveFileName(
             self,
             "통합 결과 엑셀 저장 위치 선택",
@@ -3795,7 +4011,15 @@ class DocOcrTab(QWidget):
 
         excel_paths = [self.list_merge_excels.item(i).text() for i in range(count)]
         output_str = self.edit_merge_output.text().strip()
-        output_path = Path(output_str) if output_str else None
+        output_path = (
+            Path(output_str)
+            if output_str
+            else Path(
+                self._get_default_save_path(
+                    f"통합과제_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                )
+            )
+        )
 
         worker = ExcelColumnMergeWorker(
             excel_paths=excel_paths,
@@ -4110,6 +4334,27 @@ class DocOcrTab(QWidget):
         self.lbl_hwpx_ref_summary.setText(f"참고 {count}건: {preview}")
         self.lbl_hwpx_ref_summary.setToolTip("\n".join(self._hwpx_reference_files))
 
+    def add_hwpx_ref_files(self, paths: List[str]) -> int:
+        if not paths:
+            return 0
+        added = 0
+        existing = set(self._hwpx_reference_files)
+        for raw_p in paths:
+            if not raw_p:
+                continue
+            norm = str(Path(raw_p))
+            if norm not in existing:
+                self._hwpx_reference_files.append(norm)
+                existing.add(norm)
+                added += 1
+        if added > 0:
+            self._update_hwpx_ref_summary()
+            if self._hwpx_doc is None:
+                self._on_hwpx_create_new(emit_sync=False)
+            self.ai_target_requested.emit("hwpx_agent")
+            self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+        return added
+
     def _on_hwpx_add_ref_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -4117,22 +4362,8 @@ class DocOcrTab(QWidget):
             "",
             "참고 문서 (*.hwp *.hwpx *.docx *.xlsx *.xls *.pdf *.txt *.md *.csv);;모든 파일 (*)",
         )
-        if not paths:
-            return
-        added = False
-        existing = set(self._hwpx_reference_files)
-        for raw_p in paths:
-            norm = str(Path(raw_p))
-            if norm not in existing:
-                self._hwpx_reference_files.append(norm)
-                existing.add(norm)
-                added = True
-        if added:
-            self._update_hwpx_ref_summary()
-            if self._hwpx_doc is None:
-                self._on_hwpx_create_new(emit_sync=False)
-            self.ai_target_requested.emit("hwpx_agent")
-            self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+        if paths:
+            self.add_hwpx_ref_files(paths)
 
     def _on_hwpx_clear_ref_files(self) -> None:
         if not self._hwpx_reference_files:
@@ -4169,9 +4400,12 @@ class DocOcrTab(QWidget):
             "",
             "한글 문서 (*.hwpx *.hwp);;모든 파일 (*)",
         )
+        if fpath:
+            self.open_hwpx_or_hwp_path(fpath)
+
+    def open_hwpx_or_hwp_path(self, fpath: str) -> None:
         if not fpath:
             return
-
         src_path = Path(fpath)
         if src_path.suffix.lower() == ".hwp":
             temp_dir = Path(tempfile.mkdtemp(prefix="eduflow_hwpx_"))
@@ -4331,6 +4565,12 @@ class DocOcrTab(QWidget):
             QMessageBox.warning(self, "저장 실패", f"임시 HWPX 저장 중 오류가 발생했습니다:\n{exc}")
             return
 
+        if target_hwp_path.exists():
+            try:
+                os.chmod(target_hwp_path, stat.S_IWRITE)
+            except OSError:
+                pass
+
         self.btn_hwpx_save.setEnabled(False)
         self.btn_hwpx_save_as.setEnabled(False)
         self.lbl_hwpx_summary_badge.setText(
@@ -4356,6 +4596,41 @@ class DocOcrTab(QWidget):
             self.btn_hwpx_save.setEnabled(True)
             self.btn_hwpx_save_as.setEnabled(True)
             self.lbl_hwpx_summary_badge.setText("HWP 저장 실패: 아래 안내를 확인하세요.")
+            is_lock_err = any(
+                tok in err_msg
+                for tok in (
+                    "다른 한글 창에서 해당 파일이 열려 있어",
+                    "PermissionError",
+                    "Permission denied",
+                    "액세스",
+                    "읽기 전용",
+                    "쓰기 금지",
+                )
+            )
+            if is_lock_err:
+                stem = target_hwp_path.stem
+                alt_stem = stem if stem.endswith("_수정본") else f"{stem}_수정본"
+                alt_path = target_hwp_path.with_name(f"{alt_stem}.hwp")
+                if alt_path == target_hwp_path:
+                    alt_path = target_hwp_path.with_name(
+                        f"{stem}_{datetime.now().strftime('%H%M%S')}.hwp"
+                    )
+                reply = QMessageBox.question(
+                    self,
+                    "HWP 저장 실패 (파일 사용 중)",
+                    "다른 한글 창에서 해당 파일이 열려 있어 저장할 수 없습니다. "
+                    "한글 창을 닫거나 다른 이름으로 저장해 주세요.\n\n"
+                    f"대신 '{alt_path.name}' 이름으로 저장하시겠습니까?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._export_hwpx_as_hwp_async(
+                        alt_path,
+                        badge_prefix=badge_prefix,
+                        open_after_save=open_after_save,
+                    )
+                return
             QMessageBox.warning(self, "HWP 저장 실패", err_msg)
 
         worker = FunctionWorker("HWPX -> HWP 저장 변환", _convert_back_task)
@@ -4414,7 +4689,7 @@ class DocOcrTab(QWidget):
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "다른 이름으로 저장",
-            default_name,
+            self._get_default_save_path(default_name),
             file_filter,
             selected_filter_default,
         )
@@ -4531,7 +4806,12 @@ class DocOcrTab(QWidget):
             if self._hwpx_doc.source_path
             else "정답해설.hwpx"
         )
-        save_path, _ = QFileDialog.getSaveFileName(self, "정답지 HWPX 저장", default_name, "한글 문서 (*.hwpx)")
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "정답지 HWPX 저장",
+            self._get_default_save_path(default_name),
+            "한글 문서 (*.hwpx)",
+        )
         if not save_path:
             return
         try:

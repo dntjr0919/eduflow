@@ -284,7 +284,7 @@ class TestWebLlmJsonAndCleanup(unittest.TestCase):
         self.assertIn(f"--user-data-dir={expected_abs}", cmd)
         self.assertIn("--no-first-run", cmd)
         self.assertIn("--no-default-browser-check", cmd)
-        self.assertIn("--disable-features=ChromeWhatsNewUI", cmd)
+        self.assertTrue(any(arg.startswith("--disable-features=ChromeWhatsNewUI") for arg in cmd))
         self.assertNotIn("--disable-blink-features=AutomationControlled", cmd)
 
     def test_bypass_programmatic_auth_if_needed(self) -> None:
@@ -362,6 +362,147 @@ class TestWebLlmJsonAndCleanup(unittest.TestCase):
 
         with _hwp_security_popup_watcher(interval_sec=0.05):
             time.sleep(0.02)
+
+    def test_convert_via_hwp_com_watcher_readonly_and_lock_handling(self) -> None:
+        import os
+        import stat
+        import tempfile
+        import types
+        from contextlib import contextmanager
+        from services.hwpx_agent_service import (
+            _HWP_FILE_LOCKED_MSG,
+            _convert_via_hwp_com,
+        )
+
+        watcher_state = {"active": False, "events": []}
+
+        @contextmanager
+        def _fake_watcher(interval_sec: float = 0.15):
+            watcher_state["active"] = True
+            try:
+                yield
+            finally:
+                watcher_state["active"] = False
+
+        class _FakeWindow:
+            Visible = True
+
+        class _FakeWindows:
+            def Item(self, _idx: int):
+                return _FakeWindow()
+
+        class _FakeHFileOpenSave:
+            def __init__(self) -> None:
+                self.HSet = object()
+                self.filename = ""
+                self.Format = ""
+
+        class _FakeHParameterSet:
+            def __init__(self) -> None:
+                self.HFileOpenSave = _FakeHFileOpenSave()
+
+        class _FakeHAction:
+            def __init__(self, param_set: _FakeHParameterSet) -> None:
+                self._ps = param_set
+
+            def GetDefault(self, _name: str, _hset) -> None:
+                return None
+
+            def Execute(self, name: str, _hset) -> None:
+                watcher_state["events"].append((name, watcher_state["active"]))
+                target = Path(self._ps.HFileOpenSave.filename)
+                target.write_bytes(b"NEW_HWP_DATA")
+
+        class _FakeHwp:
+            def __init__(self) -> None:
+                self.XHwpWindows = _FakeWindows()
+                self.HParameterSet = _FakeHParameterSet()
+                self.HAction = _FakeHAction(self.HParameterSet)
+
+            def SetMessageBoxMode(self, _mode: int) -> None:
+                return None
+
+            def RegisterModule(self, _a: str, _b: str) -> None:
+                return None
+
+            def Open(self, _src: str, _fmt: str, _opts: str) -> None:
+                watcher_state["events"].append(("Open", watcher_state["active"]))
+
+            def SaveAs(self, _dst: str, _fmt: str, _opts: str) -> bool:
+                watcher_state["events"].append(("SaveAs", watcher_state["active"]))
+                # FileSaveAs_S 폴백 구간까지 워처가 유지되는지 함께 검증
+                return False
+
+            def Clear(self, _opt: int) -> None:
+                return None
+
+            def Quit(self) -> None:
+                return None
+
+        fake_pythoncom = types.SimpleNamespace(
+            CoInitialize=lambda: None,
+            CoUninitialize=lambda: None,
+        )
+        fake_win32_client = types.SimpleNamespace(DispatchEx=lambda _progid: _FakeHwp())
+        fake_win32com = types.SimpleNamespace(client=fake_win32_client)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            src = root / "sample.hwpx"
+            dst = root / "target.hwp"
+            src.write_bytes(b"SRC_HWPX")
+            dst.write_bytes(b"OLD_HWP_READONLY")
+            os.chmod(dst, stat.S_IREAD)
+
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "pythoncom": fake_pythoncom,
+                        "win32com": fake_win32com,
+                        "win32com.client": fake_win32_client,
+                    },
+                ),
+                patch(
+                    "services.hwpx_agent_service._hwp_security_popup_watcher",
+                    side_effect=_fake_watcher,
+                ),
+            ):
+                out_path = _convert_via_hwp_com(src, dst, "HWPX", "HWP")
+
+            self.assertEqual(out_path, dst.resolve())
+            self.assertEqual(dst.read_bytes(), b"NEW_HWP_DATA")
+            self.assertTrue(bool(dst.stat().st_mode & stat.S_IWRITE))
+            self.assertEqual(
+                watcher_state["events"],
+                [("Open", True), ("SaveAs", True), ("FileSaveAs_S", True)],
+            )
+            self.assertEqual(list(root.glob(".~eduflow_tmp_*")), [])
+
+            # 다른 한글 프로세스 잠금 시 명확한 안내 예외 발생 및 임시 파일 정리 검증
+            with (
+                patch.dict(
+                    sys.modules,
+                    {
+                        "pythoncom": fake_pythoncom,
+                        "win32com": fake_win32com,
+                        "win32com.client": fake_win32_client,
+                    },
+                ),
+                patch(
+                    "services.hwpx_agent_service._hwp_security_popup_watcher",
+                    side_effect=_fake_watcher,
+                ),
+                patch(
+                    "services.hwpx_agent_service.os.replace",
+                    side_effect=PermissionError("locked by another process"),
+                ),
+            ):
+                with self.assertRaises(PermissionError) as ctx:
+                    _convert_via_hwp_com(src, dst, "HWPX", "HWP")
+
+            self.assertIn(_HWP_FILE_LOCKED_MSG, str(ctx.exception))
+            self.assertEqual(list(root.glob(".~eduflow_tmp_*")), [])
 
     def test_no_ws_chem_replace(self) -> None:
         from services.hwpx_agent_service import _replace_with_normalized_match

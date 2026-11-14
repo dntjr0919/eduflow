@@ -55,6 +55,8 @@ from services.hwpx_agent_service import (
     convert_hwpx_to_hwp,
     create_minimal_hwpx_document,
 )
+from services.roster_parser_service import parse_homeroom_roster
+from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.utils import install_no_scroll_wheel_filter
 from utils.path_helper import get_data_path, get_resource_path
@@ -1438,6 +1440,7 @@ class ClassroomToolsTab(QWidget):
         self._duty_selected_dates: List[str] = default_weekly_dates()
         self._last_duty_plan: Dict[str, Any] = {}
         self._loading_duty_ui: bool = False
+        self._custom_duty_template_path: Optional[Path] = None
 
         self._init_ui()
         self._refresh_roster_dependent_views()
@@ -1506,17 +1509,28 @@ class ClassroomToolsTab(QWidget):
         apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
         self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
 
-        btn_sync_roster = QPushButton("명렬표 연동 새로고침")
-        apply_qss_role(btn_sync_roster, role="secondary", obj_name="BtnSyncClassroomRoster")
-        btn_sync_roster.setMinimumHeight(30)
-        btn_sync_roster.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_sync_roster.clicked.connect(self._refresh_roster_dependent_views)
+        self.btn_sync_roster = QPushButton("명렬표 연동 새로고침")
+        apply_qss_role(self.btn_sync_roster, role="secondary", obj_name="BtnSyncClassroomRoster")
+        self.btn_sync_roster.setMinimumHeight(30)
+        self.btn_sync_roster.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_roster.clicked.connect(self._refresh_roster_dependent_views)
+
+        for drop_w in (self.lbl_roster_status_badge, self.btn_sync_roster):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".xlsx"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.import_homeroom_roster_file(paths[0]),
+                context_label="학급담임 명렬표 (.xlsx)",
+            )
 
         hb_lay.addWidget(lbl_station_title)
         hb_lay.addWidget(lbl_mode_chip)
         hb_lay.addWidget(self.lbl_roster_status_badge)
         hb_lay.addStretch()
-        hb_lay.addWidget(btn_sync_roster)
+        hb_lay.addWidget(self.btn_sync_roster)
         layout.addWidget(header_bar)
 
         # 메인 2x2 Bento Grid
@@ -1696,8 +1710,19 @@ class ClassroomToolsTab(QWidget):
         apply_qss_role(self.btn_assign, role="primary", obj_name="BtnExportDutyHwpx")
         self.btn_assign.setMinimumHeight(32)
         self.btn_assign.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_assign.setToolTip("assets/cleaning_notice_template.hwpx 양식에 이름을 채워 저장합니다.")
+        self.btn_assign.setToolTip("assets/cleaning_notice_template.hwpx 양식에 이름을 채워 저장합니다 (.hwpx 드래그 시 해당 양식으로 출력).")
         self.btn_assign.clicked.connect(self._on_export_duty_hwpx)
+
+        for drop_w in (self.btn_assign, self.card_cleaning):
+            enable_file_drop(
+                drop_w,
+                allowed_exts=[".hwpx"],
+                allow_dirs=False,
+                allow_files=True,
+                multiple=False,
+                on_files_dropped=lambda paths: self.export_duty_hwpx_with_template(paths[0]),
+                context_label="당번 안내 한글 양식 (.hwpx)",
+            )
 
         duty_top_bar.addWidget(self.lbl_duty_exception_summary)
         duty_top_bar.addWidget(self.btn_duty_exceptions)
@@ -2450,12 +2475,56 @@ class ClassroomToolsTab(QWidget):
         if ans == QMessageBox.StandardButton.Yes:
             self._commit_duty_week_advance()
 
+    def import_homeroom_roster_file(self, file_path: str) -> int:
+        if not file_path:
+            return 0
+        try:
+            group_info, student_list = parse_homeroom_roster(file_path)
+            group_id = self.db.create_roster_group(
+                group_type=group_info["group_type"],
+                group_name=group_info["group_name"],
+                extra_info=group_info.get("extra_info", ""),
+                columns_json=group_info.get("columns_json", "[]"),
+                is_active=1,
+            )
+            self.db.add_roster_students(group_id, student_list)
+            for s in student_list:
+                self.db.upsert_student(
+                    student_id=s["student_id"],
+                    grade=s["grade"],
+                    class_no=s["class_no"],
+                    number=s["number"],
+                    name=s["name"],
+                    contact=s.get("contact", ""),
+                    parent_contact=s.get("parent_contact", ""),
+                    memo=s.get("memo", ""),
+                )
+            self._refresh_roster_dependent_views()
+            QMessageBox.information(
+                self,
+                "학급담임 명렬표 연동 완료",
+                f"[{group_info['group_name']}] 총 {len(student_list)}명의 학생 명렬표를 반영했습니다.",
+            )
+            return len(student_list)
+        except Exception as exc:
+            QMessageBox.critical(self, "명렬표 가져오기 오류", f"명렬표를 읽는 중 오류가 발생했습니다:\n{exc}")
+            return 0
+
+    def export_duty_hwpx_with_template(self, template_path: str) -> None:
+        if not template_path:
+            return
+        self._custom_duty_template_path = Path(template_path).resolve()
+        self._export_duty_hwpx(template_override=self._custom_duty_template_path)
+
     def _on_export_duty_hwpx(self) -> None:
+        self._export_duty_hwpx(template_override=self._custom_duty_template_path)
+
+    def _export_duty_hwpx(self, template_override: Optional[Path] = None) -> None:
         """cleaning_notice_template.hwpx 양식에 기간·이름을 채워 저장하고 다음 주 순번 이동 여부를 묻습니다."""
         if not self._last_duty_plan:
             self._update_duty_preview()
 
-        tmpl_path = resolve_cleaning_template_path()
+        tmpl_path = template_override if (template_override and template_override.is_file()) else resolve_cleaning_template_path()
         if tmpl_path is None:
             picked, _ = QFileDialog.getOpenFileName(
                 self,

@@ -22,21 +22,24 @@ class SidebarNavDelegate(QStyledItemDelegate):
     """사이드바 메뉴 항목의 벡터 아이콘·텍스트·상태 스타일을 일관되게 그리는 델리게이트."""
 
     ICON_NAME_ROLE = Qt.ItemDataRole.UserRole + 1
+    UNREAD_ROLE = Qt.ItemDataRole.UserRole + 2
 
     ICON_SIZE = 20
     ICON_BOX_WIDTH = 20
-    ICON_TEXT_GAP = 12
-    EXPANDED_LEFT_PAD = 8
-    EXPANDED_RIGHT_PAD = 4
+    ICON_TEXT_GAP = 10
+    EXPANDED_LEFT_PAD = 12
+    EXPANDED_RIGHT_PAD = 8
     ITEM_HEIGHT = 40
     CORNER_RADIUS = 8.0
+    UNREAD_DOT_SIZE = 8
 
     COLOR_DEFAULT_FG = "#94A3B8"
     COLOR_HOVER_BG = "#1E293B"
-    COLOR_HOVER_FG = "#CBD5E1"
-    COLOR_SELECTED_BG = "#004AC6"
+    COLOR_HOVER_FG = "#E2E8F0"
+    COLOR_SELECTED_BG = "#0B4DCB"
     COLOR_SELECTED_FG = "#FFFFFF"
     COLOR_FOCUS_RING = "#38BDF8"
+    COLOR_UNREAD_DOT = "#EF4444"
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -129,16 +132,27 @@ class SidebarNavDelegate(QStyledItemDelegate):
             )
 
         icon_name = str(index.data(self.ICON_NAME_ROLE) or "")
+        has_unread = bool(index.data(self.UNREAD_ROLE))
         renderer = self._get_renderer(icon_name, fg_hex)
 
         if self._collapsed:
+            icon_x = bg_rect.x() + (bg_rect.width() - self.ICON_SIZE) / 2.0
+            icon_y = bg_rect.y() + (bg_rect.height() - self.ICON_SIZE) / 2.0
             if renderer is not None:
-                icon_x = bg_rect.x() + (bg_rect.width() - self.ICON_SIZE) / 2.0
-                icon_y = bg_rect.y() + (bg_rect.height() - self.ICON_SIZE) / 2.0
                 renderer.render(
                     painter,
                     QRectF(icon_x, icon_y, float(self.ICON_SIZE), float(self.ICON_SIZE)),
                 )
+            if has_unread:
+                dot_rect = QRectF(
+                    icon_x + self.ICON_SIZE - 4.0,
+                    icon_y - 3.0,
+                    float(self.UNREAD_DOT_SIZE),
+                    float(self.UNREAD_DOT_SIZE),
+                )
+                painter.setPen(QPen(QColor("#0F172A"), 1.5))
+                painter.setBrush(QColor(self.COLOR_UNREAD_DOT))
+                painter.drawEllipse(dot_rect)
         else:
             icon_x = bg_rect.x() + self.EXPANDED_LEFT_PAD + (self.ICON_BOX_WIDTH - self.ICON_SIZE) / 2.0
             icon_y = bg_rect.y() + (bg_rect.height() - self.ICON_SIZE) / 2.0
@@ -156,7 +170,8 @@ class SidebarNavDelegate(QStyledItemDelegate):
                     + self.ICON_BOX_WIDTH
                     + self.ICON_TEXT_GAP
                 )
-                text_right = bg_rect.right() - self.EXPANDED_RIGHT_PAD
+                right_reserve = 18.0 if has_unread else 0.0
+                text_right = bg_rect.right() - self.EXPANDED_RIGHT_PAD - right_reserve
                 if text_right > text_left:
                     text_rect = QRectF(
                         text_left,
@@ -171,11 +186,24 @@ class SidebarNavDelegate(QStyledItemDelegate):
                     )
                     painter.setFont(font)
                     painter.setPen(QColor(fg_hex))
+                    painter.save()
                     painter.setClipRect(text_rect)
                     painter.drawText(
                         text_rect,
                         int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine),
                         text,
                     )
+                    painter.restore()
+
+            if has_unread:
+                dot_rect = QRectF(
+                    bg_rect.right() - 16.0,
+                    bg_rect.center().y() - (self.UNREAD_DOT_SIZE / 2.0),
+                    float(self.UNREAD_DOT_SIZE),
+                    float(self.UNREAD_DOT_SIZE),
+                )
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(self.COLOR_UNREAD_DOT))
+                painter.drawEllipse(dot_rect)
 
         painter.restore()
