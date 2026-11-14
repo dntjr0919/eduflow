@@ -23,11 +23,19 @@ def build_executable(onefile: bool = True) -> None:
         "--add-data=ui/styles/theme.qss;ui/styles",
         "--add-data=ui/assets/icons;ui/assets/icons",
         "--add-data=assets/blank_template.hwpx;assets",
+        "--add-data=docs;docs",
+        "--hidden-import=PyQt6.QtSvg",
+        "--hidden-import=lxml.etree",
+        "--hidden-import=win32com.client",
+        "--hidden-import=pythoncom",
+        "--hidden-import=win32api",
+        "--hidden-import=win32con",
         "--hidden-import=watchdog.observers",
         "--hidden-import=watchdog.events",
         "--hidden-import=openpyxl",
         "--hidden-import=pypdf",
         "--hidden-import=sqlite3",
+        "--icon=ui/assets/icons/eduflow_app.ico"
     ]
 
     if onefile:
