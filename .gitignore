@@ -43,3 +43,9 @@ playwright_web_llm_profile/
 *playwright*_profile/
 *.pma
 
+# 모든 브라우저/Playwright 프로필 폴더 차단
+*profile*/
+*gemini*profile*/
+data/
+
+
