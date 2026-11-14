@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from core.database import DatabaseManager
+from services.llm_client import extract_json_from_llm_response
 from services.notifier import NotificationService
 
 VALID_SCHEDULE_CATEGORIES: Tuple[str, ...] = ("학사일정", "수행평가", "업무", "개인")
@@ -49,6 +51,81 @@ REMINDER_LABELS: Dict[str, str] = {
     "1h": "1시간 전",
     "morning_9am": "당일 오전 09:00",
 }
+
+REMINDER_ALIASES: Dict[str, str] = {
+    "none": "none",
+    "없음": "none",
+    "알림 없음": "none",
+    "알림없음": "none",
+    "10m": "10m",
+    "10분": "10m",
+    "10분 전": "10m",
+    "10분전": "10m",
+    "1h": "1h",
+    "1시간": "1h",
+    "1시간 전": "1h",
+    "1시간전": "1h",
+    "morning_9am": "morning_9am",
+    "당일 오전 09:00": "morning_9am",
+    "당일 오전 9시": "morning_9am",
+    "오전 9시": "morning_9am",
+    "오전9시": "morning_9am",
+    "09:00": "morning_9am",
+}
+
+TODO_PRIORITY_ALIASES: Dict[str, str] = {
+    "high": "high",
+    "높음": "high",
+    "긴급": "high",
+    "상": "high",
+    "normal": "normal",
+    "medium": "normal",
+    "보통": "normal",
+    "중간": "normal",
+    "중": "normal",
+    "low": "low",
+    "낮음": "low",
+    "여유": "low",
+    "하": "low",
+}
+
+TODO_PRIORITY_LABELS: Dict[str, str] = {
+    "high": "높음",
+    "normal": "보통",
+    "low": "낮음",
+}
+
+
+def normalize_reminder_type(raw_val: Any) -> str:
+    """알림 문자열을 표준 코드(none, 10m, 1h, morning_9am)로 정규화합니다."""
+    s = str(raw_val or "").strip().lower()
+    if not s:
+        return "none"
+    if s in REMINDER_ALIASES:
+        return REMINDER_ALIASES[s]
+    compact = s.replace(" ", "")
+    if compact in REMINDER_ALIASES:
+        return REMINDER_ALIASES[compact]
+    if "10" in compact and ("m" in compact or "분" in compact):
+        return "10m"
+    if "1" in compact and ("h" in compact or "시간" in compact):
+        return "1h"
+    if "9" in compact or "오전" in compact or "morning" in compact:
+        return "morning_9am"
+    return "none"
+
+
+def normalize_todo_priority(raw_val: Any) -> str:
+    """할일 우선순위 문자열을 DB 표준 코드(high, normal, low)로 정규화합니다."""
+    s = str(raw_val or "").strip().lower()
+    if not s:
+        return "normal"
+    if s in TODO_PRIORITY_ALIASES:
+        return TODO_PRIORITY_ALIASES[s]
+    for key, mapped in TODO_PRIORITY_ALIASES.items():
+        if key in s:
+            return mapped
+    return "normal"
 
 
 def infer_schedule_category(title: str, raw_category: str = "") -> str:
@@ -191,6 +268,8 @@ def _detect_schedule_columns(rows: Sequence[Sequence[Any]]) -> Tuple[int, Dict[s
         "start_date": ("시작일", "날짜", "일자", "일시", "기간", "date", "start_date", "start"),
         "end_date": ("종료일", "마감일", "끝일", "end_date", "end"),
         "start_time": ("시간", "시작시간", "시각", "time", "start_time"),
+        "all_day": ("종일여부", "종일", "all_day", "allday"),
+        "reminder_type": ("알림", "리마인더", "reminder", "reminder_type"),
         "title": ("일정명", "일정", "행사명", "행사", "제목", "내용", "title", "summary", "event"),
         "category": ("카테고리", "구분", "분류", "유형", "category", "type"),
         "memo": ("메모", "비고", "상세", "설명", "note", "memo", "description"),
@@ -276,6 +355,11 @@ def _parse_tabular_rows(
         elif not s_time and isinstance(raw_start, str):
             s_time = normalize_time_str(raw_start)
 
+        raw_all_day = str(_cell("all_day") or "").strip().lower()
+        if raw_all_day in ("y", "yes", "true", "1", "예", "종일"):
+            s_time = ""
+
+        reminder_type = normalize_reminder_type(_cell("reminder_type"))
         memo = str(_cell("memo") or "").strip()
 
         parsed.append(
@@ -285,7 +369,7 @@ def _parse_tabular_rows(
                 "start_date": s_date,
                 "end_date": e_date or s_date,
                 "start_time": s_time,
-                "reminder_type": "none",
+                "reminder_type": reminder_type,
                 "memo": memo,
             }
         )
@@ -505,6 +589,310 @@ def export_schedules_to_ics(schedules: List[Dict[str, Any]], output_path: str) -
     lines.append("END:VCALENDAR")
     Path(output_path).write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
     return exported
+
+
+XLSX_EXPORT_HEADERS: Tuple[str, ...] = (
+    "시작일",
+    "종료일",
+    "일정명",
+    "카테고리",
+    "시작시간",
+    "종일여부",
+    "알림",
+    "메모",
+)
+
+
+def export_schedules_to_xlsx(
+    schedules: Sequence[Dict[str, Any]],
+    out_path: str | Path,
+    include_sample_when_empty: bool = True,
+) -> int:
+    """
+    일정 목록을 parse_xlsx_schedules와 호환되는 표준 Excel(.xlsx) 파일로 내보냅니다.
+    반환값은 실제 내보낸 일정 건수입니다(빈 양식 내보내기 시 0 반환).
+    """
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "학사일정"
+
+    header_fill = PatternFill(start_color="1E40AF", end_color="1E40AF", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_align = Alignment(horizontal="center", vertical="center")
+
+    ws.append(list(XLSX_EXPORT_HEADERS))
+    for col_idx in range(1, len(XLSX_EXPORT_HEADERS) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+    ws.row_dimensions[1].height = 24
+    ws.freeze_panes = "A2"
+
+    col_widths = {
+        "A": 14,  # 시작일
+        "B": 14,  # 종료일
+        "C": 32,  # 일정명
+        "D": 14,  # 카테고리
+        "E": 12,  # 시작시간
+        "F": 12,  # 종일여부
+        "G": 16,  # 알림
+        "H": 36,  # 메모
+    }
+    for col_letter, width in col_widths.items():
+        ws.column_dimensions[col_letter].width = width
+
+    exported = 0
+    for sch in schedules or []:
+        s_date = str(sch.get("start_date", "") or "").strip()
+        title = str(sch.get("title", "") or "").strip()
+        if not s_date or not title:
+            continue
+        e_date = str(sch.get("end_date", "") or "").strip() or s_date
+        if e_date < s_date:
+            e_date = s_date
+        s_time = normalize_time_str(sch.get("start_time"))
+        all_day_str = "N" if s_time else "Y"
+        cat = infer_schedule_category(title, str(sch.get("category", "") or ""))
+        r_type = normalize_reminder_type(sch.get("reminder_type", sch.get("reminder", "none")))
+        r_label = REMINDER_LABELS.get(r_type, "알림 없음")
+        memo = str(sch.get("memo", "") or "").strip()
+
+        ws.append([s_date, e_date, title, cat, s_time, all_day_str, r_label, memo])
+        exported += 1
+
+    if exported == 0 and include_sample_when_empty:
+        today_str = date.today().isoformat()
+        next_str = (date.today() + timedelta(days=2)).isoformat()
+        sample_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        sample_font = Font(color="475569", italic=True)
+        samples = [
+            [today_str, today_str, "[예시] 2학년 수학 수행평가", "수행평가", "09:30", "N", "1시간 전", "준비물: 계산기 (수정 후 사용)"],
+            [next_str, next_str, "[예시] 교직원 전체 회의", "업무", "", "Y", "당일 오전 09:00", "본관 회의실"],
+        ]
+        for row_vals in samples:
+            ws.append(row_vals)
+            r_idx = ws.max_row
+            for c_idx in range(1, len(XLSX_EXPORT_HEADERS) + 1):
+                c = ws.cell(row=r_idx, column=c_idx)
+                c.fill = sample_fill
+                c.font = sample_font
+
+        ws_guide = wb.create_sheet(title="입력안내")
+        ws_guide.column_dimensions["A"].width = 18
+        ws_guide.column_dimensions["B"].width = 62
+        ws_guide.append(["항목", "작성 규칙 및 허용 값"])
+        for col_idx in (1, 2):
+            c = ws_guide.cell(row=1, column=col_idx)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = header_align
+        guide_rows = [
+            ["시작일 / 종료일", "YYYY-MM-DD 형식 권장 (예: 2026-11-18). 종료일 비움 시 시작일과 동일 처리."],
+            ["일정명", "캘린더에 표시할 일정 제목 (필수)."],
+            ["카테고리", f"허용 값: {', '.join(VALID_SCHEDULE_CATEGORIES)}"],
+            ["시작시간", "HH:MM 24시간 형식 (예: 09:30, 14:00). 종일 일정이면 비워둡니다."],
+            ["종일여부", "Y(종일) 또는 N(시간 지정)."],
+            ["알림", "알림 없음 / 10분 전 / 1시간 전 / 당일 오전 09:00 (또는 none/10m/1h/morning_9am)."],
+            ["메모", "세부 장소, 준비물 등 참고 메모."],
+        ]
+        for g_row in guide_rows:
+            ws_guide.append(g_row)
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(out))
+    wb.close()
+    return exported
+
+
+_WEEKDAY_KO_MAP: Dict[str, int] = {
+    "월": 0,
+    "화": 1,
+    "수": 2,
+    "목": 3,
+    "금": 4,
+    "토": 5,
+    "일": 6,
+}
+
+
+def normalize_ai_date_str(raw_val: Any, today: Optional[date] = None) -> str:
+    """
+    AI 응답의 날짜(YYYY-MM-DD, MM월 DD일, '오늘', '내일', '다음주 월요일' 등)를
+    'YYYY-MM-DD' 문자열로 정규화합니다. 파싱 실패 시 ""를 반환합니다.
+    """
+    ref = today or date.today()
+    s = str(raw_val or "").strip()
+    if not s:
+        return ""
+
+    low = s.lower()
+    compact = low.replace(" ", "")
+
+    if compact in ("오늘", "금일", "당일", "today"):
+        return ref.isoformat()
+    if compact in ("내일", "명일", "tomorrow"):
+        return (ref + timedelta(days=1)).isoformat()
+    if compact in ("모레",):
+        return (ref + timedelta(days=2)).isoformat()
+    if compact in ("글피",):
+        return (ref + timedelta(days=3)).isoformat()
+    if compact in ("어제", "작일", "yesterday"):
+        return (ref - timedelta(days=1)).isoformat()
+
+    m_days_after = re.search(r"(\d{1,3})\s*일\s*(?:후|뒤)", s)
+    if m_days_after:
+        return (ref + timedelta(days=int(m_days_after.group(1)))).isoformat()
+
+    m_week = re.search(r"(이번\s*주|금주|다음\s*주|차주)\s*([월화수목금토일])(?:요일)?", s)
+    if m_week:
+        week_kw = m_week.group(1).replace(" ", "")
+        target_wd = _WEEKDAY_KO_MAP[m_week.group(2)]
+        monday = ref - timedelta(days=ref.weekday())
+        if week_kw in ("다음주", "차주"):
+            monday += timedelta(days=7)
+        return (monday + timedelta(days=target_wd)).isoformat()
+
+    s_date, _ = normalize_date_str(s, default_year=ref.year)
+    return s_date
+
+
+def build_calendar_ai_prompt(
+    user_input: str,
+    today: Optional[date] = None,
+) -> Tuple[str, str]:
+    """
+    자연어 일정 요청 또는 공문·안내문 텍스트에서 일정(schedules)과 할일(todos)을
+    구조화된 JSON으로 추출하기 위한 (system_prompt, user_prompt) 튜플을 생성합니다.
+    """
+    ref = today or date.today()
+    wd_names = ("월", "화", "수", "목", "금", "토", "일")
+    today_label = f"{ref.isoformat()} ({wd_names[ref.weekday()]}요일)"
+    categories_str = ", ".join(VALID_SCHEDULE_CATEGORIES)
+
+    system_prompt = (
+        "당신은 한국 학교 교사의 학사일정 및 업무 할일(To-Do) 정리 비서입니다.\n"
+        f"- 기준 오늘 날짜: {today_label} (YYYY-MM-DD: {ref.isoformat()})\n"
+        "- 사용자가 입력한 자연어 요청이나 공문·가정통신문·안내문에서 '일정(schedules)'과 '할일(todos)'을 정확히 추출하세요.\n"
+        f"- 허용 카테고리(category): {categories_str} (반드시 이 4가지 중 하나만 사용)\n"
+        "- 허용 우선순위(priority): 높음, 보통, 낮음 (반드시 이 3가지 중 하나만 사용)\n"
+        "- 허용 알림(reminder): none, 10m, 1h, morning_9am 중 하나 (명시되지 않으면 \"none\")\n"
+        "- 날짜는 '내일', '다음 주 월요일' 같은 상대 표현도 기준 오늘 날짜를 바탕으로 반드시 YYYY-MM-DD 형식으로 변환하세요.\n"
+        "- 시간(start_time)이 명시되지 않은 종일 일정은 all_day=true, start_time=\"\" 로 설정하세요.\n"
+        "- 반드시 설명이나 서문 없이 아래 스키마를 따르는 단일 ```json ... ``` 코드블록으로만 응답하세요.\n\n"
+        "```json\n"
+        "{\n"
+        '  "summary": "추출 요약",\n'
+        '  "schedules": [\n'
+        '    {"title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "start_time": "HH:MM", "all_day": true, "category": "학사일정", "reminder": "1h", "memo": "..."}\n'
+        "  ],\n"
+        '  "todos": [\n'
+        '    {"title": "...", "due_date": "YYYY-MM-DD", "priority": "보통", "memo": "..."}\n'
+        "  ]\n"
+        "}\n"
+        "```"
+    )
+
+    user_prompt = (
+        f"[기준 날짜: {today_label}]\n"
+        "아래 내용에서 캘린더 일정(schedules)과 할일(todos)을 추출하여 단일 ```json ... ``` 블록으로 응답해 주세요.\n\n"
+        f"{str(user_input or '').strip()}"
+    )
+    return system_prompt, user_prompt
+
+
+def parse_calendar_ai_response(
+    raw_response: Any,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """
+    AI 응답(마크다운 ```json 블록 또는 일반 JSON/dict)을 파싱하여
+    정규화된 {"summary": str, "schedules": [...], "todos": [...]} 딕셔너리를 반환합니다.
+    """
+    ref = today or date.today()
+    if isinstance(raw_response, dict):
+        parsed = raw_response
+    else:
+        parsed = extract_json_from_llm_response(str(raw_response or ""))
+
+    if not isinstance(parsed, dict):
+        raise ValueError("AI 응답이 JSON 객체 형식이 아닙니다.")
+
+    summary = str(parsed.get("summary") or "").strip()
+    raw_schedules = parsed.get("schedules")
+    if not isinstance(raw_schedules, list):
+        raw_schedules = []
+    raw_todos = parsed.get("todos")
+    if not isinstance(raw_todos, list):
+        raw_todos = []
+
+    norm_schedules: List[Dict[str, Any]] = []
+    for item in raw_schedules:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("summary") or "").strip()
+        if not title:
+            continue
+
+        s_date = normalize_ai_date_str(item.get("start_date"), today=ref)
+        if not s_date:
+            s_date = ref.isoformat()
+        e_date = normalize_ai_date_str(item.get("end_date"), today=ref) or s_date
+        if e_date < s_date:
+            e_date = s_date
+
+        all_day_raw = item.get("all_day")
+        s_time = normalize_time_str(item.get("start_time"))
+        if all_day_raw is True or (isinstance(all_day_raw, str) and all_day_raw.strip().lower() in ("true", "1", "y", "예")):
+            all_day = True
+            s_time = ""
+        elif not s_time:
+            all_day = True
+        else:
+            all_day = False
+
+        cat = infer_schedule_category(title, str(item.get("category") or ""))
+        reminder = normalize_reminder_type(item.get("reminder") or item.get("reminder_type") or "none")
+        memo = str(item.get("memo") or item.get("description") or "").strip()
+
+        norm_schedules.append(
+            {
+                "title": title,
+                "start_date": s_date,
+                "end_date": e_date,
+                "start_time": s_time,
+                "all_day": all_day,
+                "category": cat,
+                "reminder_type": reminder,
+                "memo": memo,
+            }
+        )
+
+    norm_todos: List[Dict[str, Any]] = []
+    for item in raw_todos:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("task") or "").strip()
+        if not title:
+            continue
+        due_date = normalize_ai_date_str(item.get("due_date"), today=ref)
+        priority = normalize_todo_priority(item.get("priority"))
+        memo = str(item.get("memo") or item.get("description") or "").strip()
+        norm_todos.append(
+            {
+                "title": title,
+                "due_date": due_date,
+                "priority": priority,
+                "memo": memo,
+            }
+        )
+
+    return {
+        "summary": summary,
+        "schedules": norm_schedules,
+        "todos": norm_todos,
+    }
 
 
 def calculate_dday_badge(

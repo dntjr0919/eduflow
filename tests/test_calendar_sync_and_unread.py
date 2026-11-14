@@ -30,11 +30,14 @@ from services.google_sheets_sync_service import (
 )
 from services.schedule_parser_service import (
     ScheduleReminderChecker,
+    build_calendar_ai_prompt,
     calculate_dday_badge,
     export_schedules_to_ics,
+    export_schedules_to_xlsx,
     infer_schedule_category,
     normalize_date_str,
     normalize_time_str,
+    parse_calendar_ai_response,
     parse_csv_schedules,
     parse_ics_schedules,
     parse_schedule_file,
@@ -659,6 +662,340 @@ class TestSidebarUnreadBadgesAndMainWindow(unittest.TestCase):
                 self.app.processEvents()
             DatabaseManager._instance = prev_db_inst
             ConfigManager._instance = prev_cfg_inst
+
+    def test_xlsx_export_and_reimport_roundtrip(self) -> None:
+        schedules = [
+            {
+                "title": "2학년 수학 수행평가",
+                "category": "수행평가",
+                "start_date": "2026-11-18",
+                "end_date": "2026-11-18",
+                "start_time": "09:30",
+                "reminder_type": "1h",
+                "memo": "3반 교실",
+            },
+            {
+                "title": "교직원 전체 연수",
+                "category": "업무",
+                "start_date": "2026-11-20",
+                "end_date": "2026-11-21",
+                "start_time": "",
+                "reminder_type": "morning_9am",
+                "memo": "시청각실",
+            },
+        ]
+        out_xlsx = Path(self.tmp_dir.name) / "exported_schedules.xlsx"
+        count = export_schedules_to_xlsx(schedules, out_xlsx, include_sample_when_empty=True)
+        self.assertEqual(count, 2)
+        self.assertTrue(out_xlsx.exists())
+
+        wb = openpyxl.load_workbook(out_xlsx)
+        try:
+            ws = wb["학사일정"]
+            headers = [ws.cell(row=1, column=i).value for i in range(1, 9)]
+            self.assertEqual(
+                headers,
+                ["시작일", "종료일", "일정명", "카테고리", "시작시간", "종일여부", "알림", "메모"],
+            )
+            self.assertEqual(ws.freeze_panes, "A2")
+        finally:
+            wb.close()
+
+        reparsed = parse_xlsx_schedules(str(out_xlsx), default_year=2026)
+        self.assertEqual(len(reparsed), 2)
+        self.assertEqual(reparsed[0]["title"], "2학년 수학 수행평가")
+        self.assertEqual(reparsed[0]["start_date"], "2026-11-18")
+        self.assertEqual(reparsed[0]["start_time"], "09:30")
+        self.assertEqual(reparsed[0]["category"], "수행평가")
+        self.assertEqual(reparsed[0]["reminder_type"], "1h")
+        self.assertEqual(reparsed[1]["start_date"], "2026-11-20")
+        self.assertEqual(reparsed[1]["end_date"], "2026-11-21")
+        self.assertEqual(reparsed[1]["start_time"], "")
+        self.assertEqual(reparsed[1]["reminder_type"], "morning_9am")
+
+        # 빈 양식 내보내기: 예시 행 + 입력안내 시트 확인 및 재파싱 가능 검증
+        tpl_xlsx = Path(self.tmp_dir.name) / "empty_template.xlsx"
+        tpl_count = export_schedules_to_xlsx([], tpl_xlsx, include_sample_when_empty=True)
+        self.assertEqual(tpl_count, 0)
+        wb_tpl = openpyxl.load_workbook(tpl_xlsx, read_only=True)
+        try:
+            self.assertIn("입력안내", wb_tpl.sheetnames)
+        finally:
+            wb_tpl.close()
+        tpl_parsed = parse_xlsx_schedules(str(tpl_xlsx))
+        self.assertEqual(len(tpl_parsed), 2)
+
+    def test_calendar_ai_prompt_and_response_parsing(self) -> None:
+        from datetime import date
+
+        ref_today = date(2026, 11, 15)  # 일요일
+        sys_p, usr_p = build_calendar_ai_prompt("내일 교무회의", today=ref_today)
+        self.assertIn("2026-11-15", sys_p)
+        self.assertIn("학사일정, 수행평가, 업무, 개인", sys_p)
+        self.assertIn("높음, 보통, 낮음", sys_p)
+        self.assertIn("내일 교무회의", usr_p)
+
+        # 1) 마크다운 ```json 블록 + 상대 날짜 + 누락/잘못된 필드 폴백
+        md_resp = """안내문에서 추출한 결과입니다.
+```json
+{
+  "summary": "교무회의 및 수행평가 채점",
+  "schedules": [
+    {
+      "title": "교직원 회의",
+      "start_date": "내일",
+      "start_time": "15시 30분",
+      "all_day": false,
+      "category": "잘못된카테고리",
+      "reminder": "1시간 전"
+    },
+    {
+      "title": "수학 수행평가",
+      "start_date": "잘못된날짜",
+      "all_day": true,
+      "category": "수행평가"
+    }
+  ],
+  "todos": [
+    {
+      "title": "가정통신문 발송",
+      "due_date": "다음 주 월요일",
+      "priority": "높음",
+      "memo": "1학년 전체"
+    },
+    {
+      "title": "자료 정리"
+    }
+  ]
+}
+```
+"""
+        parsed = parse_calendar_ai_response(md_resp, today=ref_today)
+        self.assertEqual(parsed["summary"], "교무회의 및 수행평가 채점")
+        self.assertEqual(len(parsed["schedules"]), 2)
+        self.assertEqual(parsed["schedules"][0]["start_date"], "2026-11-16")
+        self.assertEqual(parsed["schedules"][0]["start_time"], "15:30")
+        self.assertEqual(parsed["schedules"][0]["category"], "업무")  # 회의 -> 업무 추론
+        self.assertEqual(parsed["schedules"][0]["reminder_type"], "1h")
+        self.assertEqual(parsed["schedules"][1]["start_date"], "2026-11-15")  # 잘못된 날짜 -> 오늘 폴백
+        self.assertEqual(parsed["schedules"][1]["start_time"], "")
+        self.assertEqual(parsed["schedules"][1]["category"], "수행평가")
+
+        self.assertEqual(len(parsed["todos"]), 2)
+        self.assertEqual(parsed["todos"][0]["due_date"], "2026-11-16")  # 다음 주 월요일
+        self.assertEqual(parsed["todos"][0]["priority"], "high")
+        self.assertEqual(parsed["todos"][1]["due_date"], "")
+        self.assertEqual(parsed["todos"][1]["priority"], "normal")
+
+        # 2) 일반 JSON 문자열 파싱
+        plain_json = '{"summary": "단일", "schedules": [{"title": "개교기념일", "start_date": "2026-11-20"}], "todos": []}'
+        parsed_plain = parse_calendar_ai_response(plain_json, today=ref_today)
+        self.assertEqual(len(parsed_plain["schedules"]), 1)
+        self.assertEqual(parsed_plain["schedules"][0]["category"], "학사일정")
+
+    def test_preview_dialog_with_todos_and_dock_target_auto_switch(self) -> None:
+        app = _get_or_create_qapp()
+        dlg = ScheduleImportPreviewDialog(
+            parsed_items=[
+                {
+                    "title": "과학 실험",
+                    "start_date": "2026-11-20",
+                    "end_date": "2026-11-20",
+                    "start_time": "10:00",
+                    "category": "수행평가",
+                    "reminder_type": "1h",
+                    "memo": "실험실",
+                }
+            ],
+            file_name="AI 자동 추출",
+            parsed_todos=[
+                {
+                    "title": "실험 재료 준비",
+                    "due_date": "2026-11-19",
+                    "priority": "high",
+                    "memo": "비커 10개",
+                }
+            ],
+            summary="과학 실험 관련 일정 및 준비물",
+        )
+        sel_s = dlg.get_selected_schedules()
+        sel_t = dlg.get_selected_todos()
+        self.assertEqual(len(sel_s), 1)
+        self.assertEqual(sel_s[0]["reminder_type"], "1h")
+        self.assertEqual(len(sel_t), 1)
+        self.assertEqual(sel_t[0]["priority"], "high")
+        dlg.deleteLater()
+        app.processEvents()
+
+    def test_duplicate_schedule_prevention(self) -> None:
+        id1 = self.db.add_schedule(
+            title="교무회의",
+            category="업무",
+            start_date="2026-11-25",
+            end_date="2026-11-25",
+            start_time="15:00",
+            memo="본관",
+        )
+        self.assertGreater(id1, 0)
+        # 동일 (title, start_date, end_date, start_time) 재등록 차단
+        id2 = self.db.add_schedule(
+            title="교무회의",
+            category="학사일정",
+            start_date="2026-11-25",
+            end_date="2026-11-25",
+            start_time="15:00",
+            memo="다른 메모",
+        )
+        self.assertEqual(id2, 0)
+
+        # bulk_add_schedules에서도 기존 일정 + 배치 내 중복 모두 차단
+        added = self.db.bulk_add_schedules(
+            [
+                {
+                    "title": "교무회의",
+                    "category": "업무",
+                    "start_date": "2026-11-25",
+                    "end_date": "2026-11-25",
+                    "start_time": "15:00",
+                },
+                {
+                    "title": "신규 연수",
+                    "category": "업무",
+                    "start_date": "2026-11-26",
+                    "end_date": "2026-11-26",
+                    "start_time": "",
+                },
+                {
+                    "title": "신규 연수",
+                    "category": "업무",
+                    "start_date": "2026-11-26",
+                    "end_date": "2026-11-26",
+                    "start_time": "",
+                },
+            ]
+        )
+        self.assertEqual(added, 1)
+        all_sch = self.db.get_schedules(start_date="2026-11-25", end_date="2026-11-26")
+        self.assertEqual(len(all_sch), 2)
+
+    def test_ai_dock_target_ui_isolation_and_calendar_modes(self) -> None:
+        from core.base_worker import TaskRunner
+        from ui.components.ai_execution_dock import AiExecutionDock
+
+        dock = AiExecutionDock(task_runner=TaskRunner())
+        try:
+            dock.register_target(
+                target_id="agg_step2",
+                label="과제 파이프라인 > 2단계 세특 생성",
+                context_getter=lambda: {"target_id": "agg_step2", "kind": "excel_batch"},
+                on_result=lambda _r: None,
+            )
+            dock.register_target(
+                target_id="ocr",
+                label="2. AI OCR 및 텍스트 보정",
+                context_getter=lambda: {"target_id": "ocr", "kind": "ocr", "ocr_files": []},
+                on_result=lambda _r: None,
+            )
+            dock.register_target(
+                target_id="hwpx_agent",
+                label="4. HWPX AI 문서 에이전트",
+                context_getter=lambda: {"target_id": "hwpx_agent", "kind": "hwpx_agent"},
+                on_result=lambda _r: None,
+            )
+            dock.register_target(
+                target_id="calendar_todo",
+                label="캘린더 & 할일 (일정·할일 자동 추출)",
+                context_getter=lambda: {"target_id": "calendar_todo", "kind": "calendar_todo"},
+                on_result=lambda _r: None,
+            )
+
+            # 1) agg_step2에서만 결과 엑셀 버튼 & 배치 선택 영역 표시
+            dock.set_target("agg_step2", force=True)
+            self.assertFalse(dock.btn_dock_open_excel.isHidden())
+            self.assertFalse(dock.manual_batch_card.isHidden())
+            self.assertFalse(dock.api_summary_card.isHidden())
+            self.assertTrue(dock.calendar_instruction_card.isHidden())
+
+            # 2) ocr / hwpx_agent에서는 결과 엑셀 버튼 & 배치 선택 영역 숨김
+            for tid in ("ocr", "hwpx_agent"):
+                dock.set_target(tid, force=True)
+                self.assertTrue(dock.btn_dock_open_excel.isHidden(), f"{tid}에서 엑셀 버튼이 보임")
+                self.assertTrue(dock.manual_batch_card.isHidden(), f"{tid}에서 배치 카드가 보임")
+
+            # 3) calendar_todo에서는 3개 모드 모두에서 txt_calendar_instruction 표시, 엑셀/배치/과제요약 숨김
+            dock.set_target("calendar_todo", force=True)
+            for mode_idx in (0, 1, 2):
+                dock.set_mode_index(mode_idx)
+                self.assertFalse(dock.calendar_instruction_card.isHidden())
+                self.assertFalse(dock.txt_calendar_instruction.isHidden())
+                self.assertTrue(dock.btn_dock_open_excel.isHidden())
+                self.assertTrue(dock.manual_batch_card.isHidden())
+                self.assertTrue(dock.api_summary_card.isHidden())
+                self.assertTrue(dock.combo_pw_exec_mode.isHidden())
+        finally:
+            dock.deleteLater()
+            self.app.processEvents()
+
+    def test_ai_dock_combo_transition_sequence_visibility(self) -> None:
+        from core.base_worker import TaskRunner
+        from ui.components.ai_execution_dock import AiExecutionDock
+
+        dock = AiExecutionDock(task_runner=TaskRunner())
+        try:
+            dock.setFixedWidth(AiExecutionDock.EXPANDED_WIDTH)
+            dock.register_target(
+                target_id="agg_step2",
+                label="과제 파이프라인 > 2단계 세특 생성",
+                context_getter=lambda: {"target_id": "agg_step2", "kind": "excel_batch"},
+                on_result=lambda _r: None,
+            )
+            dock.register_target(
+                target_id="ocr",
+                label="2. AI OCR 및 텍스트 보정",
+                context_getter=lambda: {"target_id": "ocr", "kind": "ocr", "ocr_files": []},
+                on_result=lambda _r: None,
+            )
+            dock.register_target(
+                target_id="hwpx_agent",
+                label="4. HWPX AI 문서 에이전트",
+                context_getter=lambda: {"target_id": "hwpx_agent", "kind": "hwpx_agent"},
+                on_result=lambda _r: None,
+            )
+            dock.register_target(
+                target_id="calendar_todo",
+                label="캘린더 & 할일 (일정·할일 자동 추출)",
+                context_getter=lambda: {"target_id": "calendar_todo", "kind": "calendar_todo"},
+                on_result=lambda _r: None,
+            )
+
+            dock.show()
+            self.app.processEvents()
+
+            # 실제 콤보박스 전환 시퀀스: agg_step2 -> ocr -> hwpx_agent -> calendar_todo
+            for tid in ("agg_step2", "ocr", "hwpx_agent", "calendar_todo"):
+                idx = dock.combo_target_selector.findData(tid)
+                self.assertGreaterEqual(idx, 0)
+                dock.combo_target_selector.setCurrentIndex(idx)
+                self.app.processEvents()
+                self.assertEqual(dock.active_target_id(), tid)
+
+            # 최종 calendar_todo 상태에서 3개 모드 모두 이전 타겟 위젯은 False, 캘린더 입력창은 True
+            for mode_idx in (0, 1, 2):
+                dock.set_mode_index(mode_idx)
+                self.app.processEvents()
+                self.assertTrue(dock.txt_calendar_instruction.isVisible())
+                self.assertTrue(dock.calendar_instruction_card.isVisible())
+                self.assertFalse(dock.hwpx_instruction_card.isVisible())
+                self.assertFalse(dock.api_summary_card.isVisible())
+                self.assertFalse(dock.chk_api_run_integrated.isVisible())
+                self.assertFalse(dock.btn_dock_open_excel.isVisible())
+                self.assertFalse(dock.manual_batch_card.isVisible())
+                self.assertFalse(dock.manual_ocr_card.isVisible())
+                self.assertFalse(dock.combo_pw_exec_mode.isVisible())
+        finally:
+            dock.close()
+            dock.deleteLater()
+            self.app.processEvents()
 
 
 if __name__ == "__main__":

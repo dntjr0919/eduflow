@@ -49,6 +49,8 @@ from services.schedule_parser_service import (
     VALID_SCHEDULE_CATEGORIES,
     calculate_dday_badge,
     export_schedules_to_ics,
+    export_schedules_to_xlsx,
+    parse_calendar_ai_response,
     parse_schedule_file,
 )
 from ui.components.file_drop_helper import enable_file_drop
@@ -86,6 +88,31 @@ def _clear_layout(layout) -> None:
             _clear_layout(item.layout())
 
 
+class _ElidedEventButton(QPushButton):
+    """달력 셀 폭에 맞춰 일정 제목을 말줄임(...) 처리하는 버튼."""
+
+    def __init__(self, full_text: str, parent: Optional[QWidget] = None):
+        super().__init__(full_text, parent)
+        self._full_text = full_text
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, 20)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 18)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        avail = max(16, self.width() - 12)
+        elided = self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideRight, avail
+        )
+        if self.text() != elided:
+            self.setText(elided)
+
+
 class _ClickableDayCell(QFrame):
     """월간 캘린더의 개별 날짜 셀."""
 
@@ -113,8 +140,9 @@ class _ClickableDayCell(QFrame):
         else:
             role = "calendarDayCell"
         _apply_role(self, role=role)
-        self.setMinimumHeight(66)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(0)
+        self.setMinimumHeight(74)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         lay = QVBoxLayout(self)
@@ -158,7 +186,7 @@ class _ClickableDayCell(QFrame):
             time_prefix = f"{ev['start_time']} " if ev.get("start_time") else ""
             display_txt = f"{unread_prefix}{time_prefix}{ev.get('title', '')}"
 
-            ev_btn = QPushButton(display_txt)
+            ev_btn = _ElidedEventButton(display_txt, parent=self)
             ev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             ev_btn.setMinimumHeight(18)
             ev_btn.setMaximumHeight(20)
@@ -178,7 +206,9 @@ class _ClickableDayCell(QFrame):
             lay.addWidget(ev_btn)
 
         if len(events) > max_visible:
-            more_lbl = QLabel(f"+{len(events) - max_visible}건 더보기")
+            more_lbl = QLabel(f"+{len(events) - max_visible}건")
+            more_lbl.setMinimumWidth(0)
+            more_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             more_lbl.setStyleSheet("color: #64748B; font-size: 10px; font-weight: 600; padding-left: 2px;")
             lay.addWidget(more_lbl)
 
@@ -516,21 +546,43 @@ class CalendarTodoTab(QWidget):
         self.cal_view_stack.addWidget(week_scroll)
         lay.addWidget(self.cal_view_stack, stretch=1)
 
-        # 하단 캘린더 푸터
-        footer = QHBoxLayout()
+        # 하단 캘린더 푸터 (안내 문구 + 버튼 2줄 분리로 AI 패널 열림 시 잘림 방지)
+        footer_col = QVBoxLayout()
+        footer_col.setContentsMargins(0, 2, 0, 0)
+        footer_col.setSpacing(6)
+
         self.lbl_cal_footer = QLabel("일정을 클릭하면 상세 조회·수정·삭제할 수 있습니다. (빈 날짜 더블클릭 시 빠른 등록)")
         self.lbl_cal_footer.setWordWrap(True)
         self.lbl_cal_footer.setMinimumWidth(0)
         _apply_role(self.lbl_cal_footer, role="mutedText")
 
-        btn_export_ics = QPushButton("달력 내보내기 (.ics)")
+        footer_btn_row = QHBoxLayout()
+        footer_btn_row.setContentsMargins(0, 0, 0, 0)
+        footer_btn_row.setSpacing(6)
+
+        btn_export_template = QPushButton("빈 양식 (.xlsx)")
+        _apply_role(btn_export_template, role="outline", obj_name="BtnExportXlsxTemplate")
+        btn_export_template.setMinimumHeight(28)
+        btn_export_template.clicked.connect(self._on_export_xlsx_template_clicked)
+
+        btn_export_xlsx = QPushButton("엑셀 내보내기")
+        _apply_role(btn_export_xlsx, role="outline", obj_name="BtnExportXlsx")
+        btn_export_xlsx.setMinimumHeight(28)
+        btn_export_xlsx.clicked.connect(self._on_export_xlsx_clicked)
+
+        btn_export_ics = QPushButton("달력 (.ics)")
         _apply_role(btn_export_ics, role="outline", obj_name="BtnExportIcs")
         btn_export_ics.setMinimumHeight(28)
         btn_export_ics.clicked.connect(self._on_export_ics_clicked)
 
-        footer.addWidget(self.lbl_cal_footer, stretch=1)
-        footer.addWidget(btn_export_ics)
-        lay.addLayout(footer)
+        footer_btn_row.addStretch()
+        footer_btn_row.addWidget(btn_export_template)
+        footer_btn_row.addWidget(btn_export_xlsx)
+        footer_btn_row.addWidget(btn_export_ics)
+
+        footer_col.addWidget(self.lbl_cal_footer)
+        footer_col.addLayout(footer_btn_row)
+        lay.addLayout(footer_col)
         return card
 
     def _build_right_tasks_panel(self) -> QFrame:
@@ -823,7 +875,12 @@ class CalendarTodoTab(QWidget):
         _clear_layout(self.month_grid_layout)
         today_str = date.today().isoformat()
 
+        for c_idx in range(7):
+            self.month_grid_layout.setColumnStretch(c_idx, 1)
+
         for r_idx in range(6):
+            self.month_grid_layout.setRowStretch(r_idx, 1)
+            self.month_grid_layout.setRowMinimumHeight(r_idx, 74)
             for c_idx in range(7):
                 day_d = weeks[r_idx][c_idx]
                 d_str = day_d.isoformat()
@@ -988,7 +1045,13 @@ class CalendarTodoTab(QWidget):
                 if item_id:
                     self.db.update_schedule(int(item_id), **data)
                 else:
-                    self.db.add_schedule(**data, is_read=1)
+                    new_id = self.db.add_schedule(**data, is_read=1)
+                    if new_id == 0:
+                        QMessageBox.information(
+                            self,
+                            "중복 일정 건너뜀",
+                            "동일한 일정(제목·날짜·시간)이 이미 등록되어 있어 건너뛰었습니다.",
+                        )
             self.refresh_calendar()
         elif item_type == "todo":
             if action == "delete" and item_id:
@@ -1324,13 +1387,13 @@ class CalendarTodoTab(QWidget):
 
         selected = dlg.get_selected_schedules()
         added = self.db.bulk_add_schedules(selected, is_read=1)
+        skipped = max(0, len(selected) - added)
         self.refresh_calendar()
         self.unread_changed.emit()
-        QMessageBox.information(
-            self,
-            "일괄 등록 완료",
-            f"선택하신 {added}건의 학사일정이 캘린더에 등록되었습니다.",
-        )
+        msg = f"선택하신 {added}건의 학사일정이 캘린더에 등록되었습니다."
+        if skipped > 0:
+            msg += f"\n(동일 일정 중복 {skipped}건 건너뜀)"
+        QMessageBox.information(self, "일괄 등록 완료", msg)
         return added
 
     def _on_export_ics_clicked(self) -> None:
@@ -1349,6 +1412,119 @@ class CalendarTodoTab(QWidget):
             "ICS 내보내기 완료",
             f"총 {count}건의 일정을 '{Path(save_path).name}' 파일로 저장했습니다.",
         )
+
+    def _on_export_xlsx_clicked(self) -> None:
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "학사일정 엑셀 내보내기 (.xlsx)",
+            f"eduflow_schedules_{self._current_year}_{self._current_month:02d}.xlsx",
+            "Excel (*.xlsx)",
+        )
+        if not save_path:
+            return
+        schedules = self.db.get_schedules()
+        count = export_schedules_to_xlsx(schedules, save_path, include_sample_when_empty=True)
+        msg = (
+            f"총 {count}건의 일정을 '{Path(save_path).name}' 파일로 저장했습니다.\n"
+            "(편집 후 [학사일정 일괄 등록 (.xlsx)]로 다시 불러올 수 있습니다.)"
+            if count > 0
+            else f"등록된 일정이 없어 예시가 포함된 빈 양식 '{Path(save_path).name}'을 저장했습니다."
+        )
+        QMessageBox.information(self, "엑셀 내보내기 완료", msg)
+
+    def _on_export_xlsx_template_clicked(self) -> None:
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "학사일정 빈 양식 받기 (.xlsx)",
+            "eduflow_schedule_template.xlsx",
+            "Excel (*.xlsx)",
+        )
+        if not save_path:
+            return
+        export_schedules_to_xlsx([], save_path, include_sample_when_empty=True)
+        QMessageBox.information(
+            self,
+            "빈 양식 저장 완료",
+            f"표준 학사일정 양식 '{Path(save_path).name}'을 저장했습니다.\n"
+            "엑셀에서 일정을 입력한 뒤 [학사일정 일괄 등록 (.xlsx)]로 바로 불러올 수 있습니다.",
+        )
+
+    # =========================================================================
+    # 우측 AiExecutionDock 연동 (자연어/공문 → 일정·할일 JSON 추출)
+    # =========================================================================
+    def get_ai_context(self) -> Dict[str, Any]:
+        return {
+            "target_id": "calendar_todo",
+            "kind": "calendar_todo",
+            "task_label": "일정·할일 자동 추출",
+            "selected_date": self._selected_date_str,
+        }
+
+    def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        parsed_cal = payload.get("parsed_calendar")
+        if not isinstance(parsed_cal, dict):
+            raw_json = payload.get("parsed_json")
+            raw_text = payload.get("raw_response") or payload.get("formatted_text") or ""
+            try:
+                if isinstance(raw_json, dict) and raw_json:
+                    parsed_cal = parse_calendar_ai_response(raw_json)
+                elif raw_text:
+                    parsed_cal = parse_calendar_ai_response(str(raw_text))
+                else:
+                    return
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "AI 응답 파싱 오류",
+                    f"일정·할일 JSON 응답을 해석하는 중 오류가 발생했습니다:\n{exc}",
+                )
+                return
+
+        schedules = list(parsed_cal.get("schedules") or [])
+        todos = list(parsed_cal.get("todos") or [])
+        summary = str(parsed_cal.get("summary") or "").strip()
+
+        if not schedules and not todos:
+            QMessageBox.information(
+                self,
+                "추출 결과 없음",
+                "AI 응답에서 등록할 일정이나 할일을 찾지 못했습니다.",
+            )
+            return
+
+        dlg = ScheduleImportPreviewDialog(
+            parsed_items=schedules,
+            file_name="AI 자동 추출",
+            parent=self,
+            parsed_todos=todos,
+            summary=summary,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        sel_schedules = dlg.get_selected_schedules()
+        sel_todos = dlg.get_selected_todos()
+        added_sch = self.db.bulk_add_schedules(sel_schedules, is_read=1) if sel_schedules else 0
+        skipped_sch = max(0, len(sel_schedules) - added_sch)
+        added_todo = 0
+        for td in sel_todos:
+            self.db.add_todo(
+                title=td["title"],
+                due_date=td.get("due_date", ""),
+                priority=td.get("priority", "normal"),
+                memo=td.get("memo", ""),
+                is_read=1,
+            )
+            added_todo += 1
+
+        self.refresh_all()
+        self.unread_changed.emit()
+        done_msg = f"선택하신 일정 {added_sch}건, 할일 {added_todo}건이 등록되었습니다."
+        if skipped_sch > 0:
+            done_msg += f"\n(동일 일정 중복 {skipped_sch}건 건너뜀)"
+        QMessageBox.information(self, "AI 일정·할일 등록 완료", done_msg)
 
     # =========================================================================
     # Google Sheets 동기화 및 1분 주기 알림 타이머

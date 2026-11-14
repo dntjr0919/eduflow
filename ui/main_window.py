@@ -885,6 +885,12 @@ class MainWindow(QMainWindow):
             context_getter=lambda: self.tab_doc_ocr.get_ai_context("hwpx_agent"),
             on_result=self.tab_doc_ocr.apply_ai_dock_result,
         )
+        self.ai_dock.register_target(
+            target_id="calendar_todo",
+            label="캘린더 & 할일 (일정·할일 자동 추출)",
+            context_getter=self.tab_calendar.get_ai_context,
+            on_result=self.tab_calendar.apply_ai_dock_result,
+        )
         self.ai_dock.target_changed.connect(self.tab_doc_ocr.set_active_ai_target)
         self.ai_dock.go_to_settings_requested.connect(self.switch_to_settings_tab)
         self.tab_doc_ocr.ai_target_requested.connect(self._on_central_ai_target_requested)
@@ -1013,6 +1019,8 @@ class MainWindow(QMainWindow):
             meta = self._page_meta[row]
             self.lbl_page_title.setText(meta["title"].strip())
             self.lbl_page_desc.setText(meta["desc"].strip())
+            if self.stacked_widget.widget(row) is self.tab_calendar:
+                self.ai_dock.set_target("calendar_todo", force=False)
 
     def _update_ai_mode_badge(self) -> None:
         if not hasattr(self, "sidebar_ai_badge"):

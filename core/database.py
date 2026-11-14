@@ -1675,12 +1675,24 @@ class DatabaseManager:
         e_date = str(end_date or "").strip() or s_date
         if e_date < s_date:
             e_date = s_date
+        clean_title = str(title or "").strip() or "제목 없음"
+        clean_time = str(start_time or "").strip()
         rid = self._clean_remote_id(remote_id)
         now_str = self._now_str()
         with self._lock:
             conn = self._get_connection()
             try:
                 cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id FROM schedules
+                    WHERE title = ? AND start_date = ? AND end_date = ? AND start_time = ?
+                    LIMIT 1
+                    """,
+                    (clean_title, s_date, e_date, clean_time),
+                )
+                if cur.fetchone() is not None:
+                    return 0
                 cur.execute(
                     """
                     INSERT INTO schedules (
@@ -1691,11 +1703,11 @@ class DatabaseManager:
                     """,
                     (
                         rid,
-                        str(title or "").strip() or "제목 없음",
+                        clean_title,
                         str(category or "학사일정").strip() or "학사일정",
                         s_date,
                         e_date,
-                        str(start_time or "").strip(),
+                        clean_time,
                         str(reminder_type or "none").strip() or "none",
                         str(memo or "").strip(),
                         1 if is_read else 0,
@@ -1735,11 +1747,22 @@ class DatabaseManager:
                     e_date = str(item.get("end_date", "")).strip() or s_date
                     if e_date < s_date:
                         e_date = s_date
+                    s_time = str(item.get("start_time", "") or "").strip()
                     rid = self._clean_remote_id(item.get("remote_id"))
                     if rid:
                         cur.execute("SELECT id FROM schedules WHERE remote_id = ?", (rid,))
                         if cur.fetchone() is not None:
                             continue
+                    cur.execute(
+                        """
+                        SELECT id FROM schedules
+                        WHERE title = ? AND start_date = ? AND end_date = ? AND start_time = ?
+                        LIMIT 1
+                        """,
+                        (title, s_date, e_date, s_time),
+                    )
+                    if cur.fetchone() is not None:
+                        continue
                     cur.execute(
                         """
                         INSERT INTO schedules (
@@ -1754,7 +1777,7 @@ class DatabaseManager:
                             str(item.get("category", "학사일정") or "학사일정").strip(),
                             s_date,
                             e_date,
-                            str(item.get("start_time", "") or "").strip(),
+                            s_time,
                             str(item.get("reminder_type", "none") or "none").strip(),
                             str(item.get("memo", "") or "").strip(),
                             1 if is_read else 0,

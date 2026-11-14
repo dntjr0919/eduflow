@@ -36,6 +36,7 @@ from services.schedule_parser_service import (
     VALID_SCHEDULE_CATEGORIES,
     normalize_date_str,
     normalize_time_str,
+    normalize_todo_priority,
 )
 from ui.utils import install_no_scroll_wheel_filter
 
@@ -451,20 +452,30 @@ class ScheduleItemDialog(QDialog):
 
 
 class ScheduleImportPreviewDialog(QDialog):
-    """학사일정(.xlsx / .csv / .ics) 파싱 결과를 먼저 미리보고 확정 등록하는 모달."""
+    """학사일정(.xlsx / .csv / .ics) 및 AI 추출 일정·할일 미리보기/확정 모달."""
 
     def __init__(
         self,
         parsed_items: List[Dict[str, Any]],
         file_name: str = "",
         parent: Optional[QWidget] = None,
+        *,
+        parsed_todos: Optional[List[Dict[str, Any]]] = None,
+        summary: str = "",
     ):
         super().__init__(parent)
         _apply_role(self, obj_name="ScheduleImportPreviewModal")
         self.parsed_items = [dict(x) for x in parsed_items]
+        self._has_todo_section = parsed_todos is not None
+        self.parsed_todos = [dict(x) for x in (parsed_todos or [])]
+        self.summary = str(summary or "").strip()
         self.file_name = file_name
-        self.setWindowTitle("학사일정 일괄 등록 미리보기 및 확정")
-        self.resize(900, 580)
+        self.setWindowTitle(
+            "AI 추출 일정·할일 미리보기 및 확정"
+            if self._has_todo_section
+            else "학사일정 일괄 등록 미리보기 및 확정"
+        )
+        self.resize(920, 660 if self._has_todo_section else 580)
         self.setMinimumSize(760, 460)
         self._init_ui()
         self._populate_table()
@@ -475,10 +486,19 @@ class ScheduleImportPreviewDialog(QDialog):
         layout.setSpacing(12)
 
         source_text = f" ({self.file_name})" if self.file_name else ""
-        banner = QLabel(
-            f"파싱된 일정 {len(self.parsed_items)}건{source_text} — 아직 DB에 저장되지 않았습니다. "
-            "등록할 항목을 체크·검수한 뒤 [선택 일정 일괄 등록 확정]을 누르세요."
-        )
+        if self._has_todo_section:
+            banner_msg = (
+                f"일정 {len(self.parsed_items)}건 · 할일 {len(self.parsed_todos)}건 추출됨{source_text} — "
+                "아직 DB에 저장되지 않았습니다. 항목을 체크·수정한 뒤 [선택 항목 일괄 등록 확정]을 누르세요."
+            )
+            if self.summary:
+                banner_msg += f"\n요약: {self.summary}"
+        else:
+            banner_msg = (
+                f"파싱된 일정 {len(self.parsed_items)}건{source_text} — 아직 DB에 저장되지 않았습니다. "
+                "등록할 항목을 체크·검수한 뒤 [선택 일정 일괄 등록 확정]을 누르세요."
+            )
+        banner = QLabel(banner_msg)
         _apply_role(banner, role="infoBanner")
         banner.setWordWrap(True)
         layout.addWidget(banner)
@@ -502,7 +522,8 @@ class ScheduleImportPreviewDialog(QDialog):
         _apply_role(btn_apply_cat, role="outline")
         btn_apply_cat.clicked.connect(self._apply_bulk_category)
 
-        self.lbl_checked_count = QLabel(f"선택됨: {len(self.parsed_items)}건")
+        total_init = len(self.parsed_items) + (len(self.parsed_todos) if self._has_todo_section else 0)
+        self.lbl_checked_count = QLabel(f"선택됨: {total_init}건")
         _apply_role(self.lbl_checked_count, role="badgePrimary")
 
         toolbar.addWidget(btn_sel_all)
@@ -513,6 +534,11 @@ class ScheduleImportPreviewDialog(QDialog):
         toolbar.addStretch()
         toolbar.addWidget(self.lbl_checked_count)
         layout.addLayout(toolbar)
+
+        if self._has_todo_section:
+            lbl_sch = QLabel(f"일정 ({len(self.parsed_items)}건)")
+            _apply_role(lbl_sch, role="fieldLabel")
+            layout.addWidget(lbl_sch)
 
         self.table = QTableWidget(0, 7, self)
         self.table.setAlternatingRowColors(True)
@@ -532,6 +558,28 @@ class ScheduleImportPreviewDialog(QDialog):
         self.table.itemChanged.connect(self._update_checked_count)
         layout.addWidget(self.table, stretch=1)
 
+        self.todo_table: Optional[QTableWidget] = None
+        if self._has_todo_section:
+            lbl_td = QLabel(f"할일 ({len(self.parsed_todos)}건)")
+            _apply_role(lbl_td, role="fieldLabel")
+            layout.addWidget(lbl_td)
+
+            self.todo_table = QTableWidget(0, 5, self)
+            self.todo_table.setAlternatingRowColors(True)
+            self.todo_table.verticalHeader().setDefaultSectionSize(34)
+            self.todo_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.todo_table.setHorizontalHeaderLabels(
+                ["선택", "마감일", "우선순위", "할일 내용", "메모"]
+            )
+            thdr = self.todo_table.horizontalHeader()
+            thdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            thdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            thdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            thdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+            thdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+            self.todo_table.itemChanged.connect(self._update_checked_count)
+            layout.addWidget(self.todo_table, stretch=1)
+
         footer = QHBoxLayout()
         footer.setSpacing(10)
         btn_cancel = QPushButton("취소")
@@ -539,7 +587,9 @@ class ScheduleImportPreviewDialog(QDialog):
         btn_cancel.setMinimumHeight(38)
         btn_cancel.clicked.connect(self.reject)
 
-        self.btn_confirm = QPushButton("선택 일정 일괄 등록 확정")
+        self.btn_confirm = QPushButton(
+            "선택 항목 일괄 등록 확정" if self._has_todo_section else "선택 일정 일괄 등록 확정"
+        )
         _apply_role(self.btn_confirm, role="primary", obj_name="BtnConfirmImportSchedules")
         self.btn_confirm.setMinimumHeight(38)
         self.btn_confirm.setMinimumWidth(190)
@@ -566,6 +616,10 @@ class ScheduleImportPreviewDialog(QDialog):
                 )
                 chk_item.setCheckState(Qt.CheckState.Checked)
                 chk_item.setData(Qt.ItemDataRole.UserRole, item.get("remote_id", ""))
+                chk_item.setData(
+                    Qt.ItemDataRole.UserRole + 1,
+                    str(item.get("reminder_type") or item.get("reminder") or "none"),
+                )
                 self.table.setItem(idx, 0, chk_item)
 
                 self.table.setItem(idx, 1, QTableWidgetItem(str(item.get("start_date", ""))))
@@ -587,6 +641,42 @@ class ScheduleImportPreviewDialog(QDialog):
                 self.table.setItem(idx, 6, QTableWidgetItem(str(item.get("memo", ""))))
         finally:
             self.table.blockSignals(False)
+
+        if self.todo_table is not None:
+            self.todo_table.blockSignals(True)
+            try:
+                self.todo_table.setRowCount(0)
+                for idx, td in enumerate(self.parsed_todos):
+                    self.todo_table.insertRow(idx)
+
+                    chk_td = QTableWidgetItem()
+                    chk_td.setFlags(
+                        Qt.ItemFlag.ItemIsEnabled
+                        | Qt.ItemFlag.ItemIsSelectable
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    chk_td.setCheckState(Qt.CheckState.Checked)
+                    self.todo_table.setItem(idx, 0, chk_td)
+
+                    self.todo_table.setItem(idx, 1, QTableWidgetItem(str(td.get("due_date", ""))))
+
+                    prio_combo = QComboBox()
+                    prio_combo.setMinimumHeight(28)
+                    prio_combo.addItem("높음", "high")
+                    prio_combo.addItem("보통", "normal")
+                    prio_combo.addItem("낮음", "low")
+                    cur_prio = normalize_todo_priority(td.get("priority", "normal"))
+                    p_idx = prio_combo.findData(cur_prio)
+                    if p_idx >= 0:
+                        prio_combo.setCurrentIndex(p_idx)
+                    install_no_scroll_wheel_filter(prio_combo)
+                    self.todo_table.setCellWidget(idx, 2, prio_combo)
+
+                    self.todo_table.setItem(idx, 3, QTableWidgetItem(str(td.get("title", ""))))
+                    self.todo_table.setItem(idx, 4, QTableWidgetItem(str(td.get("memo", ""))))
+            finally:
+                self.todo_table.blockSignals(False)
+
         self._update_checked_count()
 
     def _set_all_checked(self, checked: bool) -> None:
@@ -599,6 +689,17 @@ class ScheduleImportPreviewDialog(QDialog):
                     it.setCheckState(state)
         finally:
             self.table.blockSignals(False)
+
+        if self.todo_table is not None:
+            self.todo_table.blockSignals(True)
+            try:
+                for row in range(self.todo_table.rowCount()):
+                    it = self.todo_table.item(row, 0)
+                    if it is not None:
+                        it.setCheckState(state)
+            finally:
+                self.todo_table.blockSignals(False)
+
         self._update_checked_count()
 
     def _apply_bulk_category(self) -> None:
@@ -618,12 +719,23 @@ class ScheduleImportPreviewDialog(QDialog):
             chk = self.table.item(row, 0)
             if chk is not None and chk.checkState() == Qt.CheckState.Checked:
                 cnt += 1
+        if self.todo_table is not None:
+            for row in range(self.todo_table.rowCount()):
+                chk = self.todo_table.item(row, 0)
+                if chk is not None and chk.checkState() == Qt.CheckState.Checked:
+                    cnt += 1
         self.lbl_checked_count.setText(f"선택됨: {cnt}건")
 
     def _on_confirm(self) -> None:
         selected = self.get_selected_schedules()
-        if not selected:
-            QMessageBox.warning(self, "선택 확인", "등록할 일정을 최소 1건 이상 선택해 주세요.")
+        selected_todos = self.get_selected_todos()
+        if not selected and not selected_todos:
+            msg = (
+                "등록할 일정 또는 할일을 최소 1건 이상 선택해 주세요."
+                if self._has_todo_section
+                else "등록할 일정을 최소 1건 이상 선택해 주세요."
+            )
+            QMessageBox.warning(self, "선택 확인", msg)
             return
         self.accept()
 
@@ -657,7 +769,33 @@ class ScheduleImportPreviewDialog(QDialog):
                     "start_date": s_date,
                     "end_date": e_date,
                     "start_time": normalize_time_str(raw_t),
-                    "reminder_type": "none",
+                    "reminder_type": str(chk.data(Qt.ItemDataRole.UserRole + 1) or "none").strip() or "none",
+                    "memo": memo,
+                }
+            )
+        return selected
+
+    def get_selected_todos(self) -> List[Dict[str, Any]]:
+        if self.todo_table is None:
+            return []
+        selected: List[Dict[str, Any]] = []
+        for row in range(self.todo_table.rowCount()):
+            chk = self.todo_table.item(row, 0)
+            if chk is None or chk.checkState() != Qt.CheckState.Checked:
+                continue
+            raw_due = self.todo_table.item(row, 1).text().strip() if self.todo_table.item(row, 1) else ""
+            title = self.todo_table.item(row, 3).text().strip() if self.todo_table.item(row, 3) else ""
+            memo = self.todo_table.item(row, 4).text().strip() if self.todo_table.item(row, 4) else ""
+            if not title:
+                continue
+            combo = self.todo_table.cellWidget(row, 2)
+            prio = normalize_todo_priority(combo.currentData() if isinstance(combo, QComboBox) else "normal")
+            due_date, _ = normalize_date_str(raw_due)
+            selected.append(
+                {
+                    "title": title,
+                    "due_date": due_date,
+                    "priority": prio,
                     "memo": memo,
                 }
             )

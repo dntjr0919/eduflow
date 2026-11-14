@@ -69,6 +69,10 @@ from services.record_generator_service import (
     load_all_references,
     load_prompt_text,
 )
+from services.schedule_parser_service import (
+    build_calendar_ai_prompt,
+    parse_calendar_ai_response,
+)
 from services.web_gemini_auto_worker import (
     PROVIDER_CONFIGS,
     WebGeminiAutoWorker,
@@ -397,6 +401,29 @@ class _DockApiHwpxAgentWorker(BaseWorker):
         }
 
 
+class _DockApiCalendarTodoWorker(BaseWorker):
+    """캘린더 & 할일 자연어/공문 텍스트에서 구조화된 일정·할일 JSON을 추출하는 API 워커."""
+
+    def __init__(self, instruction: str):
+        super().__init__(task_name="캘린더 & 할일 AI 추출 (API)")
+        self.instruction = instruction
+
+    def execute(self) -> Dict[str, Any]:
+        self.emit_progress(25, "일정·할일 추출 프롬프트 전송 중...")
+        sys_p, usr_p = build_calendar_ai_prompt(self.instruction)
+        client = MultiLlmClient()
+        raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+        self.emit_progress(80, "추출된 JSON 정규화 중...")
+        parsed_cal = parse_calendar_ai_response(raw_reply)
+        self.emit_progress(100, "일정·할일 JSON 추출 완료")
+        return {
+            "target_id": "calendar_todo",
+            "mode": "api",
+            "raw_response": raw_reply,
+            "parsed_calendar": parsed_cal,
+        }
+
+
 class AiExecutionDock(QFrame):
     """EduFlow 우측 접이식 AI 실행 사이드바 위젯 (폭 340px)."""
 
@@ -582,6 +609,27 @@ class AiExecutionDock(QFrame):
         self.hwpx_instruction_card.setVisible(False)
         root_lay.addWidget(self.hwpx_instruction_card)
 
+        # [2.5단-B] 캘린더 & 할일 전용 지시사항/공문 입력창 (calendar_todo 타겟일 때만 표시)
+        self.calendar_instruction_card = QFrame(panel)
+        _apply_role(self.calendar_instruction_card, role="subCard")
+        cal_lay = QVBoxLayout(self.calendar_instruction_card)
+        cal_lay.setContentsMargins(10, 8, 10, 8)
+        cal_lay.setSpacing(6)
+        lbl_cal_inst = QLabel("일정·할일 추출 지시사항 / 공문·안내문")
+        _apply_role(lbl_cal_inst, role="fieldLabel")
+        self.txt_calendar_instruction = QTextEdit()
+        _apply_role(self.txt_calendar_instruction, obj_name="CalendarAiInputBox")
+        self.txt_calendar_instruction.setMinimumHeight(80)
+        self.txt_calendar_instruction.setMaximumHeight(130)
+        self.txt_calendar_instruction.setPlaceholderText(
+            "예: 내일 오전 10시 교무회의, 11월 25일까지 2학년 수행평가 채점 완료\n"
+            "또는 공문·안내문 본문을 그대로 붙여넣으세요."
+        )
+        cal_lay.addWidget(lbl_cal_inst)
+        cal_lay.addWidget(self.txt_calendar_instruction)
+        self.calendar_instruction_card.setVisible(False)
+        root_lay.addWidget(self.calendar_instruction_card)
+
         # ---------------------------------------------------------------------
         # [3단] 모드별 실행 컨트롤 영역 (QStackedWidget in QScrollArea)
         # ---------------------------------------------------------------------
@@ -625,6 +673,7 @@ class AiExecutionDock(QFrame):
         self.btn_dock_open_excel.setFixedHeight(32)
         self.btn_dock_open_excel.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_dock_open_excel.setEnabled(False)
+        self.btn_dock_open_excel.setVisible(False)
         self.btn_dock_open_excel.clicked.connect(self._on_open_result_excel)
 
         ft_lay.addWidget(self.progress_dock)
@@ -677,9 +726,9 @@ class AiExecutionDock(QFrame):
         mc_lay.addLayout(link_row)
         lay.addWidget(model_card)
 
-        summary_card = QFrame()
-        _apply_role(summary_card, role="subCard")
-        sc_lay = QVBoxLayout(summary_card)
+        self.api_summary_card = QFrame()
+        _apply_role(self.api_summary_card, role="subCard")
+        sc_lay = QVBoxLayout(self.api_summary_card)
         sc_lay.setContentsMargins(10, 10, 10, 10)
         sc_lay.setSpacing(6)
 
@@ -695,7 +744,7 @@ class AiExecutionDock(QFrame):
         sc_lay.addWidget(lbl_sum_cap)
         sc_lay.addWidget(self.lbl_api_summary)
         sc_lay.addWidget(self.chk_api_run_integrated)
-        lay.addWidget(summary_card)
+        lay.addWidget(self.api_summary_card)
 
         self.btn_api_start = QPushButton("API 일괄 생성 시작")
         _apply_role(self.btn_api_start, role="primary", obj_name="BtnDockApiStart")
@@ -956,8 +1005,8 @@ class AiExecutionDock(QFrame):
         oc_lay.setContentsMargins(10, 8, 10, 8)
         oc_lay.setSpacing(6)
 
-        lbl_exec_mode = QLabel("실행 방식")
-        _apply_role(lbl_exec_mode, role="fieldLabel")
+        self.lbl_pw_exec_mode = QLabel("실행 방식")
+        _apply_role(self.lbl_pw_exec_mode, role="fieldLabel")
         self.combo_pw_exec_mode = QComboBox()
         _apply_role(self.combo_pw_exec_mode, obj_name="ComboPlaywrightExecMode")
         self.combo_pw_exec_mode.setFixedHeight(30)
@@ -974,7 +1023,7 @@ class AiExecutionDock(QFrame):
         self.lbl_pw_summary.setWordWrap(True)
         _apply_role(self.lbl_pw_summary, role="mutedText")
 
-        oc_lay.addWidget(lbl_exec_mode)
+        oc_lay.addWidget(self.lbl_pw_exec_mode)
         oc_lay.addWidget(self.combo_pw_exec_mode)
         oc_lay.addWidget(self.chk_pw_keep_login)
         oc_lay.addWidget(self.chk_pw_temp_chat)
@@ -1259,10 +1308,90 @@ class AiExecutionDock(QFrame):
             pass
         return {}
 
+    def _apply_target_visibility(
+        self,
+        kind: str,
+        *,
+        hwpx_multi_parts: bool = False,
+        has_atts: bool = False,
+    ) -> None:
+        """모든 타겟 전용 위젯을 먼저 일괄 숨김 처리한 뒤, 현재 타겟 전용 위젯만 표시합니다."""
+        # 1) 모든 타겟 전용 위젯 일괄 숨김 (이전 타겟 잔존 방지)
+        self.hwpx_instruction_card.setVisible(False)
+        self.calendar_instruction_card.setVisible(False)
+        self.api_summary_card.setVisible(False)
+        self.chk_api_run_integrated.setVisible(False)
+        self.btn_dock_open_excel.setVisible(False)
+        self.manual_batch_card.setVisible(False)
+        if hasattr(self, "spin_manual_students"):
+            self.spin_manual_students.setVisible(False)
+        if hasattr(self, "spin_manual_tokens"):
+            self.spin_manual_tokens.setVisible(False)
+        if hasattr(self, "btn_manual_resplit"):
+            self.btn_manual_resplit.setVisible(False)
+        self.manual_ocr_card.setVisible(False)
+        self.manual_attachment_card.setVisible(False)
+        self.combo_pw_exec_mode.setVisible(False)
+
+        # 2) 현재 타겟에 해당하는 전용 위젯만 활성화
+        if kind == "calendar_todo":
+            self.calendar_instruction_card.setVisible(True)
+            self.txt_calendar_instruction.setVisible(True)
+            self.btn_api_start.setText("일정·할일 AI 추출 실행")
+            self.btn_manual_apply_next.setText("JSON 검증 후 일정·할일 확인")
+            self.lbl_pw_exec_mode.setText("실행 방식: 단일 프롬프트")
+            self.btn_pw_collect_next.setText("응답 회수")
+        elif kind == "hwpx_agent":
+            self.hwpx_instruction_card.setVisible(True)
+            self.api_summary_card.setVisible(True)
+            self.combo_pw_exec_mode.setVisible(True)
+            self.manual_batch_card.setVisible(hwpx_multi_parts)
+            self.btn_api_start.setText("API 일괄 생성 시작")
+            self.lbl_pw_exec_mode.setText("실행 방식")
+            self.btn_pw_collect_next.setText("응답 회수 · 다음 배치")
+            self.btn_manual_apply_next.setText(
+                "JSON Patch 검증 후 적용 · 다음 파트 복사"
+                if hwpx_multi_parts
+                else "JSON Patch 검증 후 문서에 적용"
+            )
+        elif kind == "ocr":
+            self.api_summary_card.setVisible(True)
+            self.manual_ocr_card.setVisible(True)
+            self.manual_attachment_card.setVisible(has_atts)
+            self.combo_pw_exec_mode.setVisible(True)
+            self.btn_api_start.setText("API 일괄 생성 시작")
+            self.lbl_pw_exec_mode.setText("실행 방식")
+            self.btn_pw_collect_next.setText("응답 회수 · 다음 배치")
+            self.btn_manual_apply_next.setText("검증 후 OCR 결과 반영")
+        else:  # excel_batch (과제 파이프라인 > 2단계 세특 생성)
+            self.api_summary_card.setVisible(True)
+            self.chk_api_run_integrated.setVisible(True)
+            self.btn_dock_open_excel.setVisible(True)
+            self.manual_batch_card.setVisible(True)
+            if hasattr(self, "spin_manual_students"):
+                self.spin_manual_students.setVisible(True)
+            if hasattr(self, "spin_manual_tokens"):
+                self.spin_manual_tokens.setVisible(True)
+            if hasattr(self, "btn_manual_resplit"):
+                self.btn_manual_resplit.setVisible(True)
+            self.manual_attachment_card.setVisible(has_atts)
+            self.combo_pw_exec_mode.setVisible(True)
+            self.btn_api_start.setText("API 일괄 생성 시작")
+            self.lbl_pw_exec_mode.setText("실행 방식")
+            self.btn_pw_collect_next.setText("응답 회수 · 다음 배치")
+            self.btn_manual_apply_next.setText("검증 후 엑셀 반영 · 다음 묶음 복사")
+
     def sync_from_context(self, ctx: Optional[Dict[str, Any]] = None) -> None:
         """중앙 입력창 변경(300ms 디바운스) 또는 타겟 전환 시 우측 사이드바 배치 요약을 재계산합니다."""
         if not ctx:
             ctx = self._fetch_fresh_context()
+        if not ctx and self._active_target_id:
+            fallback_kind = (
+                self._active_target_id
+                if self._active_target_id in ("ocr", "hwpx_agent", "calendar_todo")
+                else "excel_batch"
+            )
+            ctx = {"target_id": self._active_target_id, "kind": fallback_kind}
         if not ctx:
             return
         tid = str(ctx.get("target_id", "") or "")
@@ -1271,7 +1400,13 @@ class AiExecutionDock(QFrame):
 
         prev_ctx = self._last_context or {}
         prev_tid = str(prev_ctx.get("target_id", "") or "")
-        kind = str(ctx.get("kind", "excel_batch"))
+        kind = str(ctx.get("kind") or "")
+        if not kind:
+            kind = (
+                tid
+                if tid in ("ocr", "hwpx_agent", "calendar_todo")
+                else "excel_batch"
+            )
         if prev_tid and tid and prev_tid != tid:
             self.reset_target_state()
         elif kind == "hwpx_agent" and prev_ctx.get("kind") == "hwpx_agent":
@@ -1288,34 +1423,14 @@ class AiExecutionDock(QFrame):
         self._last_context = dict(ctx)
         is_excel = kind == "excel_batch"
         is_hwpx = kind == "hwpx_agent"
+        is_cal = kind == "calendar_todo"
 
         hwpx_chunks = self._ensure_hwpx_ref_chunks(ctx) if is_hwpx else []
         hwpx_total_parts = len(hwpx_chunks)
         hwpx_multi_parts = is_hwpx and hwpx_total_parts >= 2
 
-        self.hwpx_instruction_card.setVisible(is_hwpx)
-        self.chk_api_run_integrated.setVisible(is_excel)
-        self.manual_batch_card.setVisible(is_excel or hwpx_multi_parts)
-        if hasattr(self, "spin_manual_students"):
-            self.spin_manual_students.setVisible(is_excel)
-        if hasattr(self, "spin_manual_tokens"):
-            self.spin_manual_tokens.setVisible(is_excel)
-        if hasattr(self, "btn_manual_resplit"):
-            self.btn_manual_resplit.setVisible(is_excel)
-        self.manual_ocr_card.setVisible((not is_excel) and (not is_hwpx))
-        if is_hwpx:
-            self.btn_manual_apply_next.setText(
-                "JSON Patch 검증 후 적용 · 다음 파트 복사"
-                if hwpx_multi_parts
-                else "JSON Patch 검증 후 문서에 적용"
-            )
-        else:
-            self.btn_manual_apply_next.setText(
-                "검증 후 엑셀 반영 · 다음 묶음 복사" if is_excel else "검증 후 OCR 결과 반영"
-            )
-
-        # 첨부파일 목록 추출 및 수동 복붙 안내 배너 토글 (hwpx_agent는 ocr_files와 엄격 격리)
-        if is_hwpx:
+        # 첨부파일 목록 추출 및 수동 복붙 안내 배너 토글 (hwpx_agent / calendar_todo는 제외)
+        if is_hwpx or is_cal:
             attachment_paths: List[str] = []
         else:
             raw_atts = ctx.get("attachment_paths")
@@ -1323,7 +1438,13 @@ class AiExecutionDock(QFrame):
                 raw_atts = ctx.get("ocr_files") or []
             attachment_paths = [str(p).strip() for p in (raw_atts or []) if str(p).strip()]
         has_atts = len(attachment_paths) > 0
-        self.manual_attachment_card.setVisible(has_atts)
+
+        self._apply_target_visibility(
+            kind,
+            hwpx_multi_parts=hwpx_multi_parts,
+            has_atts=has_atts,
+        )
+
         if has_atts:
             self.lbl_manual_attachment_info.setText(
                 f"첨부파일 {len(attachment_paths)}개 포함: 보안상 웹 브라우저에 파일이 자동 첨부되지 않습니다. "
@@ -1368,6 +1489,10 @@ class AiExecutionDock(QFrame):
                 cur_pw = self.lbl_pw_summary.text().strip()
                 att_note = f"첨부 예정 파일 {len(attachment_paths)}개 — 자동 업로드됨"
                 self.lbl_pw_summary.setText(f"{cur_pw}\n{att_note}" if cur_pw else att_note)
+        elif is_cal:
+            msg = "단일 프롬프트 모드로 실행됩니다. 상단 입력창의 지시사항/공문을 웹 AI에 전달합니다."
+            self.lbl_pw_summary.setText(msg)
+            self.lbl_dock_progress_meta.setText("일정·할일 추출 준비 완료")
         else:
             files = ctx.get("ocr_files") or []
             cur_text = str(ctx.get("ocr_current_text", "") or "").strip()
@@ -1462,6 +1587,43 @@ class AiExecutionDock(QFrame):
                     tid, p_payload
                 )
             )
+        elif kind == "calendar_todo":
+            inst = self.txt_calendar_instruction.toPlainText().strip()
+            if not inst:
+                QMessageBox.information(
+                    self,
+                    "입력 확인",
+                    "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요.",
+                )
+                self.txt_calendar_instruction.setFocus()
+                return
+            worker = _DockApiCalendarTodoWorker(
+                instruction=self._append_quote_to_prompt(inst),
+            )
+        elif kind == "calendar_todo":
+            inst = self.txt_calendar_instruction.toPlainText().strip()
+            if not inst:
+                QMessageBox.warning(
+                    self,
+                    "입력 확인",
+                    "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요.",
+                )
+                self.txt_calendar_instruction.setFocus()
+                return
+            prompt_text = self._build_current_manual_prompt()
+            worker = WebGeminiAutoWorker(
+                excel_path=None,
+                single_prompt=prompt_text,
+                attachment_paths=attachment_paths,
+                provider=self._pw_provider,
+                custom_url=custom_url,
+                execution_mode=exec_mode,
+                require_login=False,
+                keep_login_session=keep_login,
+                use_temp_chat=use_temp_chat,
+                headless=False,
+                task_label=task_label,
+            )
         elif kind == "ocr":
             files = ctx.get("ocr_files") or []
             if not files:
@@ -1518,6 +1680,13 @@ class AiExecutionDock(QFrame):
             self.sync_from_context(self._fetch_fresh_context(target_id))
             if kind == "ocr":
                 self.lbl_dock_progress_meta.setText(f"API OCR 완료 ({res.get('count', 0)}개 파일)")
+            elif kind == "calendar_todo":
+                p_cal = res.get("parsed_calendar") or {}
+                s_cnt = len(p_cal.get("schedules") or [])
+                t_cnt = len(p_cal.get("todos") or [])
+                self.lbl_dock_progress_meta.setText(
+                    f"API 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건"
+                )
             elif kind == "hwpx_agent":
                 c_p = res.get("completed_parts", 1)
                 t_p = res.get("total_parts", 1)
@@ -1845,6 +2014,12 @@ class AiExecutionDock(QFrame):
                 current_dom_map=dom_map if isinstance(dom_map, dict) else None,
             )
             return f"{sys_p}\n\n{usr_p}"
+        if kind == "calendar_todo" or self._active_target_id == "calendar_todo":
+            inst = self.txt_calendar_instruction.toPlainText().strip()
+            if not inst:
+                return ""
+            sys_p, user_p = build_calendar_ai_prompt(self._append_quote_to_prompt(inst))
+            return f"[System 지시문]\n{sys_p}\n\n{user_p}"
         if kind == "ocr":
             from ui.tabs.tab_doc_ocr import extract_local_text_from_files
 
@@ -1930,6 +2105,20 @@ class AiExecutionDock(QFrame):
             self._manual_parsed_items = []
             self._manual_single_parsed = {}
             self.lbl_manual_verify.setText("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
+            return
+
+        if kind == "calendar_todo":
+            try:
+                parsed_cal = parse_calendar_ai_response(raw_resp)
+                self._manual_single_parsed = parsed_cal
+                s_cnt = len(parsed_cal.get("schedules") or [])
+                t_cnt = len(parsed_cal.get("todos") or [])
+                self.lbl_manual_verify.setText(
+                    f"유효한 일정·할일 JSON 확인됨 (일정 {s_cnt}건, 할일 {t_cnt}건)"
+                )
+            except Exception as exc:
+                self._manual_single_parsed = {}
+                self.lbl_manual_verify.setText(f"JSON 추출 오류: {exc}")
             return
 
         if kind in ("ocr", "hwpx_agent"):
@@ -2038,6 +2227,33 @@ class AiExecutionDock(QFrame):
                 self.lbl_manual_verify.setText("HWPX JSON Patch가 문서에 적용되었습니다.")
                 self.lbl_dock_progress_meta.setText("수동 Patch 반영 완료")
                 self.progress_dock.setValue(100)
+            return
+        if ctx.get("kind") == "calendar_todo":
+            try:
+                parsed_cal = parse_calendar_ai_response(raw_resp)
+            except Exception as exc:
+                QMessageBox.warning(self, "JSON 검증 오류", f"유효한 일정·할일 JSON 응답을 추출하지 못했습니다:\n{exc}")
+                return
+            s_cnt = len(parsed_cal.get("schedules") or [])
+            t_cnt = len(parsed_cal.get("todos") or [])
+            if s_cnt == 0 and t_cnt == 0:
+                QMessageBox.information(self, "추출 결과 없음", "추출된 일정이나 할일이 없습니다.")
+                return
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.clear()
+            self.txt_manual_response.blockSignals(False)
+            self._dispatch_result(
+                target_id,
+                {
+                    "target_id": target_id,
+                    "mode": "manual",
+                    "raw_response": raw_resp,
+                    "parsed_calendar": parsed_cal,
+                },
+            )
+            self.lbl_manual_verify.setText(f"일정 {s_cnt}건, 할일 {t_cnt}건 확인창으로 전달됨")
+            self.lbl_dock_progress_meta.setText(f"수동 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건")
+            self.progress_dock.setValue(100)
             return
         if ctx.get("kind") == "ocr":
             try:
@@ -2264,6 +2480,43 @@ class AiExecutionDock(QFrame):
                     headless=False,
                     task_label=task_label,
                 )
+        elif kind == "calendar_todo":
+            inst = self.txt_calendar_instruction.toPlainText().strip()
+            if not inst:
+                QMessageBox.information(
+                    self,
+                    "입력 확인",
+                    "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요.",
+                )
+                self.txt_calendar_instruction.setFocus()
+                return
+            worker = _DockApiCalendarTodoWorker(
+                instruction=self._append_quote_to_prompt(inst),
+            )
+        elif kind == "calendar_todo":
+            inst = self.txt_calendar_instruction.toPlainText().strip()
+            if not inst:
+                QMessageBox.warning(
+                    self,
+                    "입력 확인",
+                    "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요.",
+                )
+                self.txt_calendar_instruction.setFocus()
+                return
+            prompt_text = self._build_current_manual_prompt()
+            worker = WebGeminiAutoWorker(
+                excel_path=None,
+                single_prompt=prompt_text,
+                attachment_paths=attachment_paths,
+                provider=self._pw_provider,
+                custom_url=custom_url,
+                execution_mode=exec_mode,
+                require_login=False,
+                keep_login_session=keep_login,
+                use_temp_chat=use_temp_chat,
+                headless=False,
+                task_label=task_label,
+            )
         elif kind == "ocr":
             prompt_text = self._build_current_manual_prompt()
             if not prompt_text:
@@ -2321,7 +2574,7 @@ class AiExecutionDock(QFrame):
         self.progress_dock.setValue(0)
         self.lbl_dock_progress_meta.setText(
             f"[{task_label}] Playwright 브라우저 실행 중..."
-            if kind in ("ocr", "hwpx_agent")
+            if kind in ("ocr", "hwpx_agent", "calendar_todo")
             else "Playwright 브라우저 실행 중..."
         )
 
