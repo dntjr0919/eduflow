@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import webbrowser
 
 import pandas as pd
@@ -47,7 +47,17 @@ from services.batch_prompt_service import (
     normalize_student_id_str,
     resolve_batch_output_path,
 )
+from services.hwpx_agent_service import (
+    HwpxDocument,
+    apply_hwpx_operations,
+    build_hwpx_agent_prompt,
+    build_hwpx_create_prompt,
+    create_minimal_hwpx_document,
+    extract_hwpx_dom_map,
+    extract_hwpx_reference_chunks,
+)
 from services.llm_client import (
+    MultiLlmClient,
     build_structured_prompt,
     extract_json_from_llm_response,
     format_parsed_json_to_readable_text,
@@ -255,28 +265,135 @@ class _DockApiOcrWorker(BaseWorker):
         }
 
 
-class _DockApiHwpxAgentWorker(BaseWorker):
-    """HWPX AI 문서 에이전트용 API 단일 JSON Patch 생성 워커."""
+def _build_running_hwpx_seed_from_dom(dom_map: Optional[Dict[str, Any]]) -> HwpxDocument:
+    """실행 워커 전용 경량 HwpxDocument 스냅샷을 DOM 맵으로부터 생성합니다."""
+    seed_doc = create_minimal_hwpx_document(title="새 양식", empty=True)
+    if not isinstance(dom_map, dict):
+        return seed_doc
+    blocks = dom_map.get("blocks") or []
+    seed_ops: List[Dict[str, Any]] = []
+    for blk in blocks:
+        if blk.get("type") == "table":
+            raw_rows = blk.get("rows") or []
+            str_rows = [[str(c.get("text", "")) for c in row] for row in raw_rows]
+            seed_ops.append({"op": "append_table", "headers": [], "rows": str_rows})
+        else:
+            if blk.get("page_break"):
+                seed_ops.append({"op": "page_break"})
+            else:
+                seed_ops.append({"op": "append_paragraph", "text": str(blk.get("text", ""))})
+    if seed_ops:
+        apply_hwpx_operations(seed_doc, seed_ops)
+    return seed_doc
 
-    def __init__(self, dom_map: Dict[str, Any], instruction: str):
+
+class _DockApiHwpxAgentWorker(BaseWorker):
+    """HWPX AI 문서 에이전트용 API 단일/분할 JSON Patch 생성 워커."""
+
+    part_completed = pyqtSignal(dict)
+
+    def __init__(
+        self,
+        dom_map: Optional[Dict[str, Any]],
+        instruction: str,
+        *,
+        is_create_mode: bool = False,
+        ref_chunks: Optional[List[Dict[str, Any]]] = None,
+    ):
         super().__init__(task_name="HWPX AI 문서 에이전트 (API)")
         self.dom_map = dom_map
         self.instruction = instruction
+        self.is_create_mode = bool(is_create_mode)
+        self.ref_chunks: List[Dict[str, Any]] = list(ref_chunks or [])
 
     def execute(self) -> Dict[str, Any]:
-        from services.hwpx_agent_service import build_hwpx_agent_prompt
-
-        self.emit_progress(25, "HWPX DOM 맵 분석 및 AI 프롬프트 전송 중...")
-        sys_p, usr_p = build_hwpx_agent_prompt(self.dom_map, self.instruction)
         client = MultiLlmClient()
-        raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
-        parsed = extract_json_from_llm_response(raw_reply)
-        self.emit_progress(100, "JSON Patch 생성 완료")
+        total_parts = len(self.ref_chunks) if self.ref_chunks else 1
+
+        # 단일 파트 (기존 수정 모드 또는 지시사항/단일참고 생성 모드)
+        if total_parts <= 1:
+            ref_content = str(self.ref_chunks[0].get("content", "")) if self.ref_chunks else ""
+            if self.is_create_mode or ref_content:
+                self.emit_progress(25, "새 HWPX 양식 생성 프롬프트 전송 중...")
+                sys_p, usr_p = build_hwpx_create_prompt(
+                    user_instruction=self.instruction,
+                    reference_chunk=ref_content,
+                    part_index=1,
+                    total_parts=1,
+                    current_dom_map=self.dom_map,
+                )
+            else:
+                self.emit_progress(25, "HWPX DOM 맵 분석 및 AI 프롬프트 전송 중...")
+                sys_p, usr_p = build_hwpx_agent_prompt(self.dom_map or {}, self.instruction)
+
+            raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+            parsed = extract_json_from_llm_response(raw_reply)
+            self.emit_progress(100, "JSON Patch 생성 완료")
+            return {
+                "target_id": "hwpx_agent",
+                "mode": "api",
+                "parsed_json": parsed,
+                "raw_response": raw_reply,
+                "immediate": bool(self.is_create_mode or ref_content),
+                "already_applied_parts": False,
+                "completed_parts": 1,
+                "total_parts": 1,
+            }
+
+        # 다중 분할 파트(Part 1/N ~ Part N/N) 순차 생성
+        running_doc = _build_running_hwpx_seed_from_dom(self.dom_map)
+        last_parsed: Dict[str, Any] = {}
+        last_raw: str = ""
+        completed_parts = 0
+
+        for idx, chunk in enumerate(self.ref_chunks, start=1):
+            if self.is_stop_requested():
+                break
+            pct_start = int(((idx - 1) / max(1, total_parts)) * 100)
+            self.emit_progress(
+                max(5, pct_start),
+                f"HWPX 양식 분할 생성 중... (Part {idx}/{total_parts})",
+            )
+            cur_dom = extract_hwpx_dom_map(running_doc)
+            sys_p, usr_p = build_hwpx_create_prompt(
+                user_instruction=self.instruction,
+                reference_chunk=str(chunk.get("content", "")),
+                part_index=idx,
+                total_parts=total_parts,
+                current_dom_map=cur_dom,
+            )
+            raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+            parsed = extract_json_from_llm_response(raw_reply)
+            ops = parsed.get("operations") if isinstance(parsed, dict) else None
+            if isinstance(ops, list) and ops:
+                apply_hwpx_operations(running_doc, [o for o in ops if isinstance(o, dict)])
+            last_parsed = parsed if isinstance(parsed, dict) else {}
+            last_raw = raw_reply
+            completed_parts = idx
+            self.part_completed.emit(
+                {
+                    "target_id": "hwpx_agent",
+                    "mode": "api",
+                    "part_index": idx,
+                    "total_parts": total_parts,
+                    "parsed_json": last_parsed,
+                    "raw_response": raw_reply,
+                    "immediate": True,
+                }
+            )
+            self.emit_progress(
+                int((idx / max(1, total_parts)) * 100),
+                f"Part {idx}/{total_parts} 생성·반영 완료",
+            )
+
         return {
             "target_id": "hwpx_agent",
             "mode": "api",
-            "parsed_json": parsed,
-            "raw_response": raw_reply,
+            "parsed_json": last_parsed,
+            "raw_response": last_raw,
+            "already_applied_parts": True,
+            "completed_parts": completed_parts,
+            "total_parts": total_parts,
         }
 
 
@@ -313,6 +430,12 @@ class AiExecutionDock(QFrame):
         self._pw_provider: str = "gemini"
         self._active_pw_worker: Optional[WebGeminiAutoWorker] = None
         self._is_api_running: bool = False
+        self._pw_single_batches_applied: bool = False
+
+        # HWPX 참고 문서 청크 상태
+        self._hwpx_ref_chunks: List[Dict[str, Any]] = []
+        self._hwpx_ref_signature: Tuple[str, ...] = ()
+        self._hwpx_ref_error: str = ""
 
         # 미리보기 선택 인용 상태
         self._quoted_text: str = ""
@@ -965,6 +1088,9 @@ class AiExecutionDock(QFrame):
         self._manual_batches = []
         self._manual_parsed_items = []
         self._manual_single_parsed = {}
+        self._hwpx_ref_chunks = []
+        self._hwpx_ref_signature = ()
+        self._hwpx_ref_error = ""
         if hasattr(self, "btn_dock_open_excel"):
             self.btn_dock_open_excel.setEnabled(False)
         if hasattr(self, "txt_manual_response"):
@@ -1107,18 +1233,33 @@ class AiExecutionDock(QFrame):
             if (prev_doc_id and new_doc_id and prev_doc_id != new_doc_id) or (
                 prev_hwpx_path and new_hwpx_path and prev_hwpx_path != new_hwpx_path
             ):
+                # 문서 전환/새 양식 클릭 시에도 중앙 탭의 첨부 참고목록 캐시는 sync 아래에서 재평가되도록 둠
                 self.reset_target_state()
 
         self._last_context = dict(ctx)
         is_excel = kind == "excel_batch"
         is_hwpx = kind == "hwpx_agent"
 
+        hwpx_chunks = self._ensure_hwpx_ref_chunks(ctx) if is_hwpx else []
+        hwpx_total_parts = len(hwpx_chunks)
+        hwpx_multi_parts = is_hwpx and hwpx_total_parts >= 2
+
         self.hwpx_instruction_card.setVisible(is_hwpx)
         self.chk_api_run_integrated.setVisible(is_excel)
-        self.manual_batch_card.setVisible(is_excel)
+        self.manual_batch_card.setVisible(is_excel or hwpx_multi_parts)
+        if hasattr(self, "spin_manual_students"):
+            self.spin_manual_students.setVisible(is_excel)
+        if hasattr(self, "spin_manual_tokens"):
+            self.spin_manual_tokens.setVisible(is_excel)
+        if hasattr(self, "btn_manual_resplit"):
+            self.btn_manual_resplit.setVisible(is_excel)
         self.manual_ocr_card.setVisible((not is_excel) and (not is_hwpx))
         if is_hwpx:
-            self.btn_manual_apply_next.setText("JSON Patch 검증 후 문서에 적용")
+            self.btn_manual_apply_next.setText(
+                "JSON Patch 검증 후 적용 · 다음 파트 복사"
+                if hwpx_multi_parts
+                else "JSON Patch 검증 후 문서에 적용"
+            )
         else:
             self.btn_manual_apply_next.setText(
                 "검증 후 엑셀 반영 · 다음 묶음 복사" if is_excel else "검증 후 OCR 결과 반영"
@@ -1147,12 +1288,25 @@ class AiExecutionDock(QFrame):
         if is_hwpx:
             dom_map = ctx.get("dom_map")
             hwpx_path = str(ctx.get("hwpx_path", "") or "").strip()
-            if isinstance(dom_map, dict):
+            ref_files = ctx.get("reference_files") or []
+            is_create = bool(ctx.get("is_create_mode"))
+            self._sync_hwpx_manual_part_combo(hwpx_chunks)
+            if self._hwpx_ref_error:
+                msg = f"참고 문서 파싱 경고: {self._hwpx_ref_error}"
+            elif is_create or ref_files or not isinstance(dom_map, dict):
+                blk_cnt = dom_map.get("block_count", len(dom_map.get("blocks", []))) if isinstance(dom_map, dict) else 0
+                if hwpx_multi_parts:
+                    msg = f"새 HWPX 양식 생성 · 참고 {len(ref_files)}건 (Part 1~{hwpx_total_parts} 분할, 현재 {blk_cnt}블록)"
+                elif ref_files:
+                    msg = f"새 HWPX 양식 생성 · 참고 {len(ref_files)}건 (단일 파트, 현재 {blk_cnt}블록)"
+                elif isinstance(dom_map, dict):
+                    msg = f"새 HWPX 양식 생성 모드 (지시사항 단독, 현재 {blk_cnt}블록)"
+                else:
+                    msg = "지시사항 입력 후 실행 시 새 .hwpx 양식이 자동 생성됩니다."
+            else:
                 blk_cnt = dom_map.get("block_count", len(dom_map.get("blocks", [])))
                 fname = Path(hwpx_path).name if hwpx_path else dom_map.get("file_name", "HWPX")
                 msg = f"HWPX 로드됨: {fname} (블록 {blk_cnt}개)"
-            else:
-                msg = "중앙 [4. HWPX AI 문서 에이전트] 탭에서 .hwpx 파일을 먼저 열어주세요."
             self.lbl_api_summary.setText(msg)
             self.lbl_pw_summary.setText(msg)
             self.lbl_dock_progress_meta.setText(msg)
@@ -1232,20 +1386,31 @@ class AiExecutionDock(QFrame):
         if kind == "hwpx_agent":
             dom_map = ctx.get("dom_map")
             inst = self.txt_hwpx_instruction.toPlainText().strip()
-            if not isinstance(dom_map, dict):
-                QMessageBox.information(
-                    self, "문서 확인", "중앙 [4. HWPX AI 문서 에이전트] 탭에서 .hwpx 파일을 먼저 열어주세요."
-                )
+            chunks = self._ensure_hwpx_ref_chunks(ctx)
+            if self._hwpx_ref_error:
+                QMessageBox.warning(self, "참고 문서 오류", self._hwpx_ref_error)
                 return
-            if not inst:
-                QMessageBox.information(
-                    self, "지시사항 확인", "상단 입력창에 문서 수정 지시사항을 입력해 주세요."
+            create_or_ref = self._is_hwpx_create_or_ref_mode(ctx)
+            if not inst and not chunks:
+                msg = (
+                    "상단 입력창에 생성할 양식 지시사항을 입력하거나 참고 파일을 첨부해 주세요."
+                    if create_or_ref
+                    else "상단 입력창에 문서 수정 또는 새 양식 생성 지시사항을 입력해 주세요."
                 )
+                QMessageBox.information(self, "지시사항 확인", msg)
                 self.txt_hwpx_instruction.setFocus()
                 return
+            effective_inst = inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
             worker = _DockApiHwpxAgentWorker(
-                dom_map=dom_map,
-                instruction=self._append_quote_to_prompt(inst),
+                dom_map=dom_map if isinstance(dom_map, dict) else None,
+                instruction=self._append_quote_to_prompt(effective_inst),
+                is_create_mode=create_or_ref,
+                ref_chunks=chunks,
+            )
+            worker.part_completed.connect(
+                lambda p_payload, tid=str(ctx.get("target_id", self._active_target_id)): self._on_api_hwpx_part_completed(
+                    tid, p_payload
+                )
             )
         elif kind == "ocr":
             files = ctx.get("ocr_files") or []
@@ -1298,10 +1463,19 @@ class AiExecutionDock(QFrame):
             out_path = str(res.get("output_path", "") or "")
             if out_path:
                 self._set_result_excel_path(out_path)
-            self._dispatch_result(target_id, res)
+            if not res.get("already_applied_parts"):
+                self._dispatch_result(target_id, res)
             self.sync_from_context(self._fetch_fresh_context(target_id))
             if kind == "ocr":
                 self.lbl_dock_progress_meta.setText(f"API OCR 완료 ({res.get('count', 0)}개 파일)")
+            elif kind == "hwpx_agent":
+                c_p = res.get("completed_parts", 1)
+                t_p = res.get("total_parts", 1)
+                self.lbl_dock_progress_meta.setText(
+                    f"API HWPX 양식 완료 ({c_p}/{t_p} 파트)"
+                    if t_p > 1
+                    else "API HWPX Patch 생성 완료"
+                )
             else:
                 self.lbl_dock_progress_meta.setText(
                     f"API 완료 · {res.get('completed', 0)}/{res.get('total', 0)}명"
@@ -1467,10 +1641,105 @@ class AiExecutionDock(QFrame):
             return self._manual_batches[idx]
         return None
 
+    def _ensure_hwpx_ref_chunks(self, ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """참고 파일 목록이 변경된 경우에만 extract_hwpx_reference_chunks()를 재파싱해 캐시합니다."""
+        target_ctx = ctx if ctx is not None else self._last_context
+        ref_files = tuple(
+            str(p).strip() for p in (target_ctx.get("reference_files") or []) if str(p).strip()
+        )
+        if ref_files != self._hwpx_ref_signature:
+            self._hwpx_ref_signature = ref_files
+            self._hwpx_ref_error = ""
+            if not ref_files:
+                self._hwpx_ref_chunks = []
+            else:
+                try:
+                    self._hwpx_ref_chunks = extract_hwpx_reference_chunks(
+                        list(ref_files), max_chars_per_chunk=8000
+                    )
+                except Exception as exc:
+                    self._hwpx_ref_chunks = []
+                    self._hwpx_ref_error = str(exc)
+        return self._hwpx_ref_chunks
+
+    def _is_hwpx_create_or_ref_mode(self, ctx: Optional[Dict[str, Any]] = None) -> bool:
+        """새 양식 생성 모드이거나 참고 파일이 첨부되었거나 빈 문서 상태인지 판별합니다."""
+        target_ctx = ctx if ctx is not None else self._last_context
+        if bool(target_ctx.get("is_create_mode")):
+            return True
+        if target_ctx.get("reference_files"):
+            return True
+        dom_map = target_ctx.get("dom_map")
+        if not isinstance(dom_map, dict):
+            return True
+        return int(dom_map.get("block_count", len(dom_map.get("blocks", []))) or 0) == 0
+
+    def _sync_hwpx_manual_part_combo(self, chunks: List[Dict[str, Any]]) -> None:
+        """참고 문서가 2개 이상 파트로 분할된 경우 combo_manual_batch를 Part 1/N..N/N 목록으로 동기화합니다."""
+        if len(chunks) < 2:
+            if self._manual_batches and self._manual_batches[0].get("is_hwpx_part"):
+                self._manual_batches = []
+                self.combo_manual_batch.blockSignals(True)
+                self.combo_manual_batch.clear()
+                self.combo_manual_batch.blockSignals(False)
+            return
+
+        already_matches = (
+            len(self._manual_batches) == len(chunks)
+            and all(b.get("is_hwpx_part") for b in self._manual_batches)
+            and all(
+                self._manual_batches[i].get("content") == chunks[i].get("content")
+                for i in range(len(chunks))
+            )
+        )
+        if already_matches and self.combo_manual_batch.count() == len(chunks):
+            self._update_manual_batch_meta_label()
+            return
+
+        prev_idx = self.combo_manual_batch.currentIndex()
+        self._manual_batches = [
+            {
+                "batch_index": int(c.get("part_index", idx + 1)),
+                "total_parts": int(c.get("total_parts", len(chunks))),
+                "content": str(c.get("content", "")),
+                "students": [],
+                "estimated_tokens": max(1, len(str(c.get("content", ""))) // 2),
+                "is_hwpx_part": True,
+            }
+            for idx, c in enumerate(chunks)
+        ]
+        self.combo_manual_batch.blockSignals(True)
+        self.combo_manual_batch.clear()
+        total_p = len(self._manual_batches)
+        for idx, part in enumerate(self._manual_batches, start=1):
+            char_cnt = len(part["content"])
+            self.combo_manual_batch.addItem(
+                f"Part {idx}/{total_p} ({char_cnt:,}자 · 예상 {part['estimated_tokens']:,} 토큰)"
+            )
+        if 0 <= prev_idx < total_p:
+            self.combo_manual_batch.setCurrentIndex(prev_idx)
+        elif total_p > 0:
+            self.combo_manual_batch.setCurrentIndex(0)
+        self.combo_manual_batch.blockSignals(False)
+        self._update_manual_batch_meta_label()
+
+    def _on_api_hwpx_part_completed(self, target_id: str, payload: Dict[str, Any]) -> None:
+        self._dispatch_result(target_id, payload)
+        self.sync_from_context(self._fetch_fresh_context(target_id))
+
     def _update_manual_batch_meta_label(self) -> None:
         batch = self._get_current_manual_batch()
         if batch is None:
             self.lbl_manual_batch_meta.setText("선택된 배치가 없습니다.")
+            return
+        if batch.get("is_hwpx_part"):
+            p_idx = batch.get("batch_index", 1)
+            t_parts = batch.get("total_parts", 1)
+            c_len = len(str(batch.get("content", "")))
+            self.lbl_manual_batch_meta.setText(
+                f"선택 파트: Part {p_idx}/{t_parts} · 참고 텍스트 {c_len:,}자"
+            )
+            self._on_manual_response_changed()
             return
         stus = batch.get("students", [])
         toks = batch.get("estimated_tokens", 0)
@@ -1491,11 +1760,38 @@ class AiExecutionDock(QFrame):
         if kind == "hwpx_agent" or self._active_target_id == "hwpx_agent":
             dom_map = ctx.get("dom_map")
             inst = self.txt_hwpx_instruction.toPlainText().strip()
-            if not isinstance(dom_map, dict) or not inst:
+            chunks = self._ensure_hwpx_ref_chunks(ctx)
+            if self._hwpx_ref_error:
                 return ""
-            from services.hwpx_agent_service import build_hwpx_agent_prompt
+            create_or_ref = self._is_hwpx_create_or_ref_mode(ctx)
+            if not create_or_ref:
+                if not isinstance(dom_map, dict) or not inst:
+                    return ""
+                sys_p, usr_p = build_hwpx_agent_prompt(dom_map, self._append_quote_to_prompt(inst))
+                return f"{sys_p}\n\n{usr_p}"
 
-            sys_p, usr_p = build_hwpx_agent_prompt(dom_map, self._append_quote_to_prompt(inst))
+            if not inst and not chunks:
+                return ""
+            effective_inst = inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
+            if chunks:
+                self._sync_hwpx_manual_part_combo(chunks)
+                total_parts = len(chunks)
+                cur_idx = max(0, min(self.combo_manual_batch.currentIndex(), total_parts - 1))
+                part_chunk = chunks[cur_idx]
+                ref_content = str(part_chunk.get("content", ""))
+                part_index = int(part_chunk.get("part_index", cur_idx + 1))
+            else:
+                total_parts = 1
+                part_index = 1
+                ref_content = ""
+
+            sys_p, usr_p = build_hwpx_create_prompt(
+                user_instruction=self._append_quote_to_prompt(effective_inst),
+                reference_chunk=ref_content,
+                part_index=part_index,
+                total_parts=total_parts,
+                current_dom_map=dom_map if isinstance(dom_map, dict) else None,
+            )
             return f"{sys_p}\n\n{usr_p}"
         if kind == "ocr":
             from ui.tabs.tab_doc_ocr import extract_local_text_from_files
@@ -1644,16 +1940,52 @@ class AiExecutionDock(QFrame):
             except Exception as exc:
                 QMessageBox.warning(self, "JSON 검증 오류", f"유효한 JSON Patch 응답을 추출하지 못했습니다:\n{exc}")
                 return
+            chunks = self._ensure_hwpx_ref_chunks(ctx)
+            total_parts = len(chunks)
+            is_multi_parts = total_parts >= 2
+            cur_idx = max(0, self.combo_manual_batch.currentIndex()) if is_multi_parts else 0
+            create_or_ref = self._is_hwpx_create_or_ref_mode(ctx)
+
             self.txt_manual_response.blockSignals(True)
             self.txt_manual_response.clear()
             self.txt_manual_response.blockSignals(False)
             self._dispatch_result(
                 target_id,
-                {"target_id": target_id, "mode": "manual", "parsed_json": parsed},
+                {
+                    "target_id": target_id,
+                    "mode": "manual",
+                    "parsed_json": parsed,
+                    "immediate": bool(is_multi_parts or create_or_ref),
+                },
             )
-            self.lbl_manual_verify.setText("HWPX JSON Patch가 문서에 적용되었습니다.")
-            self.lbl_dock_progress_meta.setText("수동 Patch 반영 완료")
-            self.progress_dock.setValue(100)
+
+            if is_multi_parts and cur_idx + 1 < total_parts:
+                next_idx = cur_idx + 1
+                self.combo_manual_batch.setCurrentIndex(next_idx)
+                self.sync_from_context(self._fetch_fresh_context(target_id))
+                self.combo_manual_batch.setCurrentIndex(next_idx)
+                next_prompt = self._build_current_manual_prompt()
+                if next_prompt:
+                    QApplication.clipboard().setText(next_prompt)
+                pct = int(((cur_idx + 1) / total_parts) * 100)
+                self.progress_dock.setValue(pct)
+                self.lbl_manual_verify.setText(
+                    f"Part {cur_idx + 1}/{total_parts} 적용 완료 · Part {next_idx + 1}/{total_parts} 프롬프트 클립보드 복사됨!"
+                )
+                self.lbl_dock_progress_meta.setText(
+                    f"수동 파트 {cur_idx + 1}/{total_parts} 반영 완료"
+                )
+            elif is_multi_parts:
+                self.sync_from_context(self._fetch_fresh_context(target_id))
+                self.lbl_manual_verify.setText(
+                    f"전체 {total_parts}/{total_parts} 파트 HWPX 문서 반영 완료!"
+                )
+                self.lbl_dock_progress_meta.setText(f"수동 생성 {total_parts}/{total_parts} 완료")
+                self.progress_dock.setValue(100)
+            else:
+                self.lbl_manual_verify.setText("HWPX JSON Patch가 문서에 적용되었습니다.")
+                self.lbl_dock_progress_meta.setText("수동 Patch 반영 완료")
+                self.progress_dock.setValue(100)
             return
         if ctx.get("kind") == "ocr":
             try:
@@ -1796,15 +2128,95 @@ class AiExecutionDock(QFrame):
             or ("HWPX 문서 편집" if kind == "hwpx_agent" else "단일 OCR/보정")
         ).strip()
 
-        if kind in ("ocr", "hwpx_agent"):
-            prompt_text = self._build_current_manual_prompt()
-            if not prompt_text:
+        if kind == "hwpx_agent":
+            chunks = self._ensure_hwpx_ref_chunks(ctx)
+            if self._hwpx_ref_error:
+                QMessageBox.warning(self, "참고 문서 오류", self._hwpx_ref_error)
+                return
+            inst = self.txt_hwpx_instruction.toPlainText().strip()
+            create_or_ref = self._is_hwpx_create_or_ref_mode(ctx)
+            if not inst and not chunks:
                 msg = (
-                    "중앙 탭에서 HWPX 문서를 열고 수정 지시사항을 입력해 주세요."
-                    if kind == "hwpx_agent"
-                    else "중앙 탭에서 파일이나 보정 지침을 확인해 주세요."
+                    "상단 입력창에 생성할 양식 지시사항을 입력하거나 참고 파일을 첨부해 주세요."
+                    if create_or_ref
+                    else "중앙 탭에서 HWPX 문서를 열고 수정 지시사항을 입력해 주세요."
                 )
                 QMessageBox.warning(self, "입력 확인", msg)
+                return
+
+            if len(chunks) >= 2:
+                effective_inst = self._append_quote_to_prompt(
+                    inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
+                )
+                running_doc = _build_running_hwpx_seed_from_dom(ctx.get("dom_map"))
+                placeholders = [
+                    f"[Part {c['part_index']}/{len(chunks)}] {str(c.get('content', ''))[:80]}"
+                    for c in chunks
+                ]
+
+                def _build_pw_part_prompt(
+                    b_idx: int, total_b: int, prev_res: Optional[Dict[str, Any]]
+                ) -> str:
+                    if b_idx > 1 and isinstance(prev_res, dict):
+                        p_json = prev_res.get("parsed_json")
+                        ops = p_json.get("operations") if isinstance(p_json, dict) else None
+                        if isinstance(ops, list) and ops:
+                            apply_hwpx_operations(
+                                running_doc, [o for o in ops if isinstance(o, dict)]
+                            )
+                    cur_dom = extract_hwpx_dom_map(running_doc)
+                    ref_txt = str(chunks[b_idx - 1].get("content", ""))
+                    sys_p, usr_p = build_hwpx_create_prompt(
+                        user_instruction=effective_inst,
+                        reference_chunk=ref_txt,
+                        part_index=b_idx,
+                        total_parts=total_b,
+                        current_dom_map=cur_dom,
+                    )
+                    return f"{sys_p}\n\n{usr_p}"
+
+                worker = WebGeminiAutoWorker(
+                    excel_path=None,
+                    single_prompts=placeholders,
+                    prompt_builder=_build_pw_part_prompt,
+                    attachment_paths=attachment_paths,
+                    provider=self._pw_provider,
+                    custom_url=custom_url,
+                    execution_mode=exec_mode,
+                    require_login=False,
+                    keep_login_session=keep_login,
+                    use_temp_chat=use_temp_chat,
+                    headless=False,
+                    task_label=task_label,
+                )
+            else:
+                prompt_text = self._build_current_manual_prompt()
+                if not prompt_text:
+                    QMessageBox.warning(
+                        self,
+                        "입력 확인",
+                        "중앙 탭에서 HWPX 문서를 열고 수정/생성 지시사항을 입력해 주세요.",
+                    )
+                    return
+                worker = WebGeminiAutoWorker(
+                    excel_path=None,
+                    single_prompt=prompt_text,
+                    attachment_paths=attachment_paths,
+                    provider=self._pw_provider,
+                    custom_url=custom_url,
+                    execution_mode=exec_mode,
+                    require_login=False,
+                    keep_login_session=keep_login,
+                    use_temp_chat=use_temp_chat,
+                    headless=False,
+                    task_label=task_label,
+                )
+        elif kind == "ocr":
+            prompt_text = self._build_current_manual_prompt()
+            if not prompt_text:
+                QMessageBox.warning(
+                    self, "입력 확인", "중앙 탭에서 파일이나 보정 지침을 확인해 주세요."
+                )
                 return
             worker = WebGeminiAutoWorker(
                 excel_path=None,
@@ -1851,6 +2263,7 @@ class AiExecutionDock(QFrame):
         worker.batch_completed.connect(lambda payload, tid=target_id: self._on_pw_batch_completed(tid, payload))
 
         self._active_pw_worker = worker
+        self._pw_single_batches_applied = False
         self._set_pw_running_state(True)
         self.progress_dock.setValue(0)
         self.lbl_dock_progress_meta.setText(
@@ -1936,6 +2349,8 @@ class AiExecutionDock(QFrame):
         out_path = str(payload.get("output_path", "") or "")
         if out_path:
             self._set_result_excel_path(out_path)
+        if payload.get("is_single_prompt"):
+            self._pw_single_batches_applied = True
         self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **payload})
         self.sync_from_context(self._fetch_fresh_context(target_id))
 
@@ -1951,7 +2366,9 @@ class AiExecutionDock(QFrame):
         out_path = str(res.get("output_path", "") or "")
         if out_path:
             self._set_result_excel_path(out_path)
-        self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **res})
+        if not self._pw_single_batches_applied:
+            self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **res})
+        self._pw_single_batches_applied = False
         self.sync_from_context(self._fetch_fresh_context(target_id))
 
     def _on_pw_error(self, err: str) -> None:

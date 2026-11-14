@@ -101,6 +101,11 @@ QListWidget#SidebarNavList {
     outline: none;
 }
 
+QListWidget#SidebarNavList:focus {
+    border: none;
+    outline: none;
+}
+
 QListWidget#SidebarNavList::item {
     background-color: transparent;
     color: #94A3B8;

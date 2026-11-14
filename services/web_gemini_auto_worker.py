@@ -395,6 +395,8 @@ class WebGeminiAutoWorker(BaseWorker):
         custom_url: str = "",
         keep_login_session: bool = True,
         single_prompt: Optional[str] = None,
+        single_prompts: Optional[List[str]] = None,
+        prompt_builder: Optional[Any] = None,
         attachment_paths: Optional[List[str]] = None,
         task_label: str = "단일 AI 작업",
     ):
@@ -425,6 +427,10 @@ class WebGeminiAutoWorker(BaseWorker):
         super().__init__(task_name=f"Playwright 웹 {self.provider_config['name']} {mode_tag}")
 
         self.single_prompt = str(single_prompt).strip() if single_prompt else None
+        self.single_prompts: List[str] = [
+            str(p).strip() for p in (single_prompts or []) if str(p).strip()
+        ]
+        self.prompt_builder = prompt_builder
         self.task_label = str(task_label or "단일 AI 작업").strip() or "단일 AI 작업"
         self.attachment_paths: List[str] = [
             str(p).strip() for p in (attachment_paths or []) if str(p).strip()
@@ -2664,7 +2670,20 @@ class WebGeminiAutoWorker(BaseWorker):
         return cleaned
 
     def _build_execution_batches(self) -> List[Dict[str, Any]]:
-        """실행 대상 배치 목록을 생성합니다 (엑셀 배치 또는 단일 프롬프트)."""
+        """실행 대상 배치 목록을 생성합니다 (엑셀 배치 또는 단일/다중 파트 프롬프트)."""
+        if self.single_prompts:
+            out_batches: List[Dict[str, Any]] = []
+            for idx, sp in enumerate(self.single_prompts, start=1):
+                out_batches.append(
+                    {
+                        "batch_index": idx,
+                        "students": [],
+                        "estimated_tokens": max(1, len(sp) // 2),
+                        "final_prompt": sp,
+                        "is_single_prompt": True,
+                    }
+                )
+            return out_batches
         if self.single_prompt:
             return [
                 {
@@ -2884,9 +2903,20 @@ class WebGeminiAutoWorker(BaseWorker):
 
                 students = batch.get("students", [])
                 is_single = bool(batch.get("is_single_prompt", False))
+                if is_single and callable(self.prompt_builder):
+                    built_prompt = str(
+                        self.prompt_builder(b_idx, total_batches, last_single_result) or ""
+                    ).strip()
+                    if built_prompt:
+                        batch["final_prompt"] = built_prompt
+                        batch["estimated_tokens"] = max(1, len(built_prompt) // 2)
                 est_tokens = batch.get("estimated_tokens", 0)
                 pct_base = int(((b_idx - 1) / max(1, total_batches)) * 100)
-                stu_info = self.task_label if is_single else f"{len(students)}명"
+                stu_info = (
+                    f"{self.task_label} (Part {b_idx}/{total_batches})"
+                    if (is_single and total_batches > 1)
+                    else (self.task_label if is_single else f"{len(students)}명")
+                )
                 self.emit_progress(
                     max(5, pct_base),
                     f"[{provider_name}] Batch {b_idx}/{total_batches} 실행 중 ({stu_info} | 예상 {est_tokens:,} 토큰)...",
@@ -2906,13 +2936,20 @@ class WebGeminiAutoWorker(BaseWorker):
                     if is_single:
                         completed_batches += 1
                         last_single_result = semi_res
-                        self.emit_progress(100, f"[{provider_name}] 응답 회수 완료")
+                        pct_done = int((b_idx / max(1, total_batches)) * 100)
+                        self.emit_progress(
+                            pct_done,
+                            f"[{provider_name}] Part {b_idx}/{total_batches} 응답 회수 완료"
+                            if total_batches > 1
+                            else f"[{provider_name}] 응답 회수 완료",
+                        )
                         self.batch_completed.emit(
                             {
                                 "provider": self.provider,
                                 "batch_index": b_idx,
                                 "total_batches": total_batches,
                                 "is_single_prompt": True,
+                                "immediate": bool(total_batches > 1),
                                 "raw_response": semi_res.get("raw_reply", ""),
                                 "parsed_json": semi_res.get("parsed_json", {}),
                                 "formatted_text": semi_res.get("formatted_text", ""),
@@ -3017,13 +3054,20 @@ class WebGeminiAutoWorker(BaseWorker):
                                 "parsed_json": parsed_json,
                                 "formatted_text": formatted,
                             }
-                            self.emit_progress(100, f"[{provider_name}] 응답 수신 및 변환 완료")
+                            pct_done = int((b_idx / max(1, total_batches)) * 100)
+                            self.emit_progress(
+                                pct_done,
+                                f"[{provider_name}] Part {b_idx}/{total_batches} 응답 수신 완료"
+                                if total_batches > 1
+                                else f"[{provider_name}] 응답 수신 및 변환 완료",
+                            )
                             self.batch_completed.emit(
                                 {
                                     "provider": self.provider,
                                     "batch_index": b_idx,
                                     "total_batches": total_batches,
                                     "is_single_prompt": True,
+                                    "immediate": bool(total_batches > 1),
                                     "raw_response": raw_reply,
                                     "parsed_json": parsed_json,
                                     "formatted_text": formatted,
@@ -3098,7 +3142,7 @@ class WebGeminiAutoWorker(BaseWorker):
                     self._sleep_interruptible(wait_sec)
 
             if not self.is_stop_requested():
-                if self.single_prompt:
+                if self.single_prompt or self.single_prompts:
                     self.emit_progress(100, f"[{provider_name}] 처리 완료")
                 else:
                     self.emit_progress(
@@ -3125,6 +3169,7 @@ class WebGeminiAutoWorker(BaseWorker):
             "applied_students": total_applied,
             "failed_batches": failed_batches,
             "missing_playwright": False,
+            "is_multi_single": bool(len(self.single_prompts) > 1),
             "output_path": last_saved_path,
             "formatted_text": last_single_result.get("formatted_text", ""),
             "raw_response": last_single_result.get("raw_reply", ""),

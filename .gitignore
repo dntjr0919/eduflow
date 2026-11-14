@@ -51,5 +51,6 @@ data/
 #문서 파일
 *.hwp
 *.hwpx
+!assets/blank_template.hwpx
 *.xlsx
 *.pdf

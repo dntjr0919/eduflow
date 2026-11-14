@@ -40,6 +40,7 @@ from services.record_generator_service import get_active_ai_info
 
 # 독립된 각 기능 탭(페이지) 위젯 및 우측 AI 도크 import
 from ui.components.ai_execution_dock import AiExecutionDock
+from ui.components.sidebar_nav_delegate import SidebarNavDelegate
 from ui.tabs.tab_classroom_tools import ClassroomToolsTab
 from ui.tabs.tab_doc_ocr import DocOcrTab
 from ui.tabs.tab_file_sorter import FileSorterTab
@@ -123,7 +124,7 @@ class MainWindow(QMainWindow):
         self.sidebar_frame.setMaximumWidth(self.SIDEBAR_EXPANDED_WIDTH)
 
         self.sidebar_layout = QVBoxLayout(self.sidebar_frame)
-        self.sidebar_layout.setContentsMargins(14, 18, 14, 16)
+        self.sidebar_layout.setContentsMargins(10, 18, 10, 16)
         self.sidebar_layout.setSpacing(6)
 
         # 사이드바 상단: 브랜드 타이틀 + [ = ] 햄버거 토글 버튼
@@ -153,6 +154,10 @@ class MainWindow(QMainWindow):
         polish_widget(self.sidebar_nav, obj_name="SidebarNavList")
         self.sidebar_nav.setSpacing(4)
         self.sidebar_nav.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar_nav.setMouseTracking(True)
+        self.sidebar_nav.setUniformItemSizes(True)
+        self._sidebar_nav_delegate = SidebarNavDelegate(self.sidebar_nav)
+        self.sidebar_nav.setItemDelegate(self._sidebar_nav_delegate)
         self.sidebar_nav.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sidebar_nav.currentRowChanged.connect(self._on_sidebar_nav_changed)
 
@@ -335,6 +340,7 @@ class MainWindow(QMainWindow):
         self.sidebar_frame.setProperty("collapsed", collapsed_str)
         self.sidebar_nav.setProperty("collapsed", collapsed_str)
         self.btn_hide_tray.setProperty("collapsed", collapsed_str)
+        self._sidebar_nav_delegate.set_collapsed(self._sidebar_collapsed)
 
         if self._sidebar_collapsed:
             self.sidebar_layout.setContentsMargins(8, 18, 8, 16)
@@ -349,14 +355,13 @@ class MainWindow(QMainWindow):
             for idx, meta in enumerate(self._page_meta):
                 item = self.sidebar_nav.item(idx)
                 if item is not None:
-                    item.setText(meta["short"])
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    item.setText(meta["title"])
                     item.setToolTip(
                         f"<div style='padding:2px 4px;'><b>{meta['title']}</b><br/>"
                         f"<span style='color:#cbd5e1;'>{meta['desc']}</span></div>"
                     )
         else:
-            self.sidebar_layout.setContentsMargins(14, 18, 14, 16)
+            self.sidebar_layout.setContentsMargins(10, 18, 10, 16)
             self.brand_title.show()
             self.brand_sub.show()
             self.nav_section_lbl.show()
@@ -367,9 +372,6 @@ class MainWindow(QMainWindow):
                 item = self.sidebar_nav.item(idx)
                 if item is not None:
                     item.setText(meta["title"])
-                    item.setTextAlignment(
-                        Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-                    )
                     item.setToolTip(
                         f"<div style='padding:2px 4px;'><b>{meta['title']}</b><br/>"
                         f"<span style='color:#cbd5e1;'>{meta['desc']}</span></div>"
@@ -380,6 +382,8 @@ class MainWindow(QMainWindow):
             if st is not None:
                 st.unpolish(w)
                 st.polish(w)
+
+        self.sidebar_nav.viewport().update()
 
         if hasattr(self, "_shortcuts") and self._shortcuts:
             self._update_shortcut_tooltips()
@@ -531,12 +535,21 @@ class MainWindow(QMainWindow):
     # =========================================================================
     # 모듈형 페이지 등록 (좌측 QListWidget + 우측 QStackedWidget 동시 등록)
     # =========================================================================
-    def register_tab(self, widget: QWidget, title: str, tooltip: str = "", short_code: str = "") -> int:
+    def register_tab(
+        self,
+        widget: QWidget,
+        title: str,
+        tooltip: str = "",
+        short_code: str = "",
+        icon_name: str = "",
+    ) -> int:
         polish_widget(widget)
         idx = self.stacked_widget.addWidget(widget)
         short = short_code or (title[:2] if len(title) >= 2 else title)
 
         item = QListWidgetItem(title)
+        item.setData(SidebarNavDelegate.ICON_NAME_ROLE, icon_name)
+        item.setData(Qt.ItemDataRole.AccessibleTextRole, title.strip())
         rich_tip = (
             f"<div style='padding:2px 4px;'><b>{title.strip()}</b><br/>"
             f"<span style='color:#cbd5e1;'>{tooltip}</span></div>"
@@ -546,7 +559,7 @@ class MainWindow(QMainWindow):
         item.setToolTip(rich_tip)
         self.sidebar_nav.addItem(item)
         self._page_meta.append(
-            {"title": title, "short": short, "desc": tooltip}
+            {"title": title, "short": short, "desc": tooltip, "icon": icon_name}
         )
         return idx
 
@@ -563,36 +576,42 @@ class MainWindow(QMainWindow):
             "스마트 파일 자동 분류",
             "원본 폴더 실시간 감시 및 키워드/확장자 기반 자동 폴더 생성·분류·실행취소",
             short_code="FS",
+            icon_name="folder-input",
         )
         self.register_tab(
             self.tab_doc_ocr,
             "문서 처리 & AI 과제 파이프라인",
             "학번/이름 기준 제출 파일 병합 · 미제출자 대조 · 멀티 AI OCR 및 DOCX 과제 평가",
             short_code="DOC",
+            icon_name="file-text",
         )
         self.register_tab(
             self.tab_grade,
             "성적·수업자료 관리",
             "학생 명렬표 DB 연동 지필/수행평가 성적 관리 및 수업 자료 버전 관리",
             short_code="GRD",
+            icon_name="chart-column",
         )
         self.register_tab(
             self.tab_classroom,
             "학급 경영 도구함",
             "학급 출결 서류 체크, 청소 당번/1인1역 랜덤 추첨기, 자리 배치 등 미니 툴",
             short_code="CLS",
+            icon_name="users",
         )
         self.register_tab(
             self.tab_notify,
             "외부 연동·알림 센터",
             "구글 시트(설문지 응답) 실시간 폴링 감시 및 카카오톡/데스크톱 토스트 알림 센터",
             short_code="NOT",
+            icon_name="bell",
         )
         self.register_tab(
             self.tab_settings,
             "환경설정 & 명렬표",
             "멀티 LLM(Gemini/OpenAI/Claude/Ollama) 설정, 트레이 동작, 학생 명렬표 마스터 데이터 등록",
             short_code="SET",
+            icon_name="settings",
         )
 
         # 우측 AiExecutionDock AI 대상 등록 및 양방향 동기화 연결

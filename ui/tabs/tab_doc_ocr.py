@@ -71,6 +71,7 @@ from services.hwpx_agent_service import (
     apply_single_hwpx_operation,
     convert_hwp_to_hwpx,
     convert_hwpx_to_hwp,
+    create_minimal_hwpx_document,
     export_exam_answers_hwpx,
     extract_hwpx_dom_map,
     render_hwpx_to_html,
@@ -1540,6 +1541,8 @@ class DocOcrTab(QWidget):
         self._hwpx_original_hwp_path: Optional[Path] = None
         self._hwpx_last_exported_path: Optional[Path] = None
         self._hwpx_dirty: bool = False
+        self._hwpx_is_create_mode: bool = False
+        self._hwpx_reference_files: List[str] = []
         self._hwpx_highlighted_ids: set = set()
         self._hwpx_modified_ids: List[str] = []
         self._hwpx_focus_index: int = 0
@@ -1579,6 +1582,12 @@ class DocOcrTab(QWidget):
         apply_qss_role(self.btn_hwpx_open, role="primary")
         self.btn_hwpx_open.clicked.connect(self._on_hwpx_open)
 
+        self.btn_hwpx_create_new = QPushButton("새 HWPX 양식 만들기")
+        self.btn_hwpx_create_new.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_create_new, role="secondary")
+        self.btn_hwpx_create_new.setToolTip("구형 .hwp를 제외한 새 .hwpx 빈 양식을 생성하여 AI로 작성합니다.")
+        self.btn_hwpx_create_new.clicked.connect(self._on_hwpx_create_new)
+
         self.btn_hwpx_undo = QPushButton("실행 취소(Undo)")
         self.btn_hwpx_undo.setMinimumHeight(32)
         apply_qss_role(self.btn_hwpx_undo, role="secondary")
@@ -1611,6 +1620,7 @@ class DocOcrTab(QWidget):
 
         for btn in (
             self.btn_hwpx_open,
+            self.btn_hwpx_create_new,
             self.btn_hwpx_undo,
             self.btn_hwpx_save,
             self.btn_hwpx_save_as,
@@ -1620,6 +1630,28 @@ class DocOcrTab(QWidget):
             toolbar.addWidget(btn)
         toolbar.addStretch(1)
         body.addLayout(toolbar)
+
+        # 참고 문서 첨부 바 (새 양식 생성용 컴팩트 1줄 바)
+        ref_bar = QHBoxLayout()
+        ref_bar.setSpacing(6)
+        self.btn_hwpx_add_ref = QPushButton("+ 참고 파일 추가 (.hwp/.hwpx/.docx/.xlsx/.pdf)")
+        self.btn_hwpx_add_ref.setFixedHeight(28)
+        apply_qss_role(self.btn_hwpx_add_ref, role="outline")
+        self.btn_hwpx_add_ref.clicked.connect(self._on_hwpx_add_ref_files)
+
+        self.btn_hwpx_clear_ref = QPushButton("참고 목록 비우기")
+        self.btn_hwpx_clear_ref.setFixedHeight(28)
+        self.btn_hwpx_clear_ref.setEnabled(False)
+        apply_qss_role(self.btn_hwpx_clear_ref, role="outline")
+        self.btn_hwpx_clear_ref.clicked.connect(self._on_hwpx_clear_ref_files)
+
+        self.lbl_hwpx_ref_summary = QLabel("참고 문서 없음 (지시사항 단독 생성)")
+        self.lbl_hwpx_ref_summary.setStyleSheet("color: #475569; font-size: 12px;")
+
+        ref_bar.addWidget(self.btn_hwpx_add_ref)
+        ref_bar.addWidget(self.btn_hwpx_clear_ref)
+        ref_bar.addWidget(self.lbl_hwpx_ref_summary, 1)
+        body.addLayout(ref_bar)
 
         # 변경 요약 배지 + 다중 수정 지점 탐색 바
         self.lbl_hwpx_summary_badge = QLabel(
@@ -4012,6 +4044,7 @@ class DocOcrTab(QWidget):
         self._hwpx_doc = HwpxDocument.load(hwpx_path)
         self._hwpx_original_hwp_path = original_hwp_path
         self._hwpx_last_exported_path = Path(hwpx_path) if original_hwp_path is None else None
+        self._hwpx_is_create_mode = False
         self._hwpx_dirty = False
         self._hwpx_highlighted_ids = set()
         self._hwpx_modified_ids = []
@@ -4022,10 +4055,90 @@ class DocOcrTab(QWidget):
         self.btn_hwpx_save_as.setEnabled(True)
         self.btn_hwpx_open_app.setEnabled(True)
         self.btn_hwpx_save_answers.setEnabled(False)
+        self.lbl_hwpx_summary_badge.setStyleSheet(
+            "background-color: #F8F9FF; color: #0F172A; border: 1px solid #E2E8F0; "
+            "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
+        )
         self.lbl_hwpx_summary_badge.setText(badge_text)
         self._render_hwpx_viewer()
         self.ai_quote_selected.emit("", "")
         self.ai_target_requested.emit("hwpx_agent")
+        self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
+    def _on_hwpx_create_new(self, _checked: bool = False, *, emit_sync: bool = True) -> None:
+        """구형 .hwp 없이 새 .hwpx 빈 양식 문서를 초기화하고 양식 생성 모드로 전환합니다."""
+        self._hwpx_patch_timer.stop()
+        self._hwpx_pending_ops.clear()
+        self._hwpx_doc = create_minimal_hwpx_document(title="새 양식", empty=True)
+        self._hwpx_original_hwp_path = None
+        self._hwpx_last_exported_path = None
+        self._hwpx_is_create_mode = True
+        self._hwpx_dirty = False
+        self._hwpx_highlighted_ids = set()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self._update_hwpx_nav_bar()
+        self.btn_hwpx_undo.setEnabled(False)
+        self.btn_hwpx_save.setEnabled(True)
+        self.btn_hwpx_save_as.setEnabled(True)
+        self.btn_hwpx_open_app.setEnabled(True)
+        self.btn_hwpx_save_answers.setEnabled(False)
+        self.lbl_hwpx_summary_badge.setStyleSheet(
+            "background-color: #EEF2FF; color: #1E3A8A; border: 1px solid #C7D2FE; "
+            "border-left: 4px solid #4F46E5; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
+        )
+        self.lbl_hwpx_summary_badge.setText(
+            "새 HWPX 양식 생성 모드 (.hwpx 전용): 우측 [AI 실행 패널]에서 지시사항 입력 후 실행하거나 아래 참고 파일을 첨부하세요."
+        )
+        self._render_hwpx_viewer()
+        self.ai_quote_selected.emit("", "")
+        if emit_sync:
+            self.ai_target_requested.emit("hwpx_agent")
+            self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
+    def _update_hwpx_ref_summary(self) -> None:
+        count = len(self._hwpx_reference_files)
+        self.btn_hwpx_clear_ref.setEnabled(count > 0)
+        if count == 0:
+            self.lbl_hwpx_ref_summary.setText("참고 문서 없음 (지시사항 단독 생성)")
+            self.lbl_hwpx_ref_summary.setToolTip("")
+            return
+        names = [Path(p).name for p in self._hwpx_reference_files]
+        preview = ", ".join(names[:3])
+        if count > 3:
+            preview += f" 외 {count - 3}건"
+        self.lbl_hwpx_ref_summary.setText(f"참고 {count}건: {preview}")
+        self.lbl_hwpx_ref_summary.setToolTip("\n".join(self._hwpx_reference_files))
+
+    def _on_hwpx_add_ref_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "새 HWPX 양식 생성용 참고 문서 선택",
+            "",
+            "참고 문서 (*.hwp *.hwpx *.docx *.xlsx *.xls *.pdf *.txt *.md *.csv);;모든 파일 (*)",
+        )
+        if not paths:
+            return
+        added = False
+        existing = set(self._hwpx_reference_files)
+        for raw_p in paths:
+            norm = str(Path(raw_p))
+            if norm not in existing:
+                self._hwpx_reference_files.append(norm)
+                existing.add(norm)
+                added = True
+        if added:
+            self._update_hwpx_ref_summary()
+            if self._hwpx_doc is None:
+                self._on_hwpx_create_new(emit_sync=False)
+            self.ai_target_requested.emit("hwpx_agent")
+            self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
+    def _on_hwpx_clear_ref_files(self) -> None:
+        if not self._hwpx_reference_files:
+            return
+        self._hwpx_reference_files.clear()
+        self._update_hwpx_ref_summary()
         self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
 
     def _on_hwpx_open(self) -> None:
@@ -4235,11 +4348,14 @@ class DocOcrTab(QWidget):
     def _on_hwpx_save(self) -> None:
         if self._hwpx_doc is None:
             return
-        if self._hwpx_original_hwp_path is not None:
+        if self._hwpx_original_hwp_path is not None and not self._hwpx_is_create_mode:
             self._export_hwpx_as_hwp_async(
                 self._hwpx_original_hwp_path,
                 badge_prefix="원본 HWP 저장 완료",
             )
+            return
+        if not self._hwpx_doc.source_path:
+            self._on_hwpx_save_as()
             return
         try:
             saved = self._hwpx_doc.save()
@@ -4253,29 +4369,44 @@ class DocOcrTab(QWidget):
     def _on_hwpx_save_as(self) -> None:
         if self._hwpx_doc is None:
             return
-        if self._hwpx_original_hwp_path is not None:
+        if self._hwpx_is_create_mode:
+            default_name = (
+                f"{self._hwpx_doc.source_path.stem}.hwpx"
+                if self._hwpx_doc.source_path
+                else "새_HWPX_양식.hwpx"
+            )
+            selected_filter_default = "한글 HWPX 문서 (*.hwpx)"
+            file_filter = "한글 HWPX 문서 (*.hwpx);;모든 파일 (*)"
+        elif self._hwpx_original_hwp_path is not None:
             default_name = f"{self._hwpx_original_hwp_path.stem}_수정.hwp"
             selected_filter_default = "한글 HWP 문서 (*.hwp)"
+            file_filter = "한글 HWPX 문서 (*.hwpx);;한글 HWP 문서 (*.hwp);;모든 파일 (*)"
         elif self._hwpx_doc.source_path:
             default_name = f"{self._hwpx_doc.source_path.stem}_수정.hwpx"
             selected_filter_default = "한글 HWPX 문서 (*.hwpx)"
+            file_filter = "한글 HWPX 문서 (*.hwpx);;한글 HWP 문서 (*.hwp);;모든 파일 (*)"
         else:
             default_name = "수정문서.hwpx"
             selected_filter_default = "한글 HWPX 문서 (*.hwpx)"
+            file_filter = "한글 HWPX 문서 (*.hwpx);;한글 HWP 문서 (*.hwp);;모든 파일 (*)"
 
         save_path, selected_filter = QFileDialog.getSaveFileName(
             self,
             "다른 이름으로 저장",
             default_name,
-            "한글 HWPX 문서 (*.hwpx);;한글 HWP 문서 (*.hwp);;모든 파일 (*)",
+            file_filter,
             selected_filter_default,
         )
         if not save_path:
             return
 
         dst_path = Path(save_path)
-        wants_hwp = dst_path.suffix.lower() == ".hwp" or (
-            not dst_path.suffix and "*.hwp)" in selected_filter
+        wants_hwp = (
+            not self._hwpx_is_create_mode
+            and (
+                dst_path.suffix.lower() == ".hwp"
+                or (not dst_path.suffix and "*.hwp)" in selected_filter)
+            )
         )
         if wants_hwp:
             if dst_path.suffix.lower() != ".hwp":
@@ -4286,7 +4417,7 @@ class DocOcrTab(QWidget):
             )
             return
 
-        if not dst_path.suffix:
+        if dst_path.suffix.lower() != ".hwpx":
             dst_path = dst_path.with_suffix(".hwpx")
         try:
             saved = self._hwpx_doc.save(dst_path)
@@ -4343,13 +4474,18 @@ class DocOcrTab(QWidget):
                 QMessageBox.StandardButton.Yes,
             )
             if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    saved = self._hwpx_doc.save()
-                    self._hwpx_last_exported_path = saved
-                    self._hwpx_dirty = False
-                except Exception as exc:
-                    QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
-                    return
+                if not self._hwpx_doc.source_path:
+                    self._on_hwpx_save_as()
+                    if not self._hwpx_last_exported_path or not self._hwpx_last_exported_path.exists():
+                        return
+                else:
+                    try:
+                        saved = self._hwpx_doc.save()
+                        self._hwpx_last_exported_path = saved
+                        self._hwpx_dirty = False
+                    except Exception as exc:
+                        QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+                        return
 
         target: Optional[Path] = None
         if self._hwpx_last_exported_path is not None and self._hwpx_last_exported_path.exists():
@@ -4383,15 +4519,21 @@ class DocOcrTab(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "저장 실패", f"정답지 저장 중 오류가 발생했습니다:\n{exc}")
 
-    def apply_hwpx_patch_payload(self, payload: Dict[str, Any]) -> None:
-        """AI가 반환한 JSON Patch(summary + operations)를 QTimer로 순차 적용하며 하이라이트합니다."""
+    def apply_hwpx_patch_payload(self, payload: Dict[str, Any], immediate: bool = False) -> None:
+        """AI가 반환한 JSON Patch(summary + operations)를 순차 적용하며 하이라이트합니다."""
         if self._hwpx_doc is None:
-            QMessageBox.warning(self, "문서 없음", "먼저 [HWP / HWPX 열기]로 문서를 열어주세요.")
-            return
+            # 새 양식 생성 또는 문서 미개방 상태에서 결과가 들어온 경우 빈 HWPX 문서 자동 초기화
+            self._on_hwpx_create_new(emit_sync=False)
         ops = payload.get("operations")
         if not isinstance(ops, list) or not ops:
             QMessageBox.information(self, "변경 없음", "적용할 JSON Patch 연산(operations)이 없습니다.")
             return
+
+        # 이전 타이머 패치가 아직 남아 있으면 유실 방지를 위해 먼저 동기 완료
+        if self._hwpx_patch_timer.isActive() and self._hwpx_pending_ops:
+            self._hwpx_patch_timer.stop()
+            while self._hwpx_pending_ops:
+                self._apply_one_pending_hwpx_op()
 
         self._hwpx_patch_timer.stop()
         self._hwpx_doc.push_undo_snapshot()
@@ -4405,9 +4547,49 @@ class DocOcrTab(QWidget):
         self.lbl_hwpx_summary_badge.setText(
             f"적용 중: {self._hwpx_pending_summary} (남은 연산 {len(self._hwpx_pending_ops)}건)"
         )
+        if immediate:
+            while self._hwpx_pending_ops:
+                if not self._apply_one_pending_hwpx_op():
+                    return
+            self._finish_hwpx_patch_batch()
+            return
+
         self._step_hwpx_patch_timer()
         if self._hwpx_pending_ops:
             self._hwpx_patch_timer.start()
+
+    def _apply_one_pending_hwpx_op(self) -> bool:
+        """대기 중인 단일 HWPX Patch 연산을 적용하고 성공 여부를 반환합니다."""
+        if self._hwpx_doc is None or not self._hwpx_pending_ops:
+            return False
+        op_data = self._hwpx_pending_ops.pop(0)
+        try:
+            touched = apply_single_hwpx_operation(self._hwpx_doc, op_data)
+            if touched:
+                self._hwpx_dirty = True
+            self._hwpx_highlighted_ids.update(touched)
+            for tid in touched:
+                if tid not in self._hwpx_modified_ids:
+                    self._hwpx_modified_ids.append(tid)
+            self._render_hwpx_viewer()
+            self._update_hwpx_nav_bar()
+            return True
+        except Exception as exc:
+            import traceback
+
+            self._hwpx_patch_timer.stop()
+            self._hwpx_pending_ops.clear()
+            err_msg = f"패치 적용 오류 ({op_data.get('op', '')}): {exc}"
+            self.lbl_hwpx_summary_badge.setText(err_msg)
+            self.lbl_hwpx_summary_badge.setStyleSheet(
+                "background:#FEE2E2; color:#991B1B; padding:4px 8px; border-radius:4px; font-weight:bold;"
+            )
+            self.task_runner.global_signals.log.emit(
+                "ERROR",
+                "HWPX Agent",
+                f"{err_msg}\n{traceback.format_exc()}",
+            )
+            return False
 
     def _finish_hwpx_patch_batch(self) -> None:
         self._hwpx_patch_timer.stop()
@@ -4448,33 +4630,7 @@ class DocOcrTab(QWidget):
         if self._hwpx_doc is None or not self._hwpx_pending_ops:
             self._finish_hwpx_patch_batch()
             return
-
-        op_data = self._hwpx_pending_ops.pop(0)
-        try:
-            touched = apply_single_hwpx_operation(self._hwpx_doc, op_data)
-            if touched:
-                self._hwpx_dirty = True
-            self._hwpx_highlighted_ids.update(touched)
-            for tid in touched:
-                if tid not in self._hwpx_modified_ids:
-                    self._hwpx_modified_ids.append(tid)
-            self._render_hwpx_viewer()
-            self._update_hwpx_nav_bar()
-        except Exception as exc:
-            import traceback
-
-            self._hwpx_patch_timer.stop()
-            self._hwpx_pending_ops.clear()
-            err_msg = f"패치 적용 오류 ({op_data.get('op', '')}): {exc}"
-            self.lbl_hwpx_summary_badge.setText(err_msg)
-            self.lbl_hwpx_summary_badge.setStyleSheet(
-                "background:#FEE2E2; color:#991B1B; padding:4px 8px; border-radius:4px; font-weight:bold;"
-            )
-            self.task_runner.global_signals.log.emit(
-                "ERROR",
-                "HWPX Agent",
-                f"{err_msg}\n{traceback.format_exc()}",
-            )
+        if not self._apply_one_pending_hwpx_op():
             return
 
         if self._hwpx_pending_ops:
@@ -4492,11 +4648,13 @@ class DocOcrTab(QWidget):
             return {
                 "target_id": "hwpx_agent",
                 "label": "4. HWPX AI 문서 에이전트",
-                "task_label": "HWPX 문서 편집",
+                "task_label": "HWPX 새 양식 생성" if self._hwpx_is_create_mode else "HWPX 문서 편집",
                 "kind": "hwpx_agent",
                 "hwpx_path": str(self._hwpx_doc.source_path) if (self._hwpx_doc and self._hwpx_doc.source_path) else "",
                 "doc_instance_id": id(self._hwpx_doc) if self._hwpx_doc is not None else 0,
                 "dom_map": dom_map,
+                "is_create_mode": bool(self._hwpx_is_create_mode),
+                "reference_files": list(self._hwpx_reference_files),
                 "attachment_paths": [],
             }
         if tid == "ocr":
@@ -4680,7 +4838,7 @@ class DocOcrTab(QWidget):
         if tid == "hwpx_agent":
             parsed = payload.get("parsed_json")
             if isinstance(parsed, dict):
-                self.apply_hwpx_patch_payload(parsed)
+                self.apply_hwpx_patch_payload(parsed, immediate=bool(payload.get("immediate", False)))
             return
         if tid == "ocr":
             formatted = str(payload.get("formatted_text", "") or "").strip()

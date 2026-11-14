@@ -21,6 +21,8 @@ def build_executable(onefile: bool = True) -> None:
         "--windowed",
         f"--name={app_name}",
         "--add-data=ui/styles/theme.qss;ui/styles",
+        "--add-data=ui/assets/icons;ui/assets/icons",
+        "--add-data=assets/blank_template.hwpx;assets",
         "--hidden-import=watchdog.observers",
         "--hidden-import=watchdog.events",
         "--hidden-import=openpyxl",
