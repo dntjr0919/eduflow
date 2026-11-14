@@ -52,5 +52,6 @@ data/
 *.hwp
 *.hwpx
 !assets/blank_template.hwpx
+!assets/cleaning_notice_template.hwpx
 *.xlsx
 *.pdf

@@ -638,9 +638,21 @@ class MainWindow(QMainWindow):
         self.tab_doc_ocr.ai_target_requested.connect(self._on_central_ai_target_requested)
         self.tab_doc_ocr.ai_context_changed.connect(self.ai_dock.sync_from_context)
         self.tab_doc_ocr.ai_quote_selected.connect(self.ai_dock.set_quoted_selection)
+        self.tab_grade.ai_reference_requested.connect(self._on_grade_material_send_to_ai)
         self.ai_dock.set_target("agg_step2", force=True)
 
         self.sidebar_nav.setCurrentRow(0)
+
+    def _on_grade_material_send_to_ai(self, path_str: str) -> None:
+        target_id, summary_msg = self.tab_doc_ocr.register_external_material_for_ai(path_str)
+        if not target_id:
+            return
+        self.ai_dock.set_target(target_id, force=True)
+        if not self._ai_dock_expanded:
+            self.toggle_ai_dock(True)
+        else:
+            self.ai_dock.sync_from_context()
+        self.append_log("INFO", summary_msg)
 
     def _on_sidebar_nav_changed(self, row: int) -> None:
         if 0 <= row < self.stacked_widget.count():

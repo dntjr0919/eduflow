@@ -29,6 +29,12 @@ DEFAULT_SORTING_RULES: List[Tuple[int, str, str, str, str, str, int]] = [
     (11, "압축 파일", "extension", "", ".zip,.7z,.rar,.alz,.egg,.tar,.gz", "15_압축파일", 1),
 ]
 
+DEFAULT_SUBJECT_EVAL_COLUMNS: List[Dict[str, str]] = [
+    {"id": "exam_1", "name": "1차 지필"},
+    {"id": "exam_2", "name": "2차 지필"},
+    {"id": "perf_1", "name": "수행평가"},
+]
+
 
 class DatabaseManager:
     """스레드 안전한 로컬 SQLite 데이터베이스 매니저 (싱글톤)."""
@@ -155,6 +161,115 @@ class DatabaseManager:
                 )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_roster_students_group ON roster_students(group_id, seq_no, student_id)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subject_eval_configs (
+                        subject_key TEXT PRIMARY KEY,
+                        columns_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subject_student_grades (
+                        subject_key TEXT NOT NULL,
+                        student_id TEXT NOT NULL,
+                        scores_json TEXT NOT NULL DEFAULT '{}',
+                        memo TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (subject_key, student_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS duty_rotation_state (
+                        homeroom_key TEXT PRIMARY KEY,
+                        cleaning_next_num INTEGER NOT NULL DEFAULT 1,
+                        bulletin_next_num INTEGER NOT NULL DEFAULT 1,
+                        excluded_json TEXT NOT NULL DEFAULT '[]',
+                        cleaning_reassign_json TEXT NOT NULL DEFAULT '[]',
+                        bulletin_reassign_json TEXT NOT NULL DEFAULT '[]',
+                        last_period_text TEXT NOT NULL DEFAULT '',
+                        selected_dates_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute("PRAGMA table_info(duty_rotation_state)")
+                duty_cols = {str(r["name"]) for r in cur.fetchall()}
+                if "selected_dates_json" not in duty_cols:
+                    cur.execute(
+                        "ALTER TABLE duty_rotation_state ADD COLUMN selected_dates_json TEXT NOT NULL DEFAULT '[]'"
+                    )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subject_material_configs (
+                        subject_key TEXT PRIMARY KEY,
+                        root_folder TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS subject_material_progress (
+                        subject_key TEXT NOT NULL,
+                        rel_path TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT '예정',
+                        memo TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (subject_key, rel_path)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS classroom_attendance_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        homeroom_key TEXT NOT NULL,
+                        student_id TEXT NOT NULL,
+                        student_name TEXT NOT NULL,
+                        category TEXT NOT NULL DEFAULT '질병결석',
+                        reason TEXT NOT NULL DEFAULT '',
+                        period_text TEXT NOT NULL DEFAULT '',
+                        selected_dates_json TEXT NOT NULL DEFAULT '[]',
+                        proof_status TEXT NOT NULL DEFAULT '증빙 대기',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_classroom_attendance_hr ON classroom_attendance_logs(homeroom_key, id DESC)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS classroom_seating_state (
+                        homeroom_key TEXT PRIMARY KEY,
+                        seating_json TEXT NOT NULL DEFAULT '[]',
+                        front_care_json TEXT NOT NULL DEFAULT '[]',
+                        use_front_care INTEGER NOT NULL DEFAULT 1,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS classroom_observation_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        homeroom_key TEXT NOT NULL,
+                        student_id TEXT NOT NULL,
+                        student_name TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_classroom_obs_hr ON classroom_observation_logs(homeroom_key, id DESC)"
                 )
                 conn.commit()
             finally:
@@ -689,5 +804,689 @@ class DatabaseManager:
                 cur = conn.cursor()
                 cur.execute("SELECT * FROM app_logs ORDER BY id DESC LIMIT ?", (limit,))
                 return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    # =========================================================================
+    # 교과별 평가 항목 구성 및 학생 성적·세특 비고 영구 저장
+    # =========================================================================
+    def get_subject_eval_columns(self, subject_key: str) -> List[Dict[str, str]]:
+        key = (subject_key or "").strip() or "__default__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT columns_json FROM subject_eval_configs WHERE subject_key = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if row is None and key != "__default__":
+                    cur.execute(
+                        "SELECT columns_json FROM subject_eval_configs WHERE subject_key = ?",
+                        ("__default__",),
+                    )
+                    row = cur.fetchone()
+                if row and row["columns_json"]:
+                    try:
+                        parsed = json.loads(row["columns_json"])
+                        cleaned: List[Dict[str, str]] = []
+                        if isinstance(parsed, list):
+                            for idx, item in enumerate(parsed, start=1):
+                                if isinstance(item, dict):
+                                    col_id = str(item.get("id", "")).strip() or f"col_{idx}"
+                                    col_name = str(item.get("name", "")).strip()
+                                    if col_name:
+                                        cleaned.append({"id": col_id, "name": col_name})
+                        if cleaned:
+                            return cleaned
+                    except Exception:
+                        pass
+                return [dict(c) for c in DEFAULT_SUBJECT_EVAL_COLUMNS]
+            finally:
+                conn.close()
+
+    def save_subject_eval_columns(
+        self, subject_key: str, columns: List[Dict[str, str]]
+    ) -> None:
+        key = (subject_key or "").strip() or "__default__"
+        cleaned: List[Dict[str, str]] = []
+        used_ids = set()
+        for idx, item in enumerate(columns, start=1):
+            col_name = str(item.get("name", "")).strip()
+            if not col_name:
+                continue
+            col_id = str(item.get("id", "")).strip() or f"col_{idx}"
+            while col_id in used_ids:
+                col_id = f"{col_id}_{idx}"
+            used_ids.add(col_id)
+            cleaned.append({"id": col_id, "name": col_name})
+        if not cleaned:
+            cleaned = [dict(c) for c in DEFAULT_SUBJECT_EVAL_COLUMNS]
+
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO subject_eval_configs (subject_key, columns_json, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(subject_key) DO UPDATE SET
+                        columns_json = excluded.columns_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, json.dumps(cleaned, ensure_ascii=False), now_str),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_subject_grades_map(self, subject_key: str) -> Dict[str, Dict[str, Any]]:
+        key = (subject_key or "").strip() or "__default__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT student_id, scores_json, memo FROM subject_student_grades WHERE subject_key = ?",
+                    (key,),
+                )
+                result: Dict[str, Dict[str, Any]] = {}
+                for r in cur.fetchall():
+                    sid = str(r["student_id"]).strip()
+                    try:
+                        scores = json.loads(r["scores_json"] or "{}")
+                        if not isinstance(scores, dict):
+                            scores = {}
+                    except Exception:
+                        scores = {}
+                    result[sid] = {
+                        "scores": {str(k): str(v) for k, v in scores.items()},
+                        "memo": str(r["memo"] or ""),
+                    }
+                return result
+            finally:
+                conn.close()
+
+    def upsert_subject_student_grade(
+        self,
+        subject_key: str,
+        student_id: str,
+        scores: Dict[str, str],
+        memo: str,
+    ) -> None:
+        key = (subject_key or "").strip() or "__default__"
+        sid = str(student_id or "").strip()
+        if not sid:
+            return
+        clean_scores = {str(k): str(v).strip() for k, v in (scores or {}).items()}
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO subject_student_grades (subject_key, student_id, scores_json, memo, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(subject_key, student_id) DO UPDATE SET
+                        scores_json = excluded.scores_json,
+                        memo = excluded.memo,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        key,
+                        sid,
+                        json.dumps(clean_scores, ensure_ascii=False),
+                        str(memo or "").strip(),
+                        now_str,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    # =========================================================================
+    # 학급 청소·게시판 당번 번호순 순환 포인터 및 예외 명단 영구 저장
+    # =========================================================================
+    def get_duty_rotation_state(self, homeroom_key: str) -> Dict[str, Any]:
+        key = (homeroom_key or "").strip() or "__sample__"
+        default_state: Dict[str, Any] = {
+            "cleaning_next_num": 1,
+            "bulletin_next_num": 1,
+            "excluded_ids": [],
+            "cleaning_reassign_ids": [],
+            "bulletin_reassign_ids": [],
+            "last_period_text": "",
+            "selected_dates": [],
+        }
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM duty_rotation_state WHERE homeroom_key = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return default_state
+                def _parse_str_list(raw: Any) -> List[str]:
+                    try:
+                        arr = json.loads(raw or "[]")
+                        if isinstance(arr, list):
+                            return [str(x).strip() for x in arr if str(x).strip()]
+                    except Exception:
+                        pass
+                    return []
+                row_keys = set(row.keys())
+                return {
+                    "cleaning_next_num": max(1, int(row["cleaning_next_num"] or 1)),
+                    "bulletin_next_num": max(1, int(row["bulletin_next_num"] or 1)),
+                    "excluded_ids": _parse_str_list(row["excluded_json"]),
+                    "cleaning_reassign_ids": _parse_str_list(row["cleaning_reassign_json"]),
+                    "bulletin_reassign_ids": _parse_str_list(row["bulletin_reassign_json"]),
+                    "last_period_text": str(row["last_period_text"] or ""),
+                    "selected_dates": _parse_str_list(
+                        row["selected_dates_json"] if "selected_dates_json" in row_keys else "[]"
+                    ),
+                }
+            finally:
+                conn.close()
+
+    def save_duty_rotation_state(
+        self,
+        homeroom_key: str,
+        *,
+        cleaning_next_num: int,
+        bulletin_next_num: int,
+        excluded_ids: List[str],
+        cleaning_reassign_ids: List[str],
+        bulletin_reassign_ids: List[str],
+        last_period_text: str = "",
+        selected_dates: Optional[List[str]] = None,
+    ) -> None:
+        key = (homeroom_key or "").strip() or "__sample__"
+        def _dedup(items: List[str]) -> List[str]:
+            seen = set()
+            out: List[str] = []
+            for raw in items or []:
+                s = str(raw).strip()
+                if s and s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
+
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO duty_rotation_state (
+                        homeroom_key, cleaning_next_num, bulletin_next_num,
+                        excluded_json, cleaning_reassign_json, bulletin_reassign_json,
+                        last_period_text, selected_dates_json, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(homeroom_key) DO UPDATE SET
+                        cleaning_next_num = excluded.cleaning_next_num,
+                        bulletin_next_num = excluded.bulletin_next_num,
+                        excluded_json = excluded.excluded_json,
+                        cleaning_reassign_json = excluded.cleaning_reassign_json,
+                        bulletin_reassign_json = excluded.bulletin_reassign_json,
+                        last_period_text = excluded.last_period_text,
+                        selected_dates_json = excluded.selected_dates_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        key,
+                        max(1, int(cleaning_next_num)),
+                        max(1, int(bulletin_next_num)),
+                        json.dumps(_dedup(excluded_ids), ensure_ascii=False),
+                        json.dumps(_dedup(cleaning_reassign_ids), ensure_ascii=False),
+                        json.dumps(_dedup(bulletin_reassign_ids), ensure_ascii=False),
+                        str(last_period_text or "").strip(),
+                        json.dumps(_dedup(selected_dates or []), ensure_ascii=False),
+                        now_str,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    # =========================================================================
+    # 교과별 로컬 수업 자료 폴더 경로 및 학반별 단원·파일 진도 상태 영구 저장
+    # =========================================================================
+    def get_subject_material_folder(self, subject_key: str) -> str:
+        key = (subject_key or "").strip() or "__default__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT root_folder FROM subject_material_configs WHERE subject_key = ?",
+                    (key,),
+                )
+                row = cur.fetchone()
+                if row and str(row["root_folder"] or "").strip():
+                    return str(row["root_folder"]).strip()
+                if "|" in key:
+                    group_prefix = key.split("|", 1)[0].strip()
+                    if group_prefix:
+                        cur.execute(
+                            """
+                            SELECT root_folder FROM subject_material_configs
+                            WHERE subject_key LIKE ? AND root_folder != ''
+                            ORDER BY updated_at DESC LIMIT 1
+                            """,
+                            (f"{group_prefix}|%",),
+                        )
+                        shared_row = cur.fetchone()
+                        if shared_row and str(shared_row["root_folder"] or "").strip():
+                            return str(shared_row["root_folder"]).strip()
+                return ""
+            finally:
+                conn.close()
+
+    def save_subject_material_folder(self, subject_key: str, root_folder: str) -> None:
+        key = (subject_key or "").strip() or "__default__"
+        folder_str = str(root_folder or "").strip()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO subject_material_configs (subject_key, root_folder, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(subject_key) DO UPDATE SET
+                        root_folder = excluded.root_folder,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, folder_str, now_str),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_subject_material_progress_map(self, subject_key: str) -> Dict[str, Dict[str, str]]:
+        key = (subject_key or "").strip() or "__default__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT rel_path, status, memo, updated_at
+                    FROM subject_material_progress
+                    WHERE subject_key = ?
+                    """,
+                    (key,),
+                )
+                out: Dict[str, Dict[str, str]] = {}
+                for r in cur.fetchall():
+                    rel = str(r["rel_path"] or "").strip()
+                    if rel:
+                        out[rel] = {
+                            "status": str(r["status"] or "예정").strip() or "예정",
+                            "memo": str(r["memo"] or "").strip(),
+                            "updated_at": str(r["updated_at"] or "").strip(),
+                        }
+                return out
+            finally:
+                conn.close()
+
+    def upsert_subject_material_progress(
+        self,
+        subject_key: str,
+        rel_path: str,
+        status: str,
+        memo: str,
+    ) -> None:
+        key = (subject_key or "").strip() or "__default__"
+        rel = str(rel_path or "").strip()
+        if not rel:
+            return
+        st_clean = str(status or "예정").strip() or "예정"
+        memo_clean = str(memo or "").strip()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO subject_material_progress (subject_key, rel_path, status, memo, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(subject_key, rel_path) DO UPDATE SET
+                        status = excluded.status,
+                        memo = excluded.memo,
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, rel, st_clean, memo_clean, now_str),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    # =========================================================================
+    # 학급 경영 도구함 (출결 대장 · 좌석 배치 · 학생 관찰/상담 메모)
+    # =========================================================================
+    def get_attendance_logs(self, homeroom_key: str) -> List[Dict[str, Any]]:
+        key = (homeroom_key or "").strip() or "__sample__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, homeroom_key, student_id, student_name, category,
+                           reason, period_text, selected_dates_json, proof_status, updated_at
+                    FROM classroom_attendance_logs
+                    WHERE homeroom_key = ?
+                    ORDER BY id DESC
+                    """,
+                    (key,),
+                )
+                rows: List[Dict[str, Any]] = []
+                for r in cur.fetchall():
+                    try:
+                        sel_dates = json.loads(r["selected_dates_json"] or "[]")
+                        if not isinstance(sel_dates, list):
+                            sel_dates = []
+                    except Exception:
+                        sel_dates = []
+                    rows.append(
+                        {
+                            "id": int(r["id"]),
+                            "homeroom_key": str(r["homeroom_key"]),
+                            "student_id": str(r["student_id"] or ""),
+                            "student_name": str(r["student_name"] or ""),
+                            "category": str(r["category"] or "질병결석"),
+                            "reason": str(r["reason"] or ""),
+                            "period_text": str(r["period_text"] or ""),
+                            "selected_dates": [str(x).strip() for x in sel_dates if str(x).strip()],
+                            "proof_status": str(r["proof_status"] or "증빙 대기"),
+                            "updated_at": str(r["updated_at"] or ""),
+                        }
+                    )
+                return rows
+            finally:
+                conn.close()
+
+    def add_attendance_log(
+        self,
+        homeroom_key: str,
+        *,
+        student_id: str,
+        student_name: str,
+        category: str,
+        reason: str,
+        period_text: str,
+        selected_dates: Optional[List[str]] = None,
+        proof_status: str = "증빙 대기",
+    ) -> int:
+        key = (homeroom_key or "").strip() or "__sample__"
+        dates_clean = [str(x).strip() for x in (selected_dates or []) if str(x).strip()]
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO classroom_attendance_logs
+                    (homeroom_key, student_id, student_name, category, reason, period_text, selected_dates_json, proof_status, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        str(student_id or "").strip(),
+                        str(student_name or "").strip(),
+                        str(category or "질병결석").strip() or "질병결석",
+                        str(reason or "").strip(),
+                        str(period_text or "").strip(),
+                        json.dumps(dates_clean, ensure_ascii=False),
+                        str(proof_status or "증빙 대기").strip() or "증빙 대기",
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                conn.commit()
+                return new_id
+            finally:
+                conn.close()
+
+    def update_attendance_log(
+        self,
+        log_id: int,
+        *,
+        student_id: str,
+        student_name: str,
+        category: str,
+        reason: str,
+        period_text: str,
+        selected_dates: Optional[List[str]] = None,
+        proof_status: str = "증빙 대기",
+    ) -> None:
+        dates_clean = [str(x).strip() for x in (selected_dates or []) if str(x).strip()]
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    UPDATE classroom_attendance_logs
+                    SET student_id = ?,
+                        student_name = ?,
+                        category = ?,
+                        reason = ?,
+                        period_text = ?,
+                        selected_dates_json = ?,
+                        proof_status = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(student_id or "").strip(),
+                        str(student_name or "").strip(),
+                        str(category or "질병결석").strip() or "질병결석",
+                        str(reason or "").strip(),
+                        str(period_text or "").strip(),
+                        json.dumps(dates_clean, ensure_ascii=False),
+                        str(proof_status or "증빙 대기").strip() or "증빙 대기",
+                        now_str,
+                        int(log_id),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_attendance_log(self, log_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM classroom_attendance_logs WHERE id = ?", (int(log_id),))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_seating_state(self, homeroom_key: str) -> Dict[str, Any]:
+        key = (homeroom_key or "").strip() or "__sample__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT seating_json, front_care_json, use_front_care
+                    FROM classroom_seating_state
+                    WHERE homeroom_key = ?
+                    """,
+                    (key,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {
+                        "seating": [],
+                        "front_care_ids": [],
+                        "use_front_care": True,
+                    }
+                try:
+                    seating = json.loads(row["seating_json"] or "[]")
+                    if not isinstance(seating, list):
+                        seating = []
+                except Exception:
+                    seating = []
+                try:
+                    care_ids = json.loads(row["front_care_json"] or "[]")
+                    if not isinstance(care_ids, list):
+                        care_ids = []
+                except Exception:
+                    care_ids = []
+                return {
+                    "seating": seating,
+                    "front_care_ids": [str(x).strip() for x in care_ids if str(x).strip()],
+                    "use_front_care": bool(int(row["use_front_care"] or 0)),
+                }
+            finally:
+                conn.close()
+
+    def save_seating_state(
+        self,
+        homeroom_key: str,
+        *,
+        seating: List[Dict[str, str]],
+        front_care_ids: List[str],
+        use_front_care: bool = True,
+    ) -> None:
+        key = (homeroom_key or "").strip() or "__sample__"
+        care_clean = [str(x).strip() for x in (front_care_ids or []) if str(x).strip()]
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO classroom_seating_state
+                    (homeroom_key, seating_json, front_care_json, use_front_care, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(homeroom_key) DO UPDATE SET
+                        seating_json = excluded.seating_json,
+                        front_care_json = excluded.front_care_json,
+                        use_front_care = excluded.use_front_care,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        key,
+                        json.dumps(seating or [], ensure_ascii=False),
+                        json.dumps(care_clean, ensure_ascii=False),
+                        1 if use_front_care else 0,
+                        now_str,
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_observation_logs(self, homeroom_key: str) -> List[Dict[str, Any]]:
+        key = (homeroom_key or "").strip() or "__sample__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT id, homeroom_key, student_id, student_name, content, created_at, updated_at
+                    FROM classroom_observation_logs
+                    WHERE homeroom_key = ?
+                    ORDER BY id DESC
+                    """,
+                    (key,),
+                )
+                return [
+                    {
+                        "id": int(r["id"]),
+                        "homeroom_key": str(r["homeroom_key"]),
+                        "student_id": str(r["student_id"] or ""),
+                        "student_name": str(r["student_name"] or ""),
+                        "content": str(r["content"] or ""),
+                        "created_at": str(r["created_at"] or ""),
+                        "updated_at": str(r["updated_at"] or ""),
+                    }
+                    for r in cur.fetchall()
+                ]
+            finally:
+                conn.close()
+
+    def add_observation_log(
+        self,
+        homeroom_key: str,
+        *,
+        student_id: str,
+        student_name: str,
+        content: str,
+    ) -> int:
+        key = (homeroom_key or "").strip() or "__sample__"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    INSERT INTO classroom_observation_logs
+                    (homeroom_key, student_id, student_name, content, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        key,
+                        str(student_id or "").strip(),
+                        str(student_name or "").strip(),
+                        str(content or "").strip(),
+                        now_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                conn.commit()
+                return new_id
+            finally:
+                conn.close()
+
+    def update_observation_log(self, log_id: int, content: str) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute(
+                    """
+                    UPDATE classroom_observation_logs
+                    SET content = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (str(content or "").strip(), now_str, int(log_id)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_observation_log(self, log_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM classroom_observation_logs WHERE id = ?", (int(log_id),))
+                conn.commit()
             finally:
                 conn.close()

@@ -832,6 +832,7 @@ QComboBox QAbstractItemView::item {
 
 QTextEdit, QListWidget, QTreeWidget {
     background-color: #FFFFFF;
+    alternate-background-color: #F8F9FF;
     color: #0F172A;
     border: 1px solid #E2E8F0;
     border-radius: 6px;
@@ -1346,4 +1347,52 @@ QLabel#ModeExplainRulesLabel {
     padding: 2px 4px;
     color: #334155;
     font-size: 12px;
+}
+
+/* QCalendarWidget Light Slate Surface (다크모드 팔레트 간섭 방지) */
+QCalendarWidget {
+    background-color: #FFFFFF;
+    border: 1px solid #CBD5E1;
+    border-radius: 8px;
+}
+QCalendarWidget QWidget#qt_calendar_navigationbar {
+    background-color: #F8FAFC;
+    border-bottom: 1px solid #E2E8F0;
+    min-height: 36px;
+}
+QCalendarWidget QToolButton {
+    color: #0F172A;
+    background-color: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 700;
+    font-size: 13px;
+}
+QCalendarWidget QToolButton:hover {
+    background-color: #E2E8F0;
+}
+QCalendarWidget QMenu {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+}
+QCalendarWidget QSpinBox {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    border-radius: 4px;
+    padding: 2px 6px;
+}
+QCalendarWidget QAbstractItemView:enabled {
+    background-color: #FFFFFF;
+    alternate-background-color: #F8FAFC;
+    color: #0F172A;
+    selection-background-color: #EFF6FF;
+    selection-color: #0F172A;
+    outline: 0;
+    font-size: 13px;
+}
+QCalendarWidget QAbstractItemView:disabled {
+    color: #94A3B8;
 }

@@ -4141,6 +4141,27 @@ class DocOcrTab(QWidget):
         self._update_hwpx_ref_summary()
         self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
 
+    def register_external_material_for_ai(self, target_path: str) -> tuple[str, str]:
+        """성적·수업자료 탭에서 선택한 로컬 파일 또는 단원 폴더를 AI 실행 패널 참고자료로 등록합니다."""
+        raw = (target_path or "").strip()
+        if not raw:
+            return "", ""
+        p = Path(raw).resolve()
+        if p.is_dir():
+            self.edit_agg_ref_dir.setText(str(p))
+            self.ai_context_changed.emit(self.get_ai_context("agg_step2"))
+            return "agg_step2", f"단원 폴더를 세특 생성 참고 경로로 지정했습니다: {p.name}"
+        if p.is_file():
+            norm = str(p)
+            if norm not in self._hwpx_reference_files:
+                self._hwpx_reference_files.append(norm)
+            self._update_hwpx_ref_summary()
+            if self._hwpx_doc is None:
+                self._on_hwpx_create_new(emit_sync=False)
+            self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+            return "hwpx_agent", f"수업자료 파일을 HWPX AI 에이전트 참고 문서로 등록했습니다: {p.name}"
+        return "", ""
+
     def _on_hwpx_open(self) -> None:
         fpath, _ = QFileDialog.getOpenFileName(
             self,

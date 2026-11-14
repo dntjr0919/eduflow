@@ -3653,6 +3653,28 @@ def _extract_reference_text_from_file(path: Path) -> str:
     if ext == ".docx":
         return _extract_docx_reference_text(path)
 
+    if ext == ".pptx":
+        a_ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        p_tag = f"{{{a_ns}}}p"
+        t_tag = f"{{{a_ns}}}t"
+        slides_out: List[str] = []
+        with zipfile.ZipFile(path, "r") as zf:
+            slide_names = sorted(
+                [n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")],
+                key=lambda s: int(re.search(r"(\d+)\.xml$", s).group(1)) if re.search(r"(\d+)\.xml$", s) else 0,
+            )
+            for s_idx, s_name in enumerate(slide_names, start=1):
+                root = ET.fromstring(zf.read(s_name))
+                p_lines: List[str] = []
+                for p_node in root.iter(p_tag):
+                    runs = [t_node.text for t_node in p_node.iter(t_tag) if t_node.text]
+                    line_txt = "".join(runs).strip()
+                    if line_txt:
+                        p_lines.append(line_txt)
+                if p_lines:
+                    slides_out.append(f"[슬라이드 {s_idx}]\n" + "\n".join(p_lines))
+        return "\n\n".join(slides_out).strip()
+
     if ext in (".xlsx", ".xls", ".xlsm"):
         return _extract_excel_reference_text(path)
 
