@@ -6,14 +6,18 @@ HWPX AI 문서 에이전트 XML 분석·패치 엔진 (services/hwpx_agent_servi
 - 아래첨자(_{...}), 위첨자(^{...}), 수식($$...$$) 자동 변환 및 실행 취소(Undo) 스냅샷 스택 지원
 """
 
+import ctypes
+from contextlib import contextmanager
 import html
 import io
 import json
 import re
+import sys
+import threading
 import zipfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 try:
     from lxml import etree as ET  # type: ignore
@@ -331,12 +335,81 @@ def _strip_linesegarray(p_elem: Any) -> None:
 
 _HWP_EQ_RESERVED_WORDS = {"rarrow", "item", "items", "iter", "italic"}
 
+_GREEK_LETTERS_PATTERN = (
+    "alpha|beta|gamma|delta|epsilon|varepsilon|zeta|eta|theta|vartheta|"
+    "iota|kappa|lambda|mu|nu|xi|pi|varpi|rho|varrho|sigma|varsigma|"
+    "tau|upsilon|phi|varphi|chi|psi|omega|"
+    "Gamma|Delta|Theta|Lambda|Xi|Pi|Sigma|Upsilon|Phi|Psi|Omega"
+)
+
+
+def _extract_braced_arg(text: str, start_idx: int) -> Optional[Tuple[str, int]]:
+    """start_idx 이후 공백을 건너뛰고 중괄호 {...} 인자(중첩 지원)를 추출합니다."""
+    n = len(text)
+    i = start_idx
+    while i < n and text[i].isspace():
+        i += 1
+    if i >= n or text[i] != "{":
+        return None
+    depth = 0
+    content_start = i + 1
+    while i < n:
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[content_start:i], i + 1
+        i += 1
+    return None
+
+
+def _replace_latex_frac_and_sqrt(text: str) -> str:
+    """중첩 중괄호를 지원하는 \\frac{A}{B} -> {A} over {B}, \\sqrt{A} -> sqrt {A} 변환."""
+    s = text
+    # \frac{A}{B} (중첩 \frac 포함 반복 치환)
+    while True:
+        m = re.search(r"\\frac(?![A-Za-z])", s)
+        if not m:
+            break
+        arg1 = _extract_braced_arg(s, m.end())
+        if arg1 is None:
+            break
+        num_str, next_idx = arg1
+        arg2 = _extract_braced_arg(s, next_idx)
+        if arg2 is None:
+            break
+        den_str, end_idx = arg2
+        s = f"{s[:m.start()]}{{{num_str}}} over {{{den_str}}}{s[end_idx:]}"
+
+    # \sqrt{A}
+    pos = 0
+    while True:
+        m = re.search(r"\\sqrt(?![A-Za-z])", s[pos:])
+        if not m:
+            break
+        abs_start = pos + m.start()
+        abs_end = pos + m.end()
+        arg = _extract_braced_arg(s, abs_end)
+        if arg is not None:
+            inner, end_idx = arg
+            repl = f"sqrt {{{inner}}}"
+            s = s[:abs_start] + repl + s[end_idx:]
+            pos = abs_start + len("sqrt {")
+        else:
+            s = s[:abs_start] + "sqrt " + s[abs_end:]
+            pos = abs_start + len("sqrt ")
+    return s
+
 
 def _normalize_hwp_equation_script(script: str) -> str:
-    """LaTeX 스타일 명령어(\\rm, \\it, \\times 등) 및 붙어 쓴 rm/it 명령어를 한글 수식 문법으로 정규화합니다."""
+    """LaTeX 스타일 명령어(\\rm, \\it, \\frac, \\times 등) 및 붙어 쓴 rm/it 명령어를 한글 수식 문법으로 정규화합니다."""
     s = (script or "").strip()
     if not s:
         return ""
+
+    s = _replace_latex_frac_and_sqrt(s)
 
     # LaTeX 백슬래시 명령어 -> 한글 수식 키워드
     latex_replacements = [
@@ -349,10 +422,12 @@ def _normalize_hwp_equation_script(script: str) -> str:
         (r"\\leq\b", "le "),
         (r"\\geq\b", "ge "),
         (r"\\neq\b", "!= "),
+        (r"\\rightleftharpoons\b", "<-> "),
         (r"\\rightarrow\b", "-> "),
         (r"\\to\b", "-> "),
         (r"\\leftarrow\b", "<- "),
         (r"\\leftrightarrow\b", "<-> "),
+        (rf"\\({_GREEK_LETTERS_PATTERN})\b", r"\1 "),
     ]
     for pat, repl in latex_replacements:
         s = re.sub(pat, repl, s)
@@ -402,12 +477,13 @@ def _find_template_equation(
 
 
 def _estimate_equation_size(eq_script: str) -> Tuple[int, int]:
-    """수식 스크립트의 보이는 문자 수 기준으로 인라인 (width, height) HWPUNIT 크기를 계산합니다."""
+    """수식 스크립트의 보이는 문자 수 및 분수/적분 포함 여부 기준으로 인라인 (width, height) HWPUNIT 크기를 계산합니다."""
+    is_tall = bool(re.search(r"\b(over|int|dint|oint|sum|lim)\b", eq_script))
     visible = re.sub(r"\b(rm|it|bold|over|sqrt|left|right|times|cdot)\b", "", eq_script)
     visible = re.sub(r"[{}\s]", "", visible)
     vis_len = max(1, len(visible))
     width = max(1200, vis_len * 550)
-    height = 1100
+    height = 2200 if is_tall else 1100
     return width, height
 
 
@@ -427,10 +503,15 @@ def _build_equation_element(
         new_id = str(max_id + 1)
 
     calc_w, calc_h = _estimate_equation_size(normalized_script)
+    is_tall = calc_h >= 2000
 
     if template_eq is not None:
         eq_el = deepcopy(template_eq)
         eq_el.set("id", new_id)
+        if is_tall:
+            eq_el.set("baseLine", "55")
+        elif not eq_el.get("baseLine"):
+            eq_el.set("baseLine", "85")
     else:
         eq_el = ET.Element(
             _qname(HP_NS, "equation"),
@@ -443,7 +524,7 @@ def _build_equation_element(
                 "lock": "0",
                 "dropcapstyle": "None",
                 "version": "Equation Version 60",
-                "baseLine": "85",
+                "baseLine": "55" if is_tall else "85",
                 "textColor": "#000000",
                 "baseUnit": "1000",
                 "lineMode": "CHAR",
@@ -466,8 +547,7 @@ def _build_equation_element(
         )
     else:
         sz_el.set("width", str(calc_w))
-        if not sz_el.get("height") or sz_el.get("height") == "0":
-            sz_el.set("height", str(calc_h))
+        sz_el.set("height", str(calc_h))
 
     pos_el = _find_child(eq_el, "pos")
     if pos_el is None:
@@ -490,6 +570,9 @@ def _build_equation_element(
         )
     else:
         pos_el.set("treatAsChar", "1")
+        pos_el.set("vertRelTo", "PARA")
+        pos_el.set("horzRelTo", "PARA")
+        pos_el.set("flowWithText", "1")
 
     sc_el = _find_child(eq_el, "script")
     if sc_el is None:
@@ -549,6 +632,7 @@ def _set_paragraph_rich_text(
     p_elem: Any,
     text: str,
     section_roots: Optional[Dict[str, Any]] = None,
+    id_counter: Optional[List[int]] = None,
 ) -> None:
     """
     텍스트 내 _{...}(아래첨자), ^{...}(위첨자), $$...$$(한글 수식)을 파싱하여
@@ -562,9 +646,9 @@ def _set_paragraph_rich_text(
         if _local_tag(ch) in ("run", "linesegarray"):
             p_elem.remove(ch)
 
-    id_counter = [0]
+    counter = id_counter if id_counter is not None else [0]
     for run_el in _build_rich_runs(
-        doc, text, base_char_pr_id=base_char_pr_id, section_roots=section_roots, id_counter=id_counter
+        doc, text, base_char_pr_id=base_char_pr_id, section_roots=section_roots, id_counter=counter
     ):
         p_elem.append(run_el)
 
@@ -579,64 +663,194 @@ def _is_plain_text_run(run_elem: Any) -> bool:
     return True
 
 
+def _is_equation_run(run_elem: Any) -> bool:
+    """<hp:equation> 수식 노드를 포함하는 <hp:run>인지 판별합니다."""
+    if _local_tag(run_elem) != "run":
+        return False
+    return any(_local_tag(ch) == "equation" for ch in run_elem)
+
+
+def _is_replaceable_run(run_elem: Any) -> bool:
+    """텍스트 치환 대상으로 취급할 수 있는 일반 텍스트 또는 수식 <hp:run>인지 판별합니다."""
+    return _is_plain_text_run(run_elem) or _is_equation_run(run_elem)
+
+
 def _extract_run_text(run_elem: Any) -> str:
     parts: List[str] = []
     for ch in run_elem:
         tag = _local_tag(ch)
         if tag == "t" and ch.text:
             parts.append(ch.text)
+        elif tag == "equation":
+            sc = _find_child(ch, "script")
+            if sc is not None and sc.text:
+                parts.append(f"$${sc.text}$$")
         elif tag in ("tab", "lineBreak"):
             parts.append(" ")
     return "".join(parts)
-
 
 _CHEM_MATCH_TRANS = str.maketrans(
     "₀₁₂₃₄₅₆₇₈₉⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻\u00a0",
     "01234567890123456789+- ",
 )
 
-
 def _normalize_match_text(text: str) -> str:
     """유니코드 위/아래첨자 및 비분리 공백을 일반 ASCII 문자로 정규화합니다."""
     return text.translate(_CHEM_MATCH_TRANS)
+
+
+def _find_normalized_match_spans(text: str, old_text: str) -> List[Tuple[int, int]]:
+    """
+    원문에서 old_text와 일치하는 (start, end) 구간 목록을 찾습니다.
+    1) 원문 정확 일치
+    2) 위/아래첨자·NBSP 정규화 일치
+    3) 연속 공백/줄바꿈 축약 일치
+    4) 공백 완전 제거 일치
+    5) 공백 및 중괄호({}) 제거 일치 (수식 내 {CH} vs CH 차이 보정)
+    """
+    if not old_text:
+        return []
+
+    spans: List[Tuple[int, int]] = []
+    if old_text in text:
+        pos = 0
+        while True:
+            found = text.find(old_text, pos)
+            if found == -1:
+                break
+            spans.append((found, found + len(old_text)))
+            pos = found + len(old_text)
+        return spans
+
+    norm_old = _normalize_match_text(old_text)
+    if not norm_old:
+        return []
+    norm_text = _normalize_match_text(text)
+    if norm_old in norm_text:
+        pos = 0
+        while True:
+            found = norm_text.find(norm_old, pos)
+            if found == -1:
+                break
+            spans.append((found, found + len(norm_old)))
+            pos = found + len(norm_old)
+        return spans
+
+    # 3) 연속 공백/줄바꿈 축약 매칭 (원본 인덱스 매핑 유지)
+    collapsed_old = re.sub(r"\s+", " ", norm_old).strip()
+    if not collapsed_old:
+        return []
+
+    c_chars: List[str] = []
+    c_starts: List[int] = []
+    c_ends: List[int] = []
+    i = 0
+    n = len(norm_text)
+    while i < n:
+        if norm_text[i].isspace():
+            j = i + 1
+            while j < n and norm_text[j].isspace():
+                j += 1
+            if c_chars:
+                c_chars.append(" ")
+                c_starts.append(i)
+                c_ends.append(j)
+            i = j
+        else:
+            c_chars.append(norm_text[i])
+            c_starts.append(i)
+            c_ends.append(i + 1)
+            i += 1
+    if c_chars and c_chars[-1] == " ":
+        c_chars.pop()
+        c_starts.pop()
+        c_ends.pop()
+
+    collapsed_text = "".join(c_chars)
+    if collapsed_old in collapsed_text:
+        pos = 0
+        while True:
+            found = collapsed_text.find(collapsed_old, pos)
+            if found == -1:
+                break
+            orig_start = c_starts[found]
+            orig_end = c_ends[found + len(collapsed_old) - 1]
+            spans.append((orig_start, orig_end))
+            pos = found + len(collapsed_old)
+        return spans
+
+    # 4) 공백 완전 제거 비교 (원본 인덱스 역매핑 유지)
+    no_ws_old = "".join(ch for ch in norm_old if not ch.isspace())
+    if no_ws_old:
+        no_ws_chars: List[str] = []
+        no_ws_indices: List[int] = []
+        for idx, ch in enumerate(norm_text):
+            if not ch.isspace():
+                no_ws_chars.append(ch)
+                no_ws_indices.append(idx)
+        no_ws_text = "".join(no_ws_chars)
+        if no_ws_old in no_ws_text:
+            pos = 0
+            while True:
+                found = no_ws_text.find(no_ws_old, pos)
+                if found == -1:
+                    break
+                orig_start = no_ws_indices[found]
+                orig_end = no_ws_indices[found + len(no_ws_old) - 1] + 1
+                spans.append((orig_start, orig_end))
+                pos = found + len(no_ws_old)
+            return spans
+
+    # 5) 공백 및 중괄호({}) 제거 비교 (예: "$$rm {CH}_{3}COOH(it aq)$$" vs "$$rmCH_{3}COOH(itaq)$$")
+    if "$$" in norm_old or "{" in norm_old or "{" in norm_text:
+        no_brace_old = "".join(ch for ch in norm_old if not ch.isspace() and ch not in "{}")
+        if not no_brace_old:
+            return []
+        nb_chars: List[str] = []
+        nb_indices: List[int] = []
+        for idx, ch in enumerate(norm_text):
+            if not ch.isspace() and ch not in "{}":
+                nb_chars.append(ch)
+                nb_indices.append(idx)
+        nb_text = "".join(nb_chars)
+        if no_brace_old in nb_text:
+            pos = 0
+            while True:
+                found = nb_text.find(no_brace_old, pos)
+                if found == -1:
+                    break
+                orig_start = nb_indices[found]
+                orig_end = nb_indices[found + len(no_brace_old) - 1] + 1
+                spans.append((orig_start, orig_end))
+                pos = found + len(no_brace_old)
+    return spans
 
 
 def _replace_with_normalized_match(
     text: str, old_text: str, new_text: str
 ) -> Tuple[str, bool]:
     """
-    원문에서 old_text를 찾되, 완전 일치가 없으면 위/아래첨자·NBSP 정규화 인덱스 매핑으로
+    원문에서 old_text를 찾되, 완전 일치가 없으면 위/아래첨자·NBSP·연속 공백 정규화 인덱스 매핑으로
     원문 내 실제 구간을 찾아 new_text로 치환합니다.
     """
-    if not old_text:
+    spans = _find_normalized_match_spans(text, old_text)
+    if not spans:
         return text, False
-    if old_text in text:
-        return text.replace(old_text, new_text), True
+    parts: List[str] = []
+    cur = 0
+    for s_idx, e_idx in spans:
+        parts.append(text[cur:s_idx])
+        parts.append(new_text)
+        cur = e_idx
+    parts.append(text[cur:])
+    return "".join(parts), True
 
-    norm_old = _normalize_match_text(old_text)
-    if not norm_old:
-        return text, False
 
-    norm_text = _normalize_match_text(text)
-    if norm_old not in norm_text:
-        return text, False
-
-    updated = text
-    norm_updated = norm_text
-    norm_new_len = len(_normalize_match_text(new_text))
-    search_from = 0
-    replaced = False
-
-    while True:
-        pos = norm_updated.find(norm_old, search_from)
-        if pos == -1:
-            break
-        updated = updated[:pos] + new_text + updated[pos + len(norm_old) :]
-        norm_updated = _normalize_match_text(updated)
-        search_from = pos + norm_new_len
-        replaced = True
-
-    return updated, replaced
+def _make_plain_run(cid: str, text: str) -> Any:
+    run_el = ET.Element(_qname(HP_NS, "run"), {"charPrIDRef": cid})
+    t_el = ET.SubElement(run_el, _qname(HP_NS, "t"))
+    t_el.text = text
+    return run_el
 
 
 def _replace_text_in_paragraph(
@@ -645,27 +859,29 @@ def _replace_text_in_paragraph(
     old_text: str,
     new_text: str,
     section_roots: Optional[Dict[str, Any]] = None,
+    id_counter: Optional[List[int]] = None,
 ) -> bool:
     """
-    문단 내 기존 <hp:equation> 등 컨트롤 <hp:run>은 그대로 보존하면서,
-    old_text가 포함된 일반 텍스트 <hp:run>만 새 텍스트/수식 <hp:run>으로 부분 치환합니다.
+    문단 내 일반 텍스트 <hp:run>과 수식(<hp:equation>) <hp:run> 모두에서
+    old_text를 찾아 새 텍스트/수식 <hp:run>으로 부분 치환합니다.
+    치환되지 않은 나머지 수식/컨트롤 <hp:run>은 원본 그대로 보존됩니다.
     """
     if not old_text:
         return False
 
-    id_counter = [0]
+    counter = id_counter if id_counter is not None else [0]
     replaced = False
 
-    # 1차: 단일 일반 텍스트 <hp:run> 내부 치환
+    # 1차: 단일 <hp:run>(일반 텍스트 또는 수식) 내부 치환
     for child in list(p_elem):
-        if not _is_plain_text_run(child):
+        if not _is_replaceable_run(child):
             continue
         r_text = _extract_run_text(child)
         updated, did_replace = _replace_with_normalized_match(r_text, old_text, new_text)
         if did_replace:
             base_cid = str(child.get("charPrIDRef", "0"))
             new_runs = _build_rich_runs(
-                doc, updated, base_char_pr_id=base_cid, section_roots=section_roots, id_counter=id_counter
+                doc, updated, base_char_pr_id=base_cid, section_roots=section_roots, id_counter=counter
             )
             idx = list(p_elem).index(child)
             p_elem.remove(child)
@@ -673,7 +889,7 @@ def _replace_text_in_paragraph(
                 p_elem.insert(idx + offset, nr)
             replaced = True
 
-    # 2차: 연속된 일반 텍스트 <hp:run> 여러 개에 걸쳐 old_text가 분할된 경우
+    # 2차: 연속된 <hp:run>(텍스트 + 수식 조합 포함) 여러 개에 걸쳐 old_text가 분할된 경우
     if not replaced:
         children = list(p_elem)
         seg_runs: List[Any] = []
@@ -681,23 +897,82 @@ def _replace_text_in_paragraph(
         def _flush_segment(segment: List[Any]) -> bool:
             if not segment:
                 return False
-            combined = "".join(_extract_run_text(r) for r in segment)
-            updated, did_replace = _replace_with_normalized_match(combined, old_text, new_text)
-            if not did_replace:
+
+            run_infos: List[Tuple[Any, str, str, int, int]] = []
+            offset = 0
+            for r in segment:
+                r_txt = _extract_run_text(r)
+                r_cid = str(r.get("charPrIDRef", "0"))
+                run_infos.append((r, r_txt, r_cid, offset, offset + len(r_txt)))
+                offset += len(r_txt)
+
+            combined = "".join(info[1] for info in run_infos)
+            matches = _find_normalized_match_spans(combined, old_text)
+
+            if not matches:
                 return False
-            base_cid = str(segment[0].get("charPrIDRef", "0"))
-            new_runs = _build_rich_runs(
-                doc, updated, base_char_pr_id=base_cid, section_roots=section_roots, id_counter=id_counter
-            )
+
+            new_segment_runs: List[Any] = []
+            cur = 0
+
+            def _emit_plain_range(range_start: int, range_end: int) -> None:
+                if range_end <= range_start:
+                    return
+                for r_el, r_txt, r_cid, r_start, r_end in run_infos:
+                    if r_end <= range_start or r_start >= range_end:
+                        continue
+                    if r_start >= range_start and r_end <= range_end:
+                        # 치환 구간과 겹치지 않는 run(수식 포함)은 원본 그대로 유지
+                        new_segment_runs.append(r_el)
+                    else:
+                        s_lo = max(range_start, r_start) - r_start
+                        s_hi = min(range_end, r_end) - r_start
+                        part = r_txt[s_lo:s_hi]
+                        if part:
+                            if "$$" in part:
+                                new_segment_runs.extend(
+                                    _build_rich_runs(
+                                        doc,
+                                        part,
+                                        base_char_pr_id=r_cid,
+                                        section_roots=section_roots,
+                                        id_counter=counter,
+                                    )
+                                )
+                            else:
+                                new_segment_runs.append(_make_plain_run(r_cid, part))
+
+            for m_start, m_end in matches:
+                _emit_plain_range(cur, m_start)
+
+                start_cid = str(segment[0].get("charPrIDRef", "0"))
+                for _, _, r_cid, r_start, r_end in run_infos:
+                    if r_start <= m_start < r_end:
+                        start_cid = r_cid
+                        break
+
+                new_segment_runs.extend(
+                    _build_rich_runs(
+                        doc,
+                        new_text,
+                        base_char_pr_id=start_cid,
+                        section_roots=section_roots,
+                        id_counter=counter,
+                    )
+                )
+                cur = m_end
+
+            _emit_plain_range(cur, len(combined))
+
             insert_idx = list(p_elem).index(segment[0])
             for r in segment:
                 p_elem.remove(r)
-            for offset, nr in enumerate(new_runs):
-                p_elem.insert(insert_idx + offset, nr)
+            for ins_offset, nr in enumerate(new_segment_runs):
+                p_elem.insert(insert_idx + ins_offset, nr)
             return True
 
         for ch in children:
-            if _is_plain_text_run(ch):
+            if _is_replaceable_run(ch):
                 seg_runs.append(ch)
             else:
                 if _flush_segment(seg_runs):
@@ -809,12 +1084,16 @@ def build_hwpx_agent_prompt(dom_map: Dict[str, Any], user_instruction: str) -> T
         "7. set_paragraph_indent: {\"op\":\"set_paragraph_indent\", \"target_id\":\"p_0\", \"indent_pt\":-12, \"left_margin_pt\":12}\n"
         "8. update_table_layout: {\"op\":\"update_table_layout\", \"target_id\":\"tbl_0\", \"left_indent_pt\":10, \"col_widths_ratio\":[1,3]}\n"
         "9. insert_exam_question: {\"op\":\"insert_exam_question\", \"target_id\":\"p_0\", \"number\":1, \"score\":\"3.2점\", \"question\":\"...\", \"bogi\":[\"ㄱ. ...\"], \"choices\":[\"① ...\"], \"answer\":\"③\", \"explanation\":\"...\"}\n"
-        "화학식/첨자/수식은 H_{2}O, Fe^{3+}, $$x^2 + y^2 = r^2$$, $$rm {CH}_{3}COOH(it {aq})$$처럼 "
-        "한글 수식 문법(rm, it 뒤 공백 유지, 백슬래시 금지)을 사용하세요."
+        "핵심 규칙:\n"
+        "- replace_text를 사용할 때 old_text는 DOM 맵에 있는 원문(공백, 중괄호 {}, $$...$$ 포함)을 임의로 고치지 말고 단 한 글자도 바꾸지 않은 채 그대로 복사하세요.\n"
+        "- 표 셀(tbl_...) 내부의 수식($$...$$)이나 여러 줄 텍스트를 수정할 때는 replace_text 대신 update_cell을 우선 사용해도 됩니다.\n"
+        "- new_text에는 지시사항에 맞게 실제로 수정된 최종 텍스트/수식을 반드시 반영하세요(원문 그대로 반환 금지).\n"
+        "- 화학식/첨자/수식은 H_{2}O, Fe^{3+}, $$x^2 + y^2 = r^2$$, $$rm {CH}_{3}COOH(it {aq})$$처럼 "
+        "한글 수식 문법(rm, it 뒤 공백 유지, 다문자 피연산자는 중괄호 {}로 감싸기, 백슬래시 금지)을 사용하세요."
     )
-    dom_json = json.dumps(dom_map, ensure_ascii=False, indent=2)
-    if len(dom_json) > 18000:
-        dom_json = dom_json[:18000] + "\n...(이하 생략)"
+    dom_json = json.dumps(dom_map, ensure_ascii=False, separators=(",", ":"))
+    if len(dom_json) > 45000:
+        dom_json = dom_json[:45000] + "\n...(이하 생략)"
 
     user_prompt = (
         f"### [교사 수정 지시사항]\n{user_instruction.strip()}\n\n"
@@ -838,12 +1117,14 @@ def _flush_sections(doc: HwpxDocument, section_roots: Dict[str, Any]) -> None:
 def apply_single_hwpx_operation(
     doc: HwpxDocument,
     op_data: Dict[str, Any],
+    id_counter: Optional[List[int]] = None,
 ) -> List[str]:
     """단일 JSON Patch 연산을 적용하고, 하이라이트할 변경 대상 ID 목록을 반환합니다."""
     op = str(op_data.get("op", "")).strip()
     target_id = str(op_data.get("target_id", "")).strip()
     id_map, _, section_roots = _collect_section_dom(doc)
     touched_ids: List[str] = []
+    counter = id_counter if id_counter is not None else [0]
 
     if op == "replace_text":
         old_text = str(op_data.get("old_text", ""))
@@ -857,14 +1138,14 @@ def apply_single_hwpx_operation(
             tag = _local_tag(elem)
             if tag == "p":
                 if _replace_text_in_paragraph(
-                    doc, elem, old_text, new_text, section_roots=section_roots
+                    doc, elem, old_text, new_text, section_roots=section_roots, id_counter=counter
                 ):
                     touched_ids.append(tid)
             elif tag in ("tc", "tbl"):
                 replaced_any = False
                 for p_node in [n for n in elem.iter() if _local_tag(n) == "p"]:
                     if _replace_text_in_paragraph(
-                        doc, p_node, old_text, new_text, section_roots=section_roots
+                        doc, p_node, old_text, new_text, section_roots=section_roots, id_counter=counter
                     ):
                         replaced_any = True
                 if replaced_any:
@@ -874,14 +1155,26 @@ def apply_single_hwpx_operation(
         if target_id in id_map:
             _, _, elem = id_map[target_id]
             if _local_tag(elem) == "p":
-                _set_paragraph_rich_text(doc, elem, str(op_data.get("new_text", "")))
+                _set_paragraph_rich_text(
+                    doc,
+                    elem,
+                    str(op_data.get("new_text", "")),
+                    section_roots=section_roots,
+                    id_counter=counter,
+                )
                 touched_ids.append(target_id)
 
     elif op == "insert_paragraph_after":
         if target_id in id_map:
             _, parent, elem = id_map[target_id]
             new_p = deepcopy(elem)
-            _set_paragraph_rich_text(doc, new_p, str(op_data.get("text", "")))
+            _set_paragraph_rich_text(
+                doc,
+                new_p,
+                str(op_data.get("text", "")),
+                section_roots=section_roots,
+                id_counter=counter,
+            )
             children = list(parent)
             idx = children.index(elem)
             parent.insert(idx + 1, new_p)
@@ -909,7 +1202,9 @@ def apply_single_hwpx_operation(
                 sub_list.remove(p_old)
             for ln in lines:
                 new_p = deepcopy(template_p)
-                _set_paragraph_rich_text(doc, new_p, ln)
+                _set_paragraph_rich_text(
+                    doc, new_p, ln, section_roots=section_roots, id_counter=counter
+                )
                 sub_list.append(new_p)
             touched_ids.append(target_id)
 
@@ -944,7 +1239,9 @@ def apply_single_hwpx_operation(
                     for p_old in ps:
                         sub_list.remove(p_old)
                     new_p = deepcopy(tmpl_p)
-                    _set_paragraph_rich_text(doc, new_p, txt)
+                    _set_paragraph_rich_text(
+                        doc, new_p, txt, section_roots=section_roots, id_counter=counter
+                    )
                     sub_list.append(new_p)
 
                 after_row = op_data.get("after_row")
@@ -1055,7 +1352,9 @@ def apply_single_hwpx_operation(
             # 1) 발문 문단
             stem_str = f"{num}. {q_text}" + (f" [{score}]" if score else "")
             stem_p = ET.Element(_qname(HP_NS, "p"), {"paraPrIDRef": stem_para_id})
-            _set_paragraph_rich_text(doc, stem_p, stem_str)
+            _set_paragraph_rich_text(
+                doc, stem_p, stem_str, section_roots=section_roots, id_counter=counter
+            )
             parent.insert(insert_pos, stem_p)
             insert_pos += 1
 
@@ -1071,10 +1370,14 @@ def apply_single_hwpx_operation(
                 sub_list = ET.SubElement(tc, _qname(HP_NS, "subList"))
 
                 hdr_p = ET.SubElement(sub_list, _qname(HP_NS, "p"), {"paraPrIDRef": stem_para_id})
-                _set_paragraph_rich_text(doc, hdr_p, "< 보 기 >")
+                _set_paragraph_rich_text(
+                    doc, hdr_p, "< 보 기 >", section_roots=section_roots, id_counter=counter
+                )
                 for b_line in bogi_list:
                     bp = ET.SubElement(sub_list, _qname(HP_NS, "p"), {"paraPrIDRef": base_para_id})
-                    _set_paragraph_rich_text(doc, bp, b_line)
+                    _set_paragraph_rich_text(
+                        doc, bp, b_line, section_roots=section_roots, id_counter=counter
+                    )
 
                 parent.insert(insert_pos, bogi_tbl)
                 insert_pos += 1
@@ -1085,7 +1388,9 @@ def apply_single_hwpx_operation(
                     doc, base_para_id, indent_pt=-12.0, left_margin_pt=12.0, keep_with_next=False
                 )
                 cp = ET.Element(_qname(HP_NS, "p"), {"paraPrIDRef": cp_id})
-                _set_paragraph_rich_text(doc, cp, ch_txt)
+                _set_paragraph_rich_text(
+                    doc, cp, ch_txt, section_roots=section_roots, id_counter=counter
+                )
                 parent.insert(insert_pos, cp)
                 insert_pos += 1
 
@@ -1108,9 +1413,10 @@ def apply_hwpx_operations(
     if record_undo:
         doc.push_undo_snapshot()
     all_touched: List[str] = []
+    id_counter = [0]
     for op_data in operations:
         if isinstance(op_data, dict):
-            all_touched.extend(apply_single_hwpx_operation(doc, op_data))
+            all_touched.extend(apply_single_hwpx_operation(doc, op_data, id_counter=id_counter))
     return list(dict.fromkeys(all_touched))
 
 
@@ -1313,6 +1619,196 @@ _HWP_COM_UNAVAILABLE_MSG = (
 )
 
 
+def _bring_hwp_security_popup_to_front(
+    stop_event: threading.Event,
+    interval_sec: float = 0.15,
+) -> None:
+    """
+    백그라운드 한글 COM(HWPFrame.HwpObject)이 띄우는 파일 접근 보안 경고창을
+    프로세스명(hwp.exe) 기준으로 직접 탐색해 화면 최상단(HWND_TOPMOST)에 강제 노출합니다.
+    """
+    if sys.platform != "win32":
+        return
+
+    try:
+        import os
+        from ctypes import wintypes
+
+        # 전역 windll 오염 방지를 위해 독립 WinDLL 인스턴스 사용
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        user32.GetWindowTextW.restype = ctypes.c_int
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        user32.AttachThreadInput.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        SW_SHOWNORMAL = 1
+        SW_RESTORE = 9
+        HWND_TOPMOST = wintypes.HWND(-1)
+        SWP_NOSIZE = 0x0001
+        SWP_NOMOVE = 0x0002
+        SWP_SHOWWINDOW = 0x0040
+
+        current_pid = os.getpid()
+        pid_is_hwp_cache: Dict[int, bool] = {}
+        attempt_counts: Dict[int, int] = {}
+
+        def _is_hwp_process(pid_val: int) -> bool:
+            if pid_val in pid_is_hwp_cache:
+                return pid_is_hwp_cache[pid_val]
+            is_hwp = False
+            h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid_val)
+            if h_proc:
+                try:
+                    buf = ctypes.create_unicode_buffer(512)
+                    size = wintypes.DWORD(512)
+                    if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(size)):
+                        exe_path = (buf.value or "").lower()
+                        is_hwp = exe_path.endswith("\\hwp.exe") or exe_path.endswith("/hwp.exe")
+                finally:
+                    kernel32.CloseHandle(h_proc)
+            pid_is_hwp_cache[pid_val] = is_hwp
+            return is_hwp
+
+        def _get_window_text(hwnd: int) -> str:
+            buf = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, buf, 512)
+            return buf.value or ""
+
+        def _is_hwp_security_dialog(hwnd: int) -> bool:
+            if not user32.IsWindowVisible(hwnd):
+                return False
+
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == 0 or pid.value == current_pid:
+                return False
+
+            # 1순위: hwp.exe 프로세스가 화면에 띄운 visible 창이면 즉시 대상 확정
+            if _is_hwp_process(pid.value):
+                return True
+
+            # 2순위: 보조 제목 매칭
+            title = _get_window_text(hwnd).strip()
+            return title in ("한글", "HWP", "Hwp", "한컴오피스 한글")
+
+        def _force_foreground(hwnd: int) -> None:
+            fg_hwnd = user32.GetForegroundWindow()
+            cur_tid = kernel32.GetCurrentThreadId()
+            fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+            target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+
+            attached_fg = False
+            attached_target = False
+            try:
+                if fg_tid and fg_tid != cur_tid:
+                    attached_fg = bool(user32.AttachThreadInput(cur_tid, fg_tid, True))
+                if target_tid and target_tid != cur_tid and target_tid != fg_tid:
+                    attached_target = bool(user32.AttachThreadInput(cur_tid, target_tid, True))
+
+                if user32.IsIconic(hwnd):
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+                else:
+                    user32.ShowWindow(hwnd, SW_SHOWNORMAL)
+
+                user32.SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOMOVE | SWP_SHOWWINDOW,
+                )
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached_target:
+                    user32.AttachThreadInput(cur_tid, target_tid, False)
+                if attached_fg:
+                    user32.AttachThreadInput(cur_tid, fg_tid, False)
+
+        def _enum_top_window(hwnd: int, _lparam: int) -> bool:
+            try:
+                hwnd_int = int(hwnd)
+                if not _is_hwp_security_dialog(hwnd_int):
+                    return True
+                cnt = attempt_counts.get(hwnd_int, 0)
+                fg = user32.GetForegroundWindow()
+                fg_int = int(fg) if fg else 0
+                if cnt == 0 or (cnt < 10 and fg_int != hwnd_int):
+                    attempt_counts[hwnd_int] = cnt + 1
+                    _force_foreground(hwnd_int)
+            except Exception:
+                pass
+            return True
+
+        enum_cb = WNDENUMPROC(_enum_top_window)
+        while not stop_event.is_set():
+            try:
+                user32.EnumWindows(enum_cb, 0)
+            except Exception:
+                pass
+            if stop_event.wait(interval_sec):
+                break
+    except Exception:
+        return
+
+
+@contextmanager
+def _hwp_security_popup_watcher(interval_sec: float = 0.15) -> Iterator[None]:
+    """hwp.Open(...) 호출 동안 보안 경고창 최상위 노출 데몬 스레드를 실행합니다."""
+    if sys.platform != "win32":
+        yield
+        return
+
+    stop_event = threading.Event()
+    watcher = threading.Thread(
+        target=_bring_hwp_security_popup_to_front,
+        args=(stop_event, interval_sec),
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        try:
+            watcher.join(timeout=0.5)
+        except Exception:
+            pass
+
+
 def _convert_via_hwp_com(
     src_path: Path,
     dst_path: Path,
@@ -1358,7 +1854,8 @@ def _convert_via_hwp_com(
         except Exception:
             pass
 
-        hwp.Open(str(src.resolve()), src_fmt, "forceopen:true")
+        with _hwp_security_popup_watcher():
+            hwp.Open(str(src.resolve()), src_fmt, "forceopen:true")
         saved_ok = hwp.SaveAs(str(dst.resolve()), dst_fmt, "")
         if saved_ok is False or not dst.is_file():
             hwp.HAction.GetDefault("FileSaveAs_S", hwp.HParameterSet.HFileOpenSave.HSet)

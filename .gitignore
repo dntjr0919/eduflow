@@ -48,4 +48,8 @@ playwright_web_llm_profile/
 *gemini*profile*/
 data/
 
-
+#문서 파일
+*.hwp
+*.hwpx
+*.xlsx
+*.pdf

@@ -11,14 +11,20 @@ Playwright 기반 멀티 웹 AI(Gemini, ChatGPT, Claude, 커스텀 URL) 자동�
 import base64
 import ctypes
 from ctypes import wintypes
+import json
 import mimetypes
+import os
 from pathlib import Path
 import random
+import shutil
+import socket
+import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+import urllib.request
 
 import pandas as pd
 from PyQt6.QtCore import pyqtSignal
@@ -44,8 +50,10 @@ GENERIC_RESPONSE_SELECTORS = (
     "message-content, model-response, "
     'div[data-message-author-role="assistant"], '
     "div.font-claude-message, "
-    'article, .markdown, .prose, [class*="assistant"], [class*="response"]'
+    'div[class*="prose"]:not([data-message-author-role="user"] *):not(aside *):not(nav *), '
+    '.markdown:not([data-message-author-role="user"] *):not(aside *):not(nav *)'
 )
+
 
 PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
     "gemini": {
@@ -67,7 +75,13 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
         "temp_url": "https://chatgpt.com/?temporary-chat=true",
         "input": '#prompt-textarea, div[contenteditable="true"]',
         "stop": 'button[data-testid="stop-button"], button[aria-label="스트리밍 중지"], button[aria-label="Stop streaming"], button[aria-label="생성 중지"]',
-        "response": '[data-message-author-role="assistant"], article[data-turn="assistant"] .markdown, article[data-testid^="conversation-turn-"] div.markdown.prose, div.markdown.prose',
+        "response": (
+            '[data-message-author-role="assistant"], '
+            'article[data-turn="assistant"] .markdown, '
+            'article[data-testid^="conversation-turn-"] .markdown, '
+            'div.markdown.prose, '
+            'div.markdown'
+        ),
         "done_action": 'button[data-testid="copy-turn-action-button"], button[aria-label*="복사"], button[aria-label*="Copy"]',
         "send": (
             'button[data-testid="send-button"], '
@@ -91,7 +105,11 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
         "done_action": 'button[aria-label*="Copy"], button[aria-label*="복사"]',
         "send": 'button[aria-label*="Send"], button[aria-label*="보내기"], button[aria-label*="전송"]',
         "new_chat": 'a[href="/new"], button[aria-label*="New chat"], button[aria-label*="새 채팅"]',
-        "temp_chat": 'button[aria-label*="Temporary"], button[aria-label*="Incognito"], button[aria-label*="임시"], button[aria-label*="시크릿"], a[href*="incognito"]',
+        "temp_chat": (
+            'button[aria-label*="incognito" i], button[aria-label*="temporary" i], '
+            'button[aria-label*="임시"], button[aria-label*="시크릿"], '
+            'button[data-testid*="incognito"], a[href*="incognito"]'
+        ),
         "file_input": 'input[type="file"]',
         "attach_btn": 'button[aria-label*="Attach"], button[aria-label*="Upload"], button[aria-label*="파일"], button[data-testid="file-upload"]',
     },
@@ -99,15 +117,24 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
         "name": "Custom Web AI",
         "url": "",
         "input": GENERIC_INPUT_SELECTORS,
-        "stop": 'button[aria-label*="Stop"], button[aria-label*="중지"], button[data-testid="stop-button"]',
+        "stop": 'button[aria-label*="Stop" i], button[aria-label*="Cancel" i], button[title*="Stop" i], button[aria-label*="중지"], button[data-testid*="stop"]',
         "response": GENERIC_RESPONSE_SELECTORS,
-        "done_action": 'button[aria-label*="Copy"], button[aria-label*="복사"]',
-        "send": 'button[type="submit"], button[aria-label*="Send"], button[aria-label*="보내기"], button[aria-label*="전송"], button[data-testid="send-button"]',
-        "new_chat": 'a[href="/"], button[aria-label*="새 채팅"], button[aria-label*="New chat"]',
-        "temp_chat": "",
+        "done_action": 'button[aria-label*="Copy" i], button[aria-label*="복사"], button[data-testid*="copy"], button[title*="Copy" i], button[title*="복사"]',
+        "send": 'button[type="submit"], button[aria-label*="Submit" i], button[aria-label*="Send" i], button[aria-label*="보내기"], button[aria-label*="전송"], button[data-testid*="send"], button[data-testid*="submit"]',
+        "new_chat": 'a[href="/"], button[aria-label*="새 채팅"], button[aria-label*="New" i]',
+        "temp_chat": (
+            'button[aria-label*="Incognito" i], button[aria-label*="Private" i], '
+            'button[aria-label*="Temporary" i], button[aria-label*="Ghost" i], '
+            'button[aria-label*="임시"], button[aria-label*="시크릿"], button[aria-label*="비공개"], '
+            'button[title*="Private" i], button[title*="Incognito" i], button[title*="비공개"], '
+            'a[aria-label*="Private" i], a[aria-label*="Incognito" i], a[href*="private" i], '
+            'button:has-text("Private"), button:has-text("Incognito"), '
+            'button:has-text("비공개"), button:has-text("시크릿")'
+        ),
         "file_input": 'input[type="file"]',
-        "attach_btn": 'button[aria-label*="파일"], button[aria-label*="첨부"], button[aria-label*="Upload"], button[aria-label*="Attach"]',
+        "attach_btn": 'button[aria-label*="파일"], button[aria-label*="첨부"], button[aria-label*="Upload" i], button[aria-label*="Attach" i]',
     },
+
 }
 
 DOMAIN_TO_PROVIDER: Dict[str, str] = {
@@ -682,7 +709,9 @@ class WebGeminiAutoWorker(BaseWorker):
             login_prompt = 'button[data-testid="login-button"], button:has-text("로그인"), button:has-text("Log in")'
             if self._has_visible_locator(page, login_prompt):
                 return False
-            return self._has_visible_locator(page, '[data-testid="profile-button"]')
+            if self._has_visible_locator(page, '[data-testid="profile-button"]'):
+                return True
+            return self._has_visible_locator(page, PROVIDER_CONFIGS["chatgpt"]["input"])
 
         if prov == "claude":
             if "/login" in curr_url:
@@ -690,6 +719,44 @@ class WebGeminiAutoWorker(BaseWorker):
             if self._has_visible_locator(page, 'input[type="email"]'):
                 return False
             return self._has_visible_locator(page, PROVIDER_CONFIGS["claude"]["input"])
+
+        # custom 모드: 상단/헤더 영역에 로그인 유도 버튼이 보이면 미로그인으로 판정
+        try:
+            has_login_cta = bool(
+                page.evaluate(
+                    """() => {
+                        const keywords = [
+                            '로그인', 'sign in', 'log in', 'continue with google',
+                            'google로 계속', '계속하기'
+                        ];
+                        const els = Array.from(
+                            document.querySelectorAll('button, a, [role="button"]')
+                        );
+                        for (const el of els) {
+                            const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                            if (!rect || rect.width <= 0 || rect.height <= 0) continue;
+                            const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                            if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
+                            const inHeaderOrTop = Boolean(el.closest && el.closest('header, nav')) || rect.top < 200;
+                            if (!inHeaderOrTop) continue;
+                            const txt = (
+                                (el.innerText || '') + ' ' +
+                                (el.getAttribute('aria-label') || '') + ' ' +
+                                (el.getAttribute('title') || '')
+                            ).trim().toLowerCase();
+                            if (!txt) continue;
+                            if (keywords.some(kw => txt.includes(kw))) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }"""
+                )
+            )
+            if has_login_cta:
+                return False
+        except Exception:
+            pass
 
         return self._detect_largest_visible_input(page) is not None
 
@@ -769,7 +836,7 @@ class WebGeminiAutoWorker(BaseWorker):
             return "로그인 화면"
 
         # 3) 입력창 미표시 또는 비활성 상태 확인
-        input_loc = self._resolve_input_locator(page, timeout_sec=0.5, allow_click_fallback=False)
+        input_loc = self._resolve_input_locator(page, timeout_sec=2.0, allow_click_fallback=False)
         if input_loc is None:
             return "채팅 입력창 미표시"
         try:
@@ -780,26 +847,76 @@ class WebGeminiAutoWorker(BaseWorker):
 
         return None
 
+    def _bypass_programmatic_auth_if_needed(self, page: Any) -> bool:
+        """Chrome 자체 동기화(programmatic_auth) 화면에 갇힌 경우 표준 웹 ServiceLogin URL로 우회합니다."""
+        try:
+            cur_url = str(getattr(page, "url", "") or "")
+        except Exception:
+            cur_url = ""
+        if "programmatic_auth" not in cur_url.lower():
+            return False
+
+        # 무한 리다이렉트 루프 방지를 위해 쿨다운 적용
+        now = time.monotonic()
+        last_bypass = getattr(self, "_last_programmatic_bypass_ts", 0.0)
+        if (now - last_bypass) < 6.0:
+            return False
+        self._last_programmatic_bypass_ts = now
+
+        from urllib.parse import quote
+
+        target_continue = self.provider_config.get("url") or "https://google.com"
+        encoded_continue = quote(target_continue, safe="")
+        safe_login_url = (
+            f"https://google.com{encoded_continue}"
+        )
+        self.emit_log(
+            "WARN",
+            "Chrome 동기화 로그인(programmatic_auth) 무한 로딩이 감지되어 표준 웹 로그인 페이지로 자동 전환합니다.",
+        )
+        try:
+            page.goto(safe_login_url, wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            pass
+        return True
+
+
     def _wait_for_user_auth_resume(self, page: Any, reason: str) -> bool:
-        """로그인·약관 동의·봇 인증 완료 후 사용자의 재개 버튼 클릭을 대기합니다."""
+        """로그인·약관 동의·봇 인증 완료 시 자동 감지하거나 사용자의 재개 버튼 클릭을 대기합니다."""
         provider_name = self.provider_config["name"]
         self._login_confirmed_event.clear()
         self.emit_log(
             "WARN",
-            f"[{provider_name}] {reason}이(가) 감지되어 대기합니다. "
-            "브라우저에서 로그인·약관 동의·봇 인증을 완료한 뒤 '인증/로그인 완료 · 작업 재개' 버튼을 눌러주세요.",
+            f"[{provider_name}] {reason}이(가) 필요합니다. 열린 크롬 창에서 로그인을 완료하면 자동으로 재개됩니다 "
+            "(또는 우측 '인증/로그인 완료 · 작업 재개' 버튼 클릭).",
         )
         self.emit_progress(
             5,
-            f"[{provider_name}] {reason} 대기 중 ('인증/로그인 완료 · 작업 재개' 클릭)...",
+            f"[{provider_name}] 브라우저에서 로그인을 완료해 주세요 (완료 시 자동 감지)...",
         )
         self.waiting_for_login.emit(provider_name)
+
+        last_check = 0.0
         while not self._login_confirmed_event.is_set():
             if self.is_stop_requested():
                 return False
+            now = time.monotonic()
+            if page is not None and (now - last_check) >= 1.5:
+                last_check = now
+                if self._bypass_programmatic_auth_if_needed(page):
+                    continue
+                # 로그인 완료 후 대상 AI 화면으로 돌아와 입력창이 활성화되었으면 자동 재개
+                if not self._is_likely_login_page(page):
+                    if self._is_logged_in(page, self.provider):
+                        blocking = self._detect_blocking_overlay_or_auth(page)
+                        if blocking is None:
+                            self.emit_log("SUCCESS", f"[{provider_name}] 로그인 세션 활성화 자동 감지 완료!")
+                            break
             time.sleep(0.2)
-        self.emit_log("INFO", f"[{provider_name}] 사용자 인증/확인 완료 — 작업을 재개합니다.")
+
+        self.emit_log("INFO", f"[{provider_name}] 인증 확인 완료 — 작업을 재개합니다.")
         return True
+
 
     def _ensure_ready_before_input(self, page: Any, input_loc: Any) -> Any:
         """프롬프트 입력 직전 차단 모달·봇 인증·입력창 비활성을 최종 점검하고 필요 시 대기합니다."""
@@ -819,28 +936,39 @@ class WebGeminiAutoWorker(BaseWorker):
 
         self.emit_log("INFO", f"[{provider_name}] 페이지로 이동합니다 ({target_url})...")
         page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        self._bypass_programmatic_auth_if_needed(page)
+
+        is_custom_mode = self.provider == "custom" or bool(self.custom_url)
 
         if not self.require_login:
             if not self._is_likely_login_page(page):
-                wait_s = 5.0 if (self.provider == "custom" or self.custom_url) else 10.0
+                wait_s = 5.0 if is_custom_mode else 10.0
                 input_loc = self._resolve_input_locator(
                     page, timeout_sec=wait_s, allow_click_fallback=False
                 )
                 blocking_reason = self._detect_blocking_overlay_or_auth(page)
                 if input_loc is not None and blocking_reason is None:
-                    return input_loc
+                    if not is_custom_mode or self._is_logged_in(page, self.provider):
+                        return input_loc
+                    if not self._wait_for_user_auth_resume(page, "로그인 확인"):
+                        return None
+                    return True
 
             if self.is_stop_requested():
                 return None
 
-            if not self._is_likely_login_page(page) and (self.provider == "custom" or self.custom_url):
+            if not self._is_likely_login_page(page) and is_custom_mode:
                 blocking_reason = self._detect_blocking_overlay_or_auth(page)
                 if blocking_reason is None or blocking_reason == "채팅 입력창 미표시":
                     input_loc = self._wait_for_user_click_input(
                         page, extract_domain_from_url(str(getattr(page, "url", "") or target_url))
                     )
                     if input_loc is not None:
-                        return input_loc
+                        if self._is_logged_in(page, self.provider):
+                            return input_loc
+                        if not self._wait_for_user_auth_resume(page, "로그인 확인"):
+                            return None
+                        return True
                     if self.is_stop_requested():
                         return None
 
@@ -849,7 +977,16 @@ class WebGeminiAutoWorker(BaseWorker):
                 return None
             return True
 
-        # 명시적 로그인 후 작업 모드
+        # 명시적 로그인 후 작업 모드: 이미 로그인되어 있고 차단 요소가 없으면 대기 알림 없이 즉시 진행
+        if not self._is_likely_login_page(page):
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if self.is_stop_requested():
+                    return None
+                if self._is_logged_in(page, self.provider) and self._detect_blocking_overlay_or_auth(page) is None:
+                    return True
+                time.sleep(0.4)
+
         if not self._wait_for_user_auth_resume(page, "로그인 확인"):
             return None
         blocking_reason = self._detect_blocking_overlay_or_auth(page)
@@ -870,11 +1007,20 @@ class WebGeminiAutoWorker(BaseWorker):
             "incognito",
             "won't appear in your history",
             "기록에 남지",
+            "private chat",
+            "비공개",
+            "저장되지",
+            "aren't saved",
+            "not saved",
         )
 
         while time.monotonic() < deadline:
             if self.is_stop_requested():
                 return False
+
+            cur_url = str(getattr(page, "url", "") or "").lower()
+            if prov == "claude" and "incognito" in cur_url:
+                return True
 
             body_lower = ""
             try:
@@ -889,7 +1035,6 @@ class WebGeminiAutoWorker(BaseWorker):
             has_banner = any(kw in body_lower for kw in banner_keywords)
 
             if prov == "chatgpt":
-                cur_url = str(getattr(page, "url", "") or "").lower()
                 if "temporary-chat=true" in cur_url and has_banner:
                     return True
             else:
@@ -927,11 +1072,43 @@ class WebGeminiAutoWorker(BaseWorker):
         target_url = self.provider_config.get("url") or cfg.get("url", "")
         new_chat_sel = cfg.get("new_chat", "")
 
+        def _try_enable_custom_temp_chat() -> None:
+            if not temp_chat:
+                return
+            custom_temp_sel = PROVIDER_CONFIGS["custom"].get("temp_chat", "")
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                if self.is_stop_requested():
+                    return
+                if custom_temp_sel:
+                    try:
+                        btns = page.locator(custom_temp_sel)
+                        cnt = btns.count()
+                        for idx in range(cnt):
+                            btn = btns.nth(idx)
+                            try:
+                                if btn.evaluate("el => Boolean(el.closest && el.closest('aside, nav'))") is True:
+                                    continue
+                                if btn.is_visible() and btn.is_enabled():
+                                    pressed = (btn.get_attribute("aria-pressed") or "").strip().lower()
+                                    checked = (btn.get_attribute("aria-checked") or "").strip().lower()
+                                    if pressed != "true" and checked != "true":
+                                        btn.click()
+                                        time.sleep(0.4)
+                                    return
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                time.sleep(0.25)
+
         # 첫 배치에서 커스텀 URL이 이미 열려 있고 입력창이 보이면 재이동 없이 바로 사용
         if is_first_batch and (prov == "custom" or self.custom_url):
             existing = self._resolve_input_locator(page, timeout_sec=3.0, allow_click_fallback=False)
             if existing is not None:
-                return existing
+                _try_enable_custom_temp_chat()
+                refreshed = self._resolve_input_locator(page, timeout_sec=3.0, allow_click_fallback=False)
+                return refreshed if refreshed is not None else existing
 
         if self.custom_url or prov == "custom":
             if not is_first_batch:
@@ -947,6 +1124,7 @@ class WebGeminiAutoWorker(BaseWorker):
                         clicked_new = False
                 if not clicked_new and target_url:
                     page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            _try_enable_custom_temp_chat()
             input_loc = self._resolve_input_locator(page, timeout_sec=8.0, allow_click_fallback=True)
             if input_loc is None and not self.is_stop_requested():
                 raise TimeoutError(f"[{provider_name}] 입력창을 찾지 못했습니다.")
@@ -983,8 +1161,54 @@ class WebGeminiAutoWorker(BaseWorker):
                     except Exception:
                         clicked_temp = False
 
+                if not clicked_temp and prov == "claude":
+                    # Claude 우측 상단 아이콘 버튼 중 title/aria-label에 incognito/ghost/임시 포함 버튼 추가 탐색
+                    claude_extra_sel = (
+                        'button[title*="incognito" i], button[title*="ghost" i], button[title*="임시"], '
+                        'button[aria-label*="ghost" i]'
+                    )
+                    try:
+                        extra_btn = page.locator(claude_extra_sel).first
+                        if extra_btn.count() > 0 and extra_btn.is_visible():
+                            extra_btn.click()
+                            clicked_temp = True
+                    except Exception:
+                        pass
+                    if not clicked_temp:
+                        try:
+                            clicked_by_js = bool(
+                                page.evaluate(
+                                    """() => {
+                                        const btns = Array.from(document.querySelectorAll('button, a'));
+                                        const vw = window.innerWidth || 1280;
+                                        for (const b of btns) {
+                                            const r = b.getBoundingClientRect();
+                                            if (r.width <= 0 || r.height <= 0) continue;
+                                            if (r.top > 180 || r.right < vw * 0.55) continue;
+                                            const label = ((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('title') || '')).toLowerCase();
+                                            if (label.includes('incognito') || label.includes('ghost') || label.includes('임시')) {
+                                                b.click();
+                                                return true;
+                                            }
+                                        }
+                                        return false;
+                                    }"""
+                                )
+                            )
+                            if clicked_by_js:
+                                clicked_temp = True
+                        except Exception:
+                            pass
+
                 if clicked_temp:
-                    temp_confirmed = self._verify_temp_chat_active(page, prov, timeout_sec=8.0)
+                    verify_sec = 2.5 if prov == "claude" else 8.0
+                    temp_confirmed = self._verify_temp_chat_active(page, prov, timeout_sec=verify_sec)
+                    if not temp_confirmed and prov == "claude":
+                        self.emit_log(
+                            "INFO",
+                            f"[{provider_name}] 임시 채팅 버튼을 클릭했습니다. 배너 미표시 상태로 진행합니다.",
+                        )
+                        temp_confirmed = True
                 else:
                     # 이미 임시 채팅 상태일 수도 있으므로 한 번 확인
                     temp_confirmed = self._verify_temp_chat_active(page, prov, timeout_sec=1.5)
@@ -1896,18 +2120,33 @@ class WebGeminiAutoWorker(BaseWorker):
         self._submit_prompt(page, input_loc, pre_response_count=pre_response_count)
 
     def _is_user_turn_element(self, loc: Any) -> bool:
-        """ChatGPT 폴백 셀렉터 매칭 요소가 사용자 메시지인지 확인합니다."""
+        """매칭된 요소가 사용자 질문/말풍선(user-query 등)인지 확인합니다."""
         try:
             res = loc.evaluate(
-                'e => Boolean(e.closest && e.closest(\'[data-message-author-role="user"]\'))'
+                """e => {
+                    const userSel = (
+                        '[data-message-author-role="user"], ' +
+                        'user-query, ' +
+                        '[data-turn="user"], ' +
+                        '[data-testid*="user-message"], ' +
+                        '[class*="user-query"], ' +
+                        '[class*="user-message"]'
+                    );
+                    return Boolean(
+                        (e.matches && e.matches(userSel)) ||
+                        (e.closest && e.closest(userSel)) ||
+                        (e.querySelector && e.querySelector(userSel))
+                    );
+                }"""
             )
             return res is True
         except Exception:
             return False
 
     def _read_latest_response_text(self, page: Any, min_index: int = 0) -> str:
-        """마지막 응답 요소의 전체 텍스트를 읽어옵니다."""
+        """마지막 어시스턴트 응답 요소의 JSON 코드 블록(실제 응답 키 포함 시 우선) 또는 전체 텍스트를 읽어옵니다."""
         resp_sel = self.provider_config.get("response") or GENERIC_RESPONSE_SELECTORS
+        response_json_keys = ('"operations"', '"summary"', '"학번"', '"결과"', '"fields"')
         try:
             responses = page.locator(resp_sel)
             count = int(responses.count())
@@ -1915,11 +2154,31 @@ class WebGeminiAutoWorker(BaseWorker):
                 return ""
             for idx in range(count - 1, min_index - 1, -1):
                 cand = responses.nth(idx)
-                if self.provider == "chatgpt" and self._is_user_turn_element(cand):
+                if self._is_user_turn_element(cand):
                     continue
                 txt = (cand.inner_text() or "").strip()
-                if txt:
-                    return txt
+                if not txt:
+                    continue
+                # 실제 응답 키가 포함된 pre code / code 블록만 우선 채택 (인라인 코드/화학식 오인 방지)
+                try:
+                    best_code = ""
+                    for code_sel in ("pre code", "code"):
+                        code_loc = cand.locator(code_sel)
+                        c_cnt = int(code_loc.count())
+                        for c_i in range(c_cnt):
+                            c_txt = (code_loc.nth(c_i).inner_text() or "").strip()
+                            if not c_txt:
+                                continue
+                            if ("{" in c_txt or "[" in c_txt) and any(
+                                k in c_txt for k in response_json_keys
+                            ):
+                                if len(c_txt) > len(best_code):
+                                    best_code = c_txt
+                        if best_code:
+                            return best_code
+                except Exception:
+                    pass
+                return txt
             return ""
         except Exception:
             return ""
@@ -1976,7 +2235,7 @@ class WebGeminiAutoWorker(BaseWorker):
             last_msg = None
             for idx in range(cnt - 1, -1, -1):
                 cand = responses.nth(idx)
-                if self.provider == "chatgpt" and self._is_user_turn_element(cand):
+                if self._is_user_turn_element(cand):
                     continue
                 last_msg = cand
                 break
@@ -1987,7 +2246,7 @@ class WebGeminiAutoWorker(BaseWorker):
             if int(msg_done.count()) > 0 and msg_done.last.is_visible() is True:
                 return True
 
-            for container_xpath in ("xpath=ancestor::article[1]", "xpath=.."):
+            for container_xpath in ("xpath=ancestor::article[1]", "xpath=..", "xpath=../..", "xpath=../../.."):
                 try:
                     container = last_msg.locator(container_xpath)
                     if int(container.count()) > 0:
@@ -2001,19 +2260,54 @@ class WebGeminiAutoWorker(BaseWorker):
         return False
 
     def _is_incomplete_json_response(self, text: str) -> bool:
-        """JSON 코드블록이 닫히지 않았거나 중괄호/대괄호가 미완성인 상태인지 판별합니다."""
+        """JSON 코드블록이 닫히지 않았거나 문자열 리터럴 외부의 중괄호/대괄호 균형이 미완성인지 판별합니다."""
         stripped = (text or "").strip()
         if not stripped:
             return False
+        target = stripped
         if "```json" in stripped:
             last_open = stripped.rfind("```json")
-            if stripped.find("```", last_open + 7) == -1:
+            close_idx = stripped.find("```", last_open + 7)
+            if close_idx == -1:
                 return True
-        if stripped.startswith("{") and not stripped.endswith("}"):
-            return True
-        if stripped.startswith("[") and not stripped.endswith("]"):
-            return True
-        return False
+            target = stripped[last_open + 7 : close_idx].strip()
+
+        first_brace = target.find("{")
+        first_bracket = target.find("[")
+        starts = [i for i in (first_brace, first_bracket) if i != -1]
+        if not starts:
+            return False
+
+        scan_from = min(starts)
+        brace_depth = 0
+        bracket_depth = 0
+        in_string = False
+        escape = False
+
+        for ch in target[scan_from:]:
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                if brace_depth > 0:
+                    brace_depth -= 1
+            elif ch == "[":
+                bracket_depth += 1
+            elif ch == "]":
+                if bracket_depth > 0:
+                    bracket_depth -= 1
+
+        return in_string or brace_depth > 0 or bracket_depth > 0
 
     def _is_chatgpt_copy_btn_visible(self, page: Any, resp_sel: str) -> bool:
         """ChatGPT 마지막 어시스턴트 응답 또는 액션 바에 복사 버튼이 표시되었는지 확인합니다."""
@@ -2245,55 +2539,61 @@ class WebGeminiAutoWorker(BaseWorker):
                     and resp_count <= pre_response_count
                     and (not fallback_probed or matched_fallback_sel)
                 ):
+                    response_json_keys = ('"operations"', '"summary"', '"학번"', '"결과"', '"fields"')
                     if matched_fallback_sel:
                         try:
                             fb_loc = page.locator(matched_fallback_sel)
                             fb_cnt = int(fb_loc.count())
-                            if fb_cnt > 0:
-                                cand = fb_loc.nth(fb_cnt - 1)
-                                if not self._is_user_turn_element(cand):
-                                    curr_text = (cand.inner_text() or "").strip()
+                            best_fb = ""
+                            for fb_i in range(fb_cnt - 1, -1, -1):
+                                cand = fb_loc.nth(fb_i)
+                                if self._is_user_turn_element(cand):
+                                    continue
+                                t = (cand.inner_text() or "").strip()
+                                if not t:
+                                    continue
+                                if any(k in t for k in response_json_keys):
+                                    best_fb = t
+                                    break
+                                if not best_fb:
+                                    best_fb = t
+                            curr_text = best_fb
                         except Exception:
                             pass
                     elif not fallback_probed:
-                        has_done_btn = self._is_done_action_visible(page, resp_sel)
-                        if not has_done_btn and resp_count == 0:
+                        for fb_sel in (
+                            ".markdown",
+                            "div.markdown.prose",
+                            'article[data-turn="assistant"]',
+                            'article[data-testid^="conversation-turn-"]',
+                            "pre code",
+                        ):
                             try:
-                                done_sel = (
-                                    self.provider_config.get("done_action")
-                                    or 'button[aria-label*="Copy"], button[aria-label*="복사"]'
-                                )
-                                p_done = page.locator(done_sel)
-                                has_done_btn = int(p_done.count()) > 0 and p_done.last.is_visible() is True
-                            except Exception:
-                                has_done_btn = False
-                        if has_done_btn:
-                            fallback_probed = True
-                            for fb_sel in (
-                                ".markdown",
-                                "div.markdown.prose",
-                                "pre code",
-                                'article[data-turn="assistant"]',
-                            ):
-                                try:
-                                    fb_loc = page.locator(fb_sel)
-                                    fb_cnt = int(fb_loc.count())
-                                    if fb_cnt <= 0:
-                                        continue
-                                    cand = fb_loc.nth(fb_cnt - 1)
+                                fb_loc = page.locator(fb_sel)
+                                fb_cnt = int(fb_loc.count())
+                                if fb_cnt <= 0:
+                                    continue
+                                for fb_i in range(fb_cnt - 1, -1, -1):
+                                    cand = fb_loc.nth(fb_i)
                                     if self._is_user_turn_element(cand):
                                         continue
                                     fb_text = (cand.inner_text() or "").strip()
-                                    if fb_text:
-                                        matched_fallback_sel = fb_sel
-                                        curr_text = fb_text
-                                        self.emit_log(
-                                            "INFO",
-                                            f"[{provider_name}] resp={resp_count} 폴백 탐색 매칭: selector={fb_sel}, len={len(fb_text)}",
-                                        )
-                                        break
-                                except Exception:
-                                    continue
+                                    if not fb_text:
+                                        continue
+                                    if fb_sel == "pre code" and not any(k in fb_text for k in response_json_keys):
+                                        continue
+                                    matched_fallback_sel = fb_sel
+                                    fallback_probed = True
+                                    curr_text = fb_text
+                                    self.emit_log(
+                                        "INFO",
+                                        f"[{provider_name}] resp={resp_count} 폴백 탐색 매칭: selector={fb_sel}, len={len(fb_text)}",
+                                    )
+                                    break
+                                if matched_fallback_sel:
+                                    break
+                            except Exception:
+                                continue
 
                 active_resp_sel = matched_fallback_sel or resp_sel
                 done_visible = bool(curr_text) and (
@@ -2547,6 +2847,9 @@ class WebGeminiAutoWorker(BaseWorker):
         playwright_obj = None
         browser = None
         context = None
+        page = None
+        temp_profile_dir: Optional[Path] = None
+        self._cdp_browser_process = None
         completed_batches = 0
         total_applied = 0
         failed_batches: List[int] = []
@@ -2555,21 +2858,9 @@ class WebGeminiAutoWorker(BaseWorker):
 
         try:
             playwright_obj = sync_playwright().start()
-            if self.keep_login_session:
-                context = playwright_obj.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
-                    headless=self.headless,
-                    permissions=["clipboard-read", "clipboard-write"],
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-            else:
-                browser = playwright_obj.chromium.launch(
-                    headless=self.headless,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-                context = browser.new_context(
-                    permissions=["clipboard-read", "clipboard-write"],
-                )
+            browser, context, temp_profile_dir = self._launch_browser_context(
+                playwright_obj, profile_dir
+            )
 
             page = context.pages[0] if context.pages else context.new_page()
 
@@ -2815,21 +3106,16 @@ class WebGeminiAutoWorker(BaseWorker):
                         f"[{provider_name}] 실행 완료: {completed_batches}/{total_batches} 배치 ({total_applied}명 저장)",
                     )
         finally:
-            if context is not None:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-            if browser is not None:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
-            if playwright_obj is not None:
-                try:
-                    playwright_obj.stop()
-                except Exception:
-                    pass
+            self._cleanup_playwright_resources(
+                page=page,
+                context=context,
+                browser=browser,
+                playwright_obj=playwright_obj,
+                temp_profile_dir=temp_profile_dir,
+                browser_process=getattr(self, "_cdp_browser_process", None),
+                timeout_sec=3.0,
+            )
+            self._cdp_browser_process = None
 
         return {
             "provider": self.provider,
@@ -2842,7 +3128,407 @@ class WebGeminiAutoWorker(BaseWorker):
             "output_path": last_saved_path,
             "formatted_text": last_single_result.get("formatted_text", ""),
             "raw_response": last_single_result.get("raw_reply", ""),
+            "parsed_json": last_single_result.get("parsed_json", {}),
         }
+
+    @staticmethod
+    def _is_profile_lock_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        return any(
+            kw in msg
+            for kw in (
+                "singletonlock",
+                "processsingleton",
+                "targetclosederror",
+                "target page, context or browser has been closed",
+                "already in use",
+                "profile is in use",
+                "user data directory",
+            )
+        )
+
+    @staticmethod
+    def _clean_stale_profile_locks(profile_dir: str | Path) -> None:
+        p_dir = Path(profile_dir)
+        for lock_name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+            lock_path = p_dir / lock_name
+            try:
+                if lock_path.exists() or lock_path.is_symlink():
+                    lock_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _kill_stale_chromium_for_profile(profile_dir: str | Path) -> None:
+        """지정된 프로필 경로를 점유한 잔류 Chromium/Chrome 프로세스만 선별 종료합니다."""
+        if sys.platform != "win32":
+            return
+        try:
+            norm_dir = os.path.normpath(str(Path(profile_dir).resolve()))
+        except Exception:
+            norm_dir = os.path.normpath(str(profile_dir))
+        if not norm_dir or len(norm_dir) < 4:
+            return
+
+        escaped_dir = norm_dir.replace("'", "''")
+        ps_script = (
+            f"$target = '{escaped_dir}'; "
+            "Get-CimInstance Win32_Process | Where-Object { "
+            "($_.Name -eq 'chrome.exe' -or $_.Name -eq 'chromium.exe') -and "
+            "$_.CommandLine -and "
+            "$_.CommandLine.IndexOf($target, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 "
+            "} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_chrome_channel_missing_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        if not msg or WebGeminiAutoWorker._is_profile_lock_error(exc):
+            return False
+        return any(
+            kw in msg
+            for kw in (
+                "executable doesn't exist",
+                "distribution 'chrome' is not found",
+                'distribution "chrome" is not found',
+                "chrome is not installed",
+                "chrome not found",
+                "cannot find",
+                "no such file",
+                "failed to find",
+                "not found at",
+            )
+        ) or ("chrome" in msg and ("not found" in msg or "missing" in msg or "executable" in msg or "install" in msg))
+
+    @staticmethod
+    def _inject_stealth_init_script(context: Any) -> None:
+        """Google OAuth 등 봇 탐지 우회를 위해 navigator.webdriver 속성을 숨깁니다."""
+        try:
+            context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _find_system_browser_exe() -> Optional[str]:
+        """시스템에 설치된 정식 Chrome 또는 Edge 실행 파일 경로를 탐색합니다."""
+        candidates: List[str] = []
+        if sys.platform == "win32":
+            candidates.extend(
+                [
+                    os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+                    os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+                    os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+                    os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+                    os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+                    os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\Application\msedge.exe"),
+                ]
+            )
+        for path_str in candidates:
+            if path_str and os.path.isfile(path_str):
+                return path_str
+        for cmd_name in ("chrome", "google-chrome", "chromium", "msedge", "microsoft-edge"):
+            found = shutil.which(cmd_name)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def _find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
+    @staticmethod
+    def _wait_for_cdp_endpoint(
+        port: int, timeout_sec: float = 10.0, proc: Any = None
+    ) -> str:
+        """http://127.0.0.1:<port>/json/version 엔드포인트가 준비될 때까지 대기합니다."""
+        version_url = f"http://127.0.0.1:{port}/json/version"
+        deadline = time.monotonic() + timeout_sec
+        last_err: Optional[Exception] = None
+        while time.monotonic() < deadline:
+            if proc is not None and proc.poll() is not None:
+                raise RuntimeError(
+                    f"브라우저 프로세스가 CDP 준비 전에 종료되었습니다 (code={proc.returncode})."
+                )
+            try:
+                with urllib.request.urlopen(version_url, timeout=1.0) as resp:
+                    if getattr(resp, "status", 200) == 200:
+                        raw = resp.read().decode("utf-8", errors="ignore")
+                        data = json.loads(raw) if raw else {}
+                        if isinstance(data, dict) and (
+                            data.get("webSocketDebuggerUrl") or data.get("Browser")
+                        ):
+                            return f"http://127.0.0.1:{port}"
+            except Exception as exc:
+                last_err = exc
+            time.sleep(0.15)
+        raise TimeoutError(
+            f"CDP 엔드포인트({version_url}) 응답 대기 시간 초과: {last_err}"
+        )
+
+    @staticmethod
+    def _prepare_clean_chrome_profile(profile_dir: str | Path) -> None:
+        """크롬 자체 프로필 동기화(programmatic_auth) 개입 및 비정상 종료 팝업을 원천 차단합니다."""
+        p_dir = Path(profile_dir)
+        default_dir = p_dir / "Default"
+        default_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1) Local State에서 브라우저 로그인 허용 비활성화
+        local_state_path = p_dir / "Local State"
+        local_state: Dict[str, Any] = {}
+        if local_state_path.exists():
+            try:
+                local_state = json.loads(local_state_path.read_text(encoding="utf-8"))
+            except Exception:
+                local_state = {}
+        local_state.setdefault("browser", {})["enabled_labs_experiments"] = []
+        try:
+            local_state_path.write_text(json.dumps(local_state, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+        # 2) Default/Preferences에서 SigninAllowed=False 및 정상 종료 상태 마킹 (쿠키 유실 방지)
+        prefs_path = default_dir / "Preferences"
+        prefs: Dict[str, Any] = {}
+        if prefs_path.exists():
+            try:
+                prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+            except Exception:
+                prefs = {}
+
+        prefs.setdefault("signin", {})["allowed"] = False
+        prefs["signin"]["allowed_on_next_startup"] = False
+        prefs.setdefault("credentials_enable_service", False)
+        prefs.setdefault("profile", {})["exit_type"] = "Normal"
+        prefs["profile"]["exited_cleanly"] = True
+
+        try:
+            prefs_path.write_text(json.dumps(prefs, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _launch_via_cdp(
+        self, playwright_obj: Any, exe_path: str, profile_dir: str | Path
+    ) -> Tuple[Any, Any, Optional[Path]]:
+        """정식 브라우저를 독립 서브프로세스로 실행한 뒤 connect_over_cdp로 연결합니다."""
+        abs_profile_dir = str(Path(profile_dir).resolve())
+        self._clean_stale_profile_locks(profile_dir)
+        self._prepare_clean_chrome_profile(profile_dir)
+
+        def _start_and_connect() -> Tuple[Any, Any, Any]:
+            port = self._find_free_port()
+            cmd = [
+                exe_path,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={abs_profile_dir}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-sync",
+                "--no-service-autorun",
+                "--password-store=basic",
+                "--disable-features=ChromeWhatsNewUI,IdentityConsistency,AccountConsistency",
+            ]
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                cdp_url = self._wait_for_cdp_endpoint(port, timeout_sec=12.0, proc=proc)
+                browser = playwright_obj.chromium.connect_over_cdp(cdp_url)
+                contexts = getattr(browser, "contexts", None) or []
+                context = (
+                    contexts[0]
+                    if contexts
+                    else browser.new_context(
+                        permissions=["clipboard-read", "clipboard-write"]
+                    )
+                )
+                try:
+                    context.grant_permissions(["clipboard-read", "clipboard-write"])
+                except Exception:
+                    pass
+                return proc, browser, context
+            except Exception:
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                raise
+
+        try:
+            proc, browser, context = _start_and_connect()
+        except Exception:
+            self._kill_stale_chromium_for_profile(profile_dir)
+            self._clean_stale_profile_locks(profile_dir)
+            self._prepare_clean_chrome_profile(profile_dir)
+            time.sleep(0.5)
+            proc, browser, context = _start_and_connect()
+
+        self._cdp_browser_process = proc
+        return browser, context, None
+
+
+
+    def _launch_browser_context(
+        self, playwright_obj: Any, profile_dir: str | Path
+    ) -> Tuple[Any, Any, Optional[Path]]:
+        """
+        keep_login_session=True이고 headless=False일 때는 시스템 정식 Chrome/Edge를
+        subprocess.Popen + connect_over_cdp 방식으로 우선 실행하고,
+        미설치 또는 headless=True인 경우 기존 launch_persistent_context로 폴백합니다.
+        """
+        self._cdp_browser_process = None
+        launch_args = ["--disable-blink-features=AutomationControlled"]
+        ignore_args = ["--enable-automation"]
+
+        if not self.keep_login_session:
+            launch_opts: Dict[str, Any] = {
+                "channel": "chrome",
+                "headless": self.headless,
+                "ignore_default_args": ignore_args,
+                "args": launch_args,
+            }
+            try:
+                browser = playwright_obj.chromium.launch(**launch_opts)
+            except Exception as exc:
+                if self._is_chrome_channel_missing_error(exc):
+                    launch_opts.pop("channel", None)
+                    browser = playwright_obj.chromium.launch(**launch_opts)
+                else:
+                    raise
+            context = browser.new_context(
+                permissions=["clipboard-read", "clipboard-write"]
+            )
+            self._inject_stealth_init_script(context)
+            return browser, context, None
+
+        if not self.headless:
+            exe_path = self._find_system_browser_exe()
+            if exe_path:
+                return self._launch_via_cdp(playwright_obj, exe_path, profile_dir)
+
+        kwargs: Dict[str, Any] = {
+            "user_data_dir": str(profile_dir),
+            "channel": "chrome",
+            "headless": self.headless,
+            "permissions": ["clipboard-read", "clipboard-write"],
+            "ignore_default_args": ignore_args,
+            "args": launch_args,
+        }
+
+        def _launch_persistent(opts: Dict[str, Any]) -> Any:
+            try:
+                return playwright_obj.chromium.launch_persistent_context(**opts)
+            except Exception as exc:
+                if "channel" in opts and self._is_chrome_channel_missing_error(exc):
+                    opts.pop("channel", None)
+                    return playwright_obj.chromium.launch_persistent_context(**opts)
+                raise
+
+        try:
+            context = _launch_persistent(kwargs)
+            self._inject_stealth_init_script(context)
+            return None, context, None
+        except Exception as exc:
+            if self._is_profile_lock_error(exc):
+                self._kill_stale_chromium_for_profile(profile_dir)
+                self._clean_stale_profile_locks(profile_dir)
+                time.sleep(0.5)
+                context = _launch_persistent(kwargs)
+                self._inject_stealth_init_script(context)
+                return None, context, None
+            raise
+
+    @staticmethod
+    def _cleanup_playwright_resources(
+        page: Any = None,
+        context: Any = None,
+        browser: Any = None,
+        playwright_obj: Any = None,
+        temp_profile_dir: Optional[Path] = None,
+        browser_process: Any = None,
+        timeout_sec: float = 4.0,
+    ) -> None:
+        """
+        CDP 모드와 일반 Persistent 모드를 구분하여 안전 종료합니다.
+        - CDP 모드: page/context를 강제 닫기하지 않고 Browser.close로 크롬이 쿠키/세션 SQLite를 디스크에 완전히 Flush하도록 유도 후 Playwright 연결 해제 (EPIPE 방지 + 세션 유지)
+        - 내장 Chromium 모드: page -> context -> browser -> playwright 순차 종료
+        """
+        is_cdp_mode = browser_process is not None
+
+        if is_cdp_mode:
+            # 1) 크롬 프로세스에 정상 종료(쿠키 디스크 저장) 명령 먼저 전달
+            if browser is not None:
+                try:
+                    if hasattr(browser, "new_browser_cdp_session"):
+                        cdp_session = browser.new_browser_cdp_session()
+                        cdp_session.send("Browser.close")
+                except Exception:
+                    pass
+
+            # 2) 크롬이 쿠키/세션을 디스크에 쓰고 스스로 닫힐 때까지 먼저 대기
+            try:
+                if browser_process.poll() is None:
+                    browser_process.wait(timeout=timeout_sec)
+            except Exception:
+                try:
+                    if browser_process.poll() is None:
+                        browser_process.terminate()
+                        browser_process.wait(timeout=1.5)
+                except Exception:
+                    pass
+
+            # 3) Playwright 드라이버 정리 (이미 닫힌 소켓 EPIPE 예외 완전 무시)
+            if playwright_obj is not None:
+                try:
+                    playwright_obj.stop()
+                except Exception:
+                    pass
+        else:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                time.sleep(0.4)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright_obj is not None:
+                try:
+                    playwright_obj.stop()
+                except Exception:
+                    pass
+
+        if temp_profile_dir is not None:
+            try:
+                shutil.rmtree(temp_profile_dir, ignore_errors=True)
+            except Exception:
+                pass
+
 
 
 WebLlmAutoWorker = WebGeminiAutoWorker

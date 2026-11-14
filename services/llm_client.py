@@ -120,39 +120,84 @@ def build_structured_prompt(
     return DEFAULT_JSON_SYSTEM_INSTRUCTION, user_prompt
 
 
+_JSON_PRIORITY_KEYS = ("operations", "summary", "fields", "학번", "결과")
+
+
+def _score_json_candidate(parsed: Any, span_len: int) -> Tuple[int, int, int]:
+    """추출된 JSON 후보의 우선순위 점수를 계산합니다."""
+    if isinstance(parsed, dict):
+        key_hits = sum(1 for k in _JSON_PRIORITY_KEYS if k in parsed)
+        return (1 if key_hits > 0 else 0, key_hits, span_len)
+    if isinstance(parsed, list):
+        key_hits = sum(
+            1
+            for item in parsed
+            if isinstance(item, dict) and any(k in item for k in _JSON_PRIORITY_KEYS)
+        )
+        return (1 if key_hits > 0 else 0, key_hits, span_len)
+    return (0, 0, span_len)
+
+
+def _extract_best_json_via_raw_decode(text: str) -> Optional[Any]:
+    """문자열 내 모든 '{', '[' 위치에서 raw_decode를 시도해 최우선 JSON 후보를 반환합니다."""
+    decoder = json.JSONDecoder()
+    best_score: Optional[Tuple[int, int, int]] = None
+    best_parsed: Any = None
+
+    for source in (text, re.sub(r",\s*([\}\]])", r"\1", text)):
+        n = len(source)
+        for idx, ch in enumerate(source):
+            if ch not in "{[":
+                continue
+            try:
+                parsed, end_idx = decoder.raw_decode(source, idx)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, (dict, list)):
+                continue
+            score = _score_json_candidate(parsed, end_idx - idx)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_parsed = parsed
+        if best_parsed is not None:
+            return best_parsed
+    return None
+
+
 def extract_json_from_llm_response(response_text: str) -> Dict[str, Any]:
     """
     외부 LLM(ChatGPT, Claude 웹 등)이나 API가 서두/결론에 인사말을 덧붙였더라도
-    정규표현식을 이용해 순수 JSON 데이터만 안전하게 추출하여 파싱합니다.
+    코드 블록 및 JSONDecoder.raw_decode 스캔을 이용해 순수 JSON 데이터만 안전하게 추출하여 파싱합니다.
     """
     if not response_text or not response_text.strip():
         raise ValueError("응답 텍스트가 비어 있습니다.")
 
     cleaned = response_text.strip()
+    parsed: Any = None
 
     # 1순위: ```json ... ``` 또는 ``` ... ``` 코드 블록 내부 추출
     code_block_match = re.search(
         r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE
     )
-    candidate_str = code_block_match.group(1).strip() if code_block_match else cleaned
-
-    # 2순위: 코드 블록이 없다면 가장 바깥쪽 { ... } 또는 [ ... ] 영역 추출
-    if not code_block_match:
-        brace_match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", candidate_str)
-        if brace_match:
-            candidate_str = brace_match.group(1).strip()
-
-    # JSON 파싱 시도 (후행 쉼표 등 경미한 문법 오류 자동 보정 포함)
-    try:
-        parsed = json.loads(candidate_str)
-    except json.JSONDecodeError:
-        fixed_str = re.sub(r",\s*([\}\]])", r"\1", candidate_str)
+    if code_block_match:
+        candidate_str = code_block_match.group(1).strip()
         try:
-            parsed = json.loads(fixed_str)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"LLM 응답에서 유효한 JSON을 추출하지 못했습니다: {exc}\n\n[추출 시도 원문]:\n{candidate_str[:400]}"
-            ) from exc
+            parsed = json.loads(candidate_str)
+        except json.JSONDecodeError:
+            fixed_str = re.sub(r",\s*([\}\]])", r"\1", candidate_str)
+            try:
+                parsed = json.loads(fixed_str)
+            except json.JSONDecodeError:
+                parsed = None
+
+    # 2순위: 코드 블록이 없거나 파싱 실패 시 모든 '{'/'[' 시작 위치에서 raw_decode 스캔
+    if parsed is None:
+        parsed = _extract_best_json_via_raw_decode(cleaned)
+
+    if parsed is None:
+        raise ValueError(
+            f"LLM 응답에서 유효한 JSON을 추출하지 못했습니다.\n\n[추출 시도 원문]:\n{cleaned[:400]}"
+        )
 
     if isinstance(parsed, list):
         return {"items": parsed, "corrected_text": json.dumps(parsed, ensure_ascii=False, indent=2)}

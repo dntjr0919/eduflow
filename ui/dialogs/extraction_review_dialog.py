@@ -299,6 +299,12 @@ class ExtractionReviewDialog(QDialog):
 
     def _on_save_and_close(self) -> None:
         # 현재 편집 중인 텍스트가 있고 아직 커밋 전이라면 반영 여부 확인 없이 현재 선택 항목 값도 보존할 수 있도록 처리
+        if self._current_item_idx is not None and 0 <= self._current_item_idx < len(self.items):
+            edited_val = self.txt_edit_value.toPlainText().strip()
+            current_item = self.items[self._current_item_idx]
+            if edited_val != str(current_item.get("extracted_value", "")):
+                current_item["extracted_value"] = edited_val
+                current_item["status"] = "reviewed"
         try:
             save_review_updates_to_excel(self.excel_path, self.items)
             self.has_saved_changes = True

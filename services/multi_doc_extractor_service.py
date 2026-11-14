@@ -33,6 +33,7 @@ from services.docx_extractor_service import (
     sanitize_for_excel,
     split_student_number_and_name,
 )
+from services.hwpx_agent_service import _hwp_security_popup_watcher
 from services.llm_client import MultiLlmClient, extract_json_from_llm_response
 
 # 선택적 외부 라이브러리 안전 임포트 (미설치 시에도 앱이 죽지 않도록 처리)
@@ -332,7 +333,8 @@ def _convert_hwp_via_com(hwp_path: Path, temp_dir: Path) -> Optional[Path]:
         except Exception:
             pass
 
-        opened = hwp.Open(str(hwp_path.resolve()), "HWP", "forceopen:true")
+        with _hwp_security_popup_watcher():
+            opened = hwp.Open(str(hwp_path.resolve()), "HWP", "forceopen:true")
         if not opened:
             return None
 

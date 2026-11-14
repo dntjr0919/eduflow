@@ -52,6 +52,7 @@ from services.llm_client import (
     extract_json_from_llm_response,
     format_parsed_json_to_readable_text,
 )
+from services.notifier import NotificationService
 from services.record_generator_service import (
     get_active_ai_info,
     is_blank_or_failed,
@@ -64,6 +65,7 @@ from services.web_gemini_auto_worker import (
     normalize_web_url,
 )
 from ui.utils import install_no_scroll_wheel_filter
+from utils.path_helper import get_data_path
 
 
 def _apply_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -1865,18 +1867,42 @@ class AiExecutionDock(QFrame):
             on_finished=self._on_pw_finished,
         )
 
+    def _notify_attention(self, title: str, message: str) -> None:
+        """로그인/인증/입력창 클릭 대기 시 데스크톱 토스트 알림과 작업 표시줄 깜빡임을 실행합니다."""
+        try:
+            NotificationService().notify(title, message, force_external=False)
+        except Exception:
+            pass
+        try:
+            win = self.window()
+            if win is not None:
+                QApplication.alert(win, 0)
+        except Exception:
+            pass
+
+    def _set_progress_meta_alert(self, text: str, alert: bool = True) -> None:
+        self.lbl_dock_progress_meta.setText(text)
+        if alert:
+            self.lbl_dock_progress_meta.setStyleSheet(
+                "background:#FEF3C7; color:#92400E; padding:4px 8px; border-radius:4px; font-weight:600;"
+            )
+        else:
+            self.lbl_dock_progress_meta.setStyleSheet("")
+
     def _on_pw_waiting_for_login(self, provider_name: str = "") -> None:
         self.btn_pw_confirm_login.setText("인증/로그인 완료 · 작업 재개")
         self.btn_pw_confirm_login.setEnabled(True)
         prefix = f"[{provider_name}] " if provider_name else ""
-        self.lbl_dock_progress_meta.setText(
+        msg = (
             f"{prefix}브라우저에서 로그인·약관 동의·봇 인증 완료 후 [인증/로그인 완료 · 작업 재개] 버튼을 눌러주세요."
         )
+        self._set_progress_meta_alert(msg, alert=True)
+        self._notify_attention("EduFlow 웹 AI 로그인/인증 대기", msg)
 
     def _on_pw_waiting_for_click(self, domain: str = "") -> None:
-        self.lbl_dock_progress_meta.setText(
-            f"[{domain}] 입력창을 자동 탐지하지 못했습니다. 브라우저에서 입력창을 1회 클릭하세요."
-        )
+        msg = f"[{domain}] 입력창을 자동 탐지하지 못했습니다. 브라우저에서 입력창을 1회 클릭하세요."
+        self._set_progress_meta_alert(msg, alert=True)
+        self._notify_attention("EduFlow 웹 AI 입력창 클릭 대기", msg)
 
     def _on_pw_waiting_for_collect(self, batch_idx: int, total_batches: int) -> None:
         self.btn_pw_collect_next.setEnabled(True)
@@ -1888,7 +1914,7 @@ class AiExecutionDock(QFrame):
         if self._active_pw_worker is not None:
             self._active_pw_worker.confirm_login()
         self.btn_pw_confirm_login.setEnabled(False)
-        self.lbl_dock_progress_meta.setText("로그인 확인 완료 — 프롬프트 입력 진행 중...")
+        self._set_progress_meta_alert("로그인 확인 완료 — 프롬프트 입력 진행 중...", alert=False)
 
     def _on_pw_collect_next_clicked(self) -> None:
         if self._active_pw_worker is not None:
@@ -1930,12 +1956,13 @@ class AiExecutionDock(QFrame):
 
     def _on_pw_error(self, err: str) -> None:
         first = (err or "").strip().split("\n")[0]
-        self.lbl_dock_progress_meta.setText(f"오류: {first}")
+        self._set_progress_meta_alert(f"오류: {first}", alert=False)
         QMessageBox.critical(self, "Playwright 실행 오류", first)
 
     def _on_pw_finished(self) -> None:
         self._active_pw_worker = None
         self._set_pw_running_state(False)
+        self.lbl_dock_progress_meta.setStyleSheet("")
 
     # =========================================================================
     # 공통 상태 / 결과 핸들러

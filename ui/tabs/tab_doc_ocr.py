@@ -1539,6 +1539,7 @@ class DocOcrTab(QWidget):
         self._hwpx_doc: Optional[HwpxDocument] = None
         self._hwpx_original_hwp_path: Optional[Path] = None
         self._hwpx_last_exported_path: Optional[Path] = None
+        self._hwpx_dirty: bool = False
         self._hwpx_highlighted_ids: set = set()
         self._hwpx_modified_ids: List[str] = []
         self._hwpx_focus_index: int = 0
@@ -4011,6 +4012,7 @@ class DocOcrTab(QWidget):
         self._hwpx_doc = HwpxDocument.load(hwpx_path)
         self._hwpx_original_hwp_path = original_hwp_path
         self._hwpx_last_exported_path = Path(hwpx_path) if original_hwp_path is None else None
+        self._hwpx_dirty = False
         self._hwpx_highlighted_ids = set()
         self._hwpx_modified_ids = []
         self._hwpx_focus_index = 0
@@ -4042,7 +4044,7 @@ class DocOcrTab(QWidget):
             temp_hwpx = temp_dir / f"{src_path.stem}.hwpx"
             self.btn_hwpx_open.setEnabled(False)
             self.lbl_hwpx_summary_badge.setText(
-                f"HWP 원본을 임시 HWPX로 백그라운드 변환 중... ({src_path.name})"
+                f"HWP 원본을 임시 HWPX로 변환 중... 한글 보안 경고창이 뜨면 [접근 허용] 또는 [모두 허용]을 클릭하세요. ({src_path.name})"
             )
 
             def _convert_task(worker: BaseWorker) -> Path:
@@ -4168,6 +4170,7 @@ class DocOcrTab(QWidget):
         self._hwpx_patch_timer.stop()
         self._hwpx_pending_ops.clear()
         self._hwpx_doc.undo()
+        self._hwpx_dirty = True
         self._hwpx_highlighted_ids = set()
         self._hwpx_modified_ids = []
         self._hwpx_focus_index = 0
@@ -4180,7 +4183,12 @@ class DocOcrTab(QWidget):
         self._render_hwpx_viewer()
         self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
 
-    def _export_hwpx_as_hwp_async(self, target_hwp_path: Path, badge_prefix: str) -> None:
+    def _export_hwpx_as_hwp_async(
+        self,
+        target_hwp_path: Path,
+        badge_prefix: str,
+        open_after_save: bool = False,
+    ) -> None:
         if self._hwpx_doc is None:
             return
         try:
@@ -4192,7 +4200,7 @@ class DocOcrTab(QWidget):
         self.btn_hwpx_save.setEnabled(False)
         self.btn_hwpx_save_as.setEnabled(False)
         self.lbl_hwpx_summary_badge.setText(
-            f"HWP 포맷으로 백그라운드 역변환 저장 중... ({target_hwp_path.name})"
+            f"HWP 포맷으로 저장 중... 한글 보안 경고창이 뜨면 [접근 허용] 또는 [모두 허용]을 클릭하세요. ({target_hwp_path.name})"
         )
 
         def _convert_back_task(worker: BaseWorker) -> Path:
@@ -4203,8 +4211,12 @@ class DocOcrTab(QWidget):
             self.btn_hwpx_save.setEnabled(True)
             self.btn_hwpx_save_as.setEnabled(True)
             self._hwpx_last_exported_path = Path(out_path)
+            self._hwpx_dirty = False
             self.lbl_hwpx_summary_badge.setText(f"{badge_prefix}: {Path(out_path).name}")
-            QMessageBox.information(self, "저장 완료", f"HWP 문서가 저장되었습니다:\n{out_path}")
+            if open_after_save:
+                os.startfile(str(Path(out_path).resolve()))
+            else:
+                QMessageBox.information(self, "저장 완료", f"HWP 문서가 저장되었습니다:\n{out_path}")
 
         def _on_save_hwp_error(err_msg: str) -> None:
             self.btn_hwpx_save.setEnabled(True)
@@ -4232,6 +4244,7 @@ class DocOcrTab(QWidget):
         try:
             saved = self._hwpx_doc.save()
             self._hwpx_last_exported_path = saved
+            self._hwpx_dirty = False
             self.lbl_hwpx_summary_badge.setText(f"저장 완료 (OCF ZIP_STORED 무결성 유지): {saved.name}")
             QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
         except Exception as exc:
@@ -4278,18 +4291,71 @@ class DocOcrTab(QWidget):
         try:
             saved = self._hwpx_doc.save(dst_path)
             self._hwpx_last_exported_path = saved
+            self._hwpx_dirty = False
             self.lbl_hwpx_summary_badge.setText(f"다른 이름으로 저장 완료 (HWPX): {saved.name}")
             QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
         except Exception as exc:
             QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
 
     def _on_hwpx_open_in_app(self) -> None:
+        if self._hwpx_doc is None:
+            QMessageBox.information(self, "안내", "먼저 문서를 열거나 저장해 주세요.")
+            return
+
+        if self._hwpx_original_hwp_path is not None:
+            needs_export = (
+                self._hwpx_last_exported_path is None
+                or not self._hwpx_last_exported_path.exists()
+                or self._hwpx_dirty
+            )
+            if needs_export:
+                reply = QMessageBox.question(
+                    self,
+                    "HWP 저장 후 열기",
+                    "현재 편집 중인 HWP 문서가 아직 저장(역변환)되지 않았거나 미저장 수정 사항이 있습니다.\n\n"
+                    "먼저 HWP 파일로 저장(역변환)한 뒤 한글(HWP)에서 열까요?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+                target_hwp = (
+                    self._hwpx_last_exported_path
+                    if (
+                        self._hwpx_last_exported_path is not None
+                        and self._hwpx_last_exported_path.suffix.lower() == ".hwp"
+                    )
+                    else self._hwpx_original_hwp_path
+                )
+                self._export_hwpx_as_hwp_async(
+                    target_hwp,
+                    badge_prefix="원본 HWP 저장 완료",
+                    open_after_save=True,
+                )
+                return
+
+        if self._hwpx_dirty:
+            reply = QMessageBox.question(
+                self,
+                "저장 후 열기",
+                "수정된 내용이 아직 파일에 저장되지 않았습니다.\n\n먼저 저장한 뒤 한글에서 열까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                try:
+                    saved = self._hwpx_doc.save()
+                    self._hwpx_last_exported_path = saved
+                    self._hwpx_dirty = False
+                except Exception as exc:
+                    QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+                    return
+
         target: Optional[Path] = None
         if self._hwpx_last_exported_path is not None and self._hwpx_last_exported_path.exists():
             target = self._hwpx_last_exported_path
         elif (
-            self._hwpx_doc is not None
-            and self._hwpx_doc.source_path is not None
+            self._hwpx_doc.source_path is not None
             and self._hwpx_doc.source_path.exists()
         ):
             target = self._hwpx_doc.source_path
@@ -4334,6 +4400,7 @@ class DocOcrTab(QWidget):
         self._hwpx_focus_index = 0
         self._update_hwpx_nav_bar()
         self._hwpx_pending_ops = [dict(o) for o in ops if isinstance(o, dict)]
+        self._hwpx_attempted_ops = [dict(o) for o in self._hwpx_pending_ops]
         self._hwpx_pending_summary = str(payload.get("summary", "") or "AI 문서 수정 적용 중").strip()
         self.lbl_hwpx_summary_badge.setText(
             f"적용 중: {self._hwpx_pending_summary} (남은 연산 {len(self._hwpx_pending_ops)}건)"
@@ -4356,6 +4423,17 @@ class DocOcrTab(QWidget):
             self.lbl_hwpx_summary_badge.setStyleSheet(
                 "background:#FEF3C7; color:#92400E; padding:4px 8px; border-radius:4px; font-weight:bold;"
             )
+            attempted = getattr(self, "_hwpx_attempted_ops", []) or []
+            if attempted:
+                details = "; ".join(
+                    f"op={o.get('op','')}, target_id={o.get('target_id','')}, old_text={str(o.get('old_text',''))[:60]!r}"
+                    for o in attempted[:10]
+                )
+                self.task_runner.global_signals.log.emit(
+                    "WARN",
+                    "HWPX Agent",
+                    f"0건 매칭 원인 진단 ({len(attempted)}건 시도): {details}",
+                )
         else:
             self.lbl_hwpx_summary_badge.setText(
                 f"적용 완료: {self._hwpx_pending_summary} (총 {len(self._hwpx_highlighted_ids)}개 영역 강조됨)"
@@ -4372,13 +4450,33 @@ class DocOcrTab(QWidget):
             return
 
         op_data = self._hwpx_pending_ops.pop(0)
-        touched = apply_single_hwpx_operation(self._hwpx_doc, op_data)
-        self._hwpx_highlighted_ids.update(touched)
-        for tid in touched:
-            if tid not in self._hwpx_modified_ids:
-                self._hwpx_modified_ids.append(tid)
-        self._render_hwpx_viewer()
-        self._update_hwpx_nav_bar()
+        try:
+            touched = apply_single_hwpx_operation(self._hwpx_doc, op_data)
+            if touched:
+                self._hwpx_dirty = True
+            self._hwpx_highlighted_ids.update(touched)
+            for tid in touched:
+                if tid not in self._hwpx_modified_ids:
+                    self._hwpx_modified_ids.append(tid)
+            self._render_hwpx_viewer()
+            self._update_hwpx_nav_bar()
+        except Exception as exc:
+            import traceback
+
+            self._hwpx_patch_timer.stop()
+            self._hwpx_pending_ops.clear()
+            err_msg = f"패치 적용 오류 ({op_data.get('op', '')}): {exc}"
+            self.lbl_hwpx_summary_badge.setText(err_msg)
+            self.lbl_hwpx_summary_badge.setStyleSheet(
+                "background:#FEE2E2; color:#991B1B; padding:4px 8px; border-radius:4px; font-weight:bold;"
+            )
+            self.task_runner.global_signals.log.emit(
+                "ERROR",
+                "HWPX Agent",
+                f"{err_msg}\n{traceback.format_exc()}",
+            )
+            return
+
         if self._hwpx_pending_ops:
             self.lbl_hwpx_summary_badge.setText(
                 f"실시간 패치 중: {self._hwpx_pending_summary} (남은 연산 {len(self._hwpx_pending_ops)}건)"

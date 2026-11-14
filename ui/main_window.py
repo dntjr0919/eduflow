@@ -795,13 +795,13 @@ class MainWindow(QMainWindow):
 
     def quit_application(self) -> None:
         self._force_quit = True
-        self.task_runner.stop_all(wait_ms=2500)
+        self.task_runner.stop_all(wait_ms=3000)
         self.tray_icon.hide()
         QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._force_quit:
-            self.task_runner.stop_all(wait_ms=2500)
+            self.task_runner.stop_all(wait_ms=3000)
             event.accept()
             return
 
