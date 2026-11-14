@@ -37,3 +37,9 @@ Desktop.ini
 # Test Dummies
 Test_Source/
 Test_Target/
+
+# Playwright browser profile & cache
+playwright_web_llm_profile/
+*playwright*_profile/
+*.pma
+

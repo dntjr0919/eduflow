@@ -608,10 +608,17 @@ class MainWindow(QMainWindow):
             context_getter=lambda: self.tab_doc_ocr.get_ai_context("ocr"),
             on_result=self.tab_doc_ocr.apply_ai_dock_result,
         )
+        self.ai_dock.register_target(
+            target_id="hwpx_agent",
+            label="4. HWPX AI 문서 에이전트",
+            context_getter=lambda: self.tab_doc_ocr.get_ai_context("hwpx_agent"),
+            on_result=self.tab_doc_ocr.apply_ai_dock_result,
+        )
         self.ai_dock.target_changed.connect(self.tab_doc_ocr.set_active_ai_target)
         self.ai_dock.go_to_settings_requested.connect(self.switch_to_settings_tab)
         self.tab_doc_ocr.ai_target_requested.connect(self._on_central_ai_target_requested)
         self.tab_doc_ocr.ai_context_changed.connect(self.ai_dock.sync_from_context)
+        self.tab_doc_ocr.ai_quote_selected.connect(self.ai_dock.set_quoted_selection)
         self.ai_dock.set_target("agg_step2", force=True)
 
         self.sidebar_nav.setCurrentRow(0)

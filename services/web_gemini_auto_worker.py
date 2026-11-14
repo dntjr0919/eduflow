@@ -8,8 +8,10 @@ Playwright 기반 멀티 웹 AI(Gemini, ChatGPT, Claude, 커스텀 URL) 자동�
 - 완전 자동(auto) 및 반자동(semi_auto: 프롬프트 입력 후 수동 전송, 회수 버튼으로 다음 배치 진행) 지원
 """
 
+import base64
 import ctypes
 from ctypes import wintypes
+import mimetypes
 from pathlib import Path
 import random
 import sys
@@ -50,31 +52,48 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
         "name": "Google Gemini",
         "url": "https://gemini.google.com/app",
         "input": 'div[contenteditable="true"], rich-textarea div[contenteditable="true"]',
-        "stop": 'button[aria-label*="중지"], button[aria-label*="Stop"]',
+        "stop": 'button[aria-label*="대답 중지"], button[aria-label*="Stop generating"], button[aria-label*="응답 중지"]',
         "response": "message-content, model-response",
+        "done_action": 'button[aria-label*="복사"], button[aria-label*="Copy"], message-actions',
         "send": 'button[aria-label*="보내기"], button[aria-label*="전송"], button[aria-label*="Send"], button.send-button',
         "new_chat": 'a[href="/app"], button[aria-label*="새 채팅"], button[aria-label*="New chat"]',
         "temp_chat": 'button[aria-label*="임시 채팅"], button[aria-label*="Temporary chat"], [data-test-id*="temporary-chat"]',
+        "file_input": 'input[type="file"]',
+        "attach_btn": 'button[aria-label*="업로드 및 도구"], button[aria-label*="Upload"], button[aria-label*="파일"], button[data-test-id*="upload"], button.upload-card-button',
     },
     "chatgpt": {
         "name": "ChatGPT",
         "url": "https://chatgpt.com/",
         "temp_url": "https://chatgpt.com/?temporary-chat=true",
         "input": '#prompt-textarea, div[contenteditable="true"]',
-        "stop": 'button[data-testid="stop-button"], button[aria-label*="중지"], button[aria-label*="Stop"]',
-        "response": 'div[data-message-author-role="assistant"]',
-        "send": 'button[data-testid="send-button"], button[aria-label*="프롬프트 보내기"], button[aria-label*="Send"]',
+        "stop": 'button[data-testid="stop-button"], button[aria-label="스트리밍 중지"], button[aria-label="Stop streaming"], button[aria-label="생성 중지"]',
+        "response": '[data-message-author-role="assistant"], article[data-turn="assistant"] .markdown, article[data-testid^="conversation-turn-"] div.markdown.prose, div.markdown.prose',
+        "done_action": 'button[data-testid="copy-turn-action-button"], button[aria-label*="복사"], button[aria-label*="Copy"]',
+        "send": (
+            'button[data-testid="send-button"], '
+            'button#composer-submit-button, '
+            'button[aria-label*="프롬프트 보내기"], '
+            'button[aria-label*="메시지 보내기"], '
+            'button[aria-label*="보내기"], '
+            'button[aria-label*="Send"], '
+            'form button[type="submit"]'
+        ),
         "new_chat": 'a[href="/"], button[aria-label*="새 채팅"], button[aria-label*="New chat"]',
+        "file_input": 'input[type="file"]',
+        "attach_btn": 'button[aria-label*="파일"], button[aria-label*="Attach"], button[data-testid="composer-plus-btn"]',
     },
     "claude": {
         "name": "Claude",
         "url": "https://claude.ai/new",
         "input": 'div[contenteditable="true"]',
-        "stop": 'button[aria-label*="Stop"], button[aria-label*="중지"]',
+        "stop": 'button[aria-label*="Stop response"], button[aria-label*="응답 중지"], button[aria-label*="생성 중지"], button[aria-label*="멈추"], button[data-testid="stop-button"]',
         "response": "div[data-is-streaming], div.font-claude-message",
+        "done_action": 'button[aria-label*="Copy"], button[aria-label*="복사"]',
         "send": 'button[aria-label*="Send"], button[aria-label*="보내기"], button[aria-label*="전송"]',
         "new_chat": 'a[href="/new"], button[aria-label*="New chat"], button[aria-label*="새 채팅"]',
-        "temp_chat": 'button[aria-label*="Temporary"], button[aria-label*="Incognito"], button[aria-label*="임시"]',
+        "temp_chat": 'button[aria-label*="Temporary"], button[aria-label*="Incognito"], button[aria-label*="임시"], button[aria-label*="시크릿"], a[href*="incognito"]',
+        "file_input": 'input[type="file"]',
+        "attach_btn": 'button[aria-label*="Attach"], button[aria-label*="Upload"], button[aria-label*="파일"], button[data-testid="file-upload"]',
     },
     "custom": {
         "name": "Custom Web AI",
@@ -82,9 +101,12 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
         "input": GENERIC_INPUT_SELECTORS,
         "stop": 'button[aria-label*="Stop"], button[aria-label*="중지"], button[data-testid="stop-button"]',
         "response": GENERIC_RESPONSE_SELECTORS,
+        "done_action": 'button[aria-label*="Copy"], button[aria-label*="복사"]',
         "send": 'button[type="submit"], button[aria-label*="Send"], button[aria-label*="보내기"], button[aria-label*="전송"], button[data-testid="send-button"]',
         "new_chat": 'a[href="/"], button[aria-label*="새 채팅"], button[aria-label*="New chat"]',
         "temp_chat": "",
+        "file_input": 'input[type="file"]',
+        "attach_btn": 'button[aria-label*="파일"], button[aria-label*="첨부"], button[aria-label*="Upload"], button[aria-label*="Attach"]',
     },
 }
 
@@ -346,6 +368,8 @@ class WebGeminiAutoWorker(BaseWorker):
         custom_url: str = "",
         keep_login_session: bool = True,
         single_prompt: Optional[str] = None,
+        attachment_paths: Optional[List[str]] = None,
+        task_label: str = "단일 AI 작업",
     ):
         provider_key = str(provider or "gemini").strip().lower()
         if provider_key not in PROVIDER_CONFIGS:
@@ -374,6 +398,10 @@ class WebGeminiAutoWorker(BaseWorker):
         super().__init__(task_name=f"Playwright 웹 {self.provider_config['name']} {mode_tag}")
 
         self.single_prompt = str(single_prompt).strip() if single_prompt else None
+        self.task_label = str(task_label or "단일 AI 작업").strip() or "단일 AI 작업"
+        self.attachment_paths: List[str] = [
+            str(p).strip() for p in (attachment_paths or []) if str(p).strip()
+        ]
         self.excel_path = Path(excel_path) if excel_path and str(excel_path).strip() else None
         self.prompt_file = Path(prompt_file) if prompt_file else None
         self.reference_dir = Path(reference_dir) if reference_dir else None
@@ -692,8 +720,98 @@ class WebGeminiAutoWorker(BaseWorker):
                 time.sleep(0.4)
         return self._resolve_input_locator(page, timeout_sec=timeout_sec, allow_click_fallback=True)
 
+    def _detect_blocking_overlay_or_auth(self, page: Any) -> Optional[str]:
+        """
+        입력창 미표시/비활성, 약관/안내 모달, 봇 아님 인증(CAPTCHA/Cloudflare) 여부를 감지합니다.
+        차단 상태이면 사유 문자열을, 정상이면 None을 반환합니다.
+        """
+        # 1) 봇 아님 인증 (Cloudflare Turnstile / CAPTCHA)
+        try:
+            cf = page.locator('iframe[src*="challenges.cloudflare"]')
+            if cf.count() > 0 and cf.first.is_visible():
+                return "봇 아님 인증(Cloudflare)"
+        except Exception:
+            pass
+
+        bot_keywords = ("사람인지 확인", "verify you are human")
+        try:
+            body_text = page.evaluate(
+                "() => (document.body && document.body.innerText) ? document.body.innerText : ''"
+            )
+            if isinstance(body_text, str):
+                lower_body = body_text.lower()
+                if any(kw in lower_body for kw in bot_keywords):
+                    return "봇 아님 인증(사람인지 확인)"
+        except Exception:
+            pass
+
+        # 2) 약관/안내 모달 ([role="dialog"] 등)
+        consent_keywords = ("동의", "시작하기", "계속", "accept", "agree", "get started")
+        try:
+            dialogs = page.locator('[role="dialog"]')
+            d_cnt = dialogs.count()
+            for idx in range(min(d_cnt, 5)):
+                dlg = dialogs.nth(idx)
+                try:
+                    if not dlg.is_visible():
+                        continue
+                    d_txt = (dlg.inner_text() or "").strip().lower()
+                    if any(kw in d_txt for kw in consent_keywords) or any(
+                        kw in d_txt for kw in bot_keywords
+                    ):
+                        return "약관 동의/안내 모달 또는 인증창"
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if self._is_likely_login_page(page):
+            return "로그인 화면"
+
+        # 3) 입력창 미표시 또는 비활성 상태 확인
+        input_loc = self._resolve_input_locator(page, timeout_sec=0.5, allow_click_fallback=False)
+        if input_loc is None:
+            return "채팅 입력창 미표시"
+        try:
+            if not input_loc.is_visible() or not input_loc.is_enabled():
+                return "채팅 입력창 비활성 상태"
+        except Exception:
+            pass
+
+        return None
+
+    def _wait_for_user_auth_resume(self, page: Any, reason: str) -> bool:
+        """로그인·약관 동의·봇 인증 완료 후 사용자의 재개 버튼 클릭을 대기합니다."""
+        provider_name = self.provider_config["name"]
+        self._login_confirmed_event.clear()
+        self.emit_log(
+            "WARN",
+            f"[{provider_name}] {reason}이(가) 감지되어 대기합니다. "
+            "브라우저에서 로그인·약관 동의·봇 인증을 완료한 뒤 '인증/로그인 완료 · 작업 재개' 버튼을 눌러주세요.",
+        )
+        self.emit_progress(
+            5,
+            f"[{provider_name}] {reason} 대기 중 ('인증/로그인 완료 · 작업 재개' 클릭)...",
+        )
+        self.waiting_for_login.emit(provider_name)
+        while not self._login_confirmed_event.is_set():
+            if self.is_stop_requested():
+                return False
+            time.sleep(0.2)
+        self.emit_log("INFO", f"[{provider_name}] 사용자 인증/확인 완료 — 작업을 재개합니다.")
+        return True
+
+    def _ensure_ready_before_input(self, page: Any, input_loc: Any) -> Any:
+        """프롬프트 입력 직전 차단 모달·봇 인증·입력창 비활성을 최종 점검하고 필요 시 대기합니다."""
+        reason = self._detect_blocking_overlay_or_auth(page)
+        if reason is not None:
+            if not self._wait_for_user_auth_resume(page, reason):
+                return None
+            return self._resolve_input_locator(page, timeout_sec=10.0, allow_click_fallback=True)
+        return input_loc
+
     def _ensure_logged_in(self, page: Any) -> Any:
-        """대상 웹 AI 접속 후 로그인 모드 설정에 따라 즉시 시작하거나 사용자 로그인 확인을 대기합니다."""
+        """대상 웹 AI 접속 후 로그인·약관·봇 인증 상태를 점검하고 필요 시 사용자 완료를 대기합니다."""
         provider_name = self.provider_config["name"]
         target_url = self.provider_config["url"]
         if not target_url:
@@ -702,65 +820,97 @@ class WebGeminiAutoWorker(BaseWorker):
         self.emit_log("INFO", f"[{provider_name}] 페이지로 이동합니다 ({target_url})...")
         page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
 
-        # 1) 비로그인 / 즉시 시작 모드: 입력창 탐지 시도 -> 로그인 화면이거나 미발견 시 대기
         if not self.require_login:
             if not self._is_likely_login_page(page):
-                # 커스텀 URL이 아닌 알려진 공급자는 최대 10초, 커스텀은 5초간 자동 탐지(클릭 폴백 전)
                 wait_s = 5.0 if (self.provider == "custom" or self.custom_url) else 10.0
                 input_loc = self._resolve_input_locator(
                     page, timeout_sec=wait_s, allow_click_fallback=False
                 )
-                if input_loc is not None:
+                blocking_reason = self._detect_blocking_overlay_or_auth(page)
+                if input_loc is not None and blocking_reason is None:
                     return input_loc
 
             if self.is_stop_requested():
                 return None
 
-            # 로그인 화면이 아니고 커스텀 URL이면 클릭 학습 폴백 바로 허용 가능
             if not self._is_likely_login_page(page) and (self.provider == "custom" or self.custom_url):
-                input_loc = self._wait_for_user_click_input(
-                    page, extract_domain_from_url(str(getattr(page, "url", "") or target_url))
-                )
-                if input_loc is not None:
-                    return input_loc
-                if self.is_stop_requested():
-                    return None
+                blocking_reason = self._detect_blocking_overlay_or_auth(page)
+                if blocking_reason is None or blocking_reason == "채팅 입력창 미표시":
+                    input_loc = self._wait_for_user_click_input(
+                        page, extract_domain_from_url(str(getattr(page, "url", "") or target_url))
+                    )
+                    if input_loc is not None:
+                        return input_loc
+                    if self.is_stop_requested():
+                        return None
 
-            self.emit_log(
-                "WARN",
-                f"[{provider_name}] 채팅 입력창이 보이지 않습니다. 브라우저에서 로그인을 마친 뒤 "
-                "우측 AI 실행 패널의 '로그인 완료' 버튼을 눌러주세요.",
-            )
-            self.emit_progress(
-                5,
-                f"[{provider_name}] 로그인 확인 대기 중 ('로그인 완료' 버튼 클릭)...",
-            )
-            self.waiting_for_login.emit(provider_name)
-            while not self._login_confirmed_event.is_set():
-                if self.is_stop_requested():
-                    return None
-                time.sleep(0.2)
-            self.emit_log("INFO", f"[{provider_name}] 로그인 확인 완료 — 작업을 시작합니다.")
+            reason = self._detect_blocking_overlay_or_auth(page) or "로그인/인증 확인"
+            if not self._wait_for_user_auth_resume(page, reason):
+                return None
             return True
 
-        # 2) 명시적 로그인 후 작업 모드 (기존 BatchManualPromptDialog 호환)
-        self.emit_log(
-            "WARN",
-            f"[{provider_name}] 브라우저에서 로그인을 마친 뒤 '로그인 완료' 버튼을 눌러주세요.",
-        )
-        self.emit_progress(
-            5,
-            f"[{provider_name}] 브라우저 로그인 대기 중 ('로그인 완료' 버튼 대기)...",
-        )
-        self.waiting_for_login.emit(provider_name)
-
-        while not self._login_confirmed_event.is_set():
-            if self.is_stop_requested():
+        # 명시적 로그인 후 작업 모드
+        if not self._wait_for_user_auth_resume(page, "로그인 확인"):
+            return None
+        blocking_reason = self._detect_blocking_overlay_or_auth(page)
+        if blocking_reason is not None:
+            if not self._wait_for_user_auth_resume(page, blocking_reason):
                 return None
-            time.sleep(0.2)
-
-        self.emit_log("INFO", f"[{provider_name}] 로그인 확인 완료 — 배치 작업을 시작합니다.")
         return True
+
+    def _verify_temp_chat_active(
+        self, page: Any, prov: str, timeout_sec: float = 8.0
+    ) -> bool:
+        """임시 채팅 모드가 실제로 활성화되었는지 최대 timeout_sec초 동안 폴링 검증합니다."""
+        deadline = time.monotonic() + timeout_sec
+        temp_sel = PROVIDER_CONFIGS.get(prov, {}).get("temp_chat", "")
+        banner_keywords = (
+            "임시 채팅",
+            "temporary chat",
+            "incognito",
+            "won't appear in your history",
+            "기록에 남지",
+        )
+
+        while time.monotonic() < deadline:
+            if self.is_stop_requested():
+                return False
+
+            body_lower = ""
+            try:
+                body_text = page.evaluate(
+                    "() => (document.body && document.body.innerText) ? document.body.innerText : ''"
+                )
+                if isinstance(body_text, str):
+                    body_lower = body_text.lower()
+            except Exception:
+                body_lower = ""
+
+            has_banner = any(kw in body_lower for kw in banner_keywords)
+
+            if prov == "chatgpt":
+                cur_url = str(getattr(page, "url", "") or "").lower()
+                if "temporary-chat=true" in cur_url and has_banner:
+                    return True
+            else:
+                if temp_sel:
+                    try:
+                        btns = page.locator(temp_sel)
+                        cnt = btns.count()
+                        for idx in range(min(cnt, 3)):
+                            b = btns.nth(idx)
+                            pressed = (b.get_attribute("aria-pressed") or "").strip().lower()
+                            checked = (b.get_attribute("aria-checked") or "").strip().lower()
+                            if pressed == "true" or checked == "true":
+                                return True
+                    except Exception:
+                        pass
+                if has_banner:
+                    return True
+
+            time.sleep(0.3)
+
+        return False
 
     def _open_new_chat(
         self,
@@ -817,26 +967,51 @@ class WebGeminiAutoWorker(BaseWorker):
                 if btn.count() > 0 and btn.is_visible():
                     btn.click()
 
-        if temp_chat and prov != "chatgpt":
-            clicked_temp = False
-            temp_sel = cfg.get("temp_chat", "")
-            if temp_sel:
-                try:
-                    temp_btn = page.locator(temp_sel).first
-                    if temp_btn.count() > 0 and temp_btn.is_visible():
-                        temp_btn.click()
-                        clicked_temp = True
-                        time.sleep(0.3)
-                except Exception:
-                    clicked_temp = False
+        if temp_chat:
+            temp_confirmed = False
+            if prov == "chatgpt":
+                temp_confirmed = self._verify_temp_chat_active(page, prov, timeout_sec=8.0)
+            else:
+                clicked_temp = False
+                temp_sel = cfg.get("temp_chat", "")
+                if temp_sel:
+                    try:
+                        temp_btn = page.locator(temp_sel).first
+                        if temp_btn.count() > 0 and temp_btn.is_visible():
+                            temp_btn.click()
+                            clicked_temp = True
+                    except Exception:
+                        clicked_temp = False
 
-            if not clicked_temp:
+                if clicked_temp:
+                    temp_confirmed = self._verify_temp_chat_active(page, prov, timeout_sec=8.0)
+                else:
+                    # 이미 임시 채팅 상태일 수도 있으므로 한 번 확인
+                    temp_confirmed = self._verify_temp_chat_active(page, prov, timeout_sec=1.5)
+                    if not temp_confirmed:
+                        if prov == "claude":
+                            self.emit_log(
+                                "INFO",
+                                f"[{provider_name}] 임시 채팅 버튼을 찾지 못해 일반 새 채팅으로 진행합니다.",
+                            )
+                            temp_confirmed = True
+                        else:
+                            self.emit_log(
+                                "WARN",
+                                f"[{provider_name}] 임시 채팅 버튼을 찾지 못했습니다. 일반 채팅 입력 방지를 위해 확인이 필요합니다.",
+                            )
+
+            if not temp_confirmed:
+                if self.is_stop_requested():
+                    return None
                 self.emit_log(
-                    "INFO",
-                    f"[{provider_name}] 임시 채팅 버튼을 찾지 못해 일반 새 채팅으로 진행합니다.",
+                    "WARN",
+                    f"[{provider_name}] 임시 채팅 모드 전환이 확인되지 않았습니다. 일반 채팅에 프롬프트가 입력되지 않도록 대기합니다.",
                 )
+                if not self._wait_for_user_auth_resume(page, "임시 채팅 모드 전환 확인"):
+                    return None
 
-        input_loc = self._resolve_input_locator(page, timeout_sec=18.0, allow_click_fallback=True)
+        input_loc = self._wait_for_input_ready(page, timeout_sec=18.0)
         if input_loc is None and not self.is_stop_requested():
             raise TimeoutError(f"[{provider_name}] 새 채팅 입력창을 찾지 못했습니다.")
         return input_loc
@@ -878,10 +1053,21 @@ class WebGeminiAutoWorker(BaseWorker):
 
         if copied:
             try:
+                page.keyboard.press("Control+A")
+                time.sleep(0.05)
+                page.keyboard.press("Backspace")
+                time.sleep(0.05)
                 page.keyboard.press("Control+V")
                 time.sleep(0.25)
-                current_text = self._read_input_box_text(input_loc)
-                if len(current_text.strip()) >= min(16, max(1, len(prompt_text.strip()) // 2)):
+                try:
+                    current_text = str(input_loc.inner_text() or "")
+                except Exception:
+                    current_text = ""
+                if not current_text.strip():
+                    current_text = self._read_input_box_text(input_loc)
+                stripped_len = len(current_text.strip())
+                prompt_len = len(prompt_text.strip())
+                if stripped_len >= 10 or (prompt_len < 10 and stripped_len >= max(1, prompt_len)):
                     return
             except Exception:
                 pass
@@ -925,45 +1111,816 @@ class WebGeminiAutoWorker(BaseWorker):
         except Exception as exc:
             raise RuntimeError(f"프롬프트 입력창에 텍스트를 삽입하지 못했습니다: {exc}") from exc
 
-    def _submit_prompt(self, page: Any, input_loc: Any) -> None:
-        """입력된 프롬프트를 Enter 또는 전송 버튼 클릭으로 전송합니다."""
+    def _is_submission_started(
+        self,
+        page: Any,
+        input_loc: Any,
+        stop_sel: str,
+        resp_sel: str,
+        pre_count: int,
+    ) -> bool:
+        """전송 시작 여부(stop 버튼 출현, 입력창 비워짐, 어시스턴트 응답 수 증가)를 확인합니다."""
+        try:
+            if page.locator(stop_sel).first.is_visible() is True:
+                return True
+        except Exception:
+            pass
+        try:
+            if len(self._read_input_box_text(input_loc).strip()) == 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if int(page.locator(resp_sel).count()) > pre_count:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _submit_prompt(
+        self,
+        page: Any,
+        input_loc: Any,
+        pre_response_count: Optional[int] = None,
+    ) -> None:
+        """입력된 프롬프트를 Enter -> 전송 버튼 순회 클릭 -> Ctrl+Enter/requestSubmit 순으로 검증 전송합니다."""
         stop_sel = self.provider_config["stop"]
         send_sel = self.provider_config["send"]
+        resp_sel = self.provider_config.get("response") or GENERIC_RESPONSE_SELECTORS
 
-        time.sleep(0.3)
+        if pre_response_count is None:
+            try:
+                pre_count = int(page.locator(resp_sel).count())
+            except Exception:
+                pre_count = 0
+        else:
+            pre_count = int(pre_response_count)
+
+        def _poll_started(timeout_sec: float) -> bool:
+            deadline = time.time() + timeout_sec
+            while True:
+                if self.is_stop_requested():
+                    return True
+                if self._is_submission_started(page, input_loc, stop_sel, resp_sel, pre_count):
+                    return True
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.2)
+
+        # 1) 입력창 포커스 유지 상태에서 Enter 전송 및 최대 1.2초 검증
+        time.sleep(0.25)
+        try:
+            input_loc.focus()
+        except Exception:
+            pass
         try:
             input_loc.press("Enter")
         except Exception:
             pass
+        if _poll_started(1.2):
+            return
 
-        time.sleep(0.6)
+        # 2) send_sel 매칭 모든 버튼 순회하며 visible & enabled 버튼 클릭 + 최대 2초 재확인
+        clicked_btn = False
         try:
-            stop_visible = page.locator(stop_sel).first.is_visible()
+            btns = page.locator(send_sel)
+            cnt = int(btns.count())
+            for idx in range(cnt):
+                cand = btns.nth(idx)
+                try:
+                    if cand.is_visible() and cand.is_enabled():
+                        cand.click()
+                        clicked_btn = True
+                        break
+                except Exception:
+                    continue
         except Exception:
-            stop_visible = False
+            pass
+        if clicked_btn and _poll_started(2.0):
+            return
 
-        if not stop_visible:
+        # 3) Ctrl+Enter 및 JS form.requestSubmit() 폴백 1회 시도
+        try:
+            input_loc.press("Control+Enter")
+        except Exception:
+            pass
+        try:
+            input_loc.evaluate(
+                "el => { const f = el.closest ? el.closest('form') : null; if (f && f.requestSubmit) f.requestSubmit(); }"
+            )
+        except Exception:
+            pass
+        if _poll_started(1.5):
+            return
+
+        self.emit_log(
+            "WARN",
+            f"[{self.provider_config['name']}] 프롬프트 전송 시작 확인 실패 (Enter/전송버튼/Ctrl+Enter 폴백 모두 미반영)",
+        )
+        raise RuntimeError("프롬프트 전송 버튼 클릭에 실패했습니다.")
+
+    def _wait_for_upload_complete(self, page: Any, timeout_sec: float = 15.0) -> None:
+        """첨부파일 업로드 스피너가 사라지고 전송 버튼이 활성화될 때까지 최대 timeout_sec초 대기합니다."""
+        send_sel = self.provider_config.get("send") or SEND_BTN_SELECTORS
+        spinner_sel = '[role="progressbar"], .loading, .spinner, [aria-busy="true"]'
+        deadline = time.time() + timeout_sec
+        time.sleep(0.5)
+
+        while time.time() < deadline:
+            if self.is_stop_requested():
+                return
+            spinner_active = False
+            try:
+                sp = page.locator(spinner_sel)
+                if sp.count() > 0 and sp.first.is_visible():
+                    spinner_active = True
+            except Exception:
+                spinner_active = False
+
+            send_ready = True
             try:
                 send_btn = page.locator(send_sel).first
-                if send_btn.count() > 0 and send_btn.is_visible() and send_btn.is_enabled():
-                    send_btn.click()
+                if send_btn.count() > 0 and send_btn.is_visible():
+                    send_ready = bool(send_btn.is_enabled())
+            except Exception:
+                send_ready = True
+
+            if not spinner_active and send_ready:
+                time.sleep(0.4)
+                return
+            time.sleep(0.3)
+
+    def _snapshot_attachment_state(self, page: Any, file_paths: List[str]) -> Dict[str, Any]:
+        """
+        입력창/컴포저 주변(aside, nav 사이드바 제외)의 현재 첨부 상태를 스냅샷으로 기록합니다.
+        반환: {"chip_count": int, "present_names": set[str]}
+        """
+        basenames = [Path(p).name for p in (file_paths or []) if p]
+        remove_btn_sel = (
+            'button[aria-label*="제거"], '
+            'button[aria-label*="삭제"], '
+            'button[aria-label*="Remove"], '
+            'button[aria-label*="Delete"], '
+            '[data-testid*="attachment"]'
+        )
+        try:
+            res = page.evaluate(
+                """({ basenames, removeSel }) => {
+                    const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+                        if (style && (style.display === 'none' || style.visibility === 'hidden')) return false;
+                        const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                        return Boolean(rect && rect.width > 0 && rect.height > 0);
+                    };
+                    const inSidebar = (el) => Boolean(el && el.closest && el.closest('aside, nav'));
+
+                    let chipCount = 0;
+                    const btns = document.querySelectorAll(removeSel);
+                    for (const btn of btns) {
+                        if (!inSidebar(btn) && isVisible(btn)) {
+                            chipCount++;
+                        }
+                    }
+
+                    const composerScopes = document.querySelectorAll(
+                        'input-area, rich-textarea, form, [role="main"], main'
+                    );
+                    let scopeText = '';
+                    if (composerScopes.length > 0) {
+                        for (const sc of composerScopes) {
+                            if (!inSidebar(sc)) {
+                                scopeText += '\\n' + (sc.innerText || '');
+                            }
+                        }
+                    } else if (document.body) {
+                        const clone = document.body.cloneNode(true);
+                        for (const sb of clone.querySelectorAll('aside, nav')) {
+                            sb.remove();
+                        }
+                        scopeText = clone.innerText || '';
+                    }
+
+                    const present = [];
+                    for (const name of basenames) {
+                        if (name && scopeText.includes(name)) {
+                            present.push(name);
+                        }
+                    }
+                    return { chip_count: chipCount, present_names: present };
+                }""",
+                {"basenames": basenames, "removeSel": remove_btn_sel},
+            )
+            if isinstance(res, dict) and "chip_count" in res:
+                return {
+                    "chip_count": int(res.get("chip_count", 0) or 0),
+                    "present_names": set(res.get("present_names") or []),
+                }
+        except Exception:
+            pass
+
+        # 단위 테스트 모킹 등 page.evaluate가 dict를 반환하지 않는 경우 Locator 기반 폴백
+        chip_count = 0
+        present_names: set[str] = set()
+        try:
+            rem = page.locator(remove_btn_sel)
+            cnt = rem.count()
+            for idx in range(min(cnt, 20)):
+                cand = rem.nth(idx)
+                try:
+                    if cand.evaluate("el => Boolean(el.closest('aside, nav'))") is True:
+                        continue
+                    if cand.is_visible() is True:
+                        chip_count += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        for name in basenames:
+            try:
+                name_loc = page.get_by_text(name, exact=False)
+                if name_loc.count() > 0:
+                    first_loc = name_loc.first
+                    if (
+                        first_loc.evaluate("el => Boolean(el.closest('aside, nav'))") is not True
+                        and first_loc.is_visible() is True
+                    ):
+                        present_names.add(name)
             except Exception:
                 pass
 
-    def _fill_and_submit_prompt(self, page: Any, input_loc: Any, prompt_text: str) -> None:
+        return {"chip_count": chip_count, "present_names": present_names}
+
+    def _verify_attachment_appeared(
+        self,
+        page: Any,
+        file_paths: List[str],
+        timeout_sec: float = 6.0,
+        baseline: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        첨부 시도 전/후를 비교해 실제로 컴포저 영역(aside, nav 제외)에 파일이 올라갔는지 확인합니다.
+        - 파일명(basename) 텍스트가 새로 나타났거나
+        - 컴포저 내부 첨부 미리보기/제거 버튼 개수가 사전 스냅샷보다 증가한 경우에만 True를 반환합니다.
+        """
+        basenames = [Path(p).name for p in (file_paths or []) if p]
+        if not basenames:
+            return False
+
+        base_chips = int((baseline or {}).get("chip_count", 0) or 0)
+        base_names = set((baseline or {}).get("present_names") or set())
+
+        deadline = time.time() + timeout_sec
+        while True:
+            if self.is_stop_requested():
+                return False
+
+            cur = self._snapshot_attachment_state(page, file_paths)
+            new_names = set(cur.get("present_names") or set()) - base_names
+            if new_names:
+                return True
+            if int(cur.get("chip_count", 0) or 0) > base_chips:
+                return True
+
+            if time.time() >= deadline:
+                break
+            time.sleep(0.3)
+
+        return False
+
+    @staticmethod
+    def _is_file_input_compatible(input_elem: Any, valid_paths: List[str]) -> bool:
+        """
+        첨부 파일 목록에 문서/PDF가 포함된 경우 accept="image/*" 전용 input은 건너뜁니다.
+        """
+        has_doc = any(
+            Path(p).suffix.lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+            for p in valid_paths
+        )
+        if not has_doc:
+            return True
+
+        try:
+            accept_attr = input_elem.get_attribute("accept") or ""
+        except Exception:
+            accept_attr = ""
+
+        accept_lower = accept_attr.strip().lower()
+        if not accept_lower:
+            return True
+        accept_tokens = [t.strip() for t in accept_lower.split(",") if t.strip()]
+        if not accept_tokens:
+            return True
+        if any(
+            t in ("*", "*/*")
+            or any(doc_tok in t for doc_tok in ("pdf", ".doc", ".hwp", ".txt", "application/"))
+            for t in accept_tokens
+        ):
+            return True
+        if all(
+            t.startswith("image/")
+            or t in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
+            for t in accept_tokens
+        ):
+            return False
+        return True
+
+    def _attach_via_js_drop(self, page: Any, valid_paths: List[str]) -> bool:
+        """
+        2단계: 입력창 및 상위 컨테이너(form, [role="main"] 등)에 JS DataTransfer drag & drop을 디스패치합니다.
+        """
+        files_payload = []
+        for p in valid_paths:
+            try:
+                raw_bytes = Path(p).read_bytes()
+                mime, _ = mimetypes.guess_type(p)
+                files_payload.append(
+                    {
+                        "name": Path(p).name,
+                        "mime": mime or "application/octet-stream",
+                        "b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    }
+                )
+            except Exception:
+                continue
+
+        if not files_payload:
+            return False
+
+        input_sel = self.provider_config.get("input") or GENERIC_INPUT_SELECTORS
+        candidate_selectors = [
+            s.strip() for s in str(input_sel).split(",") if s.strip()
+        ] + ["rich-textarea", "[xap-file-drop]", "main", "form", '[role="main"]', "body"]
+
+        js_script = """
+        ({ filesPayload, selectors }) => {
+            const dt = new DataTransfer();
+            for (const f of filesPayload) {
+                const binStr = atob(f.b64);
+                const len = binStr.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binStr.charCodeAt(i);
+                }
+                const fileObj = new File([bytes], f.name, { type: f.mime });
+                dt.items.add(fileObj);
+            }
+            const targetSet = new Set();
+            const targets = [];
+            const addTarget = (el) => {
+                if (el && !targetSet.has(el)) {
+                    targetSet.add(el);
+                    targets.push(el);
+                }
+            };
+            for (const sel of selectors) {
+                try {
+                    const el = document.querySelector(sel);
+                    if (el) addTarget(el);
+                } catch (e) {}
+            }
+            if (targets.length === 0) return false;
+
+            const firstTarget = targets[0];
+            let cur = firstTarget.parentElement;
+            let depth = 0;
+            while (cur && depth < 5) {
+                const tag = (cur.tagName || '').toUpperCase();
+                if (
+                    tag === 'FORM' ||
+                    tag === 'MAIN' ||
+                    tag === 'RICH-TEXTAREA' ||
+                    cur.getAttribute('role') === 'main' ||
+                    cur.hasAttribute('xap-file-drop')
+                ) {
+                    addTarget(cur);
+                }
+                cur = cur.parentElement;
+                depth += 1;
+            }
+
+            for (const t of targets) {
+                for (const evtName of ['dragenter', 'dragover', 'drop']) {
+                    const evt = new DragEvent(evtName, {
+                        bubbles: true,
+                        cancelable: true,
+                        dataTransfer: dt
+                    });
+                    t.dispatchEvent(evt);
+                }
+            }
+            return targets.length;
+        }
+        """
+        try:
+            dispatched = page.evaluate(
+                js_script,
+                {"filesPayload": files_payload, "selectors": candidate_selectors},
+            )
+            self.emit_log(
+                "INFO",
+                f"[첨부 진단] 2단계 JS DataTransfer drop 시도 결과: target_count={dispatched!r}",
+            )
+            return bool(dispatched)
+        except Exception as exc:
+            self.emit_log("INFO", f"[첨부 진단] 2단계 JS DataTransfer drop 예외: {exc}")
+            return False
+
+    def _attach_via_menu_or_button(self, page: Any, valid_paths: List[str]) -> bool:
+        """
+        3단계: + / 첨부 버튼을 클릭한 뒤
+        - 0.6초 대기 후 DOM에 새 input[type="file"]이 생기면 set_input_files
+        - 그렇지 않으면 .cdk-overlay-container 및 페이지 전체 visible 메뉴/버튼을 스캔해 로그로 남기고
+          "파일", "업로드", "컴퓨터", "Upload", "File", "Computer" 항목을 expect_file_chooser로 클릭합니다.
+        """
+        exclude_keywords = ("옵션 더보기", "more options", "캘린더", "삭제", "고정")
+
+        def _is_excluded_attach_btn(cand: Any, b_txt: str, b_aria: str) -> bool:
+            combined_lbl = f"{b_txt} {b_aria}".lower()
+            if any(kw in combined_lbl for kw in exclude_keywords):
+                return True
+            try:
+                if cand.evaluate("el => Boolean(el.closest('aside, nav'))") is True:
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _safe_inner_text(loc: Any) -> str:
+            try:
+                return str(loc.inner_text(timeout=500) or "").strip()
+            except TypeError:
+                return str(loc.inner_text() or "").strip()
+            except Exception:
+                return ""
+
+        def _safe_attr(loc: Any, attr: str) -> str:
+            try:
+                return str(loc.get_attribute(attr, timeout=500) or "").strip()
+            except TypeError:
+                return str(loc.get_attribute(attr) or "").strip()
+            except Exception:
+                return ""
+
+        attach_cfg_sel = self.provider_config.get("attach_btn") or ""
+        universal_btn_sel = (
+            'button[aria-label*="파일"], '
+            'button[aria-label*="첨부"], '
+            'button[aria-label*="업로드"], '
+            'button[aria-label*="Attach"], '
+            'button[aria-label*="Upload"], '
+            '[data-testid*="attach"], '
+            '[data-testid*="composer-plus"]'
+        )
+        if self.provider == "gemini":
+            selector_stages = [
+                'button[aria-label*="업로드 및 도구"], button[aria-label*="Upload"]',
+                (
+                    'uploader button, '
+                    'button:has(mat-icon:text-is("add")), '
+                    'button[aria-label*="업로드"], '
+                    'button[aria-label*="파일"], '
+                    'button[data-test-id*="upload"], '
+                    'button.upload-card-button'
+                ),
+            ]
+        else:
+            fallback_sel = (
+                f"{attach_cfg_sel}, {universal_btn_sel}" if attach_cfg_sel else universal_btn_sel
+            )
+            selector_stages = [fallback_sel]
+
+        trigger_btn = None
+        found_btn_logs: List[str] = []
+        for stage_sel in selector_stages:
+            if trigger_btn is not None:
+                break
+            try:
+                btns = page.locator(stage_sel)
+                cnt = btns.count()
+                for idx in range(cnt):
+                    cand = btns.nth(idx)
+                    try:
+                        b_txt = _safe_inner_text(cand)
+                        b_aria = _safe_attr(cand, "aria-label")
+                        b_tip = _safe_attr(cand, "mattooltip")
+                        if _is_excluded_attach_btn(cand, b_txt, b_aria):
+                            if len(found_btn_logs) < 15:
+                                found_btn_logs.append(
+                                    f"[제외:{idx}] text={b_txt!r}, aria={b_aria!r}"
+                                )
+                            continue
+                        is_vis = cand.is_visible()
+                        is_en = cand.is_enabled()
+                        if len(found_btn_logs) < 15:
+                            found_btn_logs.append(
+                                f"[{idx}] text={b_txt!r}, aria={b_aria!r}, tip={b_tip!r}, vis={is_vis}, en={is_en}"
+                            )
+                        if trigger_btn is None and is_vis and is_en:
+                            trigger_btn = cand
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+        if self.provider == "gemini" or found_btn_logs:
+            self.emit_log(
+                "INFO",
+                f"[첨부 진단] 3단계 +/첨부 버튼 후보 탐색: {found_btn_logs}",
+            )
+
+        if trigger_btn is None:
+            self.emit_log("INFO", "[첨부 진단] 3단계 +/첨부 버튼을 찾지 못했습니다.")
+            return False
+
+        # 먼저 기존 file_input 개수를 기록한 뒤 버튼 클릭
+        before_count = 0
+        try:
+            before_count = page.locator('input[type="file"]').count()
+        except Exception:
+            before_count = 0
+
+        # 일부 UI는 1차 버튼 클릭만으로 곧바로 file chooser를 열기도 함
+        try:
+            with page.expect_file_chooser(timeout=1200) as fc_direct:
+                trigger_btn.click()
+            fc_direct.value.set_files(valid_paths)
+            return True
+        except Exception:
+            # 팝업 메뉴가 열렸거나 DOM에 동적 input이 생성된 경우
+            pass
+
+        time.sleep(0.6)
+
+        # 3-A: DOM에 새 input[type="file"]이 생성되었는지 확인
+        try:
+            all_inputs = page.locator('input[type="file"]')
+            after_count = all_inputs.count()
+            if after_count > before_count:
+                self.emit_log(
+                    "INFO",
+                    f"[첨부 진단] 3단계 클릭 후 새 input[type='file'] 생성 감지 ({before_count} -> {after_count})",
+                )
+                for idx in range(after_count - 1, -1, -1):
+                    inp = all_inputs.nth(idx)
+                    if self._is_file_input_compatible(inp, valid_paths):
+                        inp.set_input_files(valid_paths)
+                        return True
+        except Exception:
+            pass
+
+        # 3-B-1: Gemini 전용 div.cdk-overlay-container 짧은 폴링(최대 2초, 0.2초 간격) + expect_file_chooser
+        if self.provider == "gemini":
+            cdk_sel = (
+                'div.cdk-overlay-container [role="menuitem"], '
+                'div.cdk-overlay-container button, '
+                'div.cdk-overlay-container mat-list-item, '
+                'div.cdk-overlay-container li'
+            )
+            gemini_upload_keywords = ("파일", "업로드", "컴퓨터", "upload", "file")
+            cdk_logs: List[str] = []
+            cdk_target = None
+            cdk_cnt = 0
+            try:
+                poll_deadline = time.time() + 2.0
+                while True:
+                    cdk_logs = []
+                    cdk_target = None
+                    cdk_items = page.locator(cdk_sel)
+                    cdk_cnt = cdk_items.count()
+                    for idx in range(cdk_cnt):
+                        item = cdk_items.nth(idx)
+                        try:
+                            is_vis = item.is_visible()
+                            txt = _safe_inner_text(item)
+                            aria = _safe_attr(item, "aria-label")
+                            cdk_logs.append(f"[{idx}] text={txt!r}, aria-label={aria!r}, vis={is_vis}")
+                            if not is_vis:
+                                continue
+                            combined = f"{txt} {aria}".lower()
+                            if cdk_target is None and any(kw in combined for kw in gemini_upload_keywords):
+                                cdk_target = item
+                        except Exception:
+                            continue
+                    if cdk_target is not None or time.time() >= poll_deadline:
+                        break
+                    time.sleep(0.2)
+
+                self.emit_log(
+                    "INFO",
+                    f"[첨부 진단] div.cdk-overlay-container 내부 항목 ({cdk_cnt}개): {cdk_logs}",
+                )
+                if cdk_target is not None:
+                    with page.expect_file_chooser(timeout=6000) as fc_info:
+                        cdk_target.click()
+                    fc_info.value.set_files(valid_paths)
+                    return True
+            except Exception as exc:
+                self.emit_log("INFO", f"[첨부 진단] div.cdk-overlay-container 클릭 실패: {exc}")
+
+        # 3-B-2: .cdk-overlay-container 및 페이지 전체 visible 메뉴/버튼 스캔 + expect_file_chooser
+        menu_item_sel = (
+            '.cdk-overlay-container [role="menuitem"], '
+            '.cdk-overlay-container button, '
+            '.cdk-overlay-container mat-list-item, '
+            '[role="menu"] [role="menuitem"], '
+            '[role="menuitemradio"], '
+            '[role="menu"] button, '
+            '[role="dialog"] button, '
+            '[role="listbox"] [role="option"], '
+            'mat-list-item, '
+            '[role="menuitem"], '
+            'button, '
+            'div[role="button"]'
+        )
+        upload_keywords = (
+            "파일",
+            "업로드",
+            "컴퓨터",
+            "사진",
+            "upload",
+            "file",
+            "computer",
+            "add photos",
+        )
+        scanned_labels: List[str] = []
+        try:
+            items = page.locator(menu_item_sel)
+            cnt = items.count()
+            target_item = None
+            for idx in range(cnt):
+                item = items.nth(idx)
+                try:
+                    if not item.is_visible():
+                        continue
+                    txt = (item.inner_text() or "").strip()
+                    aria = (item.get_attribute("aria-label") or "").strip()
+                    label_repr = txt or aria
+                    if label_repr and label_repr not in scanned_labels and len(scanned_labels) < 25:
+                        scanned_labels.append(label_repr)
+                    combined_label = f"{txt} {aria}".lower()
+                    if target_item is None and any(kw in combined_label for kw in upload_keywords):
+                        target_item = item
+                except Exception:
+                    continue
+
+            self.emit_log(
+                "INFO",
+                f"[첨부 진단] 3단계 오버레이/메뉴 스캔 결과 ({len(scanned_labels)}개): {scanned_labels}",
+            )
+
+            if target_item is not None:
+                with page.expect_file_chooser(timeout=6000) as fc_info:
+                    target_item.click()
+                fc_info.value.set_files(valid_paths)
+                return True
+        except Exception as exc:
+            self.emit_log("INFO", f"[첨부 진단] 3단계 오버레이 메뉴 클릭 실패: {exc}")
+
+        return False
+
+    def _attach_files(self, page: Any, file_paths: List[str]) -> bool:
+        """
+        모든 외부 LLM 호환 3단계 범용 파일 첨부 파이프라인:
+        1) 호환되는 <input type="file"> 직접 주입 (image/* 전용 input 건너뜀)
+        2) 범용 JS Drag & Drop (DataTransfer) 시뮬레이션
+        3) + / 첨부 버튼 클릭 -> 동적 input 또는 2단계 팝업 메뉴(expect_file_chooser)
+        각 단계 후 _verify_attachment_appeared()가 True면 즉시 완료,
+        모두 실패하면 경고 로그를 남기고 안전하게 진행합니다.
+        """
+        valid_paths = [
+            str(Path(p).resolve())
+            for p in (file_paths or [])
+            if p and Path(p).is_file()
+        ]
+        if not valid_paths:
+            return True
+
+        file_input_sel = self.provider_config.get("file_input") or 'input[type="file"]'
+
+        # ── 1단계: 호환되는 <input type="file"> 직접 주입 ─────────────────────
+        try:
+            file_inputs = page.locator(file_input_sel)
+            cnt = file_inputs.count()
+            self.emit_log("INFO", f"[첨부 진단] 1단계 input[type='file'] 탐지: {cnt}개")
+            for idx in range(cnt):
+                inp = file_inputs.nth(idx)
+                try:
+                    accept_val = inp.get_attribute("accept") or "(없음)"
+                except Exception:
+                    accept_val = "(조회 실패)"
+                self.emit_log("INFO", f"[첨부 진단] 1단계 input[{idx}] accept={accept_val!r}")
+                if not self._is_file_input_compatible(inp, valid_paths):
+                    self.emit_log(
+                        "INFO",
+                        f"[첨부 진단] 1단계 input[{idx}] 이미지 전용(accept={accept_val!r})이므로 건너뜀",
+                    )
+                    continue
+                try:
+                    baseline = self._snapshot_attachment_state(page, valid_paths)
+                    inp.set_input_files(valid_paths)
+                    if self._verify_attachment_appeared(
+                        page, valid_paths, timeout_sec=6.0, baseline=baseline
+                    ):
+                        self.emit_log(
+                            "INFO",
+                            f"[{self.provider_config['name']}] 첨부파일 {len(valid_paths)}개 업로드 중... (최대 15초 대기)",
+                        )
+                        self._wait_for_upload_complete(page, timeout_sec=15.0)
+                        return True
+                    self.emit_log(
+                        "INFO",
+                        f"[첨부 진단] 1단계 input[{idx}] 주입 후 UI 첨부 확인 실패",
+                    )
+                except Exception as exc:
+                    self.emit_log("INFO", f"[첨부 진단] 1단계 input[{idx}] 주입 예외: {exc}")
+                    continue
+        except Exception as exc:
+            self.emit_log("INFO", f"[첨부 진단] 1단계 탐색 예외: {exc}")
+
+        # ── 2단계: 범용 JS Drag & Drop (DataTransfer) 시뮬레이션 ───────────────
+        try:
+            baseline = self._snapshot_attachment_state(page, valid_paths)
+            if self._attach_via_js_drop(page, valid_paths):
+                drop_verify_sec = 2.0 if self.provider == "gemini" else 6.0
+                if self._verify_attachment_appeared(
+                    page, valid_paths, timeout_sec=drop_verify_sec, baseline=baseline
+                ):
+                    self.emit_log(
+                        "INFO",
+                        f"[{self.provider_config['name']}] 첨부파일 {len(valid_paths)}개(Drag&Drop) 업로드 중... (최대 15초 대기)",
+                    )
+                    self._wait_for_upload_complete(page, timeout_sec=15.0)
+                    return True
+                self.emit_log(
+                    "INFO",
+                    "[첨부 진단] 2단계 Drag&Drop 후 컴포저 첨부 미확인 -> 3단계 버튼/메뉴 첨부로 진행",
+                )
+        except Exception:
+            pass
+
+        # ── 3단계: + / 첨부 버튼 클릭 -> 동적 input 또는 2단계 팝업 메뉴 ───────
+        try:
+            baseline = self._snapshot_attachment_state(page, valid_paths)
+            if self._attach_via_menu_or_button(page, valid_paths):
+                if self._verify_attachment_appeared(
+                    page, valid_paths, timeout_sec=6.0, baseline=baseline
+                ):
+                    self.emit_log(
+                        "INFO",
+                        f"[{self.provider_config['name']}] 첨부파일 {len(valid_paths)}개 업로드 중... (최대 15초 대기)",
+                    )
+                    self._wait_for_upload_complete(page, timeout_sec=15.0)
+                    return True
+        except Exception:
+            pass
+
+        self.emit_log(
+            "WARN",
+            "자동 파일 첨부에 실패했습니다. 열린 브라우저 창에 파일을 직접 드래그해 첨부해 주세요.",
+        )
+        return False
+
+    def _fill_and_submit_prompt(
+        self,
+        page: Any,
+        input_loc: Any,
+        prompt_text: str,
+        pre_response_count: Optional[int] = None,
+    ) -> None:
         """프롬프트를 안전하게 주입하고 전송합니다."""
         self._inject_prompt_text(page, input_loc, prompt_text)
-        self._submit_prompt(page, input_loc)
+        time.sleep(0.6)
+        self._submit_prompt(page, input_loc, pre_response_count=pre_response_count)
+
+    def _is_user_turn_element(self, loc: Any) -> bool:
+        """ChatGPT 폴백 셀렉터 매칭 요소가 사용자 메시지인지 확인합니다."""
+        try:
+            res = loc.evaluate(
+                'e => Boolean(e.closest && e.closest(\'[data-message-author-role="user"]\'))'
+            )
+            return res is True
+        except Exception:
+            return False
 
     def _read_latest_response_text(self, page: Any, min_index: int = 0) -> str:
         """마지막 응답 요소의 전체 텍스트를 읽어옵니다."""
         resp_sel = self.provider_config.get("response") or GENERIC_RESPONSE_SELECTORS
         try:
             responses = page.locator(resp_sel)
-            count = responses.count()
+            count = int(responses.count())
             if count <= min_index:
                 return ""
-            return (responses.nth(count - 1).inner_text() or "").strip()
+            for idx in range(count - 1, min_index - 1, -1):
+                cand = responses.nth(idx)
+                if self.provider == "chatgpt" and self._is_user_turn_element(cand):
+                    continue
+                txt = (cand.inner_text() or "").strip()
+                if txt:
+                    return txt
+            return ""
         except Exception:
             return ""
 
@@ -1005,17 +1962,241 @@ class WebGeminiAutoWorker(BaseWorker):
 
         return candidates
 
+    def _is_done_action_visible(self, page: Any, resp_sel: str) -> bool:
+        """마지막 어시스턴트 응답 내부 또는 직계 턴 컨테이너의 완료 액션(복사 등) 버튼만 확인합니다."""
+        done_sel = (
+            self.provider_config.get("done_action")
+            or 'button[aria-label*="Copy"], button[aria-label*="복사"]'
+        )
+        try:
+            responses = page.locator(resp_sel)
+            cnt = int(responses.count())
+            if cnt <= 0:
+                return False
+            last_msg = None
+            for idx in range(cnt - 1, -1, -1):
+                cand = responses.nth(idx)
+                if self.provider == "chatgpt" and self._is_user_turn_element(cand):
+                    continue
+                last_msg = cand
+                break
+            if last_msg is None:
+                return False
+
+            msg_done = last_msg.locator(done_sel)
+            if int(msg_done.count()) > 0 and msg_done.last.is_visible() is True:
+                return True
+
+            for container_xpath in ("xpath=ancestor::article[1]", "xpath=.."):
+                try:
+                    container = last_msg.locator(container_xpath)
+                    if int(container.count()) > 0:
+                        c_done = container.first.locator(done_sel)
+                        if int(c_done.count()) > 0 and c_done.last.is_visible() is True:
+                            return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return False
+
+    def _is_incomplete_json_response(self, text: str) -> bool:
+        """JSON 코드블록이 닫히지 않았거나 중괄호/대괄호가 미완성인 상태인지 판별합니다."""
+        stripped = (text or "").strip()
+        if not stripped:
+            return False
+        if "```json" in stripped:
+            last_open = stripped.rfind("```json")
+            if stripped.find("```", last_open + 7) == -1:
+                return True
+        if stripped.startswith("{") and not stripped.endswith("}"):
+            return True
+        if stripped.startswith("[") and not stripped.endswith("]"):
+            return True
+        return False
+
+    def _is_chatgpt_copy_btn_visible(self, page: Any, resp_sel: str) -> bool:
+        """ChatGPT 마지막 어시스턴트 응답 또는 액션 바에 복사 버튼이 표시되었는지 확인합니다."""
+        return self._is_done_action_visible(page, resp_sel)
+
     def _wait_for_response_complete(
         self, page: Any, pre_response_count: int, timeout_sec: float = 180.0
     ) -> str:
+        """응답 완료 대기 (5/6 단계 상태 머신 위임)."""
+        return self._step_wait_response_complete(
+            page, pre_response_count=pre_response_count, timeout_sec=timeout_sec
+        )
+
+    def _clear_composer_draft(self, page: Any, input_loc: Any) -> None:
+        """브라우저 프로필이 복원한 미전송 초안(잔여 텍스트 및 잔여 첨부파일)을 깨끗이 비웁니다."""
+        # 1) 입력창 잔여 텍스트 비우기
+        if input_loc is not None:
+            try:
+                input_loc.click()
+            except Exception:
+                pass
+            try:
+                input_loc.press("Control+A")
+                input_loc.press("Backspace")
+            except Exception:
+                pass
+
+        # 2) 컴포저 내부 잔여 첨부파일 삭제 버튼 클릭 (aside, nav 사이드바 제외)
+        remove_sel = (
+            'button[aria-label*="Remove"], '
+            'button[aria-label*="제거"], '
+            'button[aria-label*="삭제"], '
+            'button[data-testid*="remove"]'
+        )
+        for _ in range(10):
+            clicked_any = False
+            try:
+                btns = page.locator(remove_sel)
+                cnt = int(btns.count())
+                for idx in range(cnt):
+                    cand = btns.nth(idx)
+                    try:
+                        in_sidebar = cand.evaluate(
+                            "e => Boolean(e.closest && e.closest('aside, nav'))"
+                        )
+                        if in_sidebar is True:
+                            continue
+                        if cand.is_visible() is True and (
+                            not hasattr(cand, "is_enabled") or cand.is_enabled() is not False
+                        ):
+                            cand.click()
+                            clicked_any = True
+                            time.sleep(0.15)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                break
+            if not clicked_any:
+                break
+
+    def _step_ensure_ready(self, page: Any, is_first_batch: bool = False) -> tuple[Any, int]:
+        """[1/6 페이지 준비] 입력창 가시성/활성화 및 임시 채팅 전환 후 준비 상태를 검증합니다."""
+        provider_name = self.provider_config["name"]
+        resp_sel = self.provider_config.get("response") or GENERIC_RESPONSE_SELECTORS
+        self.emit_log("INFO", f"[{provider_name}] [1/6 페이지 준비] 입력창 및 대화 상태 확인 중...")
+
+        input_loc = self._open_new_chat(
+            page, self.provider, self.use_temp_chat, is_first_batch=is_first_batch
+        )
+        if input_loc is None or self.is_stop_requested():
+            return None, 0
+
+        input_loc = self._ensure_ready_before_input(page, input_loc)
+        if input_loc is None or self.is_stop_requested():
+            return None, 0
+
+        try:
+            if hasattr(input_loc, "is_visible") and input_loc.is_visible() is False:
+                raise RuntimeError("프롬프트 입력창이 화면에 표시되지 않았습니다.")
+            if hasattr(input_loc, "is_enabled") and input_loc.is_enabled() is False:
+                raise RuntimeError("프롬프트 입력창이 비활성화 상태입니다.")
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        try:
+            pre_count = int(page.locator(resp_sel).count())
+        except Exception:
+            pre_count = 0
+
+        self._clear_composer_draft(page, input_loc)
+        return input_loc, pre_count
+
+    def _step_attach_and_wait(self, page: Any, file_paths: List[str]) -> bool:
+        """[2/6 파일 첨부] 파일 첨부 후 업로드 스피너 소멸 및 전송 가능 상태를 최대 20초 대기합니다."""
+        provider_name = self.provider_config["name"]
+        if not file_paths:
+            self.emit_log("INFO", f"[{provider_name}] [2/6 파일 첨부] 첨부 파일 없음 (건너뜀)")
+            return True
+
+        self.emit_log(
+            "INFO",
+            f"[{provider_name}] [2/6 파일 첨부] {len(file_paths)}개 파일 첨부 및 업로드 완료 대기 중...",
+        )
+        self._attach_files(page, file_paths)
+
+        spinner_sel = '[role="progressbar"], [aria-busy="true"], .uploading, [data-testid*="uploading"]'
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if self.is_stop_requested():
+                return False
+            spinner_visible = False
+            try:
+                sp = page.locator(spinner_sel)
+                if int(sp.count()) > 0 and sp.first.is_visible() is True:
+                    spinner_visible = True
+            except Exception:
+                spinner_visible = False
+            if not spinner_visible:
+                return True
+            time.sleep(0.3)
+
+        raise RuntimeError(f"[{provider_name}] 파일 업로드가 20초 내에 완료되지 않았습니다.")
+
+    def _step_fill_and_verify(self, page: Any, input_loc: Any, prompt_text: str) -> bool:
+        """[3/6 프롬프트 입력] 프롬프트를 입력하고 입력창 내 텍스트 존재를 최대 3초 검증합니다."""
+        provider_name = self.provider_config["name"]
+        self.emit_log("INFO", f"[{provider_name}] [3/6 프롬프트 입력] 프롬프트 주입 및 입력 검증 중...")
+        if len(self._read_input_box_text(input_loc).strip()) > 0:
+            try:
+                input_loc.click()
+            except Exception:
+                pass
+            try:
+                input_loc.press("Control+A")
+                input_loc.press("Backspace")
+            except Exception:
+                pass
+        self._inject_prompt_text(page, input_loc, prompt_text)
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.is_stop_requested():
+                return False
+            if len(self._read_input_box_text(input_loc).strip()) > 0:
+                time.sleep(0.4)
+                return True
+            time.sleep(0.2)
+
+        raise RuntimeError(f"[{provider_name}] 프롬프트 입력 검증 실패: 입력창이 비어 있습니다.")
+
+    def _step_submit_and_confirm(
+        self, page: Any, input_loc: Any, pre_response_count: int
+    ) -> bool:
+        """[4/6 전송 확인] Enter -> 전송 버튼 -> Ctrl+Enter/requestSubmit 순으로 전송하고 시작을 확인합니다."""
+        provider_name = self.provider_config["name"]
+        self.emit_log("INFO", f"[{provider_name}] [4/6 전송 확인] 프롬프트 전송 및 시작 확인 중...")
+        self._submit_prompt(page, input_loc, pre_response_count=pre_response_count)
+        if self.is_stop_requested():
+            return False
+        return True
+
+    def _step_wait_response_complete(
+        self, page: Any, pre_response_count: int, timeout_sec: float = 180.0
+    ) -> str:
         """
-        생성 중지 버튼 소멸 및 마지막 응답 텍스트 길이 3초 연속 고정을 감지하여 응답 완료를 대기합니다.
+        [5/6 응답 대기] stop 버튼 소멸 + 신규 응답 존재 + (Claude 스트리밍 종료) +
+        done_action 표시 시 1.0초 / 미표시 시 2.5초 텍스트 고정으로 응답 완료를 판정합니다.
         """
+        provider_name = self.provider_config["name"]
+        self.emit_log("INFO", f"[{provider_name}] [5/6 응답 대기] AI 응답 생성 완료 대기 중...")
         stop_sel = self.provider_config["stop"]
+        resp_sel = self.provider_config.get("response") or GENERIC_RESPONSE_SELECTORS
         deadline = time.monotonic() + timeout_sec
         saw_stop_button = False
         last_text = ""
         last_change_ts = time.monotonic()
+        last_log_ts = time.monotonic()
+        fallback_probed = False
+        matched_fallback_sel: Optional[str] = None
+        json_grace_start: Optional[float] = None
 
         while time.monotonic() < deadline:
             if self.is_stop_requested():
@@ -1024,33 +2205,163 @@ class WebGeminiAutoWorker(BaseWorker):
             stop_visible = False
             try:
                 stop_loc = page.locator(stop_sel).first
-                stop_visible = stop_loc.count() > 0 and stop_loc.is_visible()
+                stop_visible = stop_loc.count() > 0 and stop_loc.is_visible() is True
             except Exception:
                 stop_visible = False
 
-            if stop_visible:
+            try:
+                resp_count = int(page.locator(resp_sel).count())
+            except Exception:
+                resp_count = 0
+
+            is_streaming = False
+            if self.provider == "claude":
+                try:
+                    if int(page.locator('div[data-is-streaming="true"]').count()) > 0:
+                        is_streaming = True
+                        stop_visible = True
+                except Exception:
+                    pass
+                if not is_streaming and resp_count > pre_response_count:
+                    try:
+                        streaming_attr = (
+                            page.locator(resp_sel).nth(resp_count - 1).get_attribute("data-is-streaming")
+                        )
+                        if str(streaming_attr).lower() == "true":
+                            is_streaming = True
+                            stop_visible = True
+                    except Exception:
+                        pass
+
+            curr_text = ""
+            if stop_visible or is_streaming:
                 saw_stop_button = True
                 last_change_ts = time.monotonic()
             else:
                 curr_text = self._read_latest_response_text(page, min_index=pre_response_count)
+                if (
+                    not curr_text
+                    and self.provider == "chatgpt"
+                    and resp_count <= pre_response_count
+                    and (not fallback_probed or matched_fallback_sel)
+                ):
+                    if matched_fallback_sel:
+                        try:
+                            fb_loc = page.locator(matched_fallback_sel)
+                            fb_cnt = int(fb_loc.count())
+                            if fb_cnt > 0:
+                                cand = fb_loc.nth(fb_cnt - 1)
+                                if not self._is_user_turn_element(cand):
+                                    curr_text = (cand.inner_text() or "").strip()
+                        except Exception:
+                            pass
+                    elif not fallback_probed:
+                        has_done_btn = self._is_done_action_visible(page, resp_sel)
+                        if not has_done_btn and resp_count == 0:
+                            try:
+                                done_sel = (
+                                    self.provider_config.get("done_action")
+                                    or 'button[aria-label*="Copy"], button[aria-label*="복사"]'
+                                )
+                                p_done = page.locator(done_sel)
+                                has_done_btn = int(p_done.count()) > 0 and p_done.last.is_visible() is True
+                            except Exception:
+                                has_done_btn = False
+                        if has_done_btn:
+                            fallback_probed = True
+                            for fb_sel in (
+                                ".markdown",
+                                "div.markdown.prose",
+                                "pre code",
+                                'article[data-turn="assistant"]',
+                            ):
+                                try:
+                                    fb_loc = page.locator(fb_sel)
+                                    fb_cnt = int(fb_loc.count())
+                                    if fb_cnt <= 0:
+                                        continue
+                                    cand = fb_loc.nth(fb_cnt - 1)
+                                    if self._is_user_turn_element(cand):
+                                        continue
+                                    fb_text = (cand.inner_text() or "").strip()
+                                    if fb_text:
+                                        matched_fallback_sel = fb_sel
+                                        curr_text = fb_text
+                                        self.emit_log(
+                                            "INFO",
+                                            f"[{provider_name}] resp={resp_count} 폴백 탐색 매칭: selector={fb_sel}, len={len(fb_text)}",
+                                        )
+                                        break
+                                except Exception:
+                                    continue
+
+                active_resp_sel = matched_fallback_sel or resp_sel
+                done_visible = bool(curr_text) and (
+                    self._is_chatgpt_copy_btn_visible(page, active_resp_sel)
+                    if self.provider == "chatgpt"
+                    else self._is_done_action_visible(page, active_resp_sel)
+                )
+                required_stable_sec = 1.0 if done_visible else 2.5
+
                 if curr_text != last_text:
                     last_text = curr_text
                     last_change_ts = time.monotonic()
-                elif curr_text and (time.monotonic() - last_change_ts) >= 3.0:
+                    json_grace_start = None
+                elif curr_text and (time.monotonic() - last_change_ts) >= required_stable_sec:
+                    if self._is_incomplete_json_response(curr_text):
+                        if json_grace_start is None:
+                            json_grace_start = time.monotonic()
+                        if (time.monotonic() - json_grace_start) < 10.0:
+                            time.sleep(0.5)
+                            continue
                     return curr_text
 
-            if saw_stop_button and not stop_visible:
-                curr_text = self._read_latest_response_text(page, min_index=pre_response_count)
-                if curr_text and curr_text == last_text and (time.monotonic() - last_change_ts) >= 3.0:
+            if saw_stop_button and not stop_visible and not is_streaming:
+                if not curr_text:
+                    curr_text = self._read_latest_response_text(page, min_index=pre_response_count)
+                done_visible = bool(curr_text) and (
+                    self._is_chatgpt_copy_btn_visible(page, resp_sel)
+                    if self.provider == "chatgpt"
+                    else self._is_done_action_visible(page, resp_sel)
+                )
+                required_stable_sec = 1.0 if done_visible else 2.5
+                if (
+                    curr_text
+                    and curr_text == last_text
+                    and (time.monotonic() - last_change_ts) >= required_stable_sec
+                ):
+                    if self._is_incomplete_json_response(curr_text):
+                        if json_grace_start is None:
+                            json_grace_start = time.monotonic()
+                        if (time.monotonic() - json_grace_start) < 10.0:
+                            time.sleep(0.5)
+                            continue
                     return curr_text
+
+            now = time.monotonic()
+            if (now - last_log_ts) >= 15.0:
+                last_log_ts = now
+                self.emit_log(
+                    "INFO",
+                    f"[{provider_name}] 단계 대기 중: stop={stop_visible}, resp={resp_count}, len={len(curr_text)}",
+                )
 
             time.sleep(0.5)
 
         if last_text:
             return last_text
         raise TimeoutError(
-            f"[{self.provider_config['name']}] 응답 생성 대기 시간이 초과되었습니다 (180초)."
+            f"[{provider_name}] 응답 생성 대기 시간이 초과되었습니다 (180초)."
         )
+
+    def _step_collect_response(self, raw_reply: str) -> str:
+        """[6/6 응답 회수] 회수된 응답 텍스트가 비어 있지 않은지 검증하고 반환합니다."""
+        provider_name = self.provider_config["name"]
+        self.emit_log("INFO", f"[{provider_name}] [6/6 응답 회수] 응답 텍스트 유효성 검증 중...")
+        cleaned = (raw_reply or "").strip()
+        if not cleaned:
+            raise RuntimeError(f"[{provider_name}] 회수된 AI 응답이 비어 있습니다.")
+        return cleaned
 
     def _build_execution_batches(self) -> List[Dict[str, Any]]:
         """실행 대상 배치 목록을 생성합니다 (엑셀 배치 또는 단일 프롬프트)."""
@@ -1106,6 +2417,14 @@ class WebGeminiAutoWorker(BaseWorker):
             pre_count = page.locator(resp_sel).count()
         except Exception:
             pre_count = 0
+
+        input_loc = self._ensure_ready_before_input(page, input_loc)
+        if input_loc is None or self.is_stop_requested():
+            return None
+
+        batch_attachments = batch.get("attachment_paths") or self.attachment_paths
+        if batch_attachments:
+            self._attach_files(page, batch_attachments)
 
         self._inject_prompt_text(page, input_loc, batch["final_prompt"])
         self.emit_log(
@@ -1276,7 +2595,7 @@ class WebGeminiAutoWorker(BaseWorker):
                 is_single = bool(batch.get("is_single_prompt", False))
                 est_tokens = batch.get("estimated_tokens", 0)
                 pct_base = int(((b_idx - 1) / max(1, total_batches)) * 100)
-                stu_info = "단일 OCR/보정" if is_single else f"{len(students)}명"
+                stu_info = self.task_label if is_single else f"{len(students)}명"
                 self.emit_progress(
                     max(5, pct_base),
                     f"[{provider_name}] Batch {b_idx}/{total_batches} 실행 중 ({stu_info} | 예상 {est_tokens:,} 토큰)...",
@@ -1355,23 +2674,43 @@ class WebGeminiAutoWorker(BaseWorker):
                             "INFO",
                             f"[{provider_name}] Batch {b_idx}/{total_batches} 처리 시도 ({attempt}/3) — {stu_info}",
                         )
-                        input_loc = self._open_new_chat(
-                            page, self.provider, self.use_temp_chat, is_first_batch=(b_idx == 1 and attempt == 1)
+                        # [1/6 페이지 준비]
+                        input_loc, pre_count = self._step_ensure_ready(
+                            page, is_first_batch=(b_idx == 1 and attempt == 1)
                         )
                         if input_loc is None or self.is_stop_requested():
                             break
 
-                        try:
-                            pre_count = page.locator(resp_sel).count()
-                        except Exception:
-                            pre_count = 0
+                        # [2/6 파일 첨부]
+                        batch_attachments = batch.get("attachment_paths") or self.attachment_paths
+                        if not self._step_attach_and_wait(page, batch_attachments):
+                            if self.is_stop_requested():
+                                break
+                            raise RuntimeError("파일 첨부 단계 검증에 실패했습니다.")
 
-                        self._fill_and_submit_prompt(page, input_loc, batch["final_prompt"])
-                        raw_reply = self._wait_for_response_complete(
+                        # [3/6 프롬프트 입력]
+                        if not self._step_fill_and_verify(page, input_loc, batch["final_prompt"]):
+                            if self.is_stop_requested():
+                                break
+                            raise RuntimeError("프롬프트 입력 단계 검증에 실패했습니다.")
+
+                        # [4/6 전송 확인]
+                        if not self._step_submit_and_confirm(
+                            page, input_loc, pre_response_count=pre_count
+                        ):
+                            if self.is_stop_requested():
+                                break
+                            raise RuntimeError("프롬프트 전송 확인 단계에 실패했습니다.")
+
+                        # [5/6 응답 대기]
+                        raw_reply = self._step_wait_response_complete(
                             page, pre_response_count=pre_count, timeout_sec=180.0
                         )
                         if self.is_stop_requested():
                             break
+
+                        # [6/6 응답 회수]
+                        raw_reply = self._step_collect_response(raw_reply)
 
                         if is_single:
                             try:

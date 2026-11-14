@@ -20,7 +20,7 @@ from services.docx_extractor_service import EXCEL_CELL_LIMIT, sanitize_for_excel
 
 # 병합 시 자동으로 제외할 시스템 메타데이터 컬럼명 목록 (소문자/공백정제 기준)
 SYSTEM_METADATA_COLUMNS = {
-    "누락항목", "누락 항목", "양식", "원본파일명", "생성된_과세특", "과세특_바이트",
+    "누락항목", "누락 항목", "양식", "원본파일명", "검토 상태", "생성된_과세특", "과세특_바이트",
     "생성된과세특", "과세특바이트", "오류내용", "사유", "비고_시스템",
 }
 

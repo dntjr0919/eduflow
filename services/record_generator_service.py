@@ -646,6 +646,9 @@ def generate_records_from_excel(
         "누락항목",
         "양식",
         "원본파일명",
+        "검토 상태",
+        "검토 필요 항목",
+        "검토 사유",
         id_col,
         name_col,
     }

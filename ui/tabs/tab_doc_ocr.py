@@ -15,6 +15,7 @@ import mimetypes
 import os
 import re
 import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,18 +47,33 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from core.base_worker import BaseWorker, TaskRunner
+from core.base_worker import BaseWorker, FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
 from services.docx_extractor_service import (
-    extract_docx_to_excel,
     load_all_schemas,
     load_single_schema,
+)
+from services.multi_doc_extractor_service import (
+    extract_documents_to_excel,
+    extract_split_pdf_ocr_to_excel,
+    get_pdf_page_count,
+    load_review_items_from_excel,
+)
+from services.hwpx_agent_service import (
+    HwpxDocument,
+    apply_single_hwpx_operation,
+    convert_hwp_to_hwpx,
+    convert_hwpx_to_hwp,
+    export_exam_answers_hwpx,
+    extract_hwpx_dom_map,
+    render_hwpx_to_html,
 )
 from services.batch_prompt_service import resolve_batch_output_path
 from services.excel_merger_service import merge_excel_assignments
@@ -78,6 +94,7 @@ from services.llm_client import (
 from services.notifier import NotificationService
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.batch_manual_prompt_dialog import BatchManualPromptDialog
+from ui.dialogs.extraction_review_dialog import OcrReviewDialog
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
 from ui.dialogs.docx_schema_create_dialog import DocxSchemaCreateDialog
 from ui.dialogs.prompt_edit_dialog import PromptEditDialog
@@ -621,7 +638,7 @@ class OcrAndLlmWorker(BaseWorker):
 
 
 class DocxToExcelWorker(BaseWorker):
-    """학생별 DOCX 과제 문서에서 학번/이름/문항별 응답을 추출해 Excel로 변환하는 백그라운드 워커."""
+    """학생별 과제 문서(.docx, .hwpx, .hwp, .pdf)에서 학번/이름/문항별 응답을 추출해 Excel로 변환하는 백그라운드 워커."""
 
     def __init__(
         self,
@@ -629,15 +646,15 @@ class DocxToExcelWorker(BaseWorker):
         schema_path: Optional[Path | str] = None,
         output_xlsx: Optional[Path | str] = None,
     ):
-        super().__init__(task_name="과제 DOCX -> 엑셀 추출")
+        super().__init__(task_name="과제 문서 통합 -> 엑셀 추출")
         self.docx_dir = Path(docx_dir)
         self.schema_path = Path(schema_path) if schema_path else None
         self.output_xlsx = Path(output_xlsx) if output_xlsx else None
 
     def execute(self) -> Dict[str, Any]:
-        self.emit_log("INFO", f"학생 DOCX 과제 추출 시작 (폴더: {self.docx_dir.name})")
-        res = extract_docx_to_excel(
-            docx_dir=self.docx_dir,
+        self.emit_log("INFO", f"학생 과제 문서 통합 추출 시작 (폴더: {self.docx_dir.name})")
+        res = extract_documents_to_excel(
+            doc_dir=self.docx_dir,
             schema_path=self.schema_path,
             output_path=self.output_xlsx,
             progress_callback=lambda pct, msg: self.emit_progress(pct, msg),
@@ -652,6 +669,7 @@ class DocxToExcelWorker(BaseWorker):
         succ = res.get("success", 0)
         tot = res.get("total", 0)
         failed = res.get("failed", 0)
+        rev_cnt = res.get("review_count", 0)
         errors = res.get("errors", [])
 
         if failed > 0:
@@ -660,8 +678,53 @@ class DocxToExcelWorker(BaseWorker):
                 self.emit_log("ERROR", f"  • {e.get('파일명', '알수없음')}: {e.get('오류내용', '원인 미상')}")
             self.emit_log("INFO", "생성된 엑셀 파일 내 '오류 파일' 시트에도 상세 내용이 기록되었습니다.")
 
-        self.emit_log("SUCCESS", f"엑셀 추출 완료: {out_path} (성공 {succ}/{tot}명)")
-        self.emit_progress(100, f"추출 완료 ({succ}/{tot}명)")
+        if rev_cnt > 0:
+            self.emit_log("WARN", f"이중 탐지 결과 '검토 필요' 의심 항목 {rev_cnt}건이 발견되었습니다. [의심 항목 검수·수정]에서 원본과 대조하세요.")
+
+        self.emit_log("SUCCESS", f"엑셀 추출 완료: {out_path} (성공 {succ}/{tot}명, 검토 필요 {rev_cnt}건)")
+        self.emit_progress(100, f"추출 완료 ({succ}/{tot}명 · 검토 필요 {rev_cnt}건)")
+        return res
+
+
+class SplitPdfOcrWorker(BaseWorker):
+    """일괄 스캔 PDF를 명단별 페이지 범위로 분할하여 Vision OCR을 수행하는 백그라운드 워커."""
+
+    def __init__(
+        self,
+        pdf_path: Path | str,
+        assignments: List[Dict[str, Any]],
+        schema_path: Optional[Path | str] = None,
+        output_xlsx: Optional[Path | str] = None,
+    ):
+        super().__init__(task_name="일괄 스캔 PDF 명단별 분할 OCR")
+        self.pdf_path = Path(pdf_path)
+        self.assignments = assignments
+        self.schema_path = Path(schema_path) if schema_path else None
+        self.output_xlsx = Path(output_xlsx) if output_xlsx else None
+
+    def execute(self) -> Dict[str, Any]:
+        self.emit_log("INFO", f"일괄 스캔 PDF 분할 OCR 시작: {self.pdf_path.name} (대상 {len(self.assignments)}명)")
+        res = extract_split_pdf_ocr_to_excel(
+            pdf_path=self.pdf_path,
+            assignments=self.assignments,
+            schema_path=self.schema_path,
+            output_path=self.output_xlsx,
+            progress_callback=lambda pct, msg: self.emit_progress(pct, msg),
+            log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
+            stop_checker=self.is_stop_requested,
+        )
+        if self.is_stop_requested():
+            self.emit_log("WARN", "사용자 요청으로 분할 PDF OCR 작업이 중단되었습니다.")
+            return res
+
+        succ = res.get("success", 0)
+        tot = res.get("total", 0)
+        rev_cnt = res.get("review_count", 0)
+        out_path = res.get("output_file", "")
+        if rev_cnt > 0:
+            self.emit_log("WARN", f"분할 OCR 완료 — '검토 필요' 의심 항목 {rev_cnt}건 탐지됨 ([검토 필요 항목 집중 검수] 확인)")
+        self.emit_log("SUCCESS", f"분할 PDF OCR 엑셀 저장 완료: {out_path} (성공 {succ}/{tot}명, 검토 필요 {rev_cnt}건)")
+        self.emit_progress(100, f"분할 OCR 완료 ({succ}/{tot}명 · 검토 필요 {rev_cnt}건)")
         return res
 
 
@@ -774,18 +837,18 @@ class IntegratedPipelineWorker(BaseWorker):
         self.model_name = model_name
 
     def execute(self) -> Dict[str, Any]:
-        # [1단계] DOCX -> 중간 엑셀
-        self.emit_log("INFO", "=== [1단계] 학생 DOCX 과제 일괄 추출 시작 ===")
-        self.emit_progress(5, "1단계: 학생 DOCX 파일 파싱 중...")
+        # [1단계] 다중 포맷(.docx/.hwpx/.hwp/.pdf) -> 중간 엑셀
+        self.emit_log("INFO", "=== [1단계] 학생 과제 문서 통합 추출 시작 ===")
+        self.emit_progress(5, "1단계: 학생 과제 문서 파싱 중...")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         intermediate_excel = self.docx_dir / f"과제취합_{ts}.xlsx"
 
-        step1_res = extract_docx_to_excel(
-            docx_dir=self.docx_dir,
+        step1_res = extract_documents_to_excel(
+            doc_dir=self.docx_dir,
             schema_path=self.schema_path,
             output_path=intermediate_excel,
-            progress_callback=lambda pct, msg: self.emit_progress(int(pct * 0.4), f"1단계 DOCX 추출: {msg}"),
+            progress_callback=lambda pct, msg: self.emit_progress(int(pct * 0.4), f"1단계 문서 추출: {msg}"),
             log_callback=lambda lvl, msg: self.emit_log(lvl, msg),
             stop_checker=self.is_stop_requested,
         )
@@ -844,6 +907,7 @@ class DocOcrTab(QWidget):
     """[탭 2] 문서 처리 & AI OCR / 파일 병합 메인 탭 위젯."""
 
     ai_target_requested = pyqtSignal(str)
+    ai_quote_selected = pyqtSignal(str, str)
     ai_context_changed = pyqtSignal(dict)
 
     TASK_ANALYZE = "doc_tab_analyze_submissions"
@@ -855,6 +919,8 @@ class DocOcrTab(QWidget):
     TASK_RECORD_GEN = "doc_tab_record_gen"
     TASK_INTEGRATED = "doc_tab_integrated_pipeline"
     TASK_COLUMN_MERGE = "doc_tab_excel_column_merge"
+    TASK_SPLIT_PDF_OCR = "doc_tab_split_pdf_ocr"
+    TASK_HWPX_AGENT = "doc_tab_hwpx_agent"
 
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -887,7 +953,7 @@ class DocOcrTab(QWidget):
         apply_qss_role(self.sub_tabs, obj_name="DocOcrSubTabWidget")
         self.sub_tabs.addTab(
             self._build_excel_aggregator_subtab(),
-            "1. 과제 파이프라인 (DOCX 추출 + AI 세특)",
+            "1. 과제 파이프라인 (문서 추출 + AI 세특)",
         )
         self.sub_tabs.addTab(
             self._build_ocr_subtab(),
@@ -897,6 +963,11 @@ class DocOcrTab(QWidget):
             self._build_student_merge_subtab(),
             "3. 파일 취합 & 명렬표 대조 & PDF 병합",
         )
+        self.sub_tabs.addTab(
+            self._build_hwpx_agent_subtab(),
+            "4. HWPX AI 문서 에이전트",
+        )
+        self.sub_tabs.currentChanged.connect(self._on_sub_tab_changed)
         layout.addWidget(self.sub_tabs)
 
     # =========================================================================
@@ -1251,7 +1322,7 @@ class DocOcrTab(QWidget):
         lay.setSpacing(12)
 
         self.card_ocr_main = HoverZoomCard(
-            title="AI OCR 및 문서 텍스트 보정",
+            title="이미지 · 스캔 PDF AI OCR 및 텍스트 보정",
             parent=w,
             zoom_ratio=1.0,
             hover_delay_ms=0,
@@ -1316,8 +1387,297 @@ class DocOcrTab(QWidget):
         g_lay.addWidget(lbl_ocr_dock_hint)
 
         lay.addWidget(self.card_ocr_main)
+
+        # ---------------------------------------------------------------------
+        # [일괄 스캔 PDF 명단별 분할 OCR] 카드
+        # ---------------------------------------------------------------------
+        self._split_pdf_total_pages: int = 0
+        self._last_split_ocr_excel_path: str = ""
+        self._last_split_review_items: List[Dict[str, Any]] = []
+
+        self.card_split_pdf_ocr = HoverZoomCard(
+            title="일괄 스캔 PDF 명단별 분할 OCR (이미지·스캔 PDF 전담 -> 1번 파이프라인 연동)",
+            parent=w,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        apply_qss_role(self.card_split_pdf_ocr, role="hoverZoomCard", obj_name="SplitPdfOcrCard")
+        split_lay = self.card_split_pdf_ocr.body_layout()
+        split_lay.setSpacing(10)
+
+        # 1) 스캔 PDF 파일 선택 + 총 페이지 표시
+        box_split_pdf = QHBoxLayout()
+        self.edit_split_pdf_path = QLineEdit()
+        self.edit_split_pdf_path.setPlaceholderText("학생 여러 명의 과제가 하나로 스캔된 일괄 PDF 파일을 선택하세요.")
+        self.edit_split_pdf_path.setMinimumHeight(32)
+        btn_browse_split_pdf = QPushButton("스캔 PDF 찾기...")
+        btn_browse_split_pdf.setMinimumHeight(32)
+        apply_qss_role(btn_browse_split_pdf, role="secondary")
+        btn_browse_split_pdf.clicked.connect(self._on_browse_split_pdf)
+
+        self.lbl_split_pdf_pages = QLabel("총 페이지: -")
+        self.lbl_split_pdf_pages.setMinimumWidth(100)
+        apply_qss_role(self.lbl_split_pdf_pages, role="codeMeta")
+
+        box_split_pdf.addWidget(self.edit_split_pdf_path, stretch=1)
+        box_split_pdf.addWidget(btn_browse_split_pdf)
+        box_split_pdf.addWidget(self.lbl_split_pdf_pages)
+        split_lay.addLayout(self._field_block("일괄 스캔 PDF 파일", box_split_pdf))
+
+        # 2) 양식 스키마 선택
+        box_split_schema = QHBoxLayout()
+        self.combo_split_schema = QComboBox()
+        self.combo_split_schema.setMinimumHeight(32)
+        apply_qss_role(self.combo_split_schema, obj_name="ComboSplitSchema")
+        box_split_schema.addWidget(self.combo_split_schema, stretch=1)
+        split_lay.addLayout(self._field_block("추출 양식 템플릿 (스키마)", box_split_schema))
+
+        # 3) 명렬표 불러오기 (DB 나이스 명렬표 또는 외부 .xlsx/.csv)
+        box_split_roster = QHBoxLayout()
+        self.combo_split_roster = QComboBox()
+        self.combo_split_roster.setMinimumHeight(32)
+        btn_load_db_roster = QPushButton("나이스 명렬표 불러오기")
+        btn_load_db_roster.setMinimumHeight(32)
+        apply_qss_role(btn_load_db_roster, role="secondary")
+        btn_load_db_roster.clicked.connect(self._on_load_db_roster)
+
+        btn_upload_ext_roster = QPushButton("외부 명단(.xlsx/.csv) 업로드")
+        btn_upload_ext_roster.setMinimumHeight(32)
+        apply_qss_role(btn_upload_ext_roster, role="outline")
+        btn_upload_ext_roster.clicked.connect(self._on_upload_external_roster)
+
+        box_split_roster.addWidget(self.combo_split_roster, stretch=1)
+        box_split_roster.addWidget(btn_load_db_roster)
+        box_split_roster.addWidget(btn_upload_ext_roster)
+        split_lay.addLayout(self._field_block("명렬표 선택 (학급담임 · 교과 · 동아리 / 외부 파일)", box_split_roster))
+
+        # 4) 기본 학생당 페이지 수 + 전체 일괄 적용 + 할당 합계 vs PDF 총 페이지
+        box_page_ctrl = QHBoxLayout()
+        box_page_ctrl.addWidget(QLabel("기본 학생당 페이지 수:"))
+        self.spin_split_default_pages = QSpinBox()
+        self.spin_split_default_pages.setRange(1, 50)
+        self.spin_split_default_pages.setValue(1)
+        self.spin_split_default_pages.setMinimumHeight(30)
+        install_no_scroll_wheel_filter(self.spin_split_default_pages)
+
+        btn_apply_default_pages = QPushButton("전체 일괄 적용")
+        btn_apply_default_pages.setMinimumHeight(30)
+        apply_qss_role(btn_apply_default_pages, role="outline")
+        btn_apply_default_pages.clicked.connect(self._on_apply_default_pages)
+
+        self.lbl_split_page_status = QLabel("할당 합계: 0쪽 / PDF 총 페이지: 0쪽")
+        self.lbl_split_page_status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        box_page_ctrl.addWidget(self.spin_split_default_pages)
+        box_page_ctrl.addWidget(btn_apply_default_pages)
+        box_page_ctrl.addStretch(1)
+        box_page_ctrl.addWidget(self.lbl_split_page_status)
+        split_lay.addLayout(box_page_ctrl)
+
+        # 5) 학생별 페이지 배정 테이블
+        self.table_split_roster = QTableWidget(0, 5)
+        self.table_split_roster.setHorizontalHeaderLabels(
+            ["포함", "학번", "이름", "페이지 수", "할당 범위"]
+        )
+        self.table_split_roster.setMinimumHeight(210)
+        self.table_split_roster.setMaximumHeight(320)
+        self.table_split_roster.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        v_s = self.table_split_roster.verticalHeader()
+        if v_s is not None:
+            v_s.setVisible(False)
+        h_s = self.table_split_roster.horizontalHeader()
+        if h_s is not None:
+            h_s.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            h_s.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            h_s.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            h_s.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            h_s.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        split_lay.addWidget(self.table_split_roster)
+
+        # 6) 실행 및 1번 서브탭 연동 버튼 바
+        box_split_actions = QHBoxLayout()
+        box_split_actions.setSpacing(8)
+        self.btn_run_split_ocr = QPushButton("분할 Vision OCR 실행 -> 엑셀 생성")
+        self.btn_run_split_ocr.setMinimumHeight(36)
+        self.btn_run_split_ocr.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_run_split_ocr, role="primary", obj_name="BtnRunSplitPdfOcr")
+        self.btn_run_split_ocr.clicked.connect(self._on_run_split_pdf_ocr)
+
+        self.btn_split_review_dialog = QPushButton("검토 필요 항목 집중 검수")
+        self.btn_split_review_dialog.setMinimumHeight(36)
+        self.btn_split_review_dialog.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_split_review_dialog, role="secondary", obj_name="BtnSplitReviewDialog")
+        self.btn_split_review_dialog.clicked.connect(self._on_open_split_review_dialog)
+
+        self.btn_send_to_pipeline = QPushButton("과제 파이프라인(세특·채점)으로 보내기")
+        self.btn_send_to_pipeline.setMinimumHeight(36)
+        self.btn_send_to_pipeline.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_send_to_pipeline, role="success", obj_name="BtnSendToPipeline")
+        self.btn_send_to_pipeline.setEnabled(False)
+        self.btn_send_to_pipeline.clicked.connect(self._on_send_split_result_to_pipeline)
+
+        box_split_actions.addWidget(self.btn_run_split_ocr, stretch=2)
+        box_split_actions.addWidget(self.btn_split_review_dialog, stretch=1)
+        box_split_actions.addWidget(self.btn_send_to_pipeline, stretch=1)
+        split_lay.addLayout(box_split_actions)
+
+        self.lbl_split_result_status = QLabel("대기 중: 스캔 PDF와 명렬표를 불러온 뒤 분할 Vision OCR을 실행하세요.")
+        self.lbl_split_result_status.setWordWrap(True)
+        apply_qss_role(self.lbl_split_result_status, role="mutedText")
+        split_lay.addWidget(self.lbl_split_result_status)
+
+        lay.addWidget(self.card_split_pdf_ocr)
+        self._refresh_split_roster_groups()
+
         scroll.setWidget(w)
         return scroll
+
+    # =========================================================================
+    # [서브탭 4] HWPX AI 문서 에이전트 UI
+    # =========================================================================
+    def _build_hwpx_agent_subtab(self) -> QWidget:
+        self._hwpx_doc: Optional[HwpxDocument] = None
+        self._hwpx_original_hwp_path: Optional[Path] = None
+        self._hwpx_last_exported_path: Optional[Path] = None
+        self._hwpx_highlighted_ids: set = set()
+        self._hwpx_modified_ids: List[str] = []
+        self._hwpx_focus_index: int = 0
+        self._hwpx_pending_ops: List[Dict[str, Any]] = []
+        self._hwpx_pending_summary: str = ""
+        self._hwpx_patch_timer = QTimer(self)
+        self._hwpx_patch_timer.setInterval(260)
+        self._hwpx_patch_timer.timeout.connect(self._step_hwpx_patch_timer)
+
+        w = QWidget()
+        apply_qss_role(w, obj_name="SubTabHwpxAgent")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(8, 8, 12, 12)
+        lay.setSpacing(10)
+
+        self.card_hwpx_agent = HoverZoomCard(
+            title="HWPX AI 문서 에이전트 (XML·스타일 보존 JSON Patch 편집)",
+            parent=w,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        apply_qss_role(self.card_hwpx_agent, role="hoverZoomCard", obj_name="HwpxAgentCard")
+        self.card_hwpx_agent.setProperty("aiTargetSelected", "false")
+        self.lbl_target_badge_hwpx = QLabel("AI 대상 선택됨")
+        apply_qss_role(self.lbl_target_badge_hwpx, obj_name="AiTargetSelectedBadge")
+        self.lbl_target_badge_hwpx.setVisible(False)
+        self.card_hwpx_agent.add_header_widget(self.lbl_target_badge_hwpx)
+
+        body = self.card_hwpx_agent.body_layout()
+        body.setSpacing(10)
+
+        # 상단 툴바
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
+        self.btn_hwpx_open = QPushButton("HWP / HWPX 열기")
+        self.btn_hwpx_open.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_open, role="primary")
+        self.btn_hwpx_open.clicked.connect(self._on_hwpx_open)
+
+        self.btn_hwpx_undo = QPushButton("실행 취소(Undo)")
+        self.btn_hwpx_undo.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_undo, role="secondary")
+        self.btn_hwpx_undo.setEnabled(False)
+        self.btn_hwpx_undo.clicked.connect(self._on_hwpx_undo)
+
+        self.btn_hwpx_save = QPushButton("저장")
+        self.btn_hwpx_save.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_save, role="secondary")
+        self.btn_hwpx_save.setEnabled(False)
+        self.btn_hwpx_save.clicked.connect(self._on_hwpx_save)
+
+        self.btn_hwpx_save_as = QPushButton("다른 이름으로 저장")
+        self.btn_hwpx_save_as.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_save_as, role="outline")
+        self.btn_hwpx_save_as.setEnabled(False)
+        self.btn_hwpx_save_as.clicked.connect(self._on_hwpx_save_as)
+
+        self.btn_hwpx_open_app = QPushButton("한글(HWP)로 열기")
+        self.btn_hwpx_open_app.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_open_app, role="outline")
+        self.btn_hwpx_open_app.setEnabled(False)
+        self.btn_hwpx_open_app.clicked.connect(self._on_hwpx_open_in_app)
+
+        self.btn_hwpx_save_answers = QPushButton("정답지 HWPX 저장")
+        self.btn_hwpx_save_answers.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_save_answers, role="outline")
+        self.btn_hwpx_save_answers.setEnabled(False)
+        self.btn_hwpx_save_answers.clicked.connect(self._on_hwpx_save_answers)
+
+        for btn in (
+            self.btn_hwpx_open,
+            self.btn_hwpx_undo,
+            self.btn_hwpx_save,
+            self.btn_hwpx_save_as,
+            self.btn_hwpx_open_app,
+            self.btn_hwpx_save_answers,
+        ):
+            toolbar.addWidget(btn)
+        toolbar.addStretch(1)
+        body.addLayout(toolbar)
+
+        # 변경 요약 배지 + 다중 수정 지점 탐색 바
+        self.lbl_hwpx_summary_badge = QLabel(
+            "대기 중: [HWP / HWPX 열기]로 문서를 연 뒤 우측 [AI 실행 패널]에서 수정 지시사항을 입력하고 실행하세요."
+        )
+        self.lbl_hwpx_summary_badge.setWordWrap(True)
+        self.lbl_hwpx_summary_badge.setStyleSheet(
+            "background-color: #F8F9FF; color: #0F172A; border: 1px solid #E2E8F0; "
+            "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
+        )
+        body.addWidget(self.lbl_hwpx_summary_badge)
+
+        nav_bar = QHBoxLayout()
+        nav_bar.setSpacing(6)
+        self.lbl_hwpx_nav_count = QLabel("수정 0건")
+        self.lbl_hwpx_nav_count.setStyleSheet("color: #475569; font-weight: 600;")
+        self.btn_hwpx_nav_prev = QPushButton("이전")
+        self.btn_hwpx_nav_prev.setFixedHeight(26)
+        self.btn_hwpx_nav_prev.setEnabled(False)
+        apply_qss_role(self.btn_hwpx_nav_prev, role="outline")
+        self.btn_hwpx_nav_prev.clicked.connect(self._on_hwpx_nav_prev)
+
+        self.lbl_hwpx_nav_pos = QLabel("0/0")
+        self.lbl_hwpx_nav_pos.setStyleSheet("color: #334155; font-size: 12px; min-width: 38px;")
+        self.lbl_hwpx_nav_pos.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.btn_hwpx_nav_next = QPushButton("다음")
+        self.btn_hwpx_nav_next.setFixedHeight(26)
+        self.btn_hwpx_nav_next.setEnabled(False)
+        apply_qss_role(self.btn_hwpx_nav_next, role="outline")
+        self.btn_hwpx_nav_next.clicked.connect(self._on_hwpx_nav_next)
+
+        nav_bar.addWidget(self.lbl_hwpx_nav_count)
+        nav_bar.addWidget(self.btn_hwpx_nav_prev)
+        nav_bar.addWidget(self.lbl_hwpx_nav_pos)
+        nav_bar.addWidget(self.btn_hwpx_nav_next)
+        nav_bar.addStretch(1)
+        body.addLayout(nav_bar)
+
+        # 실시간 HTML 뷰어
+        self.browser_hwpx_preview = QTextBrowser()
+        self.browser_hwpx_preview.setOpenExternalLinks(False)
+        self.browser_hwpx_preview.setStyleSheet(
+            "QTextBrowser { background-color: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 6px; }"
+        )
+        self.browser_hwpx_preview.setHtml(
+            "<html><body style='font-family:\"Malgun Gothic\",sans-serif;color:#64748B;padding:24px;'>"
+            "<p>열린 문서가 없습니다. 상단의 [HWP / HWPX 열기] 버튼을 눌러 HWP 또는 HWPX 문서를 불러오세요.</p>"
+            "</body></html>"
+        )
+        self._hwpx_quote_timer = QTimer(self)
+        self._hwpx_quote_timer.setSingleShot(True)
+        self._hwpx_quote_timer.setInterval(120)
+        self._hwpx_quote_timer.timeout.connect(self._emit_hwpx_preview_quote)
+        self.browser_hwpx_preview.selectionChanged.connect(lambda: self._hwpx_quote_timer.start())
+        body.addWidget(self.browser_hwpx_preview, stretch=1)
+
+        lay.addWidget(self.card_hwpx_agent, stretch=1)
+        return w
 
     # =========================================================================
     # [서브탭 3] 과제 취합 및 AI 과세특·채점 자동화 UI
@@ -1395,9 +1755,9 @@ class DocOcrTab(QWidget):
         cards_layout = QVBoxLayout()
         cards_layout.setSpacing(14)
 
-        # [STAGE 1 CARD] DOCX Parsing & Form Schema
+        # [STAGE 1 CARD] Electronic Document Parsing & Form Schema
         self.card_agg_step1 = HoverZoomCard(
-            title="1단계 · 과제 DOCX 추출 및 양식 스키마",
+            title="1단계 · 전자 과제 문서 추출 (.docx/.hwpx/.hwp/텍스트 .pdf) 및 양식 스키마",
             parent=w,
             zoom_ratio=1.0,
             hover_delay_ms=0,
@@ -1408,10 +1768,10 @@ class DocOcrTab(QWidget):
         form1 = QVBoxLayout()
         form1.setSpacing(10)
 
-        # 학생 DOCX 폴더
+        # 학생 제출 폴더
         box_docx_dir = QHBoxLayout()
         self.edit_agg_docx_dir = QLineEdit()
-        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx 파일 폴더를 선택하세요.")
+        self.edit_agg_docx_dir.setPlaceholderText("학생들이 제출한 .docx, .hwpx, .hwp, .pdf 파일 폴더를 선택하세요.")
         self.edit_agg_docx_dir.setMinimumHeight(32)
         apply_qss_role(self.edit_agg_docx_dir, obj_name="EditAggDocxDir")
 
@@ -1428,7 +1788,7 @@ class DocOcrTab(QWidget):
         box_docx_dir.addWidget(self.edit_agg_docx_dir, stretch=1)
         box_docx_dir.addWidget(btn_browse_docx)
         box_docx_dir.addWidget(btn_open_docx)
-        form1.addLayout(self._field_block("학생 제출 폴더 (DOCX)", box_docx_dir))
+        form1.addLayout(self._field_block("학생 제출 폴더 (DOCX / HWPX / HWP / PDF)", box_docx_dir))
 
         # 과제 양식(JSON 스키마) 선택 및 새 양식 생성 버튼
         box_schema = QHBoxLayout()
@@ -1459,13 +1819,26 @@ class DocOcrTab(QWidget):
         apply_qss_role(lbl_schema_info, role="infoBanner", obj_name="SchemaInfoBanner")
         lay_step1.addWidget(lbl_schema_info)
 
-        # 1단계 단독 실행 버튼 (중앙 1단계 카드에 유지)
-        self.btn_run_docx_only = QPushButton("1. DOCX -> 엑셀 추출 실행")
+        # 1단계 단독 실행 버튼 및 의심 항목 검수 버튼
+        box_step1_actions = QHBoxLayout()
+        box_step1_actions.setSpacing(8)
+
+        self.btn_run_docx_only = QPushButton("1. 과제 문서 -> 엑셀 통합 추출 실행")
         self.btn_run_docx_only.setMinimumHeight(36)
         self.btn_run_docx_only.setCursor(Qt.CursorShape.PointingHandCursor)
         apply_qss_role(self.btn_run_docx_only, role="primary", obj_name="BtnRunDocxOnly")
         self.btn_run_docx_only.clicked.connect(self._on_run_docx_extract)
-        lay_step1.addWidget(self.btn_run_docx_only)
+
+        self.btn_open_review_dialog = QPushButton("의심 항목 검수·수정")
+        self.btn_open_review_dialog.setMinimumHeight(36)
+        self.btn_open_review_dialog.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_open_review_dialog, role="secondary", obj_name="BtnOpenReviewDialog")
+        self.btn_open_review_dialog.setToolTip("AI·로컬 이중 탐지로 '검토 필요' 플래그가 붙은 항목만 모아 원본과 대조·수정합니다.")
+        self.btn_open_review_dialog.clicked.connect(self._on_open_review_dialog)
+
+        box_step1_actions.addWidget(self.btn_run_docx_only, stretch=2)
+        box_step1_actions.addWidget(self.btn_open_review_dialog, stretch=1)
+        lay_step1.addLayout(box_step1_actions)
 
         cards_layout.addWidget(self.card_agg_step1)
 
@@ -2367,6 +2740,333 @@ class DocOcrTab(QWidget):
             QMessageBox.information(self, "저장 완료", f"저장되었습니다:\n{save_path}")
 
     # =========================================================================
+    # [서브탭 2-B] 일괄 스캔 PDF 명단별 분할 OCR 핸들러
+    # =========================================================================
+    def _refresh_split_roster_groups(self) -> None:
+        """DatabaseManager.get_roster_groups()에서 학급담임·교과·동아리 명렬표 목록을 로드합니다."""
+        if not hasattr(self, "combo_split_roster"):
+            return
+        prev_id = self.combo_split_roster.currentData()
+        self.combo_split_roster.clear()
+        try:
+            db = DatabaseManager()
+            groups = db.get_roster_groups()
+        except Exception:
+            groups = []
+
+        if not groups:
+            self.combo_split_roster.addItem("저장된 명렬표 없음 (우측 외부 명단 업로드 가능)", None)
+            return
+
+        for g in groups:
+            gid = g.get("id")
+            gtype = g.get("group_type", "")
+            gname = g.get("group_name", "")
+            cnt = g.get("student_count", "")
+            label = f"[{gtype}] {gname}" + (f" ({cnt}명)" if cnt else "")
+            self.combo_split_roster.addItem(label, gid)
+
+        if prev_id is not None:
+            idx = self.combo_split_roster.findData(prev_id)
+            if idx >= 0:
+                self.combo_split_roster.setCurrentIndex(idx)
+
+    def _on_browse_split_pdf(self) -> None:
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "일괄 스캔 PDF 파일 선택", "", "PDF 파일 (*.pdf)"
+        )
+        if not fpath:
+            return
+        self.edit_split_pdf_path.setText(fpath)
+        try:
+            total_pages = get_pdf_page_count(fpath)
+        except Exception as exc:
+            total_pages = 0
+            QMessageBox.warning(self, "PDF 읽기 오류", f"PDF 페이지 수를 읽을 수 없습니다:\n{exc}")
+        self._split_pdf_total_pages = total_pages
+        self.lbl_split_pdf_pages.setText(f"총 페이지: {total_pages}쪽")
+        self._recalculate_split_page_ranges()
+
+    def _on_load_db_roster(self) -> None:
+        self._refresh_split_roster_groups()
+        gid = self.combo_split_roster.currentData()
+        if gid is None:
+            QMessageBox.information(self, "명렬표 없음", "DB에 저장된 나이스 명렬표가 없습니다. 외부 명단(.xlsx/.csv)을 업로드해 주세요.")
+            return
+        try:
+            db = DatabaseManager()
+            students = db.get_roster_students(int(gid))
+        except Exception as exc:
+            QMessageBox.warning(self, "불러오기 실패", f"명렬표를 불러오지 못했습니다:\n{exc}")
+            return
+        if not students:
+            QMessageBox.information(self, "빈 명렬표", "선택한 명렬표에 등록된 학생이 없습니다.")
+            return
+        self._populate_split_roster_table(students)
+
+    def _on_upload_external_roster(self) -> None:
+        fpath, _ = QFileDialog.getOpenFileName(
+            self, "외부 명단 업로드", "", "엑셀/CSV 파일 (*.xlsx *.xls *.csv)"
+        )
+        if not fpath:
+            return
+        try:
+            p = Path(fpath)
+            if p.suffix.lower() == ".csv":
+                df = pd.read_csv(p, dtype=str).fillna("")
+            else:
+                df = pd.read_excel(p, dtype=str).fillna("")
+            cols = [str(c).strip() for c in df.columns]
+            sid_col = next((c for c in cols if "학번" in c), cols[0] if cols else "")
+            name_col = next((c for c in cols if "이름" in c or "성명" in c), cols[1] if len(cols) > 1 else sid_col)
+            students = []
+            for _, row in df.iterrows():
+                sid = str(row.get(sid_col, "")).strip()
+                sname = str(row.get(name_col, "")).strip()
+                if sid or sname:
+                    students.append({"student_id": sid, "name": sname})
+            if not students:
+                QMessageBox.warning(self, "명단 비어있음", "업로드한 파일에서 학생 정보를 찾지 못했습니다.")
+                return
+            self._populate_split_roster_table(students)
+        except Exception as exc:
+            QMessageBox.warning(self, "업로드 오류", f"외부 명단을 읽는 중 오류가 발생했습니다:\n{exc}")
+
+    def _populate_split_roster_table(self, students: List[Dict[str, Any]]) -> None:
+        default_pages = self.spin_split_default_pages.value()
+        self.table_split_roster.setRowCount(len(students))
+        for r_idx, stu in enumerate(students):
+            chk_w = QWidget()
+            chk_lay = QHBoxLayout(chk_w)
+            chk_lay.setContentsMargins(0, 0, 0, 0)
+            chk_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chk = QCheckBox()
+            chk.setChecked(True)
+            chk.stateChanged.connect(self._recalculate_split_page_ranges)
+            chk_lay.addWidget(chk)
+            self.table_split_roster.setCellWidget(r_idx, 0, chk_w)
+
+            sid_item = QTableWidgetItem(str(stu.get("student_id", "")).strip())
+            sid_item.setFlags(sid_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            name_item = QTableWidgetItem(str(stu.get("name", "")).strip())
+            name_item.setFlags(name_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.table_split_roster.setItem(r_idx, 1, sid_item)
+            self.table_split_roster.setItem(r_idx, 2, name_item)
+
+            spin = QSpinBox()
+            spin.setRange(1, 50)
+            spin.setValue(default_pages)
+            install_no_scroll_wheel_filter(spin)
+            spin.valueChanged.connect(self._recalculate_split_page_ranges)
+            self.table_split_roster.setCellWidget(r_idx, 3, spin)
+
+            range_item = QTableWidgetItem("-")
+            range_item.setFlags(range_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            range_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table_split_roster.setItem(r_idx, 4, range_item)
+
+        self._recalculate_split_page_ranges()
+
+    def _on_apply_default_pages(self) -> None:
+        val = self.spin_split_default_pages.value()
+        for r_idx in range(self.table_split_roster.rowCount()):
+            spin = self.table_split_roster.cellWidget(r_idx, 3)
+            if isinstance(spin, QSpinBox):
+                spin.blockSignals(True)
+                spin.setValue(val)
+                spin.blockSignals(False)
+        self._recalculate_split_page_ranges()
+
+    def _recalculate_split_page_ranges(self) -> None:
+        cursor = 1
+        assigned_sum = 0
+        for r_idx in range(self.table_split_roster.rowCount()):
+            chk_w = self.table_split_roster.cellWidget(r_idx, 0)
+            chk = chk_w.findChild(QCheckBox) if chk_w else None
+            spin = self.table_split_roster.cellWidget(r_idx, 3)
+            range_item = self.table_split_roster.item(r_idx, 4)
+            if range_item is None:
+                continue
+            is_checked = bool(chk and chk.isChecked())
+            pages = spin.value() if isinstance(spin, QSpinBox) else 1
+            if is_checked:
+                start_p = cursor
+                end_p = cursor + pages - 1
+                range_item.setText(f"p.{start_p}~{end_p}")
+                cursor = end_p + 1
+                assigned_sum += pages
+            else:
+                range_item.setText("제외")
+
+        total_p = self._split_pdf_total_pages
+        if total_p <= 0:
+            self.lbl_split_page_status.setText(f"할당 합계: {assigned_sum}쪽 / PDF 총 페이지: 미선택")
+            self.lbl_split_page_status.setStyleSheet("color: #64748B; font-weight: 600;")
+        elif assigned_sum == total_p:
+            self.lbl_split_page_status.setText(f"할당 합계: {assigned_sum}쪽 / PDF 총 페이지: {total_p}쪽 (일치)")
+            self.lbl_split_page_status.setStyleSheet("color: #15803D; font-weight: 700;")
+        else:
+            diff = assigned_sum - total_p
+            diff_str = f"+{diff}쪽 초과" if diff > 0 else f"{abs(diff)}쪽 부족"
+            self.lbl_split_page_status.setText(
+                f"할당 합계: {assigned_sum}쪽 / PDF 총 페이지: {total_p}쪽 ({diff_str})"
+            )
+            self.lbl_split_page_status.setStyleSheet("color: #B45309; font-weight: 700;")
+
+    def _collect_split_assignments(self) -> List[Dict[str, Any]]:
+        assignments: List[Dict[str, Any]] = []
+        cursor = 1
+        for r_idx in range(self.table_split_roster.rowCount()):
+            chk_w = self.table_split_roster.cellWidget(r_idx, 0)
+            chk = chk_w.findChild(QCheckBox) if chk_w else None
+            if not (chk and chk.isChecked()):
+                continue
+            sid_it = self.table_split_roster.item(r_idx, 1)
+            name_it = self.table_split_roster.item(r_idx, 2)
+            spin = self.table_split_roster.cellWidget(r_idx, 3)
+            pages = spin.value() if isinstance(spin, QSpinBox) else 1
+            start_p = cursor
+            end_p = cursor + pages - 1
+            cursor = end_p + 1
+            assignments.append(
+                {
+                    "student_id": sid_it.text().strip() if sid_it else "",
+                    "name": name_it.text().strip() if name_it else "",
+                    "start_page": start_p,
+                    "end_page": end_p,
+                }
+            )
+        return assignments
+
+    def _on_run_split_pdf_ocr(self) -> None:
+        pdf_str = self.edit_split_pdf_path.text().strip()
+        if not pdf_str or not Path(pdf_str).is_file():
+            QMessageBox.warning(self, "PDF 확인", "일괄 스캔 PDF 파일을 먼저 선택해 주세요.")
+            return
+
+        assignments = self._collect_split_assignments()
+        if not assignments:
+            QMessageBox.warning(self, "명단 확인", "OCR을 수행할 학생을 명렬표에서 1명 이상 포함해 주세요.")
+            return
+
+        total_assigned = assignments[-1]["end_page"]
+        if self._split_pdf_total_pages > 0 and total_assigned > self._split_pdf_total_pages:
+            ans = QMessageBox.question(
+                self,
+                "페이지 범위 초과 확인",
+                f"할당된 마지막 페이지(p.{total_assigned})가 PDF 총 페이지({self._split_pdf_total_pages}쪽)를 초과합니다.\n"
+                "그래도 진행하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        client = MultiLlmClient()
+        if client.is_manual_mode_active():
+            QMessageBox.warning(
+                self,
+                "API 키 설정 필요",
+                "일괄 스캔 PDF Vision OCR을 실행하려면 환경설정에서 AI API 키를 입력하고 '수동 프롬프트 모드'를 해제해 주세요.",
+            )
+            return
+
+        schema_data = self.combo_split_schema.currentData()
+        schema_path = Path(schema_data) if schema_data else None
+
+        worker = SplitPdfOcrWorker(
+            pdf_path=pdf_str,
+            assignments=assignments,
+            schema_path=schema_path,
+        )
+        self.btn_run_split_ocr.setEnabled(False)
+        self.lbl_split_result_status.setText("일괄 스캔 PDF 분할 Vision OCR 진행 중...")
+
+        def on_done(res: Dict[str, Any]) -> None:
+            out_file = res.get("output_file", "")
+            self._last_split_ocr_excel_path = out_file
+            self._last_split_review_items = res.get("review_items", [])
+            rev_cnt = res.get("review_count", 0)
+            succ = res.get("success", 0)
+            tot = res.get("total", 0)
+
+            self.btn_send_to_pipeline.setEnabled(bool(out_file and Path(out_file).is_file()))
+            if rev_cnt > 0:
+                self.btn_split_review_dialog.setText(f"검토 필요 항목 집중 검수 ({rev_cnt}건)")
+            else:
+                self.btn_split_review_dialog.setText("검토 필요 항목 집중 검수")
+
+            self.lbl_split_result_status.setText(
+                f"완료: {Path(out_file).name} (성공 {succ}/{tot}명 · 검토 필요 {rev_cnt}건)"
+            )
+            if rev_cnt > 0:
+                ans = QMessageBox.question(
+                    self,
+                    "분할 OCR 완료 — 검토 필요 항목 발견",
+                    f"일괄 스캔 PDF 분할 OCR이 완료되었습니다.\n\n"
+                    f"- 처리 학생: {succ}/{tot}명\n"
+                    f"- '검토 필요' 의심 항목: {rev_cnt}건\n\n"
+                    f"지금 바로 [검토 필요 항목 집중 검수] 창을 열어 대조·수정하시겠습니까?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    self._on_open_split_review_dialog()
+            else:
+                QMessageBox.information(
+                    self,
+                    "분할 OCR 완료",
+                    f"일괄 스캔 PDF 분할 OCR이 완료되었습니다.\n\n"
+                    f"- 처리 학생: {succ}/{tot}명\n"
+                    f"- 저장 경로: {out_file}\n\n"
+                    f"[과제 파이프라인(세특·채점)으로 보내기] 버튼으로 1번 서브탭에 바로 전달할 수 있습니다.",
+                )
+
+        self.task_runner.start_worker(
+            worker,
+            task_key=self.TASK_SPLIT_PDF_OCR,
+            on_result=on_done,
+            on_error=lambda err: self.lbl_split_result_status.setText(f"<font color='#ef4444'><b>오류: {err.splitlines()[0]}</b></font>"),
+            on_finished=lambda: self.btn_run_split_ocr.setEnabled(True),
+        )
+
+    def _on_open_split_review_dialog(self) -> None:
+        excel_str = getattr(self, "_last_split_ocr_excel_path", "")
+        if not excel_str or not Path(excel_str).is_file():
+            QMessageBox.information(self, "안내", "먼저 일괄 스캔 PDF 분할 OCR을 실행하여 엑셀을 생성해 주세요.")
+            return
+        items = getattr(self, "_last_split_review_items", None) or load_review_items_from_excel(excel_str)
+        if not items:
+            QMessageBox.information(self, "검수 항목 없음", "현재 생성된 엑셀에 '검토 필요' 항목이 없습니다.")
+            return
+        dlg = OcrReviewDialog(excel_path=excel_str, review_items=items, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.has_saved_changes:
+            self._last_split_review_items = dlg.items
+            pending = sum(1 for it in dlg.items if it.get("status") != "reviewed")
+            self.btn_split_review_dialog.setText(
+                f"검토 필요 항목 집중 검수 ({pending}건)" if pending > 0 else "검토 필요 항목 집중 검수"
+            )
+            QMessageBox.information(self, "검수 반영 완료", "수정된 검수 결과가 엑셀 파일에 반영되었습니다.")
+
+    def _on_send_split_result_to_pipeline(self) -> None:
+        excel_str = getattr(self, "_last_split_ocr_excel_path", "")
+        if not excel_str or not Path(excel_str).is_file():
+            QMessageBox.information(self, "안내", "먼저 분할 OCR을 실행해 주세요.")
+            return
+        self.edit_agg_excel_file.setText(excel_str)
+        self._last_result_excel_path = excel_str
+        self._last_review_items = list(getattr(self, "_last_split_review_items", []) or [])
+        self._update_review_button_badge(self._last_review_items)
+        self.btn_open_result_excel.setVisible(True)
+        self._update_agg_stepper(s1="done", s2="idle", s3="idle")
+        self._refresh_agg_student_preview_table(preferred_path=excel_str)
+        self.sub_tabs.setCurrentIndex(0)
+        self.notifier.notify(
+            "과제 파이프라인 연동 완료",
+            f"스캔 PDF 분할 OCR 결과({Path(excel_str).name})를 1번 서브탭 대상 엑셀로 불러왔습니다.",
+        )
+
+    # =========================================================================
     # [서브탭 3] 과제 취합 및 AI 과세특·채점 자동화 핸들러
     # =========================================================================
     def _open_dir_if_exists(self, dir_path: str) -> None:
@@ -2537,6 +3237,21 @@ class DocOcrTab(QWidget):
             if idx >= 0:
                 self.combo_agg_schema.setCurrentIndex(idx)
 
+        if hasattr(self, "combo_split_schema"):
+            prev_split = self.combo_split_schema.currentData()
+            self.combo_split_schema.clear()
+            for idx in range(1, self.combo_agg_schema.count()):
+                self.combo_split_schema.addItem(
+                    self.combo_agg_schema.itemText(idx),
+                    self.combo_agg_schema.itemData(idx),
+                )
+            if self.combo_split_schema.count() == 0:
+                self.combo_split_schema.addItem("기본 내장 탐구보고서", "")
+            if prev_split:
+                s_idx = self.combo_split_schema.findData(prev_split)
+                if s_idx >= 0:
+                    self.combo_split_schema.setCurrentIndex(s_idx)
+
     def _refresh_prompts_combo(self) -> None:
         """prompts_memory/ 디렉토리 내 .txt 프롬프트 파일 목록을 콤보박스에 로드합니다."""
         prev_data = self.combo_agg_prompt.currentData()
@@ -2640,11 +3355,60 @@ class DocOcrTab(QWidget):
         if hasattr(self, "btn_stop_agg") and self.btn_stop_agg is not None:
             self.btn_stop_agg.setEnabled(busy)
 
+    def _update_review_button_badge(self, review_items: Optional[List[Dict[str, Any]]] = None) -> None:
+        if review_items is not None:
+            self._last_review_items = review_items
+        items = getattr(self, "_last_review_items", []) or []
+        pending_cnt = sum(1 for it in items if it.get("status") != "reviewed")
+        if hasattr(self, "btn_open_review_dialog") and self.btn_open_review_dialog is not None:
+            if pending_cnt > 0:
+                self.btn_open_review_dialog.setText(f"의심 항목 검수·수정 ({pending_cnt}건)")
+            else:
+                self.btn_open_review_dialog.setText("의심 항목 검수·수정")
+
+    def _on_open_review_dialog(self) -> None:
+        """'검토 필요' 의심 항목 검수·수정 다이얼로그를 엽니다."""
+        excel_str = self.edit_agg_excel_file.text().strip() or getattr(self, "_last_result_excel_path", "")
+        if not excel_str or not Path(excel_str).is_file():
+            QMessageBox.information(
+                self,
+                "대상 엑셀 필요",
+                "1단계 과제 추출을 먼저 실행하거나 2단계 대상 엑셀(.xlsx) 파일을 선택해 주세요.",
+            )
+            return
+
+        review_items = getattr(self, "_last_review_items", None)
+        if not review_items:
+            review_items = load_review_items_from_excel(excel_str)
+
+        if not review_items:
+            QMessageBox.information(
+                self,
+                "검수 항목 없음",
+                "현재 선택된 엑셀 파일에 '검토 필요'로 탐지된 의심 항목이 없습니다.",
+            )
+            return
+
+        dlg = OcrReviewDialog(excel_path=excel_str, review_items=review_items, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted and dlg.has_saved_changes:
+            self._last_review_items = dlg.items
+            self._update_review_button_badge(dlg.items)
+            self._refresh_agg_student_preview_table(preferred_path=excel_str)
+            QMessageBox.information(
+                self,
+                "검수 반영 완료",
+                "수정·확인된 검수 내용이 엑셀 파일에 안전하게 저장되었습니다.",
+            )
+
     def _on_run_docx_extract(self) -> None:
-        """1단계: DOCX 과제 파일 추출만 단독 실행"""
+        """1단계: 다중 포맷(.docx/.hwpx/.hwp/.pdf) 과제 파일 통합 추출만 단독 실행"""
         folder_str = self.edit_agg_docx_dir.text().strip()
         if not folder_str or not Path(folder_str).is_dir():
-            QMessageBox.warning(self, "입력 확인", "학생들의 .docx 파일이 들어있는 폴더를 먼저 선택해 주세요.")
+            QMessageBox.warning(
+                self,
+                "입력 확인",
+                "학생들의 과제 파일(.docx, .hwpx, .hwp, .pdf)이 들어있는 폴더를 먼저 선택해 주세요.",
+            )
             return
 
         schema_data = self.combo_agg_schema.currentData()
@@ -2653,7 +3417,7 @@ class DocOcrTab(QWidget):
         worker = DocxToExcelWorker(docx_dir=folder_str, schema_path=schema_path)
         self._set_agg_controls_busy(True)
         self._update_agg_stepper(s1="active", s2="idle", s3="idle")
-        self.lbl_agg_status.setText("DOCX 과제 추출 진행 중...")
+        self.lbl_agg_status.setText("과제 문서(.docx/.hwpx/.hwp/.pdf) 통합 추출 진행 중...")
         self.btn_open_result_excel.setVisible(False)
 
         def on_done(res: Dict[str, Any]):
@@ -2666,12 +3430,16 @@ class DocOcrTab(QWidget):
             tot = res.get("total", 0)
             succ = res.get("success", 0)
             failed = res.get("failed", 0)
+            rev_cnt = res.get("review_count", 0)
+            review_items = res.get("review_items", [])
             errors = res.get("errors", [])
 
+            self._update_review_button_badge(review_items)
             self._update_agg_stepper(s1="done", s2="idle", s3="idle")
             self.lbl_agg_status.setText(
-                f"추출 완료: {Path(out_file).name} (성공 {succ}명 / 실패 {failed}명)"
+                f"추출 완료: {Path(out_file).name} (성공 {succ}명 / 실패 {failed}명 / 검토 필요 {rev_cnt}건)"
             )
+            self._refresh_agg_student_preview_table(preferred_path=out_file)
 
             if failed > 0:
                 preview_count = min(len(errors), 8)
@@ -2685,23 +3453,39 @@ class DocOcrTab(QWidget):
 
                 QMessageBox.warning(
                     self,
-                    "DOCX 추출 완료 (일부 실패)",
-                    f"학생 과제 추출이 완료되었으나, {failed}건의 파일에서 오류가 발생했습니다.\n\n"
+                    "과제 통합 추출 완료 (일부 실패)",
+                    f"학생 과제 통합 추출이 완료되었으나, {failed}건의 파일에서 오류가 발생했습니다.\n\n"
                     f"- 총 파일: {tot}개\n"
                     f"- 성공 추출: {succ}명\n"
+                    f"- 검토 필요 의심 항목: {rev_cnt}건\n"
                     f"- 오류 건수: {failed}건\n\n"
                     f"[오류 발생 파일 및 원인 (상위 {preview_count}건)]:\n{fail_summary_str}\n\n"
                     f"※ 자세한 원인은 결과 엑셀의 [오류 파일] 시트 및 하단 로그 콘솔에서 확인할 수 있습니다.\n\n"
                     f"생성된 엑셀 경로:\n{out_file}\n\n"
                     f"2단계 대상 엑셀 파일로 자동 등록되었습니다.",
                 )
+            elif rev_cnt > 0:
+                reply = QMessageBox.question(
+                    self,
+                    "과제 통합 추출 완료 — 의심 항목 검토 필요",
+                    f"학생 과제 통합 추출이 완료되었습니다.\n\n"
+                    f"- 총 파일: {tot}개\n"
+                    f"- 성공 추출: {succ}명\n"
+                    f"- '검토 필요' 의심 항목: {rev_cnt}건\n\n"
+                    f"지금 바로 [의심 항목 검수·수정] 창을 열어 원본과 대조·수정하시겠습니까?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self._on_open_review_dialog()
             else:
                 QMessageBox.information(
                     self,
-                    "DOCX 추출 완료",
+                    "과제 통합 추출 완료",
                     f"학생 과제 추출이 성공적으로 완료되었습니다.\n\n"
                     f"- 총 파일: {tot}개\n"
                     f"- 성공 추출: {succ}명\n"
+                    f"- 검토 필요 의심 항목: 0건\n"
                     f"- 오류 건수: 0건\n\n"
                     f"생성된 엑셀 경로:\n{out_file}\n\n"
                     f"2단계 대상 엑셀 파일로 자동 등록되었습니다.",
@@ -2783,7 +3567,11 @@ class DocOcrTab(QWidget):
 
         folder_str = self.edit_agg_docx_dir.text().strip()
         if not folder_str or not Path(folder_str).is_dir():
-            QMessageBox.warning(self, "입력 확인", "1단계 학생 과제 폴더(.docx)를 먼저 선택해 주세요.")
+            QMessageBox.warning(
+                self,
+                "입력 확인",
+                "1단계 학생 과제 폴더(.docx, .hwpx, .hwp, .pdf)를 먼저 선택해 주세요.",
+            )
             return
 
         schema_data = self.combo_agg_schema.currentData()
@@ -2810,7 +3598,7 @@ class DocOcrTab(QWidget):
         self._set_agg_controls_busy(True)
         self._update_agg_stepper(s1="active", s2="active", s3="active")
         self.lbl_agg_status.setText(
-            f"원클릭 파이프라인 진행 중: 1단계 DOCX 추출 -> 2단계 AI 세특 ({info['provider_display']} / {info['model']})"
+            f"원클릭 파이프라인 진행 중: 1단계 통합 문서 추출 -> 2단계 AI 세특 ({info['provider_display']} / {info['model']})"
         )
         self.btn_open_result_excel.setVisible(False)
 
@@ -3062,10 +3850,12 @@ class DocOcrTab(QWidget):
         self.card_agg_step2.get_ai_context = lambda: self.get_ai_context("agg_step2")  # type: ignore[attr-defined]
         self.card_agg_step3.get_ai_context = lambda: self.get_ai_context("agg_step2")  # type: ignore[attr-defined]
         self.card_ocr_main.get_ai_context = lambda: self.get_ai_context("ocr")  # type: ignore[attr-defined]
+        self.card_hwpx_agent.get_ai_context = lambda: self.get_ai_context("hwpx_agent")  # type: ignore[attr-defined]
 
         self._install_target_click_filter(self.card_agg_step2, "agg_step2")
         self._install_target_click_filter(self.card_agg_step3, "agg_step2")
         self._install_target_click_filter(self.card_ocr_main, "ocr")
+        self._install_target_click_filter(self.card_hwpx_agent, "hwpx_agent")
 
         # 300ms 디바운스 시그널 연결
         self.edit_agg_excel_file.textChanged.connect(lambda _t: self._schedule_context_debounce())
@@ -3077,6 +3867,11 @@ class DocOcrTab(QWidget):
 
         self.edit_ocr_prompt.textChanged.connect(lambda _t: self._schedule_context_debounce())
         self.txt_ocr_output.textChanged.connect(self._schedule_context_debounce)
+        self._ocr_quote_timer = QTimer(self)
+        self._ocr_quote_timer.setSingleShot(True)
+        self._ocr_quote_timer.setInterval(120)
+        self._ocr_quote_timer.timeout.connect(self._emit_ocr_preview_quote)
+        self.txt_ocr_output.selectionChanged.connect(lambda: self._ocr_quote_timer.start())
         ocr_model = self.list_ocr_files.model()
         if ocr_model is not None:
             ocr_model.rowsInserted.connect(lambda *_a: self._schedule_context_debounce())
@@ -3199,9 +3994,413 @@ class DocOcrTab(QWidget):
         self._refresh_agg_student_preview_table()
         self.ai_context_changed.emit(self.get_ai_context())
 
+    def _on_sub_tab_changed(self, index: int) -> None:
+        if index == 3:
+            self.ai_target_requested.emit("hwpx_agent")
+        elif index == 1:
+            self.ai_target_requested.emit("ocr")
+        elif index == 0:
+            self.ai_target_requested.emit("agg_step2")
+
+    def _load_hwpx_document_into_agent(
+        self,
+        hwpx_path: Path | str,
+        badge_text: str,
+        original_hwp_path: Optional[Path] = None,
+    ) -> None:
+        self._hwpx_doc = HwpxDocument.load(hwpx_path)
+        self._hwpx_original_hwp_path = original_hwp_path
+        self._hwpx_last_exported_path = Path(hwpx_path) if original_hwp_path is None else None
+        self._hwpx_highlighted_ids = set()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self._update_hwpx_nav_bar()
+        self.btn_hwpx_undo.setEnabled(False)
+        self.btn_hwpx_save.setEnabled(True)
+        self.btn_hwpx_save_as.setEnabled(True)
+        self.btn_hwpx_open_app.setEnabled(True)
+        self.btn_hwpx_save_answers.setEnabled(False)
+        self.lbl_hwpx_summary_badge.setText(badge_text)
+        self._render_hwpx_viewer()
+        self.ai_quote_selected.emit("", "")
+        self.ai_target_requested.emit("hwpx_agent")
+        self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
+    def _on_hwpx_open(self) -> None:
+        fpath, _ = QFileDialog.getOpenFileName(
+            self,
+            "HWP / HWPX 문서 열기",
+            "",
+            "한글 문서 (*.hwpx *.hwp);;모든 파일 (*)",
+        )
+        if not fpath:
+            return
+
+        src_path = Path(fpath)
+        if src_path.suffix.lower() == ".hwp":
+            temp_dir = Path(tempfile.mkdtemp(prefix="eduflow_hwpx_"))
+            temp_hwpx = temp_dir / f"{src_path.stem}.hwpx"
+            self.btn_hwpx_open.setEnabled(False)
+            self.lbl_hwpx_summary_badge.setText(
+                f"HWP 원본을 임시 HWPX로 백그라운드 변환 중... ({src_path.name})"
+            )
+
+            def _convert_task(worker: BaseWorker) -> Path:
+                worker.emit_log("INFO", f"HWP -> HWPX 백그라운드 변환 시작: {src_path}")
+                return convert_hwp_to_hwpx(src_path, temp_hwpx)
+
+            def _on_converted(converted_path: Path) -> None:
+                self.btn_hwpx_open.setEnabled(True)
+                try:
+                    self._load_hwpx_document_into_agent(
+                        converted_path,
+                        badge_text="HWP 원본 -> 임시 HWPX 변환 완료 (서식 보존 편집 중)",
+                        original_hwp_path=src_path,
+                    )
+                except Exception as exc:
+                    QMessageBox.warning(self, "열기 실패", f"변환된 HWPX 문서를 열지 못했습니다:\n{exc}")
+
+            def _on_convert_error(err_msg: str) -> None:
+                self.btn_hwpx_open.setEnabled(True)
+                self.lbl_hwpx_summary_badge.setText(
+                    "변환 실패: .hwp 자동 변환을 사용할 수 없습니다. 아래 안내를 확인하세요."
+                )
+                QMessageBox.warning(self, "HWP 변환 실패", err_msg)
+
+            worker = FunctionWorker("HWP -> HWPX 변환", _convert_task)
+            self.task_runner.start_worker(
+                worker,
+                task_key="hwpx_agent_open_hwp",
+                on_result=_on_converted,
+                on_error=_on_convert_error,
+            )
+            return
+
+        try:
+            self._load_hwpx_document_into_agent(
+                src_path,
+                badge_text=f"문서 로드 완료: {src_path.name}",
+                original_hwp_path=None,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "열기 실패", f"HWPX 문서를 열지 못했습니다:\n{exc}")
+
+    def _extract_target_id_from_cursor(self, cursor: Any) -> str:
+        """QTextBrowser 선택 영역이 속한 [p_N] 또는 [tbl_N...] target_id를 추출합니다."""
+        doc = self.browser_hwpx_preview.document()
+        if doc is None:
+            return ""
+        blk = doc.findBlock(cursor.selectionStart())
+        for _ in range(8):
+            if not blk.isValid():
+                break
+            m = re.search(r"\[(p_\d+|tbl_\d+(?:_r\d+_c\d+)?)\]", blk.text())
+            if m:
+                return m.group(1)
+            blk = blk.previous()
+        return ""
+
+    def _emit_hwpx_preview_quote(self) -> None:
+        cursor = self.browser_hwpx_preview.textCursor()
+        selected = cursor.selectedText().replace("\u2029", "\n").strip()
+        if len(selected) < 2:
+            self.ai_quote_selected.emit("", "")
+            return
+        tid = self._extract_target_id_from_cursor(cursor)
+        self.ai_quote_selected.emit(selected, tid)
+
+    def _emit_ocr_preview_quote(self) -> None:
+        cursor = self.txt_ocr_output.textCursor()
+        selected = cursor.selectedText().replace("\u2029", "\n").strip()
+        if len(selected) < 2:
+            self.ai_quote_selected.emit("", "")
+            return
+        self.ai_quote_selected.emit(selected, "ocr_output")
+
+    def _render_hwpx_viewer(self) -> None:
+        if self._hwpx_doc is None:
+            return
+        html_str = render_hwpx_to_html(
+            self._hwpx_doc,
+            highlighted_ids=self._hwpx_highlighted_ids,
+            modified_ids=self._hwpx_modified_ids,
+        )
+        self.browser_hwpx_preview.setHtml(html_str)
+
+    def _update_hwpx_nav_bar(self) -> None:
+        total = len(self._hwpx_modified_ids)
+        self.lbl_hwpx_nav_count.setText(f"수정 {total}건")
+        has_items = total > 0
+        self.btn_hwpx_nav_prev.setEnabled(has_items)
+        self.btn_hwpx_nav_next.setEnabled(has_items)
+        if has_items:
+            idx = max(0, min(self._hwpx_focus_index, total - 1))
+            self._hwpx_focus_index = idx
+            self.lbl_hwpx_nav_pos.setText(f"{idx + 1}/{total}")
+        else:
+            self._hwpx_focus_index = 0
+            self.lbl_hwpx_nav_pos.setText("0/0")
+
+    def _scroll_hwpx_preview_to_index(self, idx: int) -> None:
+        total = len(self._hwpx_modified_ids)
+        if total <= 0:
+            return
+        idx = max(0, min(idx, total - 1))
+        self._hwpx_focus_index = idx
+        self._update_hwpx_nav_bar()
+        self.browser_hwpx_preview.scrollToAnchor(f"hwpx-focus-{idx}")
+
+    def _on_hwpx_nav_prev(self) -> None:
+        total = len(self._hwpx_modified_ids)
+        if total <= 0:
+            return
+        self._scroll_hwpx_preview_to_index((self._hwpx_focus_index - 1) % total)
+
+    def _on_hwpx_nav_next(self) -> None:
+        total = len(self._hwpx_modified_ids)
+        if total <= 0:
+            return
+        self._scroll_hwpx_preview_to_index((self._hwpx_focus_index + 1) % total)
+
+    def _on_hwpx_undo(self) -> None:
+        if self._hwpx_doc is None or not self._hwpx_doc.can_undo():
+            return
+        self._hwpx_patch_timer.stop()
+        self._hwpx_pending_ops.clear()
+        self._hwpx_doc.undo()
+        self._hwpx_highlighted_ids = set()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self._update_hwpx_nav_bar()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self._update_hwpx_nav_bar()
+        self.btn_hwpx_undo.setEnabled(self._hwpx_doc.can_undo())
+        self.lbl_hwpx_summary_badge.setText("실행 취소(Undo) 완료: 이전 문서 상태로 복원되었습니다.")
+        self._render_hwpx_viewer()
+        self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
+    def _export_hwpx_as_hwp_async(self, target_hwp_path: Path, badge_prefix: str) -> None:
+        if self._hwpx_doc is None:
+            return
+        try:
+            saved_hwpx = self._hwpx_doc.save()
+        except Exception as exc:
+            QMessageBox.warning(self, "저장 실패", f"임시 HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+            return
+
+        self.btn_hwpx_save.setEnabled(False)
+        self.btn_hwpx_save_as.setEnabled(False)
+        self.lbl_hwpx_summary_badge.setText(
+            f"HWP 포맷으로 백그라운드 역변환 저장 중... ({target_hwp_path.name})"
+        )
+
+        def _convert_back_task(worker: BaseWorker) -> Path:
+            worker.emit_log("INFO", f"HWPX -> HWP 백그라운드 역변환 시작: {target_hwp_path}")
+            return convert_hwpx_to_hwp(saved_hwpx, target_hwp_path)
+
+        def _on_saved_hwp(out_path: Path) -> None:
+            self.btn_hwpx_save.setEnabled(True)
+            self.btn_hwpx_save_as.setEnabled(True)
+            self._hwpx_last_exported_path = Path(out_path)
+            self.lbl_hwpx_summary_badge.setText(f"{badge_prefix}: {Path(out_path).name}")
+            QMessageBox.information(self, "저장 완료", f"HWP 문서가 저장되었습니다:\n{out_path}")
+
+        def _on_save_hwp_error(err_msg: str) -> None:
+            self.btn_hwpx_save.setEnabled(True)
+            self.btn_hwpx_save_as.setEnabled(True)
+            self.lbl_hwpx_summary_badge.setText("HWP 저장 실패: 아래 안내를 확인하세요.")
+            QMessageBox.warning(self, "HWP 저장 실패", err_msg)
+
+        worker = FunctionWorker("HWPX -> HWP 저장 변환", _convert_back_task)
+        self.task_runner.start_worker(
+            worker,
+            task_key="hwpx_agent_save_hwp",
+            on_result=_on_saved_hwp,
+            on_error=_on_save_hwp_error,
+        )
+
+    def _on_hwpx_save(self) -> None:
+        if self._hwpx_doc is None:
+            return
+        if self._hwpx_original_hwp_path is not None:
+            self._export_hwpx_as_hwp_async(
+                self._hwpx_original_hwp_path,
+                badge_prefix="원본 HWP 저장 완료",
+            )
+            return
+        try:
+            saved = self._hwpx_doc.save()
+            self._hwpx_last_exported_path = saved
+            self.lbl_hwpx_summary_badge.setText(f"저장 완료 (OCF ZIP_STORED 무결성 유지): {saved.name}")
+            QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
+        except Exception as exc:
+            QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+
+    def _on_hwpx_save_as(self) -> None:
+        if self._hwpx_doc is None:
+            return
+        if self._hwpx_original_hwp_path is not None:
+            default_name = f"{self._hwpx_original_hwp_path.stem}_수정.hwp"
+            selected_filter_default = "한글 HWP 문서 (*.hwp)"
+        elif self._hwpx_doc.source_path:
+            default_name = f"{self._hwpx_doc.source_path.stem}_수정.hwpx"
+            selected_filter_default = "한글 HWPX 문서 (*.hwpx)"
+        else:
+            default_name = "수정문서.hwpx"
+            selected_filter_default = "한글 HWPX 문서 (*.hwpx)"
+
+        save_path, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "다른 이름으로 저장",
+            default_name,
+            "한글 HWPX 문서 (*.hwpx);;한글 HWP 문서 (*.hwp);;모든 파일 (*)",
+            selected_filter_default,
+        )
+        if not save_path:
+            return
+
+        dst_path = Path(save_path)
+        wants_hwp = dst_path.suffix.lower() == ".hwp" or (
+            not dst_path.suffix and "*.hwp)" in selected_filter
+        )
+        if wants_hwp:
+            if dst_path.suffix.lower() != ".hwp":
+                dst_path = dst_path.with_suffix(".hwp")
+            self._export_hwpx_as_hwp_async(
+                dst_path,
+                badge_prefix="다른 이름으로 저장 완료 (HWP)",
+            )
+            return
+
+        if not dst_path.suffix:
+            dst_path = dst_path.with_suffix(".hwpx")
+        try:
+            saved = self._hwpx_doc.save(dst_path)
+            self._hwpx_last_exported_path = saved
+            self.lbl_hwpx_summary_badge.setText(f"다른 이름으로 저장 완료 (HWPX): {saved.name}")
+            QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
+        except Exception as exc:
+            QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+
+    def _on_hwpx_open_in_app(self) -> None:
+        target: Optional[Path] = None
+        if self._hwpx_last_exported_path is not None and self._hwpx_last_exported_path.exists():
+            target = self._hwpx_last_exported_path
+        elif (
+            self._hwpx_doc is not None
+            and self._hwpx_doc.source_path is not None
+            and self._hwpx_doc.source_path.exists()
+        ):
+            target = self._hwpx_doc.source_path
+
+        if target is None:
+            QMessageBox.information(self, "안내", "먼저 문서를 열거나 저장해 주세요.")
+            return
+        os.startfile(str(target.resolve()))
+
+    def _on_hwpx_save_answers(self) -> None:
+        if self._hwpx_doc is None or not self._hwpx_doc.exam_answers:
+            QMessageBox.information(self, "안내", "저장할 시험문항 정답·해설 데이터가 없습니다.")
+            return
+        default_name = (
+            f"{self._hwpx_doc.source_path.stem}_정답해설.hwpx"
+            if self._hwpx_doc.source_path
+            else "정답해설.hwpx"
+        )
+        save_path, _ = QFileDialog.getSaveFileName(self, "정답지 HWPX 저장", default_name, "한글 문서 (*.hwpx)")
+        if not save_path:
+            return
+        try:
+            out = export_exam_answers_hwpx(self._hwpx_doc, save_path)
+            QMessageBox.information(self, "정답지 저장 완료", f"정답·해설 HWPX가 저장되었습니다:\n{out}")
+        except Exception as exc:
+            QMessageBox.warning(self, "저장 실패", f"정답지 저장 중 오류가 발생했습니다:\n{exc}")
+
+    def apply_hwpx_patch_payload(self, payload: Dict[str, Any]) -> None:
+        """AI가 반환한 JSON Patch(summary + operations)를 QTimer로 순차 적용하며 하이라이트합니다."""
+        if self._hwpx_doc is None:
+            QMessageBox.warning(self, "문서 없음", "먼저 [HWP / HWPX 열기]로 문서를 열어주세요.")
+            return
+        ops = payload.get("operations")
+        if not isinstance(ops, list) or not ops:
+            QMessageBox.information(self, "변경 없음", "적용할 JSON Patch 연산(operations)이 없습니다.")
+            return
+
+        self._hwpx_patch_timer.stop()
+        self._hwpx_doc.push_undo_snapshot()
+        self._hwpx_highlighted_ids = set()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self._update_hwpx_nav_bar()
+        self._hwpx_pending_ops = [dict(o) for o in ops if isinstance(o, dict)]
+        self._hwpx_pending_summary = str(payload.get("summary", "") or "AI 문서 수정 적용 중").strip()
+        self.lbl_hwpx_summary_badge.setText(
+            f"적용 중: {self._hwpx_pending_summary} (남은 연산 {len(self._hwpx_pending_ops)}건)"
+        )
+        self._step_hwpx_patch_timer()
+        if self._hwpx_pending_ops:
+            self._hwpx_patch_timer.start()
+
+    def _finish_hwpx_patch_batch(self) -> None:
+        self._hwpx_patch_timer.stop()
+        if self._hwpx_doc is None:
+            return
+        self.btn_hwpx_undo.setEnabled(self._hwpx_doc.can_undo())
+        self.btn_hwpx_save_answers.setEnabled(bool(self._hwpx_doc.exam_answers))
+        if len(self._hwpx_highlighted_ids) == 0:
+            warn_msg = (
+                "JSON Patch가 파싱되었으나 일치하는 원문(old_text)을 찾지 못해 수정된 내용이 없습니다 (0건)."
+            )
+            self.lbl_hwpx_summary_badge.setText(warn_msg)
+            self.lbl_hwpx_summary_badge.setStyleSheet(
+                "background:#FEF3C7; color:#92400E; padding:4px 8px; border-radius:4px; font-weight:bold;"
+            )
+        else:
+            self.lbl_hwpx_summary_badge.setText(
+                f"적용 완료: {self._hwpx_pending_summary} (총 {len(self._hwpx_highlighted_ids)}개 영역 강조됨)"
+            )
+            self.lbl_hwpx_summary_badge.setStyleSheet("")
+        self._update_hwpx_nav_bar()
+        if self._hwpx_modified_ids:
+            QTimer.singleShot(50, lambda: self._scroll_hwpx_preview_to_index(0))
+        self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
+    def _step_hwpx_patch_timer(self) -> None:
+        if self._hwpx_doc is None or not self._hwpx_pending_ops:
+            self._finish_hwpx_patch_batch()
+            return
+
+        op_data = self._hwpx_pending_ops.pop(0)
+        touched = apply_single_hwpx_operation(self._hwpx_doc, op_data)
+        self._hwpx_highlighted_ids.update(touched)
+        for tid in touched:
+            if tid not in self._hwpx_modified_ids:
+                self._hwpx_modified_ids.append(tid)
+        self._render_hwpx_viewer()
+        self._update_hwpx_nav_bar()
+        if self._hwpx_pending_ops:
+            self.lbl_hwpx_summary_badge.setText(
+                f"실시간 패치 중: {self._hwpx_pending_summary} (남은 연산 {len(self._hwpx_pending_ops)}건)"
+            )
+        else:
+            self._finish_hwpx_patch_batch()
+
     def get_ai_context(self, target_id: Optional[str] = None) -> Dict[str, Any]:
         """현재 선택(또는 지정)된 중앙 AI 대상 카드의 최신 설정·입력값을 딕셔너리로 반환합니다."""
         tid = target_id or self._active_ai_target_id or "agg_step2"
+        if tid == "hwpx_agent":
+            dom_map = extract_hwpx_dom_map(self._hwpx_doc) if self._hwpx_doc is not None else None
+            return {
+                "target_id": "hwpx_agent",
+                "label": "4. HWPX AI 문서 에이전트",
+                "task_label": "HWPX 문서 편집",
+                "kind": "hwpx_agent",
+                "hwpx_path": str(self._hwpx_doc.source_path) if (self._hwpx_doc and self._hwpx_doc.source_path) else "",
+                "doc_instance_id": id(self._hwpx_doc) if self._hwpx_doc is not None else 0,
+                "dom_map": dom_map,
+                "attachment_paths": [],
+            }
         if tid == "ocr":
             files: List[str] = []
             for i in range(self.list_ocr_files.count()):
@@ -3214,8 +4413,10 @@ class DocOcrTab(QWidget):
             return {
                 "target_id": "ocr",
                 "label": "2. AI OCR 및 텍스트 보정",
+                "task_label": "단일 OCR/보정",
                 "kind": "ocr",
                 "ocr_files": files,
+                "attachment_paths": [f for f in files if Path(f).is_file()],
                 "ocr_prompt": self.edit_ocr_prompt.text().strip(),
                 "ocr_current_text": self.txt_ocr_output.toPlainText().strip(),
             }
@@ -3233,6 +4434,7 @@ class DocOcrTab(QWidget):
             "reference_dir": self.edit_agg_ref_dir.text().strip(),
             "max_bytes": int(self.spin_agg_max_bytes.value()),
             "last_result_excel_path": self._last_result_excel_path or "",
+            "attachment_paths": [],
         }
 
     def set_active_ai_target(self, target_id: str) -> None:
@@ -3240,11 +4442,13 @@ class DocOcrTab(QWidget):
         self._active_ai_target_id = target_id or "agg_step2"
         is_agg = self._active_ai_target_id == "agg_step2"
         is_ocr = self._active_ai_target_id == "ocr"
+        is_hwpx = self._active_ai_target_id == "hwpx_agent"
 
         card_states = [
             (self.card_agg_step2, is_agg),
             (self.card_agg_step3, is_agg),
             (self.card_ocr_main, is_ocr),
+            (self.card_hwpx_agent, is_hwpx),
         ]
         for card, selected in card_states:
             card.setProperty("aiTargetSelected", "true" if selected else "false")
@@ -3256,6 +4460,7 @@ class DocOcrTab(QWidget):
 
         self.lbl_target_badge_step2.setVisible(is_agg)
         self.lbl_target_badge_ocr.setVisible(is_ocr)
+        self.lbl_target_badge_hwpx.setVisible(is_hwpx)
 
     def _refresh_agg_student_preview_table(self, preferred_path: str = "") -> None:
         """선택된 과제/결과 엑셀을 읽어 3단계 카드의 학생별 처리 상태 미리보기를 갱신합니다."""
@@ -3312,7 +4517,7 @@ class DocOcrTab(QWidget):
                 "",
             )
 
-        meta_skip = {sid_col, name_col, res_col, "누락 항목", "누락항목", "양식", "원본파일명", "과세특_바이트"}
+        meta_skip = {sid_col, name_col, res_col, "누락 항목", "누락항목", "양식", "원본파일명", "과세특_바이트", "검토 상태"}
         q_cols = [
             c
             for c in cols
@@ -3374,6 +4579,11 @@ class DocOcrTab(QWidget):
     def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
         """우측 AiExecutionDock에서 실행된 결과를 중앙 탭 UI 및 미리보기 테이블에 반영합니다."""
         tid = str(payload.get("target_id", "") or self._active_ai_target_id)
+        if tid == "hwpx_agent":
+            parsed = payload.get("parsed_json")
+            if isinstance(parsed, dict):
+                self.apply_hwpx_patch_payload(parsed)
+            return
         if tid == "ocr":
             formatted = str(payload.get("formatted_text", "") or "").strip()
             if formatted:

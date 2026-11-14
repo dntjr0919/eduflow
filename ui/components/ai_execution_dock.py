@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional
 import webbrowser
 
@@ -108,17 +109,17 @@ class _DockApiRecordWorker(BaseWorker):
 
     def execute(self) -> Dict[str, Any]:
         from datetime import datetime
-        from services.docx_extractor_service import extract_docx_to_excel
+        from services.multi_doc_extractor_service import extract_documents_to_excel
         from services.record_generator_service import generate_records_from_excel
 
         if self.run_integrated:
             if self.docx_dir is None or not self.docx_dir.is_dir():
-                raise ValueError("1단계 학생 DOCX 폴더를 먼저 선택해 주세요.")
+                raise ValueError("1단계 학생 과제 폴더를 먼저 선택해 주세요.")
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             intermediate_excel = self.docx_dir / f"과제취합_{ts}.xlsx"
-            self.emit_progress(5, "1단계: 학생 DOCX 파일 파싱 중...")
-            step1_res = extract_docx_to_excel(
-                docx_dir=self.docx_dir,
+            self.emit_progress(5, "1단계: 학생 과제 문서(.docx/.hwpx/.hwp/.pdf) 통합 추출 중...")
+            step1_res = extract_documents_to_excel(
+                doc_dir=self.docx_dir,
                 schema_path=self.schema_path,
                 output_path=intermediate_excel,
                 progress_callback=lambda pct, msg: self.emit_progress(int(pct * 0.4), f"1단계 추출: {msg}"),
@@ -252,6 +253,31 @@ class _DockApiOcrWorker(BaseWorker):
         }
 
 
+class _DockApiHwpxAgentWorker(BaseWorker):
+    """HWPX AI 문서 에이전트용 API 단일 JSON Patch 생성 워커."""
+
+    def __init__(self, dom_map: Dict[str, Any], instruction: str):
+        super().__init__(task_name="HWPX AI 문서 에이전트 (API)")
+        self.dom_map = dom_map
+        self.instruction = instruction
+
+    def execute(self) -> Dict[str, Any]:
+        from services.hwpx_agent_service import build_hwpx_agent_prompt
+
+        self.emit_progress(25, "HWPX DOM 맵 분석 및 AI 프롬프트 전송 중...")
+        sys_p, usr_p = build_hwpx_agent_prompt(self.dom_map, self.instruction)
+        client = MultiLlmClient()
+        raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+        parsed = extract_json_from_llm_response(raw_reply)
+        self.emit_progress(100, "JSON Patch 생성 완료")
+        return {
+            "target_id": "hwpx_agent",
+            "mode": "api",
+            "parsed_json": parsed,
+            "raw_response": raw_reply,
+        }
+
+
 class AiExecutionDock(QFrame):
     """EduFlow 우측 접이식 AI 실행 사이드바 위젯 (폭 340px)."""
 
@@ -285,6 +311,10 @@ class AiExecutionDock(QFrame):
         self._pw_provider: str = "gemini"
         self._active_pw_worker: Optional[WebGeminiAutoWorker] = None
         self._is_api_running: bool = False
+
+        # 미리보기 선택 인용 상태
+        self._quoted_text: str = ""
+        self._quoted_target_id: str = ""
 
         self.setMinimumWidth(0)
         self.setMaximumWidth(0)
@@ -385,6 +415,46 @@ class AiExecutionDock(QFrame):
         self.btn_mode_manual.setChecked(True)
         self.mode_btn_group.idClicked.connect(self._on_mode_segment_clicked)
         root_lay.addWidget(seg_frame)
+
+        # [2.3단] 미리보기 선택 인용 배지 (이모지 미사용)
+        self.quote_badge_frame = QFrame(panel)
+        _apply_role(self.quote_badge_frame, role="subCard", obj_name="AiDockQuoteBadge")
+        qb_lay = QHBoxLayout(self.quote_badge_frame)
+        qb_lay.setContentsMargins(10, 6, 8, 6)
+        qb_lay.setSpacing(6)
+        self.lbl_quote_summary = QLabel("")
+        self.lbl_quote_summary.setWordWrap(True)
+        _apply_role(self.lbl_quote_summary, role="statusBanner")
+        self.btn_clear_quote = QPushButton("해제")
+        _apply_role(self.btn_clear_quote, role="outline")
+        self.btn_clear_quote.setFixedHeight(24)
+        self.btn_clear_quote.setFixedWidth(48)
+        self.btn_clear_quote.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_clear_quote.clicked.connect(self.clear_quoted_selection)
+        qb_lay.addWidget(self.lbl_quote_summary, stretch=1)
+        qb_lay.addWidget(self.btn_clear_quote, 0, Qt.AlignmentFlag.AlignTop)
+        self.quote_badge_frame.setVisible(False)
+        root_lay.addWidget(self.quote_badge_frame)
+
+        # [2.5단] HWPX 에이전트 전용 문서 수정 지시사항 입력창 (hwpx_agent 타겟일 때만 표시)
+        self.hwpx_instruction_card = QFrame(panel)
+        _apply_role(self.hwpx_instruction_card, role="subCard")
+        hw_lay = QVBoxLayout(self.hwpx_instruction_card)
+        hw_lay.setContentsMargins(10, 8, 10, 8)
+        hw_lay.setSpacing(6)
+        lbl_hw_inst = QLabel("문서 수정 지시사항 (HWPX AI 에이전트)")
+        _apply_role(lbl_hw_inst, role="fieldLabel")
+        self.txt_hwpx_instruction = QTextEdit()
+        _apply_role(self.txt_hwpx_instruction, obj_name="WebAiInputBox")
+        self.txt_hwpx_instruction.setMinimumHeight(74)
+        self.txt_hwpx_instruction.setMaximumHeight(110)
+        self.txt_hwpx_instruction.setPlaceholderText(
+            "예: 2026년 일정으로 바꾸고 중화적정 시험문항 1개 추가해줘"
+        )
+        hw_lay.addWidget(lbl_hw_inst)
+        hw_lay.addWidget(self.txt_hwpx_instruction)
+        self.hwpx_instruction_card.setVisible(False)
+        root_lay.addWidget(self.hwpx_instruction_card)
 
         # ---------------------------------------------------------------------
         # [3단] 모드별 실행 컨트롤 영역 (QStackedWidget in QScrollArea)
@@ -598,6 +668,37 @@ class AiExecutionDock(QFrame):
         self.manual_ocr_card.setVisible(False)
         lay.addWidget(self.manual_ocr_card)
 
+        # 첨부파일 수동 업로드 안내 배너 (attachment_paths >= 1 일 때만 표시)
+        self.manual_attachment_card = QFrame()
+        self.manual_attachment_card.setObjectName("ManualAttachmentBanner")
+        self.manual_attachment_card.setStyleSheet(
+            "QFrame#ManualAttachmentBanner { "
+            "background-color: #FEF3C7; border: 1px solid #F59E0B; border-radius: 6px; }"
+        )
+        att_lay = QVBoxLayout(self.manual_attachment_card)
+        att_lay.setContentsMargins(10, 8, 10, 8)
+        att_lay.setSpacing(6)
+
+        self.lbl_manual_attachment_info = QLabel("")
+        self.lbl_manual_attachment_info.setWordWrap(True)
+        self.lbl_manual_attachment_info.setStyleSheet("color: #92400E; font-weight: 700; font-size: 12px;")
+
+        self.lbl_manual_attachment_names = QLabel("")
+        self.lbl_manual_attachment_names.setWordWrap(True)
+        self.lbl_manual_attachment_names.setStyleSheet("color: #78350F; font-size: 11px;")
+
+        self.btn_open_attachment_dir = QPushButton("첨부파일 위치 열기")
+        _apply_role(self.btn_open_attachment_dir, role="secondary", obj_name="BtnOpenAttachmentDir")
+        self.btn_open_attachment_dir.setFixedHeight(28)
+        self.btn_open_attachment_dir.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_open_attachment_dir.clicked.connect(self._on_open_attachment_dir)
+
+        att_lay.addWidget(self.lbl_manual_attachment_info)
+        att_lay.addWidget(self.lbl_manual_attachment_names)
+        att_lay.addWidget(self.btn_open_attachment_dir)
+        self.manual_attachment_card.setVisible(False)
+        lay.addWidget(self.manual_attachment_card)
+
         # 대상 웹 AI 선택 칩 4종 + 커스텀 URL
         web_card = QFrame()
         _apply_role(web_card, role="subCard")
@@ -767,7 +868,7 @@ class AiExecutionDock(QFrame):
         self.btn_pw_collect_next.setEnabled(False)
         self.btn_pw_collect_next.clicked.connect(self._on_pw_collect_next_clicked)
 
-        self.btn_pw_confirm_login = QPushButton("로그인 완료")
+        self.btn_pw_confirm_login = QPushButton("인증/로그인 완료 · 작업 재개")
         _apply_role(self.btn_pw_confirm_login, role="teal", obj_name="BtnDockPwConfirmLogin")
         self.btn_pw_confirm_login.setFixedHeight(34)
         self.btn_pw_confirm_login.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -855,6 +956,73 @@ class AiExecutionDock(QFrame):
             if btn is not None:
                 btn.setChecked(True)
 
+    def reset_target_state(self) -> None:
+        """타겟 전환 또는 새 문서 열기 시 이전 타겟의 응답창·첨부파일·배치·결과 캐시를 즉시 초기화합니다."""
+        self._last_context = {}
+        self._last_result_excel_path = ""
+        self._manual_batches = []
+        self._manual_parsed_items = []
+        self._manual_single_parsed = {}
+        if hasattr(self, "btn_dock_open_excel"):
+            self.btn_dock_open_excel.setEnabled(False)
+        if hasattr(self, "txt_manual_response"):
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.clear()
+            self.txt_manual_response.blockSignals(False)
+        if hasattr(self, "combo_manual_batch"):
+            self.combo_manual_batch.blockSignals(True)
+            self.combo_manual_batch.clear()
+            self.combo_manual_batch.blockSignals(False)
+        if hasattr(self, "manual_attachment_card"):
+            self.manual_attachment_card.setVisible(False)
+        if hasattr(self, "lbl_manual_attachment_names"):
+            self.lbl_manual_attachment_names.setText("")
+        if hasattr(self, "lbl_manual_verify"):
+            self.lbl_manual_verify.setText("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
+        self.clear_quoted_selection()
+
+    def set_quoted_selection(self, text: str, target_id: str = "") -> None:
+        """미리보기에서 드래그로 선택된 인용 텍스트와 위치 ID를 사이드바 배지에 표시합니다."""
+        cleaned = (text or "").strip()
+        if len(cleaned) < 2:
+            self.clear_quoted_selection()
+            return
+        self._quoted_text = cleaned
+        self._quoted_target_id = (target_id or "").strip()
+        single_line = re.sub(r"\s+", " ", cleaned).strip()
+        preview = single_line[:20] + ("..." if len(single_line) > 20 else "")
+        loc_tag = f"[{self._quoted_target_id}] " if self._quoted_target_id else ""
+        if hasattr(self, "lbl_quote_summary"):
+            self.lbl_quote_summary.setText(f'인용 {loc_tag}"{preview}" ({len(cleaned)}자)')
+            self.lbl_quote_summary.setToolTip(cleaned)
+        if hasattr(self, "quote_badge_frame"):
+            self.quote_badge_frame.setVisible(True)
+
+    def clear_quoted_selection(self) -> None:
+        """현재 선택된 인용 상태를 해제합니다."""
+        self._quoted_text = ""
+        self._quoted_target_id = ""
+        if hasattr(self, "lbl_quote_summary"):
+            self.lbl_quote_summary.setText("")
+            self.lbl_quote_summary.setToolTip("")
+        if hasattr(self, "quote_badge_frame"):
+            self.quote_badge_frame.setVisible(False)
+
+    def _append_quote_to_prompt(self, prompt_text: str) -> str:
+        """선택된 인용 텍스트가 있으면 프롬프트 끝에 표준 인용 블록을 자동 첨부합니다."""
+        if not self._quoted_text:
+            return prompt_text
+        loc_str = self._quoted_target_id or "미지정"
+        quote_block = (
+            "\n\n[선택된 인용 영역]\n"
+            f"- 위치 ID: {loc_str}\n"
+            "- 선택 원문:\n"
+            '"""\n'
+            f"{self._quoted_text}\n"
+            '"""'
+        )
+        return f"{prompt_text}{quote_block}"
+
     def set_target(self, target_id: str, force: bool = False) -> bool:
         """활성 AI 타겟을 전환합니다. 잠금 상태에서는 force=True일 때만 전환됩니다."""
         if target_id not in self._targets:
@@ -863,6 +1031,9 @@ class AiExecutionDock(QFrame):
             return False
         if self._active_target_id == target_id and not force:
             return False
+
+        if self._active_target_id != target_id:
+            self.reset_target_state()
 
         self._active_target_id = target_id
         meta = self._targets[target_id]
@@ -921,22 +1092,77 @@ class AiExecutionDock(QFrame):
         if self._active_target_id and tid and tid != self._active_target_id:
             return
 
-        self._last_context = dict(ctx)
+        prev_ctx = self._last_context or {}
+        prev_tid = str(prev_ctx.get("target_id", "") or "")
         kind = str(ctx.get("kind", "excel_batch"))
-        is_excel = kind == "excel_batch"
+        if prev_tid and tid and prev_tid != tid:
+            self.reset_target_state()
+        elif kind == "hwpx_agent" and prev_ctx.get("kind") == "hwpx_agent":
+            prev_doc_id = prev_ctx.get("doc_instance_id", 0)
+            new_doc_id = ctx.get("doc_instance_id", 0)
+            prev_hwpx_path = str(prev_ctx.get("hwpx_path", "") or "")
+            new_hwpx_path = str(ctx.get("hwpx_path", "") or "")
+            if (prev_doc_id and new_doc_id and prev_doc_id != new_doc_id) or (
+                prev_hwpx_path and new_hwpx_path and prev_hwpx_path != new_hwpx_path
+            ):
+                self.reset_target_state()
 
+        self._last_context = dict(ctx)
+        is_excel = kind == "excel_batch"
+        is_hwpx = kind == "hwpx_agent"
+
+        self.hwpx_instruction_card.setVisible(is_hwpx)
         self.chk_api_run_integrated.setVisible(is_excel)
         self.manual_batch_card.setVisible(is_excel)
-        self.manual_ocr_card.setVisible(not is_excel)
-        self.btn_manual_apply_next.setText(
-            "검증 후 엑셀 반영 · 다음 묶음 복사" if is_excel else "검증 후 OCR 결과 반영"
-        )
+        self.manual_ocr_card.setVisible((not is_excel) and (not is_hwpx))
+        if is_hwpx:
+            self.btn_manual_apply_next.setText("JSON Patch 검증 후 문서에 적용")
+        else:
+            self.btn_manual_apply_next.setText(
+                "검증 후 엑셀 반영 · 다음 묶음 복사" if is_excel else "검증 후 OCR 결과 반영"
+            )
 
-        if is_excel:
+        # 첨부파일 목록 추출 및 수동 복붙 안내 배너 토글 (hwpx_agent는 ocr_files와 엄격 격리)
+        if is_hwpx:
+            attachment_paths: List[str] = []
+        else:
+            raw_atts = ctx.get("attachment_paths")
+            if raw_atts is None and kind == "ocr":
+                raw_atts = ctx.get("ocr_files") or []
+            attachment_paths = [str(p).strip() for p in (raw_atts or []) if str(p).strip()]
+        has_atts = len(attachment_paths) > 0
+        self.manual_attachment_card.setVisible(has_atts)
+        if has_atts:
+            self.lbl_manual_attachment_info.setText(
+                f"첨부파일 {len(attachment_paths)}개 포함: 보안상 웹 브라우저에 파일이 자동 첨부되지 않습니다. "
+                "웹 창이 열리면 아래 폴더에서 파일을 직접 드래그해 첨부해 주세요."
+            )
+            names_preview = ", ".join(Path(p).name for p in attachment_paths[:3])
+            if len(attachment_paths) > 3:
+                names_preview += f" 외 {len(attachment_paths) - 3}건"
+            self.lbl_manual_attachment_names.setText(f"대상 파일: {names_preview}")
+
+        if is_hwpx:
+            dom_map = ctx.get("dom_map")
+            hwpx_path = str(ctx.get("hwpx_path", "") or "").strip()
+            if isinstance(dom_map, dict):
+                blk_cnt = dom_map.get("block_count", len(dom_map.get("blocks", [])))
+                fname = Path(hwpx_path).name if hwpx_path else dom_map.get("file_name", "HWPX")
+                msg = f"HWPX 로드됨: {fname} (블록 {blk_cnt}개)"
+            else:
+                msg = "중앙 [4. HWPX AI 문서 에이전트] 탭에서 .hwpx 파일을 먼저 열어주세요."
+            self.lbl_api_summary.setText(msg)
+            self.lbl_pw_summary.setText(msg)
+            self.lbl_dock_progress_meta.setText(msg)
+        elif is_excel:
             last_res = str(ctx.get("last_result_excel_path", "") or "").strip()
             if last_res and Path(last_res).exists():
                 self._set_result_excel_path(last_res)
             self._rebuild_manual_batches(copy_first=False, ctx=ctx, quiet=True)
+            if has_atts:
+                cur_pw = self.lbl_pw_summary.text().strip()
+                att_note = f"첨부 예정 파일 {len(attachment_paths)}개 — 자동 업로드됨"
+                self.lbl_pw_summary.setText(f"{cur_pw}\n{att_note}" if cur_pw else att_note)
         else:
             files = ctx.get("ocr_files") or []
             cur_text = str(ctx.get("ocr_current_text", "") or "").strip()
@@ -950,7 +1176,10 @@ class AiExecutionDock(QFrame):
                 msg = "중앙 탭에서 문서 파일을 추가하거나 텍스트를 입력하세요."
             self.lbl_api_summary.setText(msg)
             self.lbl_manual_ocr_meta.setText(msg)
-            self.lbl_pw_summary.setText(msg)
+            pw_msg = msg
+            if has_atts:
+                pw_msg += f"\n첨부 예정 파일 {len(attachment_paths)}개 — 자동 업로드됨"
+            self.lbl_pw_summary.setText(pw_msg)
             self.lbl_dock_progress_meta.setText(f"OCR 대상 · {len(files)}개 파일")
 
     def refresh_ai_info(self) -> None:
@@ -998,7 +1227,25 @@ class AiExecutionDock(QFrame):
             return
 
         kind = ctx.get("kind", "excel_batch")
-        if kind == "ocr":
+        if kind == "hwpx_agent":
+            dom_map = ctx.get("dom_map")
+            inst = self.txt_hwpx_instruction.toPlainText().strip()
+            if not isinstance(dom_map, dict):
+                QMessageBox.information(
+                    self, "문서 확인", "중앙 [4. HWPX AI 문서 에이전트] 탭에서 .hwpx 파일을 먼저 열어주세요."
+                )
+                return
+            if not inst:
+                QMessageBox.information(
+                    self, "지시사항 확인", "상단 입력창에 문서 수정 지시사항을 입력해 주세요."
+                )
+                self.txt_hwpx_instruction.setFocus()
+                return
+            worker = _DockApiHwpxAgentWorker(
+                dom_map=dom_map,
+                instruction=self._append_quote_to_prompt(inst),
+            )
+        elif kind == "ocr":
             files = ctx.get("ocr_files") or []
             if not files:
                 QMessageBox.information(
@@ -1009,7 +1256,7 @@ class AiExecutionDock(QFrame):
                 return
             worker: BaseWorker = _DockApiOcrWorker(
                 file_paths=files,
-                prompt_guide=str(ctx.get("ocr_prompt", "")),
+                prompt_guide=self._append_quote_to_prompt(str(ctx.get("ocr_prompt", ""))),
             )
         else:
             run_integrated = self.chk_api_run_integrated.isChecked()
@@ -1238,7 +1485,17 @@ class AiExecutionDock(QFrame):
         ctx = self._fetch_fresh_context()
         if not ctx:
             return ""
-        if ctx.get("kind") == "ocr":
+        kind = str(ctx.get("kind", "") or "")
+        if kind == "hwpx_agent" or self._active_target_id == "hwpx_agent":
+            dom_map = ctx.get("dom_map")
+            inst = self.txt_hwpx_instruction.toPlainText().strip()
+            if not isinstance(dom_map, dict) or not inst:
+                return ""
+            from services.hwpx_agent_service import build_hwpx_agent_prompt
+
+            sys_p, usr_p = build_hwpx_agent_prompt(dom_map, self._append_quote_to_prompt(inst))
+            return f"{sys_p}\n\n{usr_p}"
+        if kind == "ocr":
             from ui.tabs.tab_doc_ocr import extract_local_text_from_files
 
             files = ctx.get("ocr_files") or []
@@ -1246,7 +1503,7 @@ class AiExecutionDock(QFrame):
             sys_p, user_p = build_structured_prompt(
                 task_key="ocr_correction",
                 raw_content=raw_text,
-                custom_instruction=str(ctx.get("ocr_prompt", "")),
+                custom_instruction=self._append_quote_to_prompt(str(ctx.get("ocr_prompt", ""))),
             )
             return f"[System 지시문]\n{sys_p}\n\n{user_p}"
 
@@ -1256,7 +1513,8 @@ class AiExecutionDock(QFrame):
         if 0 <= prev_idx < len(self._manual_batches):
             self.combo_manual_batch.setCurrentIndex(prev_idx)
         batch = self._get_current_manual_batch()
-        return str(batch.get("final_prompt", "")) if batch else ""
+        base_prompt = str(batch.get("final_prompt", "")) if batch else ""
+        return self._append_quote_to_prompt(base_prompt) if base_prompt else ""
 
     def _on_manual_copy_only(self) -> None:
         prompt_text = self._build_current_manual_prompt()
@@ -1280,6 +1538,32 @@ class AiExecutionDock(QFrame):
         webbrowser.open(url)
         self.lbl_manual_verify.setText("프롬프트를 클립보드에 복사하고 웹 AI를 열었습니다.")
 
+    def _on_open_attachment_dir(self) -> None:
+        """수동 복붙 모드에서 첨부파일이 위치한 폴더를 엽니다."""
+        ctx = self._fetch_fresh_context() or self._last_context
+        kind = str(ctx.get("kind", "") or "")
+        if kind == "hwpx_agent":
+            QMessageBox.information(self, "파일 없음", "HWPX 에이전트 타겟에는 별도 첨부파일이 없습니다.")
+            return
+        raw_atts = ctx.get("attachment_paths")
+        if raw_atts is None and kind == "ocr":
+            raw_atts = ctx.get("ocr_files") or []
+        paths = [Path(str(p).strip()) for p in (raw_atts or []) if str(p).strip()]
+        target = next((p for p in paths if p.exists()), None)
+        if target is None:
+            QMessageBox.information(self, "파일 없음", "열 수 있는 첨부파일 경로를 찾지 못했습니다.")
+            return
+        try:
+            if sys.platform == "win32" and target.is_file():
+                import subprocess
+
+                subprocess.Popen(["explorer", "/select,", str(target.resolve())])
+            else:
+                parent_dir = target.parent if target.is_file() else target
+                os.startfile(str(parent_dir.resolve()))
+        except Exception as exc:
+            QMessageBox.warning(self, "폴더 열기 실패", f"폴더를 여는 중 오류가 발생했습니다:\n{exc}")
+
     def _on_manual_paste_from_clipboard(self) -> None:
         clip_text = QApplication.clipboard().text()
         if not clip_text or not clip_text.strip():
@@ -1298,13 +1582,19 @@ class AiExecutionDock(QFrame):
             self.lbl_manual_verify.setText("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
             return
 
-        if kind == "ocr":
+        if kind in ("ocr", "hwpx_agent"):
             try:
                 parsed = extract_json_from_llm_response(raw_resp)
                 self._manual_single_parsed = parsed
-                self.lbl_manual_verify.setText(
-                    f"JSON 검증 성공 (추출 키: {', '.join(list(parsed.keys())[:4])})"
-                )
+                if kind == "hwpx_agent":
+                    ops_cnt = len(parsed.get("operations", [])) if isinstance(parsed.get("operations"), list) else 0
+                    self.lbl_manual_verify.setText(
+                        f"유효한 HWPX JSON Patch 확인됨 (연산 {ops_cnt}건)"
+                    )
+                else:
+                    self.lbl_manual_verify.setText(
+                        f"JSON 검증 성공 (추출 키: {', '.join(list(parsed.keys())[:4])})"
+                    )
             except Exception as exc:
                 self._manual_single_parsed = {}
                 self.lbl_manual_verify.setText(f"JSON 추출 오류: {exc}")
@@ -1346,6 +1636,23 @@ class AiExecutionDock(QFrame):
             return
 
         target_id = str(ctx.get("target_id", self._active_target_id))
+        if ctx.get("kind") == "hwpx_agent":
+            try:
+                parsed = extract_json_from_llm_response(raw_resp)
+            except Exception as exc:
+                QMessageBox.warning(self, "JSON 검증 오류", f"유효한 JSON Patch 응답을 추출하지 못했습니다:\n{exc}")
+                return
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.clear()
+            self.txt_manual_response.blockSignals(False)
+            self._dispatch_result(
+                target_id,
+                {"target_id": target_id, "mode": "manual", "parsed_json": parsed},
+            )
+            self.lbl_manual_verify.setText("HWPX JSON Patch가 문서에 적용되었습니다.")
+            self.lbl_dock_progress_meta.setText("수동 Patch 반영 완료")
+            self.progress_dock.setValue(100)
+            return
         if ctx.get("kind") == "ocr":
             try:
                 parsed = extract_json_from_llm_response(raw_resp)
@@ -1474,15 +1781,33 @@ class AiExecutionDock(QFrame):
         keep_login = bool(self.chk_pw_keep_login.isChecked())
         use_temp_chat = bool(self.chk_pw_temp_chat.isChecked())
         kind = str(ctx.get("kind", "excel_batch"))
+        if kind == "hwpx_agent":
+            attachment_paths: List[str] = []
+        else:
+            raw_atts = ctx.get("attachment_paths")
+            if raw_atts is None and kind == "ocr":
+                raw_atts = ctx.get("ocr_files") or []
+            attachment_paths = [str(p).strip() for p in (raw_atts or []) if str(p).strip()]
 
-        if kind == "ocr":
+        task_label = str(
+            ctx.get("task_label", "")
+            or ("HWPX 문서 편집" if kind == "hwpx_agent" else "단일 OCR/보정")
+        ).strip()
+
+        if kind in ("ocr", "hwpx_agent"):
             prompt_text = self._build_current_manual_prompt()
             if not prompt_text:
-                QMessageBox.warning(self, "OCR 대상 확인", "중앙 탭에서 파일이나 보정 지침을 확인해 주세요.")
+                msg = (
+                    "중앙 탭에서 HWPX 문서를 열고 수정 지시사항을 입력해 주세요."
+                    if kind == "hwpx_agent"
+                    else "중앙 탭에서 파일이나 보정 지침을 확인해 주세요."
+                )
+                QMessageBox.warning(self, "입력 확인", msg)
                 return
             worker = WebGeminiAutoWorker(
                 excel_path=None,
                 single_prompt=prompt_text,
+                attachment_paths=attachment_paths,
                 provider=self._pw_provider,
                 custom_url=custom_url,
                 execution_mode=exec_mode,
@@ -1490,6 +1815,7 @@ class AiExecutionDock(QFrame):
                 keep_login_session=keep_login,
                 use_temp_chat=use_temp_chat,
                 headless=False,
+                task_label=task_label,
             )
         else:
             excel_str = str(ctx.get("excel_path", "") or "").strip()
@@ -1502,6 +1828,7 @@ class AiExecutionDock(QFrame):
                 excel_path=excel_str,
                 prompt_file=Path(prompt_str) if prompt_str else None,
                 reference_dir=Path(ref_str) if ref_str and Path(ref_str).is_dir() else None,
+                attachment_paths=attachment_paths,
                 max_students=self.spin_manual_students.value(),
                 max_input_tokens=self.spin_manual_tokens.value(),
                 max_bytes=int(ctx.get("max_bytes", 1500)),
@@ -1524,7 +1851,11 @@ class AiExecutionDock(QFrame):
         self._active_pw_worker = worker
         self._set_pw_running_state(True)
         self.progress_dock.setValue(0)
-        self.lbl_dock_progress_meta.setText("Playwright 브라우저 실행 중...")
+        self.lbl_dock_progress_meta.setText(
+            f"[{task_label}] Playwright 브라우저 실행 중..."
+            if kind in ("ocr", "hwpx_agent")
+            else "Playwright 브라우저 실행 중..."
+        )
 
         self.task_runner.start_worker(
             worker=worker,
@@ -1535,10 +1866,11 @@ class AiExecutionDock(QFrame):
         )
 
     def _on_pw_waiting_for_login(self, provider_name: str = "") -> None:
+        self.btn_pw_confirm_login.setText("인증/로그인 완료 · 작업 재개")
         self.btn_pw_confirm_login.setEnabled(True)
         prefix = f"[{provider_name}] " if provider_name else ""
         self.lbl_dock_progress_meta.setText(
-            f"{prefix}브라우저 로그인 완료 후 [로그인 완료] 버튼을 눌러주세요."
+            f"{prefix}브라우저에서 로그인·약관 동의·봇 인증 완료 후 [인증/로그인 완료 · 작업 재개] 버튼을 눌러주세요."
         )
 
     def _on_pw_waiting_for_click(self, domain: str = "") -> None:
