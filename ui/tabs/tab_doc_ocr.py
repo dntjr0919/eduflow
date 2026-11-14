@@ -19,7 +19,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from PyQt6.QtCore import Qt
+import pandas as pd
+from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -58,11 +59,13 @@ from services.docx_extractor_service import (
     load_all_schemas,
     load_single_schema,
 )
+from services.batch_prompt_service import resolve_batch_output_path
 from services.excel_merger_service import merge_excel_assignments
 from services.record_generator_service import (
     generate_records_from_excel,
     get_active_ai_info,
     get_gemini_api_key,
+    is_blank_or_failed,
     list_prompt_files,
     calculate_neis_bytes,
 )
@@ -840,6 +843,9 @@ class IntegratedPipelineWorker(BaseWorker):
 class DocOcrTab(QWidget):
     """[탭 2] 문서 처리 & AI OCR / 파일 병합 메인 탭 위젯."""
 
+    ai_target_requested = pyqtSignal(str)
+    ai_context_changed = pyqtSignal(dict)
+
     TASK_ANALYZE = "doc_tab_analyze_submissions"
     TASK_RENAME = "doc_tab_standard_rename"
     TASK_PDF_MERGE = "doc_tab_pdf_merge"
@@ -861,8 +867,16 @@ class DocOcrTab(QWidget):
         self._analyzed_items: List[Dict[str, Any]] = []
         self._missing_students: List[Dict[str, Any]] = []
         self._focused_card: Optional[str] = None
+        self._active_ai_target_id: str = "agg_step2"
+
+        self._context_debounce_timer = QTimer(self)
+        self._context_debounce_timer.setSingleShot(True)
+        self._context_debounce_timer.setInterval(300)
+        self._context_debounce_timer.timeout.connect(self._on_debounced_context_sync)
 
         self._init_ui()
+        self._wire_ai_context_sync()
+        self.set_active_ai_target("agg_step2")
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -1236,14 +1250,19 @@ class DocOcrTab(QWidget):
         lay.setContentsMargins(8, 8, 22, 22)
         lay.setSpacing(12)
 
-        grp = HoverZoomCard(
-            title="AI OCR 및 문서 텍스트 보정 (멀티 LLM API & 수동 프롬프트 복붙 하이브리드)",
+        self.card_ocr_main = HoverZoomCard(
+            title="AI OCR 및 문서 텍스트 보정",
             parent=w,
             zoom_ratio=1.0,
             hover_delay_ms=0,
         )
-        apply_qss_role(grp, role="hoverZoomCard", obj_name="AiOcrHybridGroup")
-        g_lay = grp.body_layout()
+        apply_qss_role(self.card_ocr_main, role="hoverZoomCard", obj_name="AiOcrHybridGroup")
+        self.card_ocr_main.setProperty("aiTargetSelected", "false")
+        self.lbl_target_badge_ocr = QLabel("AI 대상 선택됨")
+        apply_qss_role(self.lbl_target_badge_ocr, obj_name="AiTargetSelectedBadge")
+        self.lbl_target_badge_ocr.setVisible(False)
+        self.card_ocr_main.add_header_widget(self.lbl_target_badge_ocr)
+        g_lay = self.card_ocr_main.body_layout()
 
         # 상단 파일 추가 및 결과 저장 툴바
         file_toolbar = QHBoxLayout()
@@ -1285,33 +1304,18 @@ class DocOcrTab(QWidget):
         self.txt_ocr_output = QTextEdit()
         apply_qss_role(self.txt_ocr_output, obj_name="WebAiInputBox")
         self.txt_ocr_output.setPlaceholderText(
-            "AI API 자동 처리 결과 또는 [수동 복붙 모드]에서 파싱된 JSON 변환 결과가 이곳에 표시됩니다..."
+            "우측 AI 실행 패널(API / 수동 복붙 / Playwright 자동)에서 실행한 결과 또는 파싱된 JSON 변환 결과가 이곳에 표시됩니다..."
         )
         g_lay.addWidget(self.txt_ocr_output, stretch=1)
 
-        # 하단 실행 버튼 영역: QHBoxLayout으로 두 개의 버튼을 나란히 배치
-        exec_btn_layout = QHBoxLayout()
-        exec_btn_layout.setSpacing(12)
+        lbl_ocr_dock_hint = QLabel(
+            "AI 실행(API · 수동 복붙 · Playwright 자동)은 우측 [AI 실행 패널]에서 제어합니다."
+        )
+        lbl_ocr_dock_hint.setWordWrap(True)
+        apply_qss_role(lbl_ocr_dock_hint, role="infoBanner")
+        g_lay.addWidget(lbl_ocr_dock_hint)
 
-        # 1) AI 자동 실행 버튼
-        self.btn_run_ai_auto = QPushButton("AI 자동 실행 (API 사용)")
-        apply_qss_role(self.btn_run_ai_auto, role="primary", obj_name="BtnRunAiAuto")
-        self.btn_run_ai_auto.setMinimumHeight(38)
-        self.btn_run_ai_auto.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_run_ai_auto.clicked.connect(self._on_run_hybrid_ocr)
-
-        # 2) 수동 복붙 모드 버튼
-        self.btn_open_manual_mode = QPushButton("수동 복붙 모드 열기")
-        apply_qss_role(self.btn_open_manual_mode, role="secondary", obj_name="BtnOpenManualPrompt")
-        self.btn_open_manual_mode.setMinimumHeight(38)
-        self.btn_open_manual_mode.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open_manual_mode.clicked.connect(self._on_open_manual_llm_dialog)
-
-        exec_btn_layout.addWidget(self.btn_run_ai_auto, stretch=1)
-        exec_btn_layout.addWidget(self.btn_open_manual_mode, stretch=1)
-        g_lay.addLayout(exec_btn_layout)
-
-        lay.addWidget(grp)
+        lay.addWidget(self.card_ocr_main)
         scroll.setWidget(w)
         return scroll
 
@@ -1455,6 +1459,14 @@ class DocOcrTab(QWidget):
         apply_qss_role(lbl_schema_info, role="infoBanner", obj_name="SchemaInfoBanner")
         lay_step1.addWidget(lbl_schema_info)
 
+        # 1단계 단독 실행 버튼 (중앙 1단계 카드에 유지)
+        self.btn_run_docx_only = QPushButton("1. DOCX -> 엑셀 추출 실행")
+        self.btn_run_docx_only.setMinimumHeight(36)
+        self.btn_run_docx_only.setCursor(Qt.CursorShape.PointingHandCursor)
+        apply_qss_role(self.btn_run_docx_only, role="primary", obj_name="BtnRunDocxOnly")
+        self.btn_run_docx_only.clicked.connect(self._on_run_docx_extract)
+        lay_step1.addWidget(self.btn_run_docx_only)
+
         cards_layout.addWidget(self.card_agg_step1)
 
         # [STAGE 2 CARD] AI Evaluation & NEIS Record Generation
@@ -1465,7 +1477,66 @@ class DocOcrTab(QWidget):
             hover_delay_ms=0,
         )
         apply_qss_role(self.card_agg_step2, role="hoverZoomCard", obj_name="AggStep2Card")
+        self.card_agg_step2.setProperty("aiTargetSelected", "false")
+        self._mode_badge_hovered: bool = False
+        self.btn_agg_mode_badge = QPushButton("세특 작성 모드 활성")
+        self.btn_agg_mode_badge.setCheckable(True)
+        self.btn_agg_mode_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_agg_mode_badge.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.btn_agg_mode_badge.setMinimumHeight(24)
+        self.btn_agg_mode_badge.setToolTip(
+            "클릭하여 프롬프트별 결과 파일명 접두사 규칙 및 저장 열 설명을 펼치거나 접습니다."
+        )
+        apply_qss_role(self.btn_agg_mode_badge, obj_name="AggModeBadge")
+        self.btn_agg_mode_badge.setProperty("aggMode", "record")
+        self.btn_agg_mode_badge.clicked.connect(self._on_toggle_mode_explain_accordion)
+        self.card_agg_step2.header_layout.insertWidget(1, self.btn_agg_mode_badge)
+
+        self.lbl_target_badge_step2 = QLabel("AI 대상 선택됨")
+        apply_qss_role(self.lbl_target_badge_step2, obj_name="AiTargetSelectedBadge")
+        self.lbl_target_badge_step2.setVisible(False)
+        self.card_agg_step2.add_header_widget(self.lbl_target_badge_step2)
         lay_step2 = self.card_agg_step2.body_layout()
+
+        # 클릭 시 펼쳐지는 모드/결과 파일명 규칙 아코디언 설명 패널 (기본 접힘)
+        self.mode_explain_accordion = QFrame()
+        apply_qss_role(self.mode_explain_accordion, obj_name="ModeExplainAccordion")
+        self.mode_explain_accordion.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.mode_explain_accordion.setMaximumHeight(0)
+        self.mode_explain_accordion.setVisible(False)
+
+        lay_mode_explain = QVBoxLayout(self.mode_explain_accordion)
+        lay_mode_explain.setContentsMargins(14, 12, 14, 12)
+        lay_mode_explain.setSpacing(8)
+
+        self.lbl_mode_explain_summary = QLabel()
+        self.lbl_mode_explain_summary.setWordWrap(True)
+        self.lbl_mode_explain_summary.setTextFormat(Qt.TextFormat.RichText)
+        apply_qss_role(self.lbl_mode_explain_summary, obj_name="ModeExplainSummaryLabel")
+        lay_mode_explain.addWidget(self.lbl_mode_explain_summary)
+
+        self.lbl_mode_explain_rules = QLabel(
+            "<b>프롬프트별 결과 파일명 자동 분기 규칙</b><br>"
+            "• <b>채점 모드 (<code>채점완료_&lt;원본파일명&gt;.xlsx</code>)</b>: 선택한 프롬프트 파일명에 "
+            "<code>'채점'</code>이 포함된 경우 자동 활성화됩니다. 결과는 <code>AI_채점결과</code> 열에 저장되며 "
+            "NEIS 바이트 제한을 적용하지 않습니다.<br>"
+            "• <b>세특 작성 모드 (<code>과세특완료_&lt;원본파일명&gt;.xlsx</code>)</b>: 그 외 세특·기본 프롬프트 "
+            "선택 시 활성화됩니다. 결과는 <code>생성된_과세특</code> 및 <code>과세특_바이트</code> 열에 저장되며 "
+            "설정된 NEIS 바이트 예산을 따릅니다.<br>"
+            "• <b>이어쓰기(Resume) 동작</b>: 대상 폴더에 이미 해당 접두사(<code>채점완료_</code> 또는 "
+            "<code>과세특완료_</code>)가 붙은 결과 파일이 있으면 그 파일을 우선 읽어 미완료 학생만 이어서 처리합니다."
+        )
+        self.lbl_mode_explain_rules.setWordWrap(True)
+        self.lbl_mode_explain_rules.setTextFormat(Qt.TextFormat.RichText)
+        apply_qss_role(self.lbl_mode_explain_rules, obj_name="ModeExplainRulesLabel")
+        lay_mode_explain.addWidget(self.lbl_mode_explain_rules)
+
+        self._mode_explain_anim = QPropertyAnimation(self.mode_explain_accordion, b"maximumHeight", self)
+        self._mode_explain_anim.setDuration(220)
+        self._mode_explain_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._mode_explain_anim.finished.connect(self._on_mode_explain_anim_finished)
+
+        lay_step2.addWidget(self.mode_explain_accordion)
 
         # 활성 AI 공급자 및 모델 상태 배지 바
         box_ai_badge = QHBoxLayout()
@@ -1481,22 +1552,12 @@ class DocOcrTab(QWidget):
         apply_qss_role(btn_go_settings, role="secondary")
         btn_go_settings.clicked.connect(self._on_go_to_settings_tab)
 
-        btn_refresh_ai = QPushButton("↻ 상태 갱신")
+        btn_refresh_ai = QPushButton("상태 갱신")
         btn_refresh_ai.setMinimumHeight(30)
         apply_qss_role(btn_refresh_ai, role="subtle")
         btn_refresh_ai.clicked.connect(self._update_active_ai_display)
 
-        self.btn_open_batch_manual = QPushButton("▸ 수동 프롬프트 배치 모드 (웹 AI 복붙)")
-        self.btn_open_batch_manual.setMinimumHeight(30)
-        self.btn_open_batch_manual.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_open_batch_manual.setToolTip(
-            "API 키 없이도 선택한 엑셀 파일을 토큰 단위로 분할해 웹 AI(Gemini/ChatGPT/Claude)에 복사·붙여넣기로 처리합니다."
-        )
-        apply_qss_role(self.btn_open_batch_manual, role="secondary", obj_name="BtnOpenBatchManualMode")
-        self.btn_open_batch_manual.clicked.connect(self._on_open_batch_manual_dialog)
-
         box_ai_badge.addWidget(self.lbl_active_ai_badge, stretch=1)
-        box_ai_badge.addWidget(self.btn_open_batch_manual)
         box_ai_badge.addWidget(btn_go_settings)
         box_ai_badge.addWidget(btn_refresh_ai)
         lay_step2.addLayout(box_ai_badge)
@@ -1710,67 +1771,65 @@ class DocOcrTab(QWidget):
         lay.addLayout(cards_layout)
 
         # ---------------------------------------------------------------------
-        # 3. 하단 카드: 3단계 · 일괄 실행 및 진행 상황
+        # 3. 하단 카드: 3단계 · 학생별 처리 상태 및 결과 미리보기
         # ---------------------------------------------------------------------
         self.card_agg_step3 = HoverZoomCard(
-            title="3단계 · 일괄 실행 및 진행 상황",
+            title="3단계 · 학생별 처리 상태 및 결과 미리보기",
             parent=w,
             zoom_ratio=1.0,
             hover_delay_ms=0,
         )
         apply_qss_role(self.card_agg_step3, role="hoverZoomCard", obj_name="AggStep3Card")
+        self.card_agg_step3.setProperty("aiTargetSelected", "false")
         lay_step3 = self.card_agg_step3.body_layout()
 
-        # 주요 실행 버튼 영역 (1행: 단계별 단독 실행, 2행: 원클릭 일괄 실행 + 중단)
-        grid_actions = QVBoxLayout()
-        grid_actions.setSpacing(10)
+        preview_hdr = QHBoxLayout()
+        preview_hdr.setSpacing(8)
+        self.lbl_agg_preview_summary = QLabel(
+            "엑셀 파일을 선택하거나 1단계를 실행하면 학생별 처리 상태와 생성된 세특 미리보기가 표시됩니다."
+        )
+        self.lbl_agg_preview_summary.setWordWrap(True)
+        apply_qss_role(self.lbl_agg_preview_summary, role="mutedText")
 
-        # 1행: 단계별 실행 버튼들
-        row_steps = QHBoxLayout()
-        row_steps.setSpacing(10)
+        btn_refresh_preview = QPushButton("미리보기 갱신")
+        btn_refresh_preview.setMinimumHeight(28)
+        apply_qss_role(btn_refresh_preview, role="outline")
+        btn_refresh_preview.clicked.connect(lambda: self._refresh_agg_student_preview_table())
 
-        self.btn_run_docx_only = QPushButton("1. DOCX -> 엑셀 추출만 실행")
-        self.btn_run_docx_only.setMinimumHeight(36)
-        self.btn_run_docx_only.setCursor(Qt.CursorShape.PointingHandCursor)
-        apply_qss_role(self.btn_run_docx_only, role="secondary", obj_name="BtnRunDocxOnly")
-        self.btn_run_docx_only.clicked.connect(self._on_run_docx_extract)
+        preview_hdr.addWidget(self.lbl_agg_preview_summary, stretch=1)
+        preview_hdr.addWidget(btn_refresh_preview)
+        lay_step3.addLayout(preview_hdr)
 
-        self.btn_run_ai_only = QPushButton("2. 엑셀 -> AI 과세특 생성만 실행 (이어쓰기 지원)")
-        self.btn_run_ai_only.setMinimumHeight(36)
-        self.btn_run_ai_only.setCursor(Qt.CursorShape.PointingHandCursor)
-        apply_qss_role(self.btn_run_ai_only, role="secondary", obj_name="BtnRunAiOnly")
-        self.btn_run_ai_only.clicked.connect(self._on_run_record_generate)
+        self.table_agg_preview = QTableWidget(0, 5)
+        self.table_agg_preview.setHorizontalHeaderLabels(
+            ["학번", "이름", "응답 문항", "처리 상태", "생성된 결과 미리보기"]
+        )
+        self.table_agg_preview.setMinimumHeight(200)
+        self.table_agg_preview.setMaximumHeight(320)
+        self.table_agg_preview.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_agg_preview.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        v_hdr = self.table_agg_preview.verticalHeader()
+        if v_hdr is not None:
+            v_hdr.setVisible(False)
+        h_hdr = self.table_agg_preview.horizontalHeader()
+        if h_hdr is not None:
+            h_hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            h_hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            h_hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            h_hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            h_hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        lay_step3.addWidget(self.table_agg_preview)
 
-        row_steps.addWidget(self.btn_run_docx_only, stretch=1)
-        row_steps.addWidget(self.btn_run_ai_only, stretch=1)
-        grid_actions.addLayout(row_steps)
-
-        # 2행: 원클릭 일괄 실행 (Primary 대형 버튼) 및 중단 버튼
-        row_main = QHBoxLayout()
-        row_main.setSpacing(10)
-
-        self.btn_run_integrated = QPushButton("3. 원클릭 파이프라인 일괄 실행 (추출 + 평가 + 엑셀 내보내기)")
-        self.btn_run_integrated.setMinimumHeight(42)
-        self.btn_run_integrated.setCursor(Qt.CursorShape.PointingHandCursor)
-        apply_qss_role(self.btn_run_integrated, role="primary", obj_name="BtnRunIntegrated")
-        self.btn_run_integrated.clicked.connect(self._on_run_integrated_pipeline)
-
-        self.btn_stop_agg = QPushButton("작업 중단")
-        self.btn_stop_agg.setMinimumHeight(42)
-        self.btn_stop_agg.setCursor(Qt.CursorShape.PointingHandCursor)
-        apply_qss_role(self.btn_stop_agg, role="danger", obj_name="BtnStopAgg")
-        self.btn_stop_agg.clicked.connect(self._on_stop_agg_task)
-        self.btn_stop_agg.setEnabled(False)
-
-        row_main.addWidget(self.btn_run_integrated, stretch=3)
-        row_main.addWidget(self.btn_stop_agg, stretch=1)
-        grid_actions.addLayout(row_main)
-
-        lay_step3.addLayout(grid_actions)
+        lbl_dock_exec_hint = QLabel(
+            "AI 실행(API 일괄 생성 · 수동 복붙 · Playwright 자동)은 우측 [AI 실행 패널]에서 실행합니다."
+        )
+        lbl_dock_exec_hint.setWordWrap(True)
+        apply_qss_role(lbl_dock_exec_hint, role="infoBanner")
+        lay_step3.addWidget(lbl_dock_exec_hint)
 
         # 피드백 & 결과 열기 상태 영역
         box_feedback = QHBoxLayout()
-        self.lbl_agg_status = QLabel("대기 중: 실행할 작업을 선택해 주세요.")
+        self.lbl_agg_status = QLabel("대기 중: 1단계 추출 또는 우측 AI 실행 패널에서 작업을 실행해 주세요.")
         self.lbl_agg_status.setWordWrap(True)
         apply_qss_role(self.lbl_agg_status, role="mutedText")
 
@@ -1793,6 +1852,9 @@ class DocOcrTab(QWidget):
         self._last_result_excel_path: Optional[str] = None
         self._refresh_schemas_combo()
         self._refresh_prompts_combo()
+        self.combo_agg_prompt.currentIndexChanged.connect(lambda *_: self._update_agg_mode_badge_and_accordion())
+        self.edit_agg_excel_file.textChanged.connect(lambda *_: self._update_agg_mode_badge_and_accordion())
+        self._update_agg_mode_badge_and_accordion()
         self._update_active_ai_display()
 
         return scroll
@@ -2389,11 +2451,17 @@ class DocOcrTab(QWidget):
             )
 
     def _on_go_to_settings_tab(self) -> None:
-        """메인 윈도우의 [탭 6: 환경설정]으로 즉시 전환합니다."""
+        """메인 윈도우의 [환경설정] 탭으로 즉시 전환합니다."""
         curr: Optional[QWidget] = self
         switched = False
         while curr is not None:
-            # 1순위: MainWindow 인스턴스의 switch_tab 또는 tab_settings 호출
+            if hasattr(curr, "switch_to_settings_tab"):
+                try:
+                    getattr(curr, "switch_to_settings_tab")()
+                    switched = True
+                    break
+                except Exception:
+                    pass
             if hasattr(curr, "on_nav_btn_clicked"):
                 try:
                     getattr(curr, "on_nav_btn_clicked")("settings")
@@ -2561,12 +2629,16 @@ class DocOcrTab(QWidget):
 
     def _set_agg_controls_busy(self, busy: bool) -> None:
         """작업 진행 중 버튼 상태 토글"""
-        self.btn_run_docx_only.setEnabled(not busy)
-        self.btn_run_ai_only.setEnabled(not busy)
-        self.btn_run_integrated.setEnabled(not busy)
-        if hasattr(self, "btn_run_merge"):
+        if hasattr(self, "btn_run_docx_only") and self.btn_run_docx_only is not None:
+            self.btn_run_docx_only.setEnabled(not busy)
+        if hasattr(self, "btn_run_ai_only") and self.btn_run_ai_only is not None:
+            self.btn_run_ai_only.setEnabled(not busy)
+        if hasattr(self, "btn_run_integrated") and self.btn_run_integrated is not None:
+            self.btn_run_integrated.setEnabled(not busy)
+        if hasattr(self, "btn_run_merge") and self.btn_run_merge is not None:
             self.btn_run_merge.setEnabled(not busy)
-        self.btn_stop_agg.setEnabled(busy)
+        if hasattr(self, "btn_stop_agg") and self.btn_stop_agg is not None:
+            self.btn_stop_agg.setEnabled(busy)
 
     def _on_run_docx_extract(self) -> None:
         """1단계: DOCX 과제 파일 추출만 단독 실행"""
@@ -2812,7 +2884,8 @@ class DocOcrTab(QWidget):
 
     def _on_stop_agg_task(self) -> None:
         """진행 중인 과제 추출, 가로 병합 또는 AI 과세특 생성 작업을 안전하게 중단합니다."""
-        self.btn_stop_agg.setEnabled(False)
+        if hasattr(self, "btn_stop_agg") and self.btn_stop_agg is not None:
+            self.btn_stop_agg.setEnabled(False)
         self.task_runner.stop_task(self.TASK_DOCX_EXTRACT)
         self.task_runner.stop_task(self.TASK_COLUMN_MERGE)
         self.task_runner.stop_task(self.TASK_RECORD_GEN)
@@ -2980,3 +3053,359 @@ class DocOcrTab(QWidget):
             os.startfile(self._last_result_excel_path)
         else:
             QMessageBox.information(self, "안내", "열 수 있는 결과 엑셀 파일이 없습니다.")
+
+    # =========================================================================
+    # AI 실행 도크 연동 (공통 컨텍스트 · 디바운스 · 카드 강조 · 결과 반영)
+    # =========================================================================
+    def _wire_ai_context_sync(self) -> None:
+        """중앙 입력창 변경(300ms 디바운스) 및 AI 대상 카드 클릭 이벤트를 연결합니다."""
+        self.card_agg_step2.get_ai_context = lambda: self.get_ai_context("agg_step2")  # type: ignore[attr-defined]
+        self.card_agg_step3.get_ai_context = lambda: self.get_ai_context("agg_step2")  # type: ignore[attr-defined]
+        self.card_ocr_main.get_ai_context = lambda: self.get_ai_context("ocr")  # type: ignore[attr-defined]
+
+        self._install_target_click_filter(self.card_agg_step2, "agg_step2")
+        self._install_target_click_filter(self.card_agg_step3, "agg_step2")
+        self._install_target_click_filter(self.card_ocr_main, "ocr")
+
+        # 300ms 디바운스 시그널 연결
+        self.edit_agg_excel_file.textChanged.connect(lambda _t: self._schedule_context_debounce())
+        self.combo_agg_prompt.currentIndexChanged.connect(lambda _i: self._schedule_context_debounce())
+        self.edit_agg_ref_dir.textChanged.connect(lambda _t: self._schedule_context_debounce())
+        self.spin_agg_max_bytes.valueChanged.connect(lambda _v: self._schedule_context_debounce())
+        self.edit_agg_docx_dir.textChanged.connect(lambda _t: self._schedule_context_debounce())
+        self.combo_agg_schema.currentIndexChanged.connect(lambda _i: self._schedule_context_debounce())
+
+        self.edit_ocr_prompt.textChanged.connect(lambda _t: self._schedule_context_debounce())
+        self.txt_ocr_output.textChanged.connect(self._schedule_context_debounce)
+        ocr_model = self.list_ocr_files.model()
+        if ocr_model is not None:
+            ocr_model.rowsInserted.connect(lambda *_a: self._schedule_context_debounce())
+            ocr_model.rowsRemoved.connect(lambda *_a: self._schedule_context_debounce())
+            ocr_model.modelReset.connect(self._schedule_context_debounce)
+
+    def _install_target_click_filter(self, root_widget: QWidget, target_id: str) -> None:
+        root_widget.setProperty("_ai_target_id", target_id)
+        root_widget.installEventFilter(self)
+        for child in root_widget.findChildren(QWidget):
+            child.setProperty("_ai_target_id", target_id)
+            child.installEventFilter(self)
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if obj is getattr(self, "btn_agg_mode_badge", None):
+            ev_type = event.type()
+            if ev_type in (QEvent.Type.Enter, QEvent.Type.HoverEnter):
+                if not getattr(self, "_mode_badge_hovered", False):
+                    self._mode_badge_hovered = True
+                    self._update_agg_mode_badge_text()
+            elif ev_type in (QEvent.Type.Leave, QEvent.Type.HoverLeave):
+                if getattr(self, "_mode_badge_hovered", False):
+                    self._mode_badge_hovered = False
+                    self._update_agg_mode_badge_text()
+        if event.type() == QEvent.Type.MouseButtonPress:
+            tid = obj.property("_ai_target_id") if obj is not None else None
+            if isinstance(tid, str) and tid:
+                self.ai_target_requested.emit(tid)
+        return super().eventFilter(obj, event)
+
+    def _is_agg_grading_mode(self) -> bool:
+        """현재 선택된 프롬프트 파일명·경로 또는 표시명에 '채점'이 포함되어 있는지 판별합니다."""
+        prompt_data = str(self.combo_agg_prompt.currentData() or "").strip()
+        prompt_text = str(self.combo_agg_prompt.currentText() or "").strip()
+        prompt_name = Path(prompt_data).name if prompt_data else ""
+        return ("채점" in prompt_name) or ("채점" in prompt_data) or ("채점" in prompt_text)
+
+    def _update_agg_mode_badge_text(self) -> None:
+        base = "채점 모드 활성" if self._is_agg_grading_mode() else "세특 작성 모드 활성"
+        if getattr(self, "_mode_badge_hovered", False):
+            action_txt = "설명 접기 ▴" if self.btn_agg_mode_badge.isChecked() else "설명 보기 ▾"
+            self.btn_agg_mode_badge.setText(f"{base} · {action_txt}")
+        else:
+            self.btn_agg_mode_badge.setText(base)
+
+    def _update_agg_mode_badge_and_accordion(self) -> None:
+        is_grading = self._is_agg_grading_mode()
+        self.btn_agg_mode_badge.setProperty("aggMode", "grading" if is_grading else "record")
+        st = self.btn_agg_mode_badge.style()
+        if st is not None:
+            st.unpolish(self.btn_agg_mode_badge)
+            st.polish(self.btn_agg_mode_badge)
+        self._update_agg_mode_badge_text()
+
+        prompt_data = str(self.combo_agg_prompt.currentData() or "").strip()
+        prompt_label = Path(prompt_data).name if prompt_data else (
+            self.combo_agg_prompt.currentText().strip() or "기본 내장 과세특 프롬프트"
+        )
+        mode_name = "채점 모드" if is_grading else "세특 작성 모드"
+        excel_str = self.edit_agg_excel_file.text().strip()
+        out_name = resolve_batch_output_path(
+            excel_str or "자유 주제 탐구 종합.xlsx",
+            None,
+            is_grading=is_grading,
+        ).name
+        prefix_note = " (예시)" if not excel_str else ""
+
+        self.lbl_mode_explain_summary.setText(
+            f"<b>현재 선택 요약</b> · 프롬프트: <code>{html.escape(prompt_label)}</code> "
+            f"→ <b>{mode_name}</b> 활성 · 예상 결과 파일명{prefix_note}: "
+            f"<code>{html.escape(out_name)}</code>"
+        )
+
+        if self.btn_agg_mode_badge.isChecked() and self._mode_explain_anim.state() != QPropertyAnimation.State.Running:
+            self.mode_explain_accordion.setMaximumHeight(16777215)
+
+    def _measure_mode_explain_target_height(self) -> int:
+        layout = self.mode_explain_accordion.layout()
+        avail_w = self.mode_explain_accordion.width()
+        if avail_w <= 80:
+            avail_w = max(self.card_agg_step2.width() - 36, 460)
+        if layout is not None:
+            layout.activate()
+            if layout.hasHeightForWidth() and avail_w > 0:
+                return max(
+                    layout.totalHeightForWidth(avail_w) + 4,
+                    self.mode_explain_accordion.sizeHint().height(),
+                    110,
+                )
+        return max(self.mode_explain_accordion.sizeHint().height() + 4, 110)
+
+    def _on_toggle_mode_explain_accordion(self, checked: bool) -> None:
+        self._update_agg_mode_badge_text()
+        current_h = self.mode_explain_accordion.height() if self.mode_explain_accordion.isVisible() else 0
+        self._mode_explain_anim.stop()
+        if checked:
+            self.mode_explain_accordion.setMaximumHeight(current_h)
+            self.mode_explain_accordion.setVisible(True)
+            target_h = self._measure_mode_explain_target_height()
+            self._mode_explain_anim.setStartValue(current_h)
+            self._mode_explain_anim.setEndValue(target_h)
+        else:
+            start_h = max(current_h, 0)
+            self.mode_explain_accordion.setMaximumHeight(start_h)
+            self._mode_explain_anim.setStartValue(start_h)
+            self._mode_explain_anim.setEndValue(0)
+        self._mode_explain_anim.start()
+
+    def _on_mode_explain_anim_finished(self) -> None:
+        if self.btn_agg_mode_badge.isChecked():
+            self.mode_explain_accordion.setMaximumHeight(16777215)
+        else:
+            self.mode_explain_accordion.setMaximumHeight(0)
+            self.mode_explain_accordion.setVisible(False)
+
+    def _schedule_context_debounce(self) -> None:
+        self._context_debounce_timer.start()
+
+    def _on_debounced_context_sync(self) -> None:
+        self._refresh_agg_student_preview_table()
+        self.ai_context_changed.emit(self.get_ai_context())
+
+    def get_ai_context(self, target_id: Optional[str] = None) -> Dict[str, Any]:
+        """현재 선택(또는 지정)된 중앙 AI 대상 카드의 최신 설정·입력값을 딕셔너리로 반환합니다."""
+        tid = target_id or self._active_ai_target_id or "agg_step2"
+        if tid == "ocr":
+            files: List[str] = []
+            for i in range(self.list_ocr_files.count()):
+                item = self.list_ocr_files.item(i)
+                if item is None:
+                    continue
+                val = item.data(Qt.ItemDataRole.UserRole) or item.text()
+                if val:
+                    files.append(str(val))
+            return {
+                "target_id": "ocr",
+                "label": "2. AI OCR 및 텍스트 보정",
+                "kind": "ocr",
+                "ocr_files": files,
+                "ocr_prompt": self.edit_ocr_prompt.text().strip(),
+                "ocr_current_text": self.txt_ocr_output.toPlainText().strip(),
+            }
+
+        prompt_data = self.combo_agg_prompt.currentData()
+        schema_data = self.combo_agg_schema.currentData()
+        return {
+            "target_id": "agg_step2",
+            "label": "과제 파이프라인 > 2단계 세특 생성",
+            "kind": "excel_batch",
+            "excel_path": self.edit_agg_excel_file.text().strip(),
+            "docx_dir": self.edit_agg_docx_dir.text().strip(),
+            "schema_path": str(schema_data) if schema_data else "",
+            "prompt_file": str(prompt_data) if prompt_data else "",
+            "reference_dir": self.edit_agg_ref_dir.text().strip(),
+            "max_bytes": int(self.spin_agg_max_bytes.value()),
+            "last_result_excel_path": self._last_result_excel_path or "",
+        }
+
+    def set_active_ai_target(self, target_id: str) -> None:
+        """활성 AI 타겟에 따라 중앙 카드 강조(1.5px solid #2563EB 및 선택 배지)를 갱신합니다."""
+        self._active_ai_target_id = target_id or "agg_step2"
+        is_agg = self._active_ai_target_id == "agg_step2"
+        is_ocr = self._active_ai_target_id == "ocr"
+
+        card_states = [
+            (self.card_agg_step2, is_agg),
+            (self.card_agg_step3, is_agg),
+            (self.card_ocr_main, is_ocr),
+        ]
+        for card, selected in card_states:
+            card.setProperty("aiTargetSelected", "true" if selected else "false")
+            st = card.style()
+            if st is not None:
+                st.unpolish(card)
+                st.polish(card)
+            card.update()
+
+        self.lbl_target_badge_step2.setVisible(is_agg)
+        self.lbl_target_badge_ocr.setVisible(is_ocr)
+
+    def _refresh_agg_student_preview_table(self, preferred_path: str = "") -> None:
+        """선택된 과제/결과 엑셀을 읽어 3단계 카드의 학생별 처리 상태 미리보기를 갱신합니다."""
+        prompt_data = self.combo_agg_prompt.currentData()
+        is_grading = bool(prompt_data and "채점" in Path(str(prompt_data)).name)
+        excel_str = self.edit_agg_excel_file.text().strip()
+
+        target_path = ""
+        if preferred_path and Path(preferred_path).is_file():
+            target_path = preferred_path
+        elif excel_str and Path(excel_str).is_file():
+            cand = resolve_batch_output_path(excel_str, None, is_grading=is_grading)
+            if cand and Path(cand).is_file():
+                target_path = cand
+            else:
+                target_path = excel_str
+
+        if not target_path:
+            self.table_agg_preview.setRowCount(0)
+            self.lbl_agg_preview_summary.setText(
+                "엑셀 파일을 선택하거나 1단계를 실행하면 학생별 처리 상태와 생성된 세특 미리보기가 표시됩니다."
+            )
+            return
+
+        try:
+            df = pd.read_excel(target_path, dtype=str).fillna("")
+        except Exception as exc:
+            self.table_agg_preview.setRowCount(0)
+            self.lbl_agg_preview_summary.setText(f"미리보기 로드 오류: {exc}")
+            return
+
+        cols = [str(c) for c in df.columns]
+        sid_col = next((c for c in cols if "학번" in c), cols[0] if cols else "")
+        name_col = next((c for c in cols if "이름" in c or "성명" in c), "")
+
+        result_candidates = (
+            ["AI_채점결과", "AI_서술형평가", "피드백", "평가결과", "생성된_과세특"]
+            if is_grading
+            else ["생성된_과세특", "AI_교과세특", "과세특", "생성_세특", "AI_채점결과"]
+        )
+        res_col = ""
+        for cand_col in result_candidates:
+            if cand_col in cols:
+                res_col = cand_col
+                break
+        if not res_col:
+            res_col = next(
+                (
+                    c
+                    for c in cols
+                    if ("바이트" not in c and "Byte" not in c)
+                    and ("세특" in c or "채점" in c or "피드백" in c or "평가" in c or c.startswith("AI_"))
+                ),
+                "",
+            )
+
+        meta_skip = {sid_col, name_col, res_col, "누락 항목", "누락항목", "양식", "원본파일명", "과세특_바이트"}
+        q_cols = [
+            c
+            for c in cols
+            if c not in meta_skip
+            and not c.startswith("AI_")
+            and "오류" not in c
+            and "바이트" not in c
+            and "Byte" not in c
+            and "처리상태" not in c
+        ]
+
+        total_rows = len(df)
+        preview_rows = df.head(200)
+        self.table_agg_preview.setRowCount(len(preview_rows))
+        completed_cnt = 0
+
+        for r_idx, (_, row) in enumerate(df.iterrows()):
+            raw_res = str(row.get(res_col, "")).strip() if res_col else ""
+            is_done = bool(res_col and not is_blank_or_failed(raw_res))
+            if is_done:
+                completed_cnt += 1
+
+        for r_idx in range(len(preview_rows)):
+            row = preview_rows.iloc[r_idx]
+            sid_val = str(row.get(sid_col, "")).strip() if sid_col else ""
+            name_val = str(row.get(name_col, "")).strip() if name_col else ""
+            answered = sum(1 for qc in q_cols if str(row.get(qc, "")).strip())
+            raw_res = str(row.get(res_col, "")).strip() if res_col else ""
+            is_done = bool(res_col and not is_blank_or_failed(raw_res))
+            status_txt = "완료" if is_done else ("오류/재시도" if raw_res else "대기")
+            snippet = (raw_res[:90] + "...") if len(raw_res) > 90 else (raw_res or "-")
+
+            items = [
+                QTableWidgetItem(sid_val),
+                QTableWidgetItem(name_val),
+                QTableWidgetItem(f"{answered}/{len(q_cols)}" if q_cols else "-"),
+                QTableWidgetItem(status_txt),
+                QTableWidgetItem(snippet),
+            ]
+            items[3].setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if is_done:
+                items[3].setForeground(QBrush(QColor("#15803D")))
+            elif raw_res:
+                items[3].setForeground(QBrush(QColor("#B91C1C")))
+            else:
+                items[3].setForeground(QBrush(QColor("#64748B")))
+            if raw_res:
+                items[4].setToolTip(raw_res)
+
+            for c_idx, cell_item in enumerate(items):
+                self.table_agg_preview.setItem(r_idx, c_idx, cell_item)
+
+        suffix = " (상위 200명 표시)" if total_rows > 200 else ""
+        self.lbl_agg_preview_summary.setText(
+            f"대상 파일: {Path(target_path).name} · 완료 {completed_cnt}/{total_rows}명 "
+            f"(미완료 {max(0, total_rows - completed_cnt)}명){suffix}"
+        )
+
+    def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
+        """우측 AiExecutionDock에서 실행된 결과를 중앙 탭 UI 및 미리보기 테이블에 반영합니다."""
+        tid = str(payload.get("target_id", "") or self._active_ai_target_id)
+        if tid == "ocr":
+            formatted = str(payload.get("formatted_text", "") or "").strip()
+            if formatted:
+                self.txt_ocr_output.blockSignals(True)
+                self.txt_ocr_output.setPlainText(formatted)
+                self.txt_ocr_output.blockSignals(False)
+            return
+
+        out_path = str(payload.get("output_path", "") or "").strip()
+        if out_path and Path(out_path).exists():
+            self._last_result_excel_path = out_path
+            self.btn_open_result_excel.setVisible(True)
+            if payload.get("integrated"):
+                self.edit_agg_excel_file.blockSignals(True)
+                self.edit_agg_excel_file.setText(out_path)
+                self.edit_agg_excel_file.blockSignals(False)
+
+        mode = str(payload.get("mode", "") or "")
+        applied = payload.get("applied_count", payload.get("completed", 0))
+        if mode == "manual":
+            self.lbl_agg_status.setText(
+                f"수동 배치 반영 완료: {Path(out_path).name if out_path else ''} ({applied}명 반영)"
+            )
+        elif mode == "playwright":
+            self.lbl_agg_status.setText(
+                f"Playwright 자동화 반영 완료: {Path(out_path).name if out_path else ''} ({applied}명 반영)"
+            )
+        else:
+            tot = payload.get("total", applied)
+            self.lbl_agg_status.setText(
+                f"API 일괄 생성 완료: {Path(out_path).name if out_path else ''} ({applied}/{tot}명)"
+            )
+
+        self._update_agg_stepper(s1="done", s2="done", s3="done")
+        self._refresh_agg_student_preview_table(preferred_path=out_path)

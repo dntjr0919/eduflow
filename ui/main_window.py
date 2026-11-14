@@ -8,10 +8,10 @@
 """
 
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt
-from PyQt6.QtGui import QAction, QCloseEvent
+from PyQt6.QtCore import QEasingCurve, QParallelAnimationGroup, QPropertyAnimation, Qt, pyqtSignal
+from PyQt6.QtGui import QAction, QCloseEvent, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
@@ -33,12 +33,13 @@ from PyQt6.QtWidgets import (
 )
 
 from core.base_worker import TaskRunner
-from core.config_manager import ConfigManager
+from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
 from services.notifier import NotificationService
 from services.record_generator_service import get_active_ai_info
 
-# 독립된 각 기능 탭(페이지) 위젯 import
+# 독립된 각 기능 탭(페이지) 위젯 및 우측 AI 도크 import
+from ui.components.ai_execution_dock import AiExecutionDock
 from ui.tabs.tab_classroom_tools import ClassroomToolsTab
 from ui.tabs.tab_doc_ocr import DocOcrTab
 from ui.tabs.tab_file_sorter import FileSorterTab
@@ -66,6 +67,8 @@ class MainWindow(QMainWindow):
     SIDEBAR_EXPANDED_WIDTH = 248
     SIDEBAR_COLLAPSED_WIDTH = 64
 
+    _sig_config_changed = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("EduFlow — Teacher Workstation")
@@ -78,14 +81,24 @@ class MainWindow(QMainWindow):
         self.notifier = NotificationService()
         self._force_quit = False
         self._sidebar_collapsed = False
+        self._ai_dock_expanded = False
         self._page_meta: List[Dict[str, str]] = []
+        self._shortcuts: Dict[str, QShortcut] = {}
 
         self._init_ui()
         self._init_tray_icon()
         self._connect_global_worker_signals()
         self._register_all_tabs()
+        self._init_shortcuts()
+        self._refresh_shortcuts_from_config()
         self._update_ai_mode_badge()
-        self.config.add_listener(lambda _: self._update_ai_mode_badge())
+
+        self._sig_config_changed.connect(self._on_config_changed)
+        self.config.add_listener(lambda _: self._sig_config_changed.emit())
+
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_app_focus_changed)
 
         self.append_log("INFO", "EduFlow Workstation initialized.")
 
@@ -196,9 +209,17 @@ class MainWindow(QMainWindow):
         self.lbl_ai_badge = QLabel("AI: 수동 프롬프트 모드")
         polish_widget(self.lbl_ai_badge, obj_name="AiModeBadge")
 
+        self.btn_toggle_ai_dock = QPushButton("AI 실행 패널")
+        polish_widget(self.btn_toggle_ai_dock, obj_name="AiDockToggleBtn")
+        self.btn_toggle_ai_dock.setCheckable(True)
+        self.btn_toggle_ai_dock.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_ai_dock.setToolTip("우측 AI 실행 사이드바 열기/닫기")
+        self.btn_toggle_ai_dock.clicked.connect(lambda checked: self.toggle_ai_dock(checked))
+
         top_header_layout.addLayout(title_col)
         top_header_layout.addStretch()
         top_header_layout.addWidget(self.lbl_ai_badge)
+        top_header_layout.addWidget(self.btn_toggle_ai_dock)
 
         workspace_layout.addWidget(top_header)
 
@@ -274,6 +295,24 @@ class MainWindow(QMainWindow):
         workspace_layout.addWidget(bottom_bar)
         outer_layout.addWidget(self.workspace_frame, stretch=1)
 
+        # ---------------------------------------------------------------------
+        # 3. 우측 접이식 AI 실행 사이드바 (AiExecutionDock)
+        # ---------------------------------------------------------------------
+        self.ai_dock = AiExecutionDock(task_runner=self.task_runner, parent=central)
+        self.ai_dock.setMinimumWidth(0)
+        self.ai_dock.setMaximumWidth(0)
+        self.ai_dock.hide()
+        outer_layout.addWidget(self.ai_dock)
+
+        self._ai_dock_anim_group = QParallelAnimationGroup(self)
+        self._ai_dock_anim_min_w = QPropertyAnimation(self.ai_dock, b"minimumWidth", self)
+        self._ai_dock_anim_max_w = QPropertyAnimation(self.ai_dock, b"maximumWidth", self)
+        for anim in (self._ai_dock_anim_min_w, self._ai_dock_anim_max_w):
+            anim.setDuration(220)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._ai_dock_anim_group.addAnimation(anim)
+        self._ai_dock_anim_group.finished.connect(self._on_ai_dock_anim_finished)
+
     # =========================================================================
     # 좌측 다크 사이드바 접기/펼치기 토글 (Collapsible Sidebar)
     # =========================================================================
@@ -342,7 +381,152 @@ class MainWindow(QMainWindow):
                 st.unpolish(w)
                 st.polish(w)
 
+        if hasattr(self, "_shortcuts") and self._shortcuts:
+            self._update_shortcut_tooltips()
+
         self._sidebar_anim_group.start()
+
+    # =========================================================================
+    # 우측 AI 실행 사이드바 접기/펼치기 및 포커스·컨텍스트 연동
+    # =========================================================================
+    def toggle_ai_dock(self, expanded: Optional[bool] = None) -> None:
+        target_expanded = (not self._ai_dock_expanded) if expanded is None else bool(expanded)
+        self._ai_dock_expanded = target_expanded
+
+        self.btn_toggle_ai_dock.blockSignals(True)
+        self.btn_toggle_ai_dock.setChecked(target_expanded)
+        self.btn_toggle_ai_dock.blockSignals(False)
+
+        if target_expanded:
+            if not self._sidebar_collapsed:
+                self.toggle_sidebar()
+            self.ai_dock.show()
+            self.ai_dock.sync_from_context()
+
+        current_w = self.ai_dock.width() if self.ai_dock.isVisible() else 0
+        target_w = AiExecutionDock.EXPANDED_WIDTH if target_expanded else 0
+
+        self._ai_dock_anim_group.stop()
+        self._ai_dock_anim_min_w.setStartValue(current_w)
+        self._ai_dock_anim_min_w.setEndValue(target_w)
+        self._ai_dock_anim_max_w.setStartValue(current_w)
+        self._ai_dock_anim_max_w.setEndValue(target_w)
+        self._ai_dock_anim_group.start()
+
+    def _on_ai_dock_anim_finished(self) -> None:
+        if not self._ai_dock_expanded:
+            self.ai_dock.hide()
+
+    def switch_to_settings_tab(self) -> None:
+        idx = self.stacked_widget.indexOf(self.tab_settings)
+        if idx >= 0:
+            self.sidebar_nav.setCurrentRow(idx)
+
+    def _on_config_changed(self) -> None:
+        self._update_ai_mode_badge()
+        self.ai_dock.refresh_ai_info()
+        self._refresh_shortcuts_from_config()
+        if hasattr(self, "tab_doc_ocr"):
+            self.tab_doc_ocr._update_active_ai_display()
+
+    # =========================================================================
+    # 전역 단축키(WindowShortcut) 등록 및 실시간 동기화
+    # =========================================================================
+    def _init_shortcuts(self) -> None:
+        action_map = {
+            "toggle_ai_dock": lambda: self.toggle_ai_dock(),
+            "toggle_left_sidebar": self.toggle_sidebar,
+            "toggle_ai_target_lock": self._on_shortcut_toggle_ai_lock,
+            "switch_ai_mode_api": lambda: self._on_shortcut_switch_ai_mode(0),
+            "switch_ai_mode_manual": lambda: self._on_shortcut_switch_ai_mode(1),
+            "switch_ai_mode_playwright": lambda: self._on_shortcut_switch_ai_mode(2),
+            "toggle_log_drawer": self.btn_toggle_log.toggle,
+        }
+        for key, handler in action_map.items():
+            sc = QShortcut(QKeySequence(), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(handler)
+            self._shortcuts[key] = sc
+        self._shortcut_ai_dock = self._shortcuts["toggle_ai_dock"]
+
+    def _on_shortcut_toggle_ai_lock(self) -> None:
+        self.ai_dock.btn_lock_target.toggle()
+
+    def _on_shortcut_switch_ai_mode(self, mode_index: int) -> None:
+        if not self._ai_dock_expanded:
+            self.toggle_ai_dock(True)
+        self.ai_dock.set_mode_index(mode_index)
+
+    def _get_shortcut_str(self, key: str) -> str:
+        sec = self.config.get_section("shortcuts")
+        if isinstance(sec, dict) and key in sec:
+            return str(sec.get(key) or "").strip()
+        return str(DEFAULT_CONFIG.get("shortcuts", {}).get(key, "")).strip()
+
+    @staticmethod
+    def _format_tooltip(base: str, seq_str: str) -> str:
+        return f"{base} ({seq_str})" if seq_str else base
+
+    def _update_shortcut_tooltips(self) -> None:
+        dock_seq = self._get_shortcut_str("toggle_ai_dock")
+        self.btn_toggle_ai_dock.setToolTip(
+            self._format_tooltip("우측 AI 실행 사이드바 열기/닫기", dock_seq)
+        )
+
+        sidebar_seq = self._get_shortcut_str("toggle_left_sidebar")
+        sidebar_base = "사이드바 메뉴 펼치기" if self._sidebar_collapsed else "사이드바 메뉴 접기"
+        self.btn_sidebar_toggle.setToolTip(self._format_tooltip(sidebar_base, sidebar_seq))
+
+        lock_seq = self._get_shortcut_str("toggle_ai_target_lock")
+        self.ai_dock.btn_lock_target.setToolTip(
+            self._format_tooltip(
+                "켜면 중앙 카드를 클릭해도 활성 AI 타겟이 전환되지 않습니다.", lock_seq
+            )
+        )
+
+        self.ai_dock.btn_mode_api.setToolTip(
+            self._format_tooltip("API 모드로 전환", self._get_shortcut_str("switch_ai_mode_api"))
+        )
+        self.ai_dock.btn_mode_manual.setToolTip(
+            self._format_tooltip("수동 복붙 모드로 전환", self._get_shortcut_str("switch_ai_mode_manual"))
+        )
+        self.ai_dock.btn_mode_playwright.setToolTip(
+            self._format_tooltip(
+                "Playwright 자동 모드로 전환", self._get_shortcut_str("switch_ai_mode_playwright")
+            )
+        )
+
+        log_seq = self._get_shortcut_str("toggle_log_drawer")
+        self.btn_toggle_log.setToolTip(
+            self._format_tooltip("하단 로그 콘솔 서랍 열기/닫기", log_seq)
+        )
+
+    def _refresh_shortcuts_from_config(self) -> None:
+        for key, sc in self._shortcuts.items():
+            seq_str = self._get_shortcut_str(key)
+            sc.setKey(QKeySequence(seq_str))
+            sc.setEnabled(bool(seq_str))
+        self._update_shortcut_tooltips()
+
+    def _on_central_ai_target_requested(self, target_id: str) -> None:
+        if self.ai_dock.is_target_locked():
+            return
+        self.ai_dock.on_central_target_clicked(target_id)
+
+    def _on_app_focus_changed(self, _old: Optional[QWidget], new: Optional[QWidget]) -> None:
+        if new is None:
+            return
+        if new is self.ai_dock or self.ai_dock.isAncestorOf(new):
+            return
+        if self.ai_dock.is_target_locked():
+            return
+        curr: Optional[QWidget] = new
+        while curr is not None:
+            tid = curr.property("_ai_target_id")
+            if isinstance(tid, str) and tid:
+                self.ai_dock.on_central_target_clicked(tid)
+                break
+            curr = curr.parentWidget()
 
     # =========================================================================
     # 모듈형 페이지 등록 (좌측 QListWidget + 우측 QStackedWidget 동시 등록)
@@ -410,6 +594,25 @@ class MainWindow(QMainWindow):
             "멀티 LLM(Gemini/OpenAI/Claude/Ollama) 설정, 트레이 동작, 학생 명렬표 마스터 데이터 등록",
             short_code="SET",
         )
+
+        # 우측 AiExecutionDock AI 대상 등록 및 양방향 동기화 연결
+        self.ai_dock.register_target(
+            target_id="agg_step2",
+            label="과제 파이프라인 > 2단계 세특 생성",
+            context_getter=lambda: self.tab_doc_ocr.get_ai_context("agg_step2"),
+            on_result=self.tab_doc_ocr.apply_ai_dock_result,
+        )
+        self.ai_dock.register_target(
+            target_id="ocr",
+            label="2. AI OCR 및 텍스트 보정",
+            context_getter=lambda: self.tab_doc_ocr.get_ai_context("ocr"),
+            on_result=self.tab_doc_ocr.apply_ai_dock_result,
+        )
+        self.ai_dock.target_changed.connect(self.tab_doc_ocr.set_active_ai_target)
+        self.ai_dock.go_to_settings_requested.connect(self.switch_to_settings_tab)
+        self.tab_doc_ocr.ai_target_requested.connect(self._on_central_ai_target_requested)
+        self.tab_doc_ocr.ai_context_changed.connect(self.ai_dock.sync_from_context)
+        self.ai_dock.set_target("agg_step2", force=True)
 
         self.sidebar_nav.setCurrentRow(0)
 

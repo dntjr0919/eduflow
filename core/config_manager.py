@@ -51,6 +51,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "last_tested_ok": False,
         "max_output_tokens": 2048,
         "thinking_budget_mode": "low",    # "off"(추론 끄기), "low"(최소 추론 - 채점/세특 권장), "auto"(모델 기본값)
+        "custom_web_selectors": {},       # 도메인별 학습된 커스텀 웹 AI 입력창 CSS 셀렉터 캐시
         # Google Sheets & 카카오톡 외부 연동 설정
         "google_credentials_path": "",
         "google_sheet_url": "",
@@ -64,6 +65,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "show_tray_notifications": True,
         "confirm_before_exit": False,
         "log_retention_days": 30
+    },
+    "shortcuts": {
+        "toggle_ai_dock": "Ctrl+Shift+A",
+        "toggle_left_sidebar": "Ctrl+B",
+        "toggle_ai_target_lock": "Ctrl+Shift+L",
+        "switch_ai_mode_api": "Ctrl+1",
+        "switch_ai_mode_manual": "Ctrl+2",
+        "switch_ai_mode_playwright": "Ctrl+3",
+        "toggle_log_drawer": "Ctrl+`"
     }
 }
 

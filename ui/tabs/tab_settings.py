@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PyQt6.QtCore import QEvent, QObject, Qt
+from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -28,6 +29,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QKeySequenceEdit,
     QLabel,
     QLineEdit,
     QListView,
@@ -45,7 +47,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.base_worker import FunctionWorker, TaskRunner
-from core.config_manager import ConfigManager
+from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
 from services.llm_client import (
     MultiLlmClient,
@@ -74,7 +76,7 @@ from ui.utils import (
 SETTINGS_ACCORDION_EXCLUSIVE = True
 
 INPUT_FIELD_STYLE = """
-QLineEdit, QComboBox, QSpinBox {
+QLineEdit, QComboBox, QSpinBox, QKeySequenceEdit {
     min-height: 34px;
     height: 34px;
     font-size: 13px;
@@ -84,11 +86,18 @@ QLineEdit, QComboBox, QSpinBox {
     background-color: #FFFFFF;
     color: #0F172A;
 }
+QKeySequenceEdit QLineEdit {
+    border: none;
+    background: transparent;
+    padding: 0px;
+    min-height: 0px;
+    height: auto;
+}
 QComboBox {
     padding: 2px 30px 2px 10px;
     color: #101828;
 }
-QLineEdit:focus, QComboBox:focus, QSpinBox:focus {
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QKeySequenceEdit:focus {
     border: 1.5px solid #4F46E5;
     background-color: #FFFFFF;
 }
@@ -163,6 +172,38 @@ PROVIDER_DEFAULT_BASE_URLS: Dict[str, str] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "ollama": "http://localhost:11434",
 }
+
+SHORTCUT_DEFINITIONS: List[tuple[str, str, str]] = [
+    ("toggle_ai_dock", "AI 실행 패널 열기/닫기", "Ctrl+Shift+A"),
+    ("toggle_left_sidebar", "좌측 사이드바 접기/펼치기", "Ctrl+B"),
+    ("toggle_ai_target_lock", "AI 대상 고정(Lock) 토글", "Ctrl+Shift+L"),
+    ("switch_ai_mode_api", "AI 모드: API 모드로 전환", "Ctrl+1"),
+    ("switch_ai_mode_manual", "AI 모드: 수동 복붙으로 전환", "Ctrl+2"),
+    ("switch_ai_mode_playwright", "AI 모드: Playwright 자동으로 전환", "Ctrl+3"),
+    ("toggle_log_drawer", "하단 로그 콘솔 서랍 열기/닫기", "Ctrl+`"),
+]
+
+FORBIDDEN_SHORTCUT_KEYS = {
+    "CTRL+C",
+    "CTRL+V",
+    "CTRL+X",
+    "CTRL+A",
+    "CTRL+Z",
+    "CTRL+Y",
+    "RETURN",
+    "ENTER",
+    "TAB",
+    "BACKTAB",
+    "SHIFT+TAB",
+    "BACKSPACE",
+    "DEL",
+    "DELETE",
+    "ESC",
+    "ESCAPE",
+    "SPACE",
+}
+
+ALLOWED_BARE_FUNCTION_KEYS = {f"F{i}" for i in range(1, 13)}
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -666,6 +707,77 @@ class SettingsTab(QWidget):
         scroll_layout.addWidget(self.ext_group)
         self.settings_accordion.add_card(self.ext_group)
 
+        # ---------------------------------------------------------------------
+        # 4. 단축키 설정 (기본 접힘)
+        # ---------------------------------------------------------------------
+        self.shortcut_edits: Dict[str, QKeySequenceEdit] = {}
+        self._last_valid_shortcuts: Dict[str, str] = {}
+        self._explicit_clear_key: Optional[str] = None
+
+        self.shortcut_group = AccordionCard(
+            "단축키 설정 (Shortcuts)", parent=scroll_container, is_expanded=False
+        )
+        self.shortcut_group.setObjectName("ShortcutSettingsGroup")
+
+        shortcut_form = build_settings_form()
+        for key, label_text, default_seq in SHORTCUT_DEFINITIONS:
+            row_container = QWidget()
+            row_container.setMinimumHeight(38)
+            row_lay = QHBoxLayout(row_container)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            row_lay.setSpacing(8)
+
+            ks_edit = QKeySequenceEdit(QKeySequence(default_seq))
+            configure_input_widget(ks_edit)
+            if hasattr(ks_edit, "setMaximumSequenceLength"):
+                ks_edit.setMaximumSequenceLength(1)
+            ks_edit.keySequenceChanged.connect(
+                lambda seq, k=key: self._on_shortcut_key_changed(k, seq)
+            )
+            ks_edit.editingFinished.connect(
+                lambda k=key: self._on_shortcut_editing_finished(k)
+            )
+
+            btn_clear = QPushButton("지우기")
+            apply_qss_role(btn_clear, role="outline")
+            btn_clear.setMinimumHeight(34)
+            btn_clear.setFixedWidth(68)
+            btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_clear.setToolTip(f"{label_text} 단축키를 비웁니다.")
+            btn_clear.clicked.connect(lambda _chk=False, k=key: self._on_clear_shortcut(k))
+
+            row_lay.addWidget(ks_edit, stretch=1)
+            row_lay.addWidget(btn_clear)
+            shortcut_form.addRow(f"{label_text}:", row_container)
+
+            self.shortcut_edits[key] = ks_edit
+            self._last_valid_shortcuts[key] = default_seq
+
+        self.shortcut_group.add_layout(shortcut_form)
+
+        shortcut_footer = QHBoxLayout()
+        shortcut_footer.setContentsMargins(16, 4, 16, 8)
+        shortcut_footer.setSpacing(10)
+
+        self.lbl_shortcut_status = QLabel(
+            "입력칸을 클릭한 뒤 원하는 키 조합을 누르면 즉시 검증·적용됩니다. (기본 편집 키 및 중복 키 자동 차단)"
+        )
+        apply_qss_role(self.lbl_shortcut_status, role="mutedText", obj_name="ShortcutStatusLabel")
+        self.lbl_shortcut_status.setWordWrap(True)
+
+        self.btn_reset_shortcuts = QPushButton("단축키 기본값 복원")
+        apply_qss_role(self.btn_reset_shortcuts, role="secondary", obj_name="BtnResetShortcuts")
+        self.btn_reset_shortcuts.setMinimumHeight(36)
+        self.btn_reset_shortcuts.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_reset_shortcuts.clicked.connect(self._on_reset_shortcuts_to_default)
+
+        shortcut_footer.addWidget(self.lbl_shortcut_status, stretch=1)
+        shortcut_footer.addWidget(self.btn_reset_shortcuts)
+        self.shortcut_group.body_layout().addLayout(shortcut_footer)
+
+        scroll_layout.addWidget(self.shortcut_group)
+        self.settings_accordion.add_card(self.shortcut_group)
+
         # 펼침 애니메이션 완료 시 해당 카드가 스크롤 영역 안에 보이도록 자동 스크롤
         for card in self.settings_accordion.cards():
             card.animation_finished.connect(
@@ -1085,6 +1197,138 @@ class SettingsTab(QWidget):
         dlg.exec()
 
     # =========================================================================
+    # 단축키 검증 및 실시간 저장 핸들러
+    # =========================================================================
+    @staticmethod
+    def _normalize_key_sequence(seq: QKeySequence) -> str:
+        if seq.isEmpty():
+            return ""
+        first_chord = QKeySequence(seq[0]) if seq.count() > 1 else seq
+        return first_chord.toString(QKeySequence.SequenceFormat.PortableText).strip()
+
+    def _validate_shortcut_sequence(self, action_key: str, canonical: str) -> tuple[bool, str]:
+        if not canonical:
+            return True, ""
+
+        upper = canonical.upper().replace(" ", "")
+        parts = [p for p in upper.split("+") if p]
+        base_key = parts[-1] if parts else upper
+
+        if upper in FORBIDDEN_SHORTCUT_KEYS or base_key in {
+            "RETURN",
+            "ENTER",
+            "TAB",
+            "BACKTAB",
+            "BACKSPACE",
+            "DEL",
+            "DELETE",
+            "ESC",
+            "ESCAPE",
+            "SPACE",
+        }:
+            return (
+                False,
+                f"[차단됨] '{canonical}' 키는 기본 편집·탐색 보호를 위해 단축키로 지정할 수 없습니다.",
+            )
+
+        has_ctrl_or_alt = ("CTRL" in parts) or ("ALT" in parts) or ("META" in parts)
+        if not has_ctrl_or_alt and base_key not in ALLOWED_BARE_FUNCTION_KEYS:
+            return (
+                False,
+                f"[차단됨] 단일 문자/숫자 또는 Shift 단독 키('{canonical}')는 입력창 오작동 방지를 위해 지정할 수 없습니다. Ctrl 또는 Alt 조합을 사용하세요.",
+            )
+
+        label_map = {k: lbl for k, lbl, _ in SHORTCUT_DEFINITIONS}
+        for other_key, other_seq in self._last_valid_shortcuts.items():
+            if other_key != action_key and other_seq and other_seq.upper() == canonical.upper():
+                other_label = label_map.get(other_key, other_key)
+                return (
+                    False,
+                    f"[중복 차단] '{canonical}' 단축키는 이미 [{other_label}] 기능에 할당되어 있습니다.",
+                )
+
+        return True, ""
+
+    def _on_shortcut_key_changed(self, action_key: str, seq: QKeySequence) -> None:
+        if self._loading_ui:
+            return
+        ks_edit = self.shortcut_edits.get(action_key)
+        if ks_edit is None:
+            return
+
+        canonical = self._normalize_key_sequence(seq)
+        if not canonical and self._explicit_clear_key != action_key:
+            # Qt QKeySequenceEdit는 새 키 입력 시작 시 일시적으로 빈 시퀀스("")를 먼저 방출하므로 무시
+            return
+
+        ok, err_msg = self._validate_shortcut_sequence(action_key, canonical)
+        if not ok:
+            prev_val = self._last_valid_shortcuts.get(action_key, "")
+            ks_edit.blockSignals(True)
+            ks_edit.setKeySequence(QKeySequence(prev_val))
+            ks_edit.blockSignals(False)
+            self.lbl_shortcut_status.setStyleSheet("color: #DC2626; font-weight: 600; font-size: 12px;")
+            self.lbl_shortcut_status.setText(err_msg)
+            return
+
+        current_str = ks_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText).strip()
+        if current_str != canonical:
+            ks_edit.blockSignals(True)
+            ks_edit.setKeySequence(QKeySequence(canonical))
+            ks_edit.blockSignals(False)
+
+        self._last_valid_shortcuts[action_key] = canonical
+        self.config.update_section("shortcuts", dict(self._last_valid_shortcuts), auto_save=True)
+
+        label_map = {k: lbl for k, lbl, _ in SHORTCUT_DEFINITIONS}
+        label_disp = label_map.get(action_key, action_key)
+        self.lbl_shortcut_status.setStyleSheet("color: #15803D; font-weight: 600; font-size: 12px;")
+        self.lbl_shortcut_status.setText(
+            f"[적용됨] [{label_disp}] 단축키가 '{canonical or '해제됨'}'(으)로 즉시 반영되었습니다."
+        )
+
+    def _on_shortcut_editing_finished(self, action_key: str) -> None:
+        if self._loading_ui or self._explicit_clear_key == action_key:
+            return
+        ks_edit = self.shortcut_edits.get(action_key)
+        if ks_edit is None:
+            return
+        if ks_edit.keySequence().isEmpty():
+            prev_val = self._last_valid_shortcuts.get(action_key, "")
+            if prev_val:
+                ks_edit.blockSignals(True)
+                ks_edit.setKeySequence(QKeySequence(prev_val))
+                ks_edit.blockSignals(False)
+
+    def _on_clear_shortcut(self, action_key: str) -> None:
+        ks_edit = self.shortcut_edits.get(action_key)
+        if ks_edit is None:
+            return
+        self._explicit_clear_key = action_key
+        try:
+            ks_edit.setKeySequence(QKeySequence())
+            if self._last_valid_shortcuts.get(action_key, "") != "":
+                self._on_shortcut_key_changed(action_key, QKeySequence())
+        finally:
+            self._explicit_clear_key = None
+
+    def _on_reset_shortcuts_to_default(self) -> None:
+        defaults = dict(DEFAULT_CONFIG.get("shortcuts", {}))
+        self._loading_ui = True
+        try:
+            for key, default_seq in defaults.items():
+                ks_edit = self.shortcut_edits.get(key)
+                if ks_edit is not None:
+                    ks_edit.setKeySequence(QKeySequence(default_seq))
+                self._last_valid_shortcuts[key] = default_seq
+        finally:
+            self._loading_ui = False
+
+        self.config.update_section("shortcuts", dict(defaults), auto_save=True)
+        self.lbl_shortcut_status.setStyleSheet("color: #1D4ED8; font-weight: 600; font-size: 12px;")
+        self.lbl_shortcut_status.setText("모든 단축키가 기본값으로 복원되어 즉시 적용되었습니다.")
+
+    # =========================================================================
     # 설정 불러오기 및 전체 저장
     # =========================================================================
     def load_settings_to_ui(self) -> None:
@@ -1094,6 +1338,7 @@ class SettingsTab(QWidget):
             fs = self.config.get_section("file_sorter")
             api = self.config.get_section("api_and_integrations")
             sys_sec = self.config.get_section("system")
+            sc_sec = self.config.get_section("shortcuts")
 
             # 1) AI 및 프롬프트 설정 로드
             self.chk_manual_prompt_mode.setChecked(
@@ -1165,6 +1410,20 @@ class SettingsTab(QWidget):
             self.chk_tray_notify.setChecked(
                 bool(sys_sec.get("show_tray_notifications", True))
             )
+
+            # 4) 단축키 설정 로드
+            default_shortcuts = DEFAULT_CONFIG.get("shortcuts", {})
+            for key, _lbl, fallback_seq in SHORTCUT_DEFINITIONS:
+                raw_seq = (
+                    sc_sec.get(key)
+                    if isinstance(sc_sec, dict) and key in sc_sec
+                    else default_shortcuts.get(key, fallback_seq)
+                )
+                seq_str = str(raw_seq or "").strip()
+                self._last_valid_shortcuts[key] = seq_str
+                ks_edit = self.shortcut_edits.get(key)
+                if ks_edit is not None:
+                    ks_edit.setKeySequence(QKeySequence(seq_str))
         finally:
             self._loading_ui = False
         self._update_provider_field_states()
@@ -1199,6 +1458,11 @@ class SettingsTab(QWidget):
                 "kakao_target_room_name": self.edit_kakao_room.text().strip(),
                 "kakao_webhook_url": self.edit_kakao_webhook.text().strip(),
             },
+            auto_save=False,
+        )
+        self.config.update_section(
+            "shortcuts",
+            dict(self._last_valid_shortcuts),
             auto_save=False,
         )
         self.config.update_section(

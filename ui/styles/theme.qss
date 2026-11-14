@@ -1098,3 +1098,247 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
     background: none;
 }
+
+/* ----------------------------------------------------------------------------
+   12. Right AI Execution Dock (3-Column Slate Workstation) & Target Highlights
+   ---------------------------------------------------------------------------- */
+QPushButton#AiDockToggleBtn {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    border-radius: 7px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+QPushButton#AiDockToggleBtn:hover {
+    background-color: #EEF3FD;
+    border-color: #2563EB;
+    color: #004AC6;
+}
+
+QPushButton#AiDockToggleBtn:checked {
+    background-color: #004AC6;
+    color: #FFFFFF;
+    border: 1px solid #003EA8;
+}
+
+QFrame#AiExecutionDock,
+QFrame#AiDockPanelRoot {
+    background-color: #FFFFFF;
+    border-left: 1px solid #E2E8F0;
+}
+
+QFrame#AiDockTargetHeader {
+    background-color: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 9px;
+}
+
+QLabel[role="dockSectionLabel"] {
+    color: #004AC6;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+}
+
+QLabel#ActiveTargetDisplayBox {
+    background-color: #EEF3FD;
+    color: #0F172A;
+    border: 1px solid #C7D7F5;
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+QPushButton[role="lockToggleBtn"] {
+    background-color: #FFFFFF;
+    color: #475569;
+    border: 1px solid #CBD5E1;
+    border-radius: 5px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+QPushButton[role="lockToggleBtn"]:hover {
+    border-color: #2563EB;
+    color: #004AC6;
+}
+
+QPushButton[role="lockToggleBtn"]:checked {
+    background-color: #FEF3C7;
+    color: #92400E;
+    border: 1px solid #F59E0B;
+}
+
+QFrame#AiDockSegmentFrame {
+    background-color: #F1F5F9;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+}
+
+QPushButton[role="segmentBtn"] {
+    background-color: transparent;
+    color: #475569;
+    border: none;
+    border-radius: 6px;
+    padding: 0px 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    min-height: 32px;
+    max-height: 32px;
+}
+
+QPushButton[role="segmentBtn"]:hover {
+    color: #0F172A;
+    background-color: #E2E8F0;
+}
+
+QPushButton[role="segmentBtn"]:checked {
+    background-color: #004AC6;
+    color: #FFFFFF;
+    font-weight: 700;
+}
+
+QFrame[role="subCard"] {
+    background-color: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+}
+
+QLabel[role="statusBanner"] {
+    background-color: #EEF3FD;
+    color: #1E3A8A;
+    border: 1px solid #C7D7F5;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    font-weight: 600;
+}
+
+QPushButton[role="webAiChip"] {
+    background-color: #FFFFFF;
+    color: #334155;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 3px 6px;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+QPushButton[role="webAiChip"]:hover {
+    border-color: #2563EB;
+    color: #004AC6;
+}
+
+QPushButton[role="webAiChip"]:checked {
+    background-color: #2563EB;
+    color: #FFFFFF;
+    border: 1px solid #004AC6;
+}
+
+QFrame#AiDockFooter {
+    background-color: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+}
+
+HoverZoomCard[aiTargetSelected="true"],
+QFrame[role="hoverZoomCard"][aiTargetSelected="true"] {
+    border: 1.5px solid #2563EB;
+    background-color: #FFFFFF;
+}
+
+QLabel#AiTargetSelectedBadge {
+    background-color: #DBEAFE;
+    color: #1D4ED8;
+    border: 1px solid #93C5FD;
+    border-radius: 10px;
+    padding: 2px 9px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+/* 2단계 헤더 활성 모드 배지 & 아코디언 설명 패널 */
+QPushButton#AggModeBadge {
+    border-radius: 11px;
+    padding: 3px 11px;
+    font-size: 11px;
+    font-weight: 700;
+    min-height: 24px;
+    max-height: 26px;
+}
+
+QPushButton#AggModeBadge[aggMode="record"] {
+    background-color: #ECFDF5;
+    color: #047857;
+    border: 1px solid #6EE7B7;
+}
+
+QPushButton#AggModeBadge[aggMode="record"]:hover {
+    background-color: #D1FAE5;
+    color: #065F46;
+    border: 1px solid #34D399;
+}
+
+QPushButton#AggModeBadge[aggMode="record"]:checked {
+    background-color: #059669;
+    color: #FFFFFF;
+    border: 1px solid #047857;
+}
+
+QPushButton#AggModeBadge[aggMode="record"]:checked:hover {
+    background-color: #047857;
+    color: #FFFFFF;
+    border: 1px solid #065F46;
+}
+
+QPushButton#AggModeBadge[aggMode="grading"] {
+    background-color: #FEF3C7;
+    color: #B45309;
+    border: 1px solid #FCD34D;
+}
+
+QPushButton#AggModeBadge[aggMode="grading"]:hover {
+    background-color: #FDE68A;
+    color: #92400E;
+    border: 1px solid #F59E0B;
+}
+
+QPushButton#AggModeBadge[aggMode="grading"]:checked {
+    background-color: #D97706;
+    color: #FFFFFF;
+    border: 1px solid #B45309;
+}
+
+QPushButton#AggModeBadge[aggMode="grading"]:checked:hover {
+    background-color: #B45309;
+    color: #FFFFFF;
+    border: 1px solid #92400E;
+}
+
+QFrame#ModeExplainAccordion {
+    background-color: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 8px;
+}
+
+QLabel#ModeExplainSummaryLabel {
+    background-color: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: #0F172A;
+    font-size: 12px;
+}
+
+QLabel#ModeExplainRulesLabel {
+    background-color: transparent;
+    border: none;
+    padding: 2px 4px;
+    color: #334155;
+    font-size: 12px;
+}

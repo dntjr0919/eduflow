@@ -92,6 +92,7 @@ class BatchManualPromptDialog(QDialog):
         self.max_bytes = int(max_bytes)
         self._task_runner = task_runner if task_runner is not None else TaskRunner(self)
         self._active_worker: Optional[WebGeminiAutoWorker] = None
+        self._worker: Optional[WebGeminiAutoWorker] = None
 
         self.is_grading = bool(
             self.prompt_file is not None and "채점" in self.prompt_file.name
@@ -235,14 +236,25 @@ class BatchManualPromptDialog(QDialog):
         self.combo_web_provider.addItem("ChatGPT (웹)", "chatgpt")
         self.combo_web_provider.addItem("Claude (웹)", "claude")
 
-        self.chk_require_login = QCheckBox("로그인 상태 확인 후 실행 (구독 모델 사용)")
+        self.chk_require_login = QCheckBox("로그인 후 실행 (구독 모델 사용)")
         self.chk_require_login.setChecked(True)
         install_no_scroll_wheel_filter(self.chk_require_login)
+        self.chk_require_login.toggled.connect(self._on_require_login_toggled)
+
+        self.chk_use_temp_chat = QCheckBox("임시 채팅 모드 (대화 기록 미저장)")
+        self.chk_use_temp_chat.setChecked(True)
+        install_no_scroll_wheel_filter(self.chk_use_temp_chat)
 
         auto_opt_row.addWidget(lbl_provider)
         auto_opt_row.addWidget(self.combo_web_provider, stretch=1)
-        auto_opt_row.addWidget(self.chk_require_login)
         left_lay.addLayout(auto_opt_row)
+
+        auto_chk_row = QHBoxLayout()
+        auto_chk_row.setSpacing(12)
+        auto_chk_row.addWidget(self.chk_require_login)
+        auto_chk_row.addWidget(self.chk_use_temp_chat)
+        auto_chk_row.addStretch()
+        left_lay.addLayout(auto_chk_row)
 
         auto_btn_row = QHBoxLayout()
         auto_btn_row.setSpacing(8)
@@ -260,8 +272,16 @@ class BatchManualPromptDialog(QDialog):
         self.btn_stop_auto_gemini.setEnabled(False)
         self.btn_stop_auto_gemini.clicked.connect(self._on_stop_auto_gemini)
 
+        self.btn_confirm_login = QPushButton("✓ 로그인 완료 · 작업 시작")
+        apply_qss_role(self.btn_confirm_login, role="primary", obj_name="BtnConfirmWebLogin")
+        self.btn_confirm_login.setMinimumHeight(38)
+        self.btn_confirm_login.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_confirm_login.setEnabled(False)
+        self.btn_confirm_login.clicked.connect(self._on_confirm_login)
+
         auto_btn_row.addWidget(self.btn_auto_gemini, stretch=1)
         auto_btn_row.addWidget(self.btn_stop_auto_gemini)
+        auto_btn_row.addWidget(self.btn_confirm_login)
         left_lay.addLayout(auto_btn_row)
 
         splitter.addWidget(left_group)
@@ -658,12 +678,19 @@ class BatchManualPromptDialog(QDialog):
         url = PROVIDER_CONFIGS.get(provider_key, PROVIDER_CONFIGS["gemini"])["url"]
         webbrowser.open(url)
 
+    def _on_require_login_toggled(self, checked: bool) -> None:
+        is_idle = self._active_worker is None
+        self.chk_use_temp_chat.setEnabled(bool(checked) and is_idle)
+
     def _set_auto_running_state(self, running: bool) -> None:
         has_batches = len(self._batches) > 0
         self.btn_auto_gemini.setEnabled((not running) and has_batches)
         self.btn_stop_auto_gemini.setEnabled(running)
+        if not running:
+            self.btn_confirm_login.setEnabled(False)
         self.combo_web_provider.setEnabled(not running)
         self.chk_require_login.setEnabled(not running)
+        self.chk_use_temp_chat.setEnabled((not running) and self.chk_require_login.isChecked())
         self.btn_resplit.setEnabled(not running)
         self.spin_max_students.setEnabled(not running)
         self.spin_max_tokens.setEnabled(not running)
@@ -680,6 +707,7 @@ class BatchManualPromptDialog(QDialog):
 
         selected_provider = str(self.combo_web_provider.currentData() or "gemini")
         require_login = bool(self.chk_require_login.isChecked())
+        use_temp_chat = bool(require_login and self.chk_use_temp_chat.isChecked())
         provider_name = PROVIDER_CONFIGS.get(selected_provider, PROVIDER_CONFIGS["gemini"])["name"]
 
         worker = WebGeminiAutoWorker(
@@ -696,12 +724,16 @@ class BatchManualPromptDialog(QDialog):
             headless=False,
             provider=selected_provider,
             require_login=require_login,
+            use_temp_chat=use_temp_chat,
         )
         worker.signals.progress.connect(self._on_auto_progress)
         worker.signals.log.connect(self._on_auto_log)
         worker.batch_completed.connect(self._on_auto_batch_completed)
+        worker.waiting_for_login.connect(self._on_waiting_for_login)
 
         self._active_worker = worker
+        self._worker = worker
+        self.btn_confirm_login.setEnabled(False)
         self._set_auto_running_state(True)
         self.progress_auto.setValue(0)
         mode_str = "로그인 후 작업" if require_login else "비로그인 즉시 작업"
@@ -717,11 +749,28 @@ class BatchManualPromptDialog(QDialog):
             on_finished=self._on_auto_finished,
         )
 
+    def _on_waiting_for_login(self, provider_name: str = "") -> None:
+        self.btn_confirm_login.setEnabled(True)
+        apply_qss_role(self.btn_confirm_login, role="primary", obj_name="BtnConfirmWebLogin")
+        prefix = f"[{provider_name}] " if provider_name else ""
+        self.lbl_auto_status.setText(
+            f"[!] {prefix}브라우저 로그인 후 우측 '로그인 완료 · 작업 시작' 버튼을 클릭하세요."
+        )
+
+    def _on_confirm_login(self) -> None:
+        worker = self._worker or self._active_worker
+        if worker is not None:
+            worker.confirm_login()
+        self.btn_confirm_login.setEnabled(False)
+        self.lbl_auto_status.setText("▸ 로그인 확인 완료 — 배치 자동 실행을 즉시 시작합니다...")
+
     def _on_stop_auto_gemini(self) -> None:
-        if self._active_worker is not None:
-            self._active_worker.request_stop()
+        worker = self._worker or self._active_worker
+        if worker is not None:
+            worker.request_stop()
         self._task_runner.stop_task(self.TASK_AUTO_GEMINI)
         self.btn_stop_auto_gemini.setEnabled(False)
+        self.btn_confirm_login.setEnabled(False)
         self.lbl_auto_status.setText("[!] 자동 실행 중지 요청됨 (브라우저를 안전하게 닫는 중입니다...)")
 
     def _on_auto_progress(self, percent: int, message: str) -> None:
@@ -796,6 +845,7 @@ class BatchManualPromptDialog(QDialog):
 
     def _on_auto_finished(self) -> None:
         self._active_worker = None
+        self._worker = None
         self._set_auto_running_state(False)
         self._rebuild_batches(copy_first=False)
 

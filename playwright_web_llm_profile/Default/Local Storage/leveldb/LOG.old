@@ -1,0 +1,12 @@
+2026/11/14-14:48:50.733 7cfc Reusing MANIFEST C:\vibecoding_school\eduflow\playwright_web_llm_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/11/14-14:48:50.737 7cfc Recovering log #3
+2026/11/14-14:48:50.760 7cfc Reusing old log C:\vibecoding_school\eduflow\playwright_web_llm_profile\Default\Local Storage\leveldb/000003.log 
+2026/11/14-15:05:51.265 7190 Level-0 table #5: started
+2026/11/14-15:05:51.277 7190 Level-0 table #5: 26024 bytes OK
+2026/11/14-15:05:51.280 7190 Delete type=0 #3
+2026/11/14-15:17:51.304 7190 Level-0 table #7: started
+2026/11/14-15:17:51.319 7190 Level-0 table #7: 36026 bytes OK
+2026/11/14-15:17:51.322 7190 Delete type=0 #4
+2026/11/14-15:28:51.336 7190 Level-0 table #9: started
+2026/11/14-15:28:51.349 7190 Level-0 table #9: 36061 bytes OK
+2026/11/14-15:28:51.354 7190 Delete type=0 #6
