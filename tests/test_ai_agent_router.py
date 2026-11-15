@@ -10,6 +10,7 @@ from services.ai_agent_router import (
     MAX_PW_ATTACHMENTS,
     TOOL_REGISTRY,
     build_agent_system_prompt,
+    execute_action_tool,
     execute_read_only_tool,
     parse_agent_response,
     prepare_attachments_for_mode,
@@ -297,6 +298,313 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
             called_url = mock_get.call_args[0][0]
             self.assertTrue(called_url.startswith("https://script.google.com/"))
             self.assertIn("User-Agent", mock_get.call_args.kwargs["headers"])
+
+    def test_external_integration_action_tools(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        self.assertEqual(TOOL_REGISTRY["send_external_notification"]["kind"], "action")
+        self.assertEqual(TOOL_REGISTRY["push_comcigan_timetable"]["kind"], "action")
+
+        fake_notifier = MagicMock()
+        fake_notifier.notify.return_value = ["데스크톱 토스트 발송 완료", "웹훅(Webhook) 알림 전송 완료"]
+        with patch("services.ai_agent_router.NotificationService", return_value=fake_notifier):
+            res_noti = execute_action_tool(
+                "send_external_notification",
+                {"title": "긴급 공지", "message": "3교시 수업 장소 변경"},
+                db=self.db,
+                enabled_tools={"send_external_notification": True},
+            )
+            self.assertTrue(res_noti["ok"])
+            fake_notifier.notify.assert_called_once_with(
+                "긴급 공지", "3교시 수업 장소 변경", force_external=True
+            )
+
+        with patch(
+            "services.ai_agent_router.push_comcigan_changes",
+            return_value={"ok": True, "pushed": 1, "rows": [{"period": "2"}]},
+        ) as mock_push:
+            res_push = execute_action_tool(
+                "push_comcigan_timetable",
+                {
+                    "raw_data": "1-3 2교시 수학Ⅰ -> 영어 (한가인)",
+                    "target_date": "2026-11-16",
+                    "grade": "1",
+                    "class_no": "3",
+                },
+                db=self.db,
+                enabled_tools={"push_comcigan_timetable": True},
+            )
+            self.assertTrue(res_push["ok"])
+            self.assertIn("1건", res_push["summary"])
+            mock_push.assert_called_once_with(
+                raw_data="1-3 2교시 수학Ⅰ -> 영어 (한가인)",
+                target_date="2026-11-16",
+                grade="1",
+                class_no="3",
+            )
+
+    def test_enabled_agent_tools_filtering_and_custom_prompt_suffix(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        # 1) 명시적 인자로 도구 필터링 + 추가 지침 반영
+        filtered = build_agent_system_prompt(
+            enabled_tools={
+                "query_calendar_todos": True,
+                "send_external_notification": False,
+                "push_comcigan_timetable": False,
+            },
+            extra_prompt="교무실 보고체로 간결하게 작성하세요.",
+        )
+        self.assertIn("query_calendar_todos", filtered)
+        self.assertNotIn("send_external_notification", filtered)
+        self.assertNotIn("push_comcigan_timetable", filtered)
+        self.assertIn("[사용자 추가 지침]", filtered)
+        self.assertIn("교무실 보고체로 간결하게 작성하세요.", filtered)
+
+        # 2) 인자 생략 시 ConfigManager의 api_and_integrations 설정 자동 반영
+        fake_cfg = MagicMock()
+        fake_cfg.get_section.return_value = {
+            "enabled_agent_tools": {
+                "query_calendar_todos": False,
+                "send_external_notification": True,
+            },
+            "custom_agent_prompt_suffix": "일정 변경 시 사유를 꼭 확인하세요.",
+        }
+        with patch("services.ai_agent_router.ConfigManager", return_value=fake_cfg):
+            from_cfg = build_agent_system_prompt()
+            self.assertNotIn("query_calendar_todos", from_cfg)
+            self.assertIn("send_external_notification", from_cfg)
+            self.assertIn("[사용자 추가 지침]", from_cfg)
+            self.assertIn("일정 변경 시 사유를 꼭 확인하세요.", from_cfg)
+
+            # 비활성화된 도구는 parse_agent_response 및 실행 단계에서 모두 차단됨
+            blocked_parse = parse_agent_response(
+                '{"tool": "query_calendar_todos", "args": {}, "reply": "조회합니다."}'
+            )
+            self.assertFalse(blocked_parse["is_tool_call"])
+            self.assertIn("비활성화된 도구", blocked_parse["reply"])
+
+            blocked_read = execute_read_only_tool("query_calendar_todos", {}, db=self.db)
+            self.assertFalse(blocked_read["ok"])
+            self.assertIn("비활성화된 도구", blocked_read["summary"])
+
+        blocked_action = execute_action_tool(
+            "send_external_notification",
+            {"title": "알림", "message": "테스트"},
+            db=self.db,
+            enabled_tools={"send_external_notification": False},
+        )
+        self.assertFalse(blocked_action["ok"])
+        self.assertIn("비활성화된 도구", blocked_action["summary"])
+
+    def test_comcigan_html_parsing_and_auto_sync_tool(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        sample_html = """
+        <html><body>
+          <table>
+            <caption>1학년 3반 시간표</caption>
+            <tr>
+              <th>교시</th><th>월(11/16)</th><th>화(11/17)</th><th>수(11/18)</th>
+            </tr>
+            <tr>
+              <td>1교시</td>
+              <td>국어<br>김철수</td>
+              <td class="changed" style="background-color:#fee2e2;"><del>수학Ⅰ</del> 영어 (한가인)</td>
+              <td>과학 (이영희)</td>
+            </tr>
+            <tr>
+              <td>2교시</td>
+              <td>사회<br>박민수</td>
+              <td>음악 -> 미술 (최예술)</td>
+              <td>체육<br>정건강</td>
+            </tr>
+          </table>
+        </body></html>
+        """
+        base_rows, change_rows = ComciganPlaywrightFetcher.parse_html(
+            sample_html,
+            target_date="2026-11-16",
+        )
+        self.assertEqual(len(base_rows), 6)
+        self.assertEqual(base_rows[0]["grade"], "1")
+        self.assertEqual(base_rows[0]["class_no"], "3")
+        self.assertEqual(base_rows[0]["day_of_week"], "월")
+        self.assertEqual(base_rows[0]["period"], "1")
+        self.assertEqual(base_rows[0]["subject"], "국어")
+        self.assertEqual(base_rows[0]["teacher_name"], "김철수")
+
+        self.assertEqual(len(change_rows), 2)
+        self.assertEqual(change_rows[0]["original_subject"], "수학Ⅰ")
+        self.assertEqual(change_rows[0]["changed_subject"], "영어")
+        self.assertEqual(change_rows[0]["changed_teacher"], "한가인")
+        self.assertEqual(change_rows[1]["original_subject"], "음악")
+        self.assertEqual(change_rows[1]["changed_subject"], "미술")
+        self.assertEqual(change_rows[1]["changed_teacher"], "최예술")
+
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch.return_value = {
+            "ok": True,
+            "base_rows": base_rows,
+            "change_rows": change_rows,
+        }
+        fake_sync = MagicMock()
+        fake_sync.upsert_timetable_base.return_value = True
+        fake_sync.push_timetable_changes.return_value = True
+
+        sync_res = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            school_code="OO고",
+            target_date="2026-11-16",
+            sync_service=fake_sync,
+            fetcher=fake_fetcher,
+        )
+        self.assertTrue(sync_res["ok"])
+        self.assertEqual(sync_res["base_count"], 6)
+        self.assertEqual(sync_res["change_count"], 2)
+        fake_sync.upsert_timetable_base.assert_called_once_with(base_rows)
+        fake_sync.push_timetable_changes.assert_called_once_with(change_rows)
+
+        self.assertEqual(TOOL_REGISTRY["sync_comcigan_auto"]["kind"], "action")
+        with patch(
+            "services.ai_agent_router.sync_comcigan_from_web",
+            return_value={"ok": True, "base_count": 6, "change_count": 2},
+        ) as mock_auto:
+            tool_res = execute_action_tool(
+                "sync_comcigan_auto",
+                {"url": "http://comci.net:4082/st", "school_code": "OO고", "target_date": "2026-11-16"},
+                db=self.db,
+                enabled_tools={"sync_comcigan_auto": True},
+            )
+            self.assertTrue(tool_res["ok"])
+            self.assertIn("기본 6건, 변동 2건", tool_res["summary"])
+            mock_auto.assert_called_once()
+
+    def test_comcigan_teacher_personal_timetable_parsing_and_merge(self) -> None:
+        from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
+
+        teacher_html = """
+        <html><body>
+          <table>
+            <caption>홍길동 선생님 시간표</caption>
+            <tr>
+              <th>교시</th><th>월</th><th>화</th><th>수</th>
+            </tr>
+            <tr>
+              <td>1</td>
+              <td>2-1<br>수학Ⅰ</td>
+              <td></td>
+              <td>1학년 3반<br>수학Ⅰ</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td></td>
+              <td class="changed"><del>2-4 수학Ⅰ</del> 2-4 자습</td>
+              <td>3-2 수학Ⅱ</td>
+            </tr>
+          </table>
+        </body></html>
+        """
+        t_base, t_chg = ComciganPlaywrightFetcher.parse_html(
+            teacher_html,
+            target_date="2026-11-16",
+            teacher_name="홍길동",
+            mode="teacher",
+        )
+        self.assertEqual(len(t_base), 4)
+        self.assertEqual(t_base[0]["grade"], "2")
+        self.assertEqual(t_base[0]["class_no"], "1")
+        self.assertEqual(t_base[0]["subject"], "수학Ⅰ")
+        self.assertEqual(t_base[0]["teacher_name"], "홍길동")
+
+        self.assertEqual(t_base[1]["grade"], "1")
+        self.assertEqual(t_base[1]["class_no"], "3")
+        self.assertEqual(t_base[3]["grade"], "3")
+        self.assertEqual(t_base[3]["class_no"], "2")
+        self.assertEqual(t_base[3]["subject"], "수학Ⅱ")
+
+        self.assertEqual(len(t_chg), 1)
+        self.assertEqual(t_chg[0]["grade"], "2")
+        self.assertEqual(t_chg[0]["class_no"], "4")
+        self.assertEqual(t_chg[0]["original_subject"], "수학Ⅰ")
+        self.assertEqual(t_chg[0]["changed_subject"], "자습")
+        self.assertEqual(t_chg[0]["changed_teacher"], "홍길동")
+
+    def test_comcigan_weekday_date_mapping_and_unchanged_skip(self) -> None:
+        from unittest.mock import MagicMock
+        from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        week_html = """
+        <html><body>
+          <table>
+            <caption>1학년 2반 시간표</caption>
+            <tr>
+              <th>교시</th>
+              <th>월(11/16)</th>
+              <th>화 (11/17)</th>
+              <th>수요일</th>
+              <th>목<br>(11/19)</th>
+              <th>금 11/20</th>
+            </tr>
+            <tr>
+              <td>1교시</td>
+              <td class="changed"><del>국어</del> 영어</td>
+              <td class="changed"><del>수학</del> 과학</td>
+              <td class="changed"><del>사회</del> 역사</td>
+              <td class="changed"><del>음악</del> 미술</td>
+              <td class="changed"><del>체육</del> 진로</td>
+            </tr>
+          </table>
+        </body></html>
+        """
+        base_rows, change_rows = ComciganPlaywrightFetcher.parse_html(
+            week_html,
+            target_date="2026-11-18",
+        )
+        self.assertEqual([r["day_of_week"] for r in base_rows], ["월", "화", "수", "목", "금"])
+        self.assertEqual(
+            [r["date"] for r in change_rows],
+            ["2026-11-16", "2026-11-17", "2026-11-18", "2026-11-19", "2026-11-20"],
+        )
+
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch.return_value = {
+            "ok": True,
+            "base_rows": base_rows,
+            "change_rows": change_rows,
+        }
+        fake_sync = MagicMock()
+        fake_sync.upsert_timetable_base.return_value = True
+        fake_sync.push_timetable_changes.return_value = True
+
+        first = sync_comcigan_from_web(
+            url="http://comci.net:4082/th",
+            target_date="2026-11-18",
+            sync_service=fake_sync,
+            fetcher=fake_fetcher,
+            prev_snapshot_hash="",
+            skip_if_unchanged=True,
+        )
+        self.assertTrue(first["ok"])
+        self.assertFalse(first["skipped"])
+        self.assertEqual(fake_sync.upsert_timetable_base.call_count, 1)
+        self.assertEqual(fake_sync.push_timetable_changes.call_count, 1)
+
+        second = sync_comcigan_from_web(
+            url="http://comci.net:4082/th",
+            target_date="2026-11-18",
+            sync_service=fake_sync,
+            fetcher=fake_fetcher,
+            prev_snapshot_hash=first["snapshot_hash"],
+            skip_if_unchanged=True,
+        )
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["skipped"])
+        self.assertEqual(fake_sync.upsert_timetable_base.call_count, 1)
+        self.assertEqual(fake_sync.push_timetable_changes.call_count, 1)
 
 
 if __name__ == "__main__":

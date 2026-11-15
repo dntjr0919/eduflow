@@ -731,6 +731,8 @@ class CalendarTodoTab(QWidget):
         self.date_quick_due.setCalendarPopup(True)
         self.date_quick_due.setDisplayFormat("yyyy-MM-dd")
         self.date_quick_due.setDate(QDate.currentDate())
+        if self.date_quick_due.calendarWidget() is not None:
+            self.date_quick_due.calendarWidget().setMinimumSize(320, 260)
         self.date_quick_due.setStyleSheet(
             "QDateEdit { background-color: #FFFFFF; color: #0F172A; border: 1px solid #CBD5E1; "
             "border-radius: 6px; padding: 3px 10px; } "

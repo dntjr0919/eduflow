@@ -5,11 +5,14 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from core.config_manager import ConfigManager
 from core.database import DatabaseManager
 from services.excel_merger_service import merge_excel_assignments
 from services.file_sorter_service import BatchSortWorker, FileSorterService
 from services.llm_client import extract_json_from_llm_response
+from services.mobile_integration_worker import push_comcigan_changes, sync_comcigan_from_web
 from services.multi_doc_extractor_service import extract_raw_text_preview
+from services.notifier import NotificationService
 from services.record_generator_service import extract_text_from_xlsx
 
 MAX_PW_ATTACHMENTS = 10
@@ -132,11 +135,78 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
             "instruction": "처리 지시사항 (선택)",
         },
     },
+    "send_external_notification": {
+        "kind": "action",
+        "label": "외부 알림 발송",
+        "description": "데스크톱 토스트, PC 카카오톡 매크로 또는 웹훅으로 알림을 즉시 전송합니다.",
+        "args": {
+            "title": "알림 제목 (필수)",
+            "message": "알림 본문 내용 (필수)",
+        },
+    },
+    "push_comcigan_timetable": {
+        "kind": "action",
+        "label": "컴시간 시간표 변동 시트 반영",
+        "description": "컴시간 알리미 시간표 변동 내역을 파싱해 Google Sheets '시간표_변동' 시트로 전송합니다.",
+        "args": {
+            "raw_data": "변동 내역 텍스트 또는 JSON 문자열 (필수)",
+            "target_date": "대상 날짜 YYYY-MM-DD (선택, 기본 오늘)",
+            "grade": "기본 학년 (선택)",
+            "class_no": "기본 반 (선택)",
+        },
+    },
+    "sync_comcigan_auto": {
+        "kind": "action",
+        "label": "컴시간 웹 자동 파싱 및 시트 반영",
+        "description": "Playwright로 컴시간 알리미 웹 페이지에서 시간표를 자동 파싱해 Google Sheets(시간표_기본/시간표_변동)에 반영합니다.",
+        "args": {
+            "url": "컴시간 접속 URL (선택, 미지정 시 설정값 사용)",
+            "school_code": "학교코드 또는 학교명 (선택, 미지정 시 설정값 사용)",
+            "target_date": "대상 날짜 YYYY-MM-DD (선택, 기본 오늘)",
+            "headless": "백그라운드 헤드리스 실행 여부 (선택, 기본 true)",
+        },
+    },
 }
 
 
-def build_agent_system_prompt() -> str:
+def _get_agent_router_config() -> Tuple[Dict[str, bool], str]:
+    """ConfigManager에서 활성화된 도구 맵과 사용자 추가 시스템 프롬프트를 읽습니다."""
+    try:
+        sec = ConfigManager().get_section("api_and_integrations") or {}
+    except Exception:
+        sec = {}
+    raw_tools = sec.get("enabled_agent_tools")
+    enabled_map: Dict[str, bool] = {}
+    if isinstance(raw_tools, dict):
+        for k, v in raw_tools.items():
+            enabled_map[str(k)] = bool(v)
+    extra = str(sec.get("custom_agent_prompt_suffix", "") or "").strip()
+    return enabled_map, extra
+
+
+def is_tool_enabled(
+    tool_name: str,
+    enabled_tools: Optional[Dict[str, bool]] = None,
+) -> bool:
+    """도구가 TOOL_REGISTRY에 존재하며 활성화되어 있는지 확인합니다."""
+    if tool_name not in TOOL_REGISTRY:
+        return False
+    if enabled_tools is None:
+        enabled_tools, _ = _get_agent_router_config()
+    if not enabled_tools:
+        return True
+    return bool(enabled_tools.get(tool_name, True))
+
+
+def build_agent_system_prompt(
+    enabled_tools: Optional[Dict[str, bool]] = None,
+    extra_prompt: str = "",
+) -> str:
     """3모드(API/Playwright/수동) 공통 에이전트 도구 스키마 및 JSON 액션 규격 시스템 프롬프트를 생성합니다."""
+    cfg_tools, cfg_extra = _get_agent_router_config()
+    eff_tools = cfg_tools if enabled_tools is None else enabled_tools
+    eff_extra = str(extra_prompt or "").strip() or cfg_extra
+
     lines = [
         "당신은 교직 실무 어시스턴트 EduFlow 에이전트입니다.",
         "일반 질문에는 자연어로 답하고, 아래 EduFlow 내부 도구를 사용해야 할 때는 반드시 단일 JSON 블록으로 응답하세요.",
@@ -149,14 +219,26 @@ def build_agent_system_prompt() -> str:
         "",
         "[사용 가능한 도구 목록]",
     ]
+    enabled_count = 0
     for name, meta in TOOL_REGISTRY.items():
+        if not is_tool_enabled(name, eff_tools):
+            continue
+        enabled_count += 1
         kind_lbl = "조회형(즉시 자동 실행)" if meta["kind"] == "read" else "실행형(사용자 승인 후 실행)"
         args_desc = ", ".join(f"{k}: {v}" for k, v in (meta.get("args") or {}).items())
         lines.append(f"- {name} [{kind_lbl}]: {meta['description']} | args=({args_desc})")
+    if enabled_count == 0:
+        lines.append("- (현재 활성화된 내부 도구가 없습니다. 일반 대화로만 응답하세요.)")
+
+    if eff_extra:
+        lines.extend(["", "[사용자 추가 지침]", eff_extra])
     return "\n".join(lines)
 
 
-def parse_agent_response(raw_text: str) -> Dict[str, Any]:
+def parse_agent_response(
+    raw_text: str,
+    enabled_tools: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
     """LLM 응답 텍스트에서 도구 호출 JSON({tool, args, reply})을 파싱합니다."""
     txt = str(raw_text or "").strip()
     if not txt:
@@ -190,6 +272,16 @@ def parse_agent_response(raw_text: str) -> Dict[str, Any]:
 
     tool_name = str(parsed.get("tool", "") or "").strip()
     if tool_name and tool_name in TOOL_REGISTRY:
+        if not is_tool_enabled(tool_name, enabled_tools):
+            return {
+                "is_tool_call": False,
+                "tool_name": "",
+                "tool_kind": "",
+                "tool_label": "",
+                "args": {},
+                "reply": f"비활성화된 도구({tool_name})는 호출할 수 없습니다.",
+                "raw_text": txt,
+            }
         meta = TOOL_REGISTRY[tool_name]
         args = parsed.get("args")
         if not isinstance(args, dict):
@@ -324,8 +416,16 @@ def execute_read_only_tool(
     args: Dict[str, Any],
     db: Optional[DatabaseManager] = None,
     session_id: Optional[int] = None,
+    enabled_tools: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     """조회형(read-only) 도구를 즉시 실행하고 구조화된 결과를 반환합니다."""
+    if not is_tool_enabled(tool_name, enabled_tools):
+        return {
+            "ok": False,
+            "tool_name": tool_name,
+            "summary": f"비활성화된 도구입니다: {tool_name}",
+            "data": {},
+        }
     db_mgr = db or DatabaseManager()
     if tool_name == "query_calendar_todos":
         start_date = str(args.get("start_date", "") or "").strip() or None
@@ -435,8 +535,16 @@ def execute_action_tool(
     tool_name: str,
     args: Dict[str, Any],
     db: Optional[DatabaseManager] = None,
+    enabled_tools: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     """실행/변경형(action) 도구를 사용자 승인 후 실행합니다."""
+    if not is_tool_enabled(tool_name, enabled_tools):
+        return {
+            "ok": False,
+            "tool_name": tool_name,
+            "summary": f"비활성화된 도구입니다: {tool_name}",
+            "data": {},
+        }
     db_mgr = db or DatabaseManager()
     if tool_name == "add_calendar_todo":
         item_type = str(args.get("item_type", "todo") or "todo").strip().lower()
@@ -519,6 +627,90 @@ def execute_action_tool(
             "summary": f"대상 타겟 전환 준비 완료: {tid}",
             "data": {"target_id": tid, "instruction": instruction},
         }
+
+    if tool_name == "send_external_notification":
+        title = str(args.get("title", "") or "").strip() or "EduFlow 알림"
+        message = str(args.get("message", "") or "").strip()
+        if not message:
+            return {
+                "ok": False,
+                "tool_name": tool_name,
+                "summary": "알림 본문(message)이 비어 있습니다.",
+                "data": {},
+            }
+        results = NotificationService().notify(title, message, force_external=True)
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": f"외부 알림 발송 완료: {', '.join(results) if results else '기록됨'}",
+            "data": {"title": title, "message": message, "results": results},
+        }
+
+    if tool_name == "push_comcigan_timetable":
+        raw_data = args.get("raw_data", "")
+        target_date = str(args.get("target_date", "") or "").strip()
+        grade = str(args.get("grade", "") or "").strip()
+        class_no = str(args.get("class_no", "") or "").strip()
+        if not raw_data:
+            return {
+                "ok": False,
+                "tool_name": tool_name,
+                "summary": "전송할 시간표 변동 내역(raw_data)이 비어 있습니다.",
+                "data": {},
+            }
+        res = push_comcigan_changes(
+            raw_data=raw_data,
+            target_date=target_date,
+            grade=grade,
+            class_no=class_no,
+        )
+        ok = bool(res.get("ok"))
+        pushed = int(res.get("pushed", 0) or 0)
+        summary = (
+            f"컴시간 시간표 변동 {pushed}건 Google Sheets 반영 완료"
+            if ok
+            else str(res.get("error", "시간표 변동 시트 반영 실패"))
+        )
+        return {
+            "ok": ok,
+            "tool_name": tool_name,
+            "summary": summary,
+            "data": res,
+        }
+
+    if tool_name == "sync_comcigan_auto":
+        url = str(args.get("url", "") or "").strip()
+        school_code = str(args.get("school_code", "") or "").strip()
+        target_date = str(args.get("target_date", "") or "").strip()
+        headless = bool(args.get("headless", True))
+        try:
+            res = sync_comcigan_from_web(
+                url=url,
+                school_code=school_code,
+                target_date=target_date,
+                headless=headless,
+            )
+            ok = bool(res.get("ok"))
+            b_cnt = int(res.get("base_count", 0) or 0)
+            c_cnt = int(res.get("change_count", 0) or 0)
+            summary = (
+                f"컴시간 웹 자동 파싱 및 시트 반영 완료 (기본 {b_cnt}건, 변동 {c_cnt}건)"
+                if ok
+                else str(res.get("error", "컴시간 웹 자동 반영 실패"))
+            )
+            return {
+                "ok": ok,
+                "tool_name": tool_name,
+                "summary": summary,
+                "data": res,
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "tool_name": tool_name,
+                "summary": f"컴시간 웹 자동 파싱 오류: {exc}",
+                "data": {},
+            }
 
     return {
         "ok": False,

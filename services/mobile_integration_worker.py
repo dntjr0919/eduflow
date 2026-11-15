@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.request
@@ -17,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
 from services.excel_merger_service import merge_excel_assignments
 from services.file_sorter_service import BatchSortWorker, FileSorterService
 from services.google_sheets_sync_service import GoogleSheetsSyncService
@@ -121,6 +123,111 @@ def push_comcigan_changes(
         return {"ok": False, "pushed": 0, "error": "파싱된 시간표 변동 항목이 없습니다."}
     ok = svc.push_timetable_changes(rows)
     return {"ok": ok, "pushed": len(rows) if ok else 0, "rows": rows}
+
+
+def compute_comcigan_snapshot_hash(
+    base_rows: List[Dict[str, Any]],
+    change_rows: List[Dict[str, Any]],
+) -> str:
+    """파싱된 기본/변동 시간표 스냅샷의 결정적 SHA-256 해시를 계산합니다."""
+    payload = json.dumps(
+        {"base_rows": base_rows, "change_rows": change_rows},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def sync_comcigan_from_web(
+    url: str = "",
+    school_code: str = "",
+    target_date: str = "",
+    teacher_name: str = "",
+    target_grade: str = "",
+    target_class: str = "",
+    scope: str = "homeroom_and_teacher",
+    headless: bool = True,
+    sync_service: Optional[GoogleSheetsSyncService] = None,
+    fetcher: Optional[ComciganPlaywrightFetcher] = None,
+    prev_snapshot_hash: str = "",
+    skip_if_unchanged: bool = False,
+) -> Dict[str, Any]:
+    """Playwright로 컴시간 웹 시간표를 파싱한 뒤 시간표_기본 및 시간표_변동 시트로 반영합니다."""
+    cfg_sec = ConfigManager().get_section("api_and_integrations") or {}
+    eff_url = str(url or cfg_sec.get("comcigan_url", "") or "").strip()
+    eff_code = str(school_code or cfg_sec.get("comcigan_school_code", "") or "").strip()
+    eff_teacher = str(teacher_name or cfg_sec.get("comcigan_teacher_name", "") or "").strip()
+    eff_date = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()
+
+    if not eff_url and fetcher is None:
+        return {
+            "ok": False,
+            "skipped": False,
+            "changed": False,
+            "snapshot_hash": "",
+            "base_count": 0,
+            "class_base_count": 0,
+            "teacher_base_count": 0,
+            "change_count": 0,
+            "error": "컴시간 접속 URL이 설정되지 않았습니다.",
+        }
+
+    active_fetcher = fetcher or ComciganPlaywrightFetcher(
+        url=eff_url,
+        school_code=eff_code,
+        target_date=eff_date,
+        teacher_name=eff_teacher,
+        target_grade=str(target_grade or "").strip(),
+        target_class=str(target_class or "").strip(),
+        scope=scope,
+        headless=headless,
+    )
+    fetched = active_fetcher.fetch()
+    base_rows = list(fetched.get("base_rows") or [])
+    change_rows = list(fetched.get("change_rows") or [])
+    cls_cnt = int(fetched.get("class_base_count", len(base_rows)) or 0)
+    tch_cnt = int(fetched.get("teacher_base_count", 0) or 0)
+    snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows)
+
+    if skip_if_unchanged and prev_snapshot_hash and snap_hash == prev_snapshot_hash:
+        return {
+            "ok": True,
+            "skipped": True,
+            "changed": False,
+            "snapshot_hash": snap_hash,
+            "url": eff_url,
+            "school_code": eff_code,
+            "target_date": eff_date,
+            "base_count": len(base_rows),
+            "class_base_count": cls_cnt,
+            "teacher_base_count": tch_cnt,
+            "change_count": len(change_rows),
+            "base_pushed": 0,
+            "changes_pushed": 0,
+            "error": "",
+        }
+
+    svc = sync_service or GoogleSheetsSyncService()
+    base_ok = svc.upsert_timetable_base(base_rows) if base_rows else True
+    chg_ok = svc.push_timetable_changes(change_rows) if change_rows else True
+    ok = bool(base_ok and chg_ok)
+
+    return {
+        "ok": ok,
+        "skipped": False,
+        "changed": True,
+        "snapshot_hash": snap_hash,
+        "url": eff_url,
+        "school_code": eff_code,
+        "target_date": eff_date,
+        "base_count": len(base_rows),
+        "class_base_count": cls_cnt,
+        "teacher_base_count": tch_cnt,
+        "change_count": len(change_rows),
+        "base_pushed": len(base_rows) if base_ok else 0,
+        "changes_pushed": len(change_rows) if chg_ok else 0,
+        "error": "" if ok else "Google Sheets 시트 반영 중 일부 또는 전체가 실패했습니다.",
+    }
 
 
 def build_notice_extract_prompt(pdf_path: Path | str) -> str:

@@ -58,9 +58,29 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "google_apps_script_url": "",
         "google_sheet_poll_interval_sec": 30,
         "sync_on_startup": True,
+        "comcigan_url": "",
+        "comcigan_school_code": "",
+        "comcigan_teacher_name": "",
+        "comcigan_auto_sync_enabled": False,
+        "comcigan_auto_sync_interval_min": 30,
         "kakao_notify_mode": "toast_only",  # "toast_only", "pc_macro", "webhook"
         "kakao_target_room_name": "",
-        "kakao_webhook_url": ""
+        "kakao_webhook_url": "",
+        # AI 에이전트 도구 라우터 관리 설정
+        "enabled_agent_tools": {
+            "query_calendar_todos": True,
+            "query_class_roster": True,
+            "scan_folder_files": True,
+            "get_session_history": True,
+            "add_calendar_todo": True,
+            "sort_files_auto": True,
+            "merge_excel_assignments": True,
+            "process_hwpx_or_ocr": True,
+            "send_external_notification": True,
+            "push_comcigan_timetable": True,
+            "sync_comcigan_auto": True,
+        },
+        "custom_agent_prompt_suffix": ""
     },
     "system": {
         "minimize_to_tray_on_close": True,

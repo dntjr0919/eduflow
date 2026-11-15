@@ -10,17 +10,20 @@
 from datetime import datetime
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QDate, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
+    QDateEdit,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -32,9 +35,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.base_worker import PeriodicWorker, TaskRunner
+from core.base_worker import FunctionWorker, PeriodicWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from services.mobile_integration_worker import push_comcigan_changes, sync_comcigan_from_web
 from services.notifier import NotificationService
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.utils import install_no_scroll_wheel_filter
@@ -102,9 +106,14 @@ class NotificationCenterTab(QWidget):
         self.config = config or ConfigManager()
         self.notifier = notifier or NotificationService()
         self._watching_sheet = False
+        self._comcigan_sync_running = False
+        self._last_comcigan_snapshot_hash = ""
+        self._comcigan_timer = QTimer(self)
+        self._comcigan_timer.timeout.connect(self._on_comcigan_auto_timer_tick)
 
         self.new_sheet_row_signal.connect(self._on_new_sheet_row)
         self._init_ui()
+        self._sync_comcigan_timer_state()
         self._refresh_channel_status_chips()
         self.refresh_notifications_inbox()
         self.config.add_listener(lambda _cfg: self._refresh_channel_status_chips())
@@ -276,6 +285,171 @@ class NotificationCenterTab(QWidget):
         send_bar.addStretch()
         n_lay.addLayout(send_bar)
         layout.addWidget(self.notify_group)
+
+        # -----------------------------------------------------------------
+        # 3.2 컴시간 알리미 시간표 변동 반영 (Google Sheets Push) 카드
+        # -----------------------------------------------------------------
+        self.comcigan_group = HoverZoomCard(
+            title="컴시간 알리미 시간표 변동 반영 (Google Sheets Push)",
+            parent=container,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        apply_qss_role(self.comcigan_group, role="hoverZoomCard", obj_name="ComciganPushGroup")
+        c_lay = self.comcigan_group.body_layout()
+
+        # 자동 연동 설정 영역 (Playwright 웹 파싱)
+        auto_form = QFormLayout()
+        auto_form.setVerticalSpacing(10)
+        auto_form.setHorizontalSpacing(16)
+        auto_form.setContentsMargins(4, 4, 4, 4)
+
+        self.edit_comcigan_url = QLineEdit(
+            str(self.config.get("api_and_integrations", "comcigan_url", ""))
+        )
+        self.edit_comcigan_url.setMinimumHeight(34)
+        self.edit_comcigan_url.setPlaceholderText("예: http://comci.net:4082/st 또는 교사용/학생용 컴시간 URL")
+        self.edit_comcigan_url.textChanged.connect(self._on_comcigan_config_changed)
+        auto_form.addRow("컴시간 접속 URL:", self.edit_comcigan_url)
+
+        code_row = QHBoxLayout()
+        code_row.setSpacing(10)
+        self.edit_comcigan_school_code = QLineEdit(
+            str(self.config.get("api_and_integrations", "comcigan_school_code", ""))
+        )
+        self.edit_comcigan_school_code.setMinimumHeight(34)
+        self.edit_comcigan_school_code.setPlaceholderText("학교코드 또는 학교명 (예: OO고등학교)")
+        self.edit_comcigan_school_code.textChanged.connect(self._on_comcigan_config_changed)
+
+        self.btn_auto_sync_comcigan = QPushButton("🔄 컴시간 웹에서 자동 파싱 & 시트 반영")
+        apply_qss_role(self.btn_auto_sync_comcigan, role="primary", obj_name="BtnAutoSyncComcigan")
+        self.btn_auto_sync_comcigan.setMinimumHeight(34)
+        self.btn_auto_sync_comcigan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_auto_sync_comcigan.clicked.connect(self._on_auto_sync_comcigan_clicked)
+
+        code_row.addWidget(self.edit_comcigan_school_code, stretch=1)
+        code_row.addWidget(self.btn_auto_sync_comcigan)
+        auto_form.addRow("학교코드/학교명:", code_row)
+
+        teacher_scope_row = QHBoxLayout()
+        teacher_scope_row.setSpacing(10)
+        self.edit_comcigan_teacher_name = QLineEdit(
+            str(self.config.get("api_and_integrations", "comcigan_teacher_name", ""))
+        )
+        self.edit_comcigan_teacher_name.setMinimumHeight(34)
+        self.edit_comcigan_teacher_name.setPlaceholderText("내 교사명 (교사 개인 시간표 추출용, 예: 홍길동)")
+        self.edit_comcigan_teacher_name.textChanged.connect(self._on_comcigan_config_changed)
+
+        self.combo_comcigan_scope = QComboBox()
+        self.combo_comcigan_scope.setMinimumHeight(34)
+        self.combo_comcigan_scope.addItem("담임반 + 내 교사 시간표", "homeroom_and_teacher")
+        self.combo_comcigan_scope.addItem("전체 학급 + 내 교사 시간표", "all_classes_and_teacher")
+
+        teacher_scope_row.addWidget(self.edit_comcigan_teacher_name, stretch=1)
+        teacher_scope_row.addWidget(QLabel("수집 범위:"))
+        teacher_scope_row.addWidget(self.combo_comcigan_scope)
+        auto_form.addRow("교사명 및 수집 범위:", teacher_scope_row)
+
+        auto_timer_row = QHBoxLayout()
+        auto_timer_row.setSpacing(10)
+        self.chk_comcigan_auto_sync = QCheckBox("자동 주기 동기화")
+        self.chk_comcigan_auto_sync.setChecked(
+            bool(self.config.get("api_and_integrations", "comcigan_auto_sync_enabled", False))
+        )
+
+        self.combo_comcigan_interval = QComboBox()
+        self.combo_comcigan_interval.setMinimumHeight(34)
+        self.combo_comcigan_interval.addItem("10분마다", 10)
+        self.combo_comcigan_interval.addItem("30분마다", 30)
+        self.combo_comcigan_interval.addItem("1시간마다", 60)
+        self.combo_comcigan_interval.addItem("2시간마다", 120)
+        saved_interval = int(
+            self.config.get("api_and_integrations", "comcigan_auto_sync_interval_min", 30) or 30
+        )
+        i_idx = self.combo_comcigan_interval.findData(saved_interval)
+        self.combo_comcigan_interval.setCurrentIndex(i_idx if i_idx >= 0 else 1)
+
+        self.lbl_comcigan_auto_status = QLabel("마지막 확인: 대기 중")
+        apply_qss_role(self.lbl_comcigan_auto_status, role="mutedText")
+
+        self.chk_comcigan_auto_sync.stateChanged.connect(self._on_comcigan_config_changed)
+        self.combo_comcigan_interval.currentIndexChanged.connect(self._on_comcigan_config_changed)
+
+        auto_timer_row.addWidget(self.chk_comcigan_auto_sync)
+        auto_timer_row.addWidget(self.combo_comcigan_interval)
+        auto_timer_row.addWidget(self.lbl_comcigan_auto_status, stretch=1)
+        auto_form.addRow("백그라운드 주기 실행:", auto_timer_row)
+
+        c_lay.addLayout(auto_form)
+
+        c_divider = QFrame()
+        c_divider.setFrameShape(QFrame.Shape.HLine)
+        c_divider.setStyleSheet("color: #E2E8F0; margin: 4px 0;")
+        c_lay.addWidget(c_divider)
+
+        c_form = QFormLayout()
+        c_form.setVerticalSpacing(12)
+        c_form.setHorizontalSpacing(16)
+        c_form.setContentsMargins(4, 4, 4, 4)
+
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(10)
+
+        self.date_comcigan = QDateEdit()
+        self.date_comcigan.setCalendarPopup(True)
+        self.date_comcigan.setDisplayFormat("yyyy-MM-dd")
+        self.date_comcigan.setDate(QDate.currentDate())
+        self.date_comcigan.setMinimumHeight(34)
+        self.date_comcigan.setFixedWidth(140)
+        if self.date_comcigan.calendarWidget() is not None:
+            self.date_comcigan.calendarWidget().setMinimumSize(320, 260)
+
+        self.edit_comcigan_grade = QLineEdit()
+        self.edit_comcigan_grade.setMinimumHeight(34)
+        self.edit_comcigan_grade.setFixedWidth(90)
+        self.edit_comcigan_grade.setPlaceholderText("학년 (예: 1)")
+
+        self.edit_comcigan_class = QLineEdit()
+        self.edit_comcigan_class.setMinimumHeight(34)
+        self.edit_comcigan_class.setFixedWidth(90)
+        self.edit_comcigan_class.setPlaceholderText("반 (예: 3)")
+
+        meta_row.addWidget(self.date_comcigan)
+        meta_row.addWidget(QLabel("기본 학년:"))
+        meta_row.addWidget(self.edit_comcigan_grade)
+        meta_row.addWidget(QLabel("기본 반:"))
+        meta_row.addWidget(self.edit_comcigan_class)
+        meta_row.addStretch()
+        c_form.addRow("대상 날짜 및 학급:", meta_row)
+
+        self.txt_comcigan_payload = QTextEdit()
+        self.txt_comcigan_payload.setMinimumHeight(88)
+        self.txt_comcigan_payload.setPlaceholderText(
+            "변동 내역 텍스트 또는 JSON을 입력하세요.\n"
+            "예: 1-3 2교시 수학Ⅰ -> 영어 (한가인)\n"
+            '또는 [{"grade": "1", "class_no": "3", "period": 2, "original_subject": "수학Ⅰ", "changed_subject": "영어", "changed_teacher": "한가인"}]'
+        )
+        c_form.addRow("변동 내역 (텍스트/JSON):", self.txt_comcigan_payload)
+        c_lay.addLayout(c_form)
+
+        c_btn_row = QHBoxLayout()
+        c_btn_row.setSpacing(10)
+        self.btn_push_comcigan = QPushButton("시간표 변동 시트에 반영")
+        apply_qss_role(self.btn_push_comcigan, role="primary", obj_name="BtnPushComcigan")
+        self.btn_push_comcigan.setMinimumHeight(34)
+        self.btn_push_comcigan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_push_comcigan.clicked.connect(self._on_push_comcigan_clicked)
+
+        lbl_comcigan_hint = QLabel(
+            "Google Sheets '시간표_변동' 시트에 즉시 반영하며, 결과를 로그와 알림으로 기록합니다."
+        )
+        apply_qss_role(lbl_comcigan_hint, role="mutedText")
+
+        c_btn_row.addWidget(self.btn_push_comcigan)
+        c_btn_row.addWidget(lbl_comcigan_hint)
+        c_btn_row.addStretch()
+        c_lay.addLayout(c_btn_row)
+        layout.addWidget(self.comcigan_group)
 
         # -----------------------------------------------------------------
         # 3.5 외부 연동 및 알림 수신함 (Incoming Notifications & History)
@@ -493,6 +667,274 @@ class NotificationCenterTab(QWidget):
             f"[즉시 발송 | 채널: {ch_summary}] {title}: {body} -> {', '.join(results)}"
         )
         self.refresh_notifications_inbox()
+
+    def _on_push_comcigan_clicked(self) -> None:
+        raw_data = self.txt_comcigan_payload.toPlainText().strip()
+        if not raw_data:
+            QMessageBox.warning(
+                self,
+                "입력 확인",
+                "반영할 컴시간 시간표 변동 내역(텍스트 또는 JSON)을 입력해 주세요.",
+            )
+            self.txt_comcigan_payload.setFocus()
+            return
+
+        target_date = self.date_comcigan.date().toString("yyyy-MM-dd")
+        grade = self.edit_comcigan_grade.text().strip()
+        class_no = self.edit_comcigan_class.text().strip()
+
+        self.btn_push_comcigan.setEnabled(False)
+        self._append_log(
+            f"[컴시간 Push 시작] 날짜={target_date}, 기본={grade or '-'}학년 {class_no or '-'}반"
+        )
+
+        def _run_push(_worker: FunctionWorker) -> dict:
+            return push_comcigan_changes(
+                raw_data=raw_data,
+                target_date=target_date,
+                grade=grade,
+                class_no=class_no,
+            )
+
+        def _on_result(res: dict) -> None:
+            ok = bool((res or {}).get("ok"))
+            pushed = int((res or {}).get("pushed", 0) or 0)
+            if ok:
+                msg = f"{target_date} 시간표 변동 {pushed}건이 Google Sheets에 반영되었습니다."
+                self._append_log(f"[컴시간 Push 완료] {msg}")
+                self.notifier.notify("컴시간 시간표 변동 반영 완료", msg)
+                self.db.add_notification(
+                    title="컴시간 시간표 변동 반영 완료",
+                    message=msg,
+                    channel="google_sheets",
+                    sender="comcigan",
+                    is_read=1,
+                )
+                self.refresh_notifications_inbox()
+            else:
+                err_txt = str((res or {}).get("error") or "Google Sheets 반영에 실패했습니다.")
+                self._append_log(f"[컴시간 Push 실패] {err_txt}")
+                self.notifier.notify("컴시간 시간표 변동 반영 실패", err_txt)
+
+        def _on_error(err: str) -> None:
+            first_line = (err or "").strip().splitlines()[0] if err else "알 수 없는 오류"
+            self._append_log(f"[컴시간 Push 오류] {first_line}")
+            self.notifier.notify("컴시간 시간표 변동 반영 오류", first_line)
+
+        worker = FunctionWorker("컴시간 시간표 변동 시트 반영", _run_push)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="comcigan_timetable_push",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=lambda: self.btn_push_comcigan.setEnabled(True),
+        )
+
+    def _on_comcigan_config_changed(self) -> None:
+        self.config.update_section(
+            "api_and_integrations",
+            {
+                "comcigan_url": self.edit_comcigan_url.text().strip(),
+                "comcigan_school_code": self.edit_comcigan_school_code.text().strip(),
+                "comcigan_teacher_name": self.edit_comcigan_teacher_name.text().strip(),
+                "comcigan_auto_sync_enabled": self.chk_comcigan_auto_sync.isChecked(),
+                "comcigan_auto_sync_interval_min": int(
+                    self.combo_comcigan_interval.currentData() or 30
+                ),
+            },
+            auto_save=True,
+        )
+        self._sync_comcigan_timer_state()
+
+    def _sync_comcigan_timer_state(self) -> None:
+        enabled = self.chk_comcigan_auto_sync.isChecked()
+        interval_min = int(self.combo_comcigan_interval.currentData() or 30)
+        if enabled:
+            self._comcigan_timer.start(interval_min * 60 * 1000)
+            self.lbl_comcigan_auto_status.setText(f"자동 주기 동기화 활성 ({interval_min}분마다)")
+        else:
+            self._comcigan_timer.stop()
+            self.lbl_comcigan_auto_status.setText("마지막 확인: 자동 동기화 꺼짐")
+
+    def _on_comcigan_auto_timer_tick(self) -> None:
+        if self._comcigan_sync_running:
+            return
+        url = self.edit_comcigan_url.text().strip()
+        if not url:
+            self.lbl_comcigan_auto_status.setText("마지막 확인: URL 미입력으로 건너뜀")
+            return
+
+        school_code = self.edit_comcigan_school_code.text().strip()
+        teacher_name = self.edit_comcigan_teacher_name.text().strip()
+        grade = self.edit_comcigan_grade.text().strip()
+        class_no = self.edit_comcigan_class.text().strip()
+        scope = str(self.combo_comcigan_scope.currentData() or "homeroom_and_teacher")
+        today_str = QDate.currentDate().toString("yyyy-MM-dd")
+
+        self._comcigan_sync_running = True
+        self.btn_auto_sync_comcigan.setEnabled(False)
+
+        def _run_periodic(_worker: FunctionWorker) -> dict:
+            return sync_comcigan_from_web(
+                url=url,
+                school_code=school_code,
+                target_date=today_str,
+                teacher_name=teacher_name,
+                target_grade=grade,
+                target_class=class_no,
+                scope=scope,
+                headless=True,
+                prev_snapshot_hash=self._last_comcigan_snapshot_hash,
+                skip_if_unchanged=True,
+            )
+
+        def _on_result(res: dict) -> None:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            snap_hash = str((res or {}).get("snapshot_hash", "") or "")
+            if snap_hash:
+                self._last_comcigan_snapshot_hash = snap_hash
+
+            if (res or {}).get("skipped"):
+                self._append_log("[INFO] 컴시간 주기 확인: 변경사항 없음")
+                self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (변경사항 없음)")
+                return
+
+            ok = bool((res or {}).get("ok"))
+            b_cnt = int((res or {}).get("base_count", 0) or 0)
+            cls_cnt = int((res or {}).get("class_base_count", b_cnt) or 0)
+            tch_cnt = int((res or {}).get("teacher_base_count", 0) or 0)
+            c_cnt = int((res or {}).get("change_count", 0) or 0)
+            if ok:
+                msg = (
+                    f"{today_str} 기본 시간표 {b_cnt}건(학급 {cls_cnt}건 + 교사 {tch_cnt}건), "
+                    f"변동 {c_cnt}건이 자동 반영되었습니다."
+                )
+                self._append_log(f"[컴시간 주기 자동 반영 완료] {msg}")
+                self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (변경 반영 완료)")
+                self.notifier.notify("컴시간 시간표 변경 감지 및 반영", msg)
+                self.db.add_notification(
+                    title="컴시간 시간표 변경 감지 및 반영",
+                    message=msg,
+                    channel="google_sheets",
+                    sender="comcigan_auto_timer",
+                    is_read=0,
+                )
+                self.refresh_notifications_inbox()
+                self.unread_changed.emit()
+            else:
+                err_txt = str((res or {}).get("error") or "컴시간 주기 동기화 실패")
+                self._append_log(f"[컴시간 주기 동기화 실패] {err_txt}")
+                self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (오류)")
+
+        def _on_error(err: str) -> None:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            first_line = (err or "").strip().splitlines()[0] if err else "알 수 없는 오류"
+            self._append_log(f"[컴시간 주기 동기화 오류] {first_line}")
+            self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (오류)")
+
+        def _on_finished() -> None:
+            self._comcigan_sync_running = False
+            self.btn_auto_sync_comcigan.setEnabled(True)
+
+        worker = FunctionWorker("컴시간 주기 자동 동기화", _run_periodic)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="comcigan_auto_sync",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
+        )
+
+    def _on_auto_sync_comcigan_clicked(self) -> None:
+        if self._comcigan_sync_running:
+            return
+        url = self.edit_comcigan_url.text().strip()
+        school_code = self.edit_comcigan_school_code.text().strip()
+        teacher_name = self.edit_comcigan_teacher_name.text().strip()
+        grade = self.edit_comcigan_grade.text().strip()
+        class_no = self.edit_comcigan_class.text().strip()
+        scope = str(self.combo_comcigan_scope.currentData() or "homeroom_and_teacher")
+        if not url:
+            QMessageBox.warning(
+                self,
+                "URL 확인",
+                "컴시간 접속 URL을 먼저 입력해 주세요.",
+            )
+            self.edit_comcigan_url.setFocus()
+            return
+
+        self._on_comcigan_config_changed()
+        target_date = self.date_comcigan.date().toString("yyyy-MM-dd")
+        self._comcigan_sync_running = True
+        self.btn_auto_sync_comcigan.setEnabled(False)
+        self._append_log(
+            f"[컴시간 웹 자동 파싱 시작] URL={url}, 학교={school_code or '(미지정)'}, "
+            f"교사={teacher_name or '(미지정)'}, 범위={scope}, 날짜={target_date}"
+        )
+
+        def _run_auto(_worker: FunctionWorker) -> dict:
+            return sync_comcigan_from_web(
+                url=url,
+                school_code=school_code,
+                target_date=target_date,
+                teacher_name=teacher_name,
+                target_grade=grade,
+                target_class=class_no,
+                scope=scope,
+                headless=True,
+            )
+
+        def _on_result(res: dict) -> None:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            snap_hash = str((res or {}).get("snapshot_hash", "") or "")
+            if snap_hash:
+                self._last_comcigan_snapshot_hash = snap_hash
+            ok = bool((res or {}).get("ok"))
+            b_cnt = int((res or {}).get("base_count", 0) or 0)
+            cls_cnt = int((res or {}).get("class_base_count", b_cnt) or 0)
+            tch_cnt = int((res or {}).get("teacher_base_count", 0) or 0)
+            c_cnt = int((res or {}).get("change_count", 0) or 0)
+            if ok:
+                msg = (
+                    f"{target_date} 기본 시간표 {b_cnt}건(학급 {cls_cnt}건 + 교사 {tch_cnt}건), "
+                    f"변동 {c_cnt}건이 Google Sheets에 반영되었습니다."
+                )
+                self._append_log(f"[컴시간 웹 자동 파싱 완료] {msg}")
+                self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (수동 반영 완료)")
+                self.notifier.notify("컴시간 웹 자동 파싱 완료", msg)
+                self.db.add_notification(
+                    title="컴시간 웹 자동 파싱 완료",
+                    message=msg,
+                    channel="google_sheets",
+                    sender="comcigan_playwright",
+                    is_read=1,
+                )
+                self.refresh_notifications_inbox()
+            else:
+                err_txt = str((res or {}).get("error") or "컴시간 웹 자동 반영에 실패했습니다.")
+                self._append_log(f"[컴시간 웹 자동 파싱 실패] {err_txt}")
+                self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (실패)")
+                self.notifier.notify("컴시간 웹 자동 파싱 실패", err_txt)
+
+        def _on_error(err: str) -> None:
+            now_str = datetime.now().strftime("%H:%M:%S")
+            first_line = (err or "").strip().splitlines()[0] if err else "알 수 없는 오류"
+            self._append_log(f"[컴시간 웹 자동 파싱 오류] {first_line} (디버그: logs/comcigan_debug.html 확인)")
+            self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (오류)")
+            self.notifier.notify("컴시간 웹 자동 파싱 오류", first_line)
+
+        def _on_finished() -> None:
+            self._comcigan_sync_running = False
+            self.btn_auto_sync_comcigan.setEnabled(True)
+
+        worker = FunctionWorker("컴시간 웹 자동 파싱 및 시트 반영", _run_auto)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="comcigan_auto_sync",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
+        )
 
     def refresh_notifications_inbox(self) -> None:
         """SQLite notifications 테이블을 읽어 수신함 테이블과 미확인 배지를 갱신합니다."""

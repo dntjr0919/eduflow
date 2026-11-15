@@ -220,6 +220,8 @@ class ScheduleItemDialog(QDialog):
         self.date_sch_start.setCalendarPopup(True)
         self.date_sch_start.setDisplayFormat("yyyy-MM-dd")
         self.date_sch_start.setStyleSheet(DATE_TIME_LIGHT_QSS)
+        if self.date_sch_start.calendarWidget() is not None:
+            self.date_sch_start.calendarWidget().setMinimumSize(320, 260)
         install_no_scroll_wheel_filter(self.date_sch_start)
 
         self.date_sch_end = QDateEdit()
@@ -227,6 +229,8 @@ class ScheduleItemDialog(QDialog):
         self.date_sch_end.setCalendarPopup(True)
         self.date_sch_end.setDisplayFormat("yyyy-MM-dd")
         self.date_sch_end.setStyleSheet(DATE_TIME_LIGHT_QSS)
+        if self.date_sch_end.calendarWidget() is not None:
+            self.date_sch_end.calendarWidget().setMinimumSize(320, 260)
         install_no_scroll_wheel_filter(self.date_sch_end)
 
         self.date_sch_start.dateChanged.connect(self._on_start_date_changed)
@@ -291,6 +295,8 @@ class ScheduleItemDialog(QDialog):
         self.date_todo_due.setCalendarPopup(True)
         self.date_todo_due.setDisplayFormat("yyyy-MM-dd")
         self.date_todo_due.setStyleSheet(DATE_TIME_LIGHT_QSS)
+        if self.date_todo_due.calendarWidget() is not None:
+            self.date_todo_due.calendarWidget().setMinimumSize(320, 260)
         install_no_scroll_wheel_filter(self.date_todo_due)
         self.chk_todo_has_due.toggled.connect(self.date_todo_due.setEnabled)
         due_row.addWidget(self.chk_todo_has_due)

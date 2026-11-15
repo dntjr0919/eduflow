@@ -508,6 +508,37 @@ class GoogleSheetsSyncService:
             self.db.add_log("WARN", "GoogleSheetsSync", f"시트 조회 실패 ({sheet_name}): {exc}")
             return []
 
+    def upsert_timetable_base(
+        self,
+        rows: List[Dict[str, Any]],
+        apps_script_url: str = "",
+        sheet_url: str = "",
+        timeout: float = 15.0,
+        api_secret: str = "",
+    ) -> bool:
+        """컴시간 알리미 등에서 파싱한 기본 시간표를 시간표_기본 시트로 Upsert합니다."""
+        gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
+        if not gas_url or not rows:
+            return False
+        try:
+            payload = self._with_api_secret(
+                {
+                    "action": "upsert_timetable_base",
+                    "sheetId": sheet_id,
+                    "rows": rows,
+                },
+                api_secret=api_secret,
+            )
+            res = _http_post_json(
+                gas_url,
+                payload,
+                timeout=timeout,
+            )
+            return bool(res.get("ok", True))
+        except Exception as exc:
+            self.db.add_log("WARN", "GoogleSheetsSync", f"기본 시간표 Upsert 실패: {exc}")
+            return False
+
     def push_timetable_changes(
         self,
         rows: List[Dict[str, Any]],

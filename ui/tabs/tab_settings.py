@@ -50,6 +50,7 @@ from PyQt6.QtWidgets import (
 from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
+from services.ai_agent_router import TOOL_REGISTRY
 from services.google_sheets_sync_service import (
     GoogleSheetsSyncService,
     GoogleSheetsSyncWorker,
@@ -619,6 +620,49 @@ class SettingsTab(QWidget):
         ai_btn_row.addWidget(self.btn_preview_manual)
         ai_btn_row.addStretch()
         ai_vbox.addLayout(ai_btn_row)
+
+        # (7) AI 에이전트 도구 라우터 관리
+        router_box = QFrame()
+        router_box.setObjectName("AiAgentRouterManageBox")
+        router_box.setStyleSheet(
+            "QFrame#AiAgentRouterManageBox { border-top: 1px solid #E2E8F0; margin-top: 8px; padding-top: 10px; }"
+        )
+        router_lay = QVBoxLayout(router_box)
+        router_lay.setContentsMargins(16, 12, 16, 8)
+        router_lay.setSpacing(8)
+
+        lbl_router_title = QLabel("AI 에이전트 도구 라우터 관리")
+        lbl_router_title.setStyleSheet("font-weight: 700; color: #0F172A; font-size: 13px;")
+        lbl_router_desc = QLabel(
+            "활성화한 도구만 AI 시스템 프롬프트에 포함되며, 비활성화된 도구는 호출이 차단됩니다."
+        )
+        lbl_router_desc.setStyleSheet("color: #64748B; font-size: 12px;")
+        router_lay.addWidget(lbl_router_title)
+        router_lay.addWidget(lbl_router_desc)
+
+        self.agent_tool_checks: Dict[str, QCheckBox] = {}
+        for tool_name, meta in TOOL_REGISTRY.items():
+            kind_tag = "[조회]" if meta.get("kind") == "read" else "[실행]"
+            t_label = str(meta.get("label", tool_name))
+            t_desc = str(meta.get("description", ""))
+            chk = QCheckBox(f"{kind_tag} {t_label} ({tool_name}) — {t_desc}")
+            chk.setChecked(True)
+            chk.stateChanged.connect(self._on_ai_setting_changed)
+            self.agent_tool_checks[tool_name] = chk
+            router_lay.addWidget(chk)
+
+        lbl_extra_prompt = QLabel("외부 LLM / API 전달 시 추가 시스템 프롬프트:")
+        lbl_extra_prompt.setStyleSheet("font-weight: 600; color: #334155; margin-top: 6px;")
+        self.edit_custom_agent_prompt = QPlainTextEdit()
+        self.edit_custom_agent_prompt.setFixedHeight(70)
+        self.edit_custom_agent_prompt.setPlaceholderText(
+            "예: 항상 간결한 교무실 실무 어조로 답하고, 일정 추가 전 날짜를 먼저 확인하세요."
+        )
+        self.edit_custom_agent_prompt.textChanged.connect(self._on_ai_setting_changed)
+        router_lay.addWidget(lbl_extra_prompt)
+        router_lay.addWidget(self.edit_custom_agent_prompt)
+
+        ai_vbox.addWidget(router_box)
 
         # 실시간 즉시 저장 시그널 연결
         self.chk_manual_prompt_mode.stateChanged.connect(self._on_ai_setting_changed)
@@ -1227,6 +1271,10 @@ class SettingsTab(QWidget):
             "ai_provider": prov_code,
             "max_output_tokens": int(self.spin_max_output_tokens.value()),
             "thinking_budget_mode": str(self.combo_thinking_budget.currentData() or "low"),
+            "enabled_agent_tools": {
+                t_name: chk.isChecked() for t_name, chk in self.agent_tool_checks.items()
+            },
+            "custom_agent_prompt_suffix": self.edit_custom_agent_prompt.toPlainText().strip(),
         }
         if prov_code == "gemini":
             updates["gemini_api_key"] = api_key
@@ -1496,6 +1544,16 @@ class SettingsTab(QWidget):
                 str(api.get("thinking_budget_mode", "low") or "low").strip().lower()
             )
             self.combo_thinking_budget.setCurrentIndex(t_idx if t_idx >= 0 else 0)
+
+            enabled_tools = api.get("enabled_agent_tools")
+            for t_name, chk in self.agent_tool_checks.items():
+                if isinstance(enabled_tools, dict):
+                    chk.setChecked(bool(enabled_tools.get(t_name, True)))
+                else:
+                    chk.setChecked(True)
+            self.edit_custom_agent_prompt.setPlainText(
+                str(api.get("custom_agent_prompt_suffix", "") or "")
+            )
 
             # 2) 폴더 및 감시 설정 로드
             self.edit_default_target.setText(fs.get("target_base_dir", ""))

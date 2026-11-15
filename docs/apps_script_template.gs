@@ -996,13 +996,38 @@ function doGet(e) {
       var subs = _readSheetAsObjects(ss.getSheetByName('Push_Subscriptions'), SHEET_SCHEMAS.Push_Subscriptions, tz);
       var filterRole = (params.target_role || '').toString().trim().toLowerCase();
       var filterIdsRaw = (params.target_student_ids || '').toString().trim();
-      var filterIds = filterIdsRaw ? filterIdsRaw.split(',').map(function (s) { return s.trim(); }).filter(Boolean) : [];
+      var filterIds = filterIdsRaw ? filterIdsRaw.split(',').map(function (s) { return String(s).trim(); }).filter(Boolean) : [];
+      var filterUserId = (params.target_user_id || '').toString().trim();
+      var filterEndpoint = (params.endpoint || '').toString().trim();
+
+      var parentToStudent = {};
+      var parentRows = _readSheetAsObjects(ss.getSheetByName('계정_학부모'), SHEET_SCHEMAS['계정_학부모'], tz);
+      for (var pi = 0; pi < parentRows.length; pi++) {
+        var pid = String(parentRows[pi].parent_id || '').trim();
+        var psid = String(parentRows[pi].student_id || '').trim();
+        if (pid && psid) parentToStudent[pid] = psid;
+      }
+
       var filteredSubs = subs.filter(function (sub) {
-        if (filterRole && filterRole !== 'all' && String(sub.role || '').toLowerCase() !== filterRole) {
+        var subRole = String(sub.role || '').trim().toLowerCase();
+        var subUserId = String(sub.user_id || '').trim();
+        var subEndpoint = String(sub.endpoint || '').trim();
+
+        if (filterEndpoint && subEndpoint !== filterEndpoint) {
           return false;
         }
-        if (filterIds.length > 0 && filterIds.indexOf('ALL') < 0) {
-          return filterIds.indexOf(String(sub.user_id || '').trim()) >= 0;
+        if (filterUserId) {
+          return subUserId === filterUserId;
+        }
+        if (filterRole && filterRole !== 'all' && subRole !== filterRole) {
+          return false;
+        }
+        if (filterIds.length > 0 && filterIds.indexOf('ALL') < 0 && filterIds.indexOf('all') < 0) {
+          if (filterIds.indexOf(subUserId) >= 0) return true;
+          if (subRole === 'parent' && parentToStudent[subUserId] && filterIds.indexOf(parentToStudent[subUserId]) >= 0) {
+            return true;
+          }
+          return false;
         }
         return true;
       });
@@ -1049,17 +1074,24 @@ function doGet(e) {
         });
       }
       if (role !== 'teacher') {
+        var normStudentId = String(studentId || '').trim();
+        var normGrade = String(grade || '').trim();
+        var normClassNo = String(classNo || '').trim();
         notificationsAll = notificationsAll.filter(function (n) {
-          var ch = (n.channel || '').toString().trim();
-          var tRole = (n.target_role || '').toString().trim().toLowerCase();
-          var tStu = (n.target_student_id || '').toString().trim();
+          var ch = String(n.channel === undefined || n.channel === null ? '' : n.channel).trim();
+          var tRole = String(n.target_role === undefined || n.target_role === null ? '' : n.target_role).trim().toLowerCase();
+          var tStu = String(n.target_student_id === undefined || n.target_student_id === null ? '' : n.target_student_id).trim();
+          var nGrade = String(n.grade === undefined || n.grade === null ? '' : n.grade).trim();
+          var nClass = String(n.class_no === undefined || n.class_no === null ? '' : n.class_no).trim();
+
           if (ch === 'mobile_attendance' || ch === 'mobile_chat') {
             if (tRole !== role) return false;
           }
-          var roleMatch = (tRole === role || tRole === 'all');
-          var stuMatch = (!studentId && tStu === 'ALL') || (tStu === studentId || tStu === 'ALL');
-          var classMatch = (!n.grade && !n.class_no) || (!grade && !classNo) ||
-            (String(n.grade) === grade && String(n.class_no) === classNo);
+          var roleMatch = (!tRole || tRole === role || tRole === 'all');
+          var isAllStu = (!tStu || tStu.toUpperCase() === 'ALL');
+          var stuMatch = isAllStu || (normStudentId !== '' && tStu === normStudentId);
+          var classMatch = (!nGrade && !nClass) || (!normGrade && !normClass) ||
+            (nGrade === normGrade && nClass === normClass);
           return roleMatch && stuMatch && classMatch;
         });
       }

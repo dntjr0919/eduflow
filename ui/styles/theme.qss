@@ -1602,6 +1602,22 @@ QCalendarWidget QAbstractItemView:enabled {
 QCalendarWidget QAbstractItemView:disabled {
     color: #94A3B8;
 }
+QCalendarWidget QTableView#qt_calendar_calendarview {
+    border: none;
+    border-radius: 0px;
+    gridline-color: #E2E8F0;
+}
+QCalendarWidget QTableView#qt_calendar_calendarview::item {
+    padding: 2px 4px;
+    border-bottom: none;
+}
+QCalendarWidget QHeaderView::section {
+    min-height: 24px;
+    height: 24px;
+    padding: 2px 4px;
+    font-size: 11px;
+    border-right: none;
+}
 
 /* ----------------------------------------------------------------------------
    13. Calendar & Todo Tab (Google Calendar & Tasks Style)
