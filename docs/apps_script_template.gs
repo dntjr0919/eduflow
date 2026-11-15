@@ -11,7 +11,9 @@
  * 1. 연동할 Google 스프레드시트를 열고 상단 메뉴 [확장 프로그램] -> [Apps Script] 클릭
  * 2. 기존 코드를 모두 지우고 이 파일 전체 내용을 붙여넣은 뒤 저장(Ctrl+S)
  * 3. 상단 함수 드롭다운에서 `initSheets` (또는 `seedSampleData`)를 선택해 [실행]하면
- *    데스크톱(Schedules/Tasks/Notifications) + 모바일 연동용 12개 시트 탭이 자동 생성됩니다.
+ *    데스크톱(Schedules/Tasks/Notifications) + 모바일 연동용 14개 시트 탭이 자동 생성됩니다.
+ *    (기존 Notifications 시트가 있다면 1행 맨 오른쪽에 target_role, target_student_id,
+ *     grade, class_no 헤더가 정상 추가되었는지 확인하세요.)
  * 4. [프로젝트 설정] -> [스크립트 속성]에 아래 속성을 등록하세요.
  *    - API_SECRET (강력 권장): 임의의 영문·숫자 비밀키 (Vercel `GAS_API_SECRET` 및
  *      PC EduFlow [Apps Script API Secret]과 동일한 값 입력 시 외부 직접 요청 차단)
@@ -20,9 +22,14 @@
  * 5. 우측 상단 [배포] -> [새 배포] -> 유형: [웹 앱] 선택 (업데이트 시 [배포 관리] -> [새 버전])
  *    - 다음 사용자 권한으로 실행: 나(Me)
  *    - 액세스 권한이 있는 사용자: 모든 사용자(Anyone)
- * 6. 생성된 웹 앱 URL(https://script.google.com/macros/s/.../exec)을 복사하여
- *    - PC EduFlow -> [환경설정 & 명렬표] -> [Apps Script 웹 앱 URL]에 입력
- *    - Vercel 대시보드 -> [Settings] -> [Environment Variables]의 `GAS_WEB_APP_URL`에 등록
+ * 6. Vercel 대시보드 -> [Settings] -> [Environment Variables]에 아래 환경변수를 등록 후 Redeploy:
+ *    - GAS_WEB_APP_URL: 생성된 웹 앱 URL (https://script.google.com/macros/s/.../exec)
+ *    - GAS_API_SECRET : 4번에서 설정한 API_SECRET과 동일한 값
+ *    - (Web Push OS 알림 사용 시) 터미널에서 `npx web-push generate-vapid-keys` 실행 후 추가:
+ *      · VAPID_PUBLIC_KEY  : 생성된 Public Key
+ *      · VAPID_PRIVATE_KEY : 생성된 Private Key
+ *      · VAPID_SUBJECT     : mailto:본인이메일@gmail.com
+ * 7. PC EduFlow -> [환경설정 & 명렬표] -> [Apps Script 웹 앱 URL] 및 [API Secret] 입력
  * ============================================================================
  */
 
@@ -61,7 +68,11 @@ var SHEET_SCHEMAS = {
     'title',
     'message',
     'created_at',
-    'is_read'
+    'is_read',
+    'target_role',
+    'target_student_id',
+    'grade',
+    'class_no'
   ],
 
   // ── 2. 모바일 연동 확장 시트 (12종) ──────────────────────────────────────────
@@ -225,6 +236,29 @@ var SHEET_SCHEMAS = {
     'message',
     'is_read',
     'created_at'
+  ],
+  '학급회비': [
+    'remote_id',
+    'grade',
+    'class_no',
+    'date',
+    'title',
+    'type',
+    'amount',
+    'store',
+    'card',
+    'receipt_url',
+    'updated_at'
+  ],
+  Push_Subscriptions: [
+    'remote_id',
+    'user_id',
+    'role',
+    'endpoint',
+    'p256dh',
+    'auth',
+    'user_agent',
+    'updated_at'
   ]
 };
 
@@ -958,6 +992,27 @@ function doGet(e) {
       });
     }
 
+    if (action === 'get_push_subscriptions') {
+      var subs = _readSheetAsObjects(ss.getSheetByName('Push_Subscriptions'), SHEET_SCHEMAS.Push_Subscriptions, tz);
+      var filterRole = (params.target_role || '').toString().trim().toLowerCase();
+      var filterIdsRaw = (params.target_student_ids || '').toString().trim();
+      var filterIds = filterIdsRaw ? filterIdsRaw.split(',').map(function (s) { return s.trim(); }).filter(Boolean) : [];
+      var filteredSubs = subs.filter(function (sub) {
+        if (filterRole && filterRole !== 'all' && String(sub.role || '').toLowerCase() !== filterRole) {
+          return false;
+        }
+        if (filterIds.length > 0 && filterIds.indexOf('ALL') < 0) {
+          return filterIds.indexOf(String(sub.user_id || '').trim()) >= 0;
+        }
+        return true;
+      });
+      return _jsonResponse({
+        ok: true,
+        subscriptions: filteredSubs,
+        server_time: nowStr
+      });
+    }
+
     if (action === 'get_mobile_bundle') {
       var role = (params.role || '').toString().trim().toLowerCase();
       var studentId = (params.student_id || '').toString().trim();
@@ -976,6 +1031,7 @@ function doGet(e) {
       var timetableBase = _readSheetAsObjects(ss.getSheetByName('시간표_기본'), SHEET_SCHEMAS['시간표_기본'], tz);
       var timetableChanges = _readSheetAsObjects(ss.getSheetByName('시간표_변동'), SHEET_SCHEMAS['시간표_변동'], tz);
       var meals = _readSheetAsObjects(ss.getSheetByName('급식_식단표'), SHEET_SCHEMAS['급식_식단표'], tz);
+      var budgetList = _readSheetAsObjects(ss.getSheetByName('학급회비'), SHEET_SCHEMAS['학급회비'], tz);
       var chatsAll = _readSheetAsObjects(ss.getSheetByName('1:1_상담채팅'), SHEET_SCHEMAS['1:1_상담채팅'], tz);
       var tasksAll = _readSheetAsObjects(ss.getSheetByName('Tasks'), SHEET_SCHEMAS.Tasks, tz);
       var schedulesAll = _readSheetAsObjects(ss.getSheetByName('Schedules'), SHEET_SCHEMAS.Schedules, tz);
@@ -992,7 +1048,27 @@ function doGet(e) {
             String(c.receiver_id) === studentId;
         });
       }
+      if (role !== 'teacher') {
+        notificationsAll = notificationsAll.filter(function (n) {
+          var ch = (n.channel || '').toString().trim();
+          var tRole = (n.target_role || '').toString().trim().toLowerCase();
+          var tStu = (n.target_student_id || '').toString().trim();
+          if (ch === 'mobile_attendance' || ch === 'mobile_chat') {
+            if (tRole !== role) return false;
+          }
+          var roleMatch = (tRole === role || tRole === 'all');
+          var stuMatch = (!studentId && tStu === 'ALL') || (tStu === studentId || tStu === 'ALL');
+          var classMatch = (!n.grade && !n.class_no) || (!grade && !classNo) ||
+            (String(n.grade) === grade && String(n.class_no) === classNo);
+          return roleMatch && stuMatch && classMatch;
+        });
+      }
       if (grade && classNo) {
+        budgetList = budgetList.filter(function (b) {
+          return (!b.grade && !b.class_no) || (String(b.grade) === grade && String(b.class_no) === classNo);
+        });
+      }
+      if (role !== 'teacher' && grade && classNo) {
         timetableBase = timetableBase.filter(function (tb) {
           return String(tb.grade) === grade && String(tb.class_no) === classNo;
         });
@@ -1017,6 +1093,7 @@ function doGet(e) {
         timetable_base: timetableBase,
         timetable_changes: timetableChanges,
         meals: meals,
+        budget: budgetList,
         chat_messages: chatsAll,
         schedules: schedulesAll,
         remote_tasks: tasksAll.filter(function (t) {
@@ -1181,6 +1258,10 @@ function doPost(e) {
           sender: attData.student_name || attData.submitted_by || '모바일',
           title: '[출결] ' + (attData.student_name || '') + ' (' + (attData.attendance_type || '출결') + ')',
           message: (attData.date || '') + ' 사유: ' + (attData.reason || '미입력'),
+          target_role: 'teacher',
+          target_student_id: attData.student_id || '',
+          grade: attData.grade || '',
+          class_no: attData.class_no || '',
           created_at: nowStr,
           is_read: 0
         }, tz);
@@ -1309,12 +1390,15 @@ function doPost(e) {
       var chat = body.data || body;
       var chatId = _upsertRowByRemoteId(ss.getSheetByName('1:1_상담채팅'), SHEET_SCHEMAS['1:1_상담채팅'], chat, tz);
       if (chat.notify !== false) {
+        var isFromTeacher = String(chat.sender_role || '').toLowerCase() === 'teacher';
         _upsertRowByRemoteId(ss.getSheetByName('Notifications'), SHEET_SCHEMAS.Notifications, {
           remote_id: 'noti_chat_' + chatId,
           channel: 'mobile_chat',
           sender: chat.sender_name || chat.sender_id || '상담채팅',
           title: '[1:1 상담] ' + (chat.sender_name || '새 메시지'),
           message: (chat.message || '').toString().slice(0, 120),
+          target_role: isFromTeacher ? 'all' : 'teacher',
+          target_student_id: isFromTeacher ? (chat.receiver_id || '') : (chat.sender_id || ''),
           created_at: nowStr,
           is_read: 0
         }, tz);
@@ -1393,6 +1477,136 @@ function doPost(e) {
       }
       var rowRid = _upsertRowByRemoteId(ss.getSheetByName(sName), SHEET_SCHEMAS[sName], body.data || {}, tz);
       return _jsonResponse({ ok: true, sheet: sName, remote_id: rowRid });
+    }
+
+    // ── 11. 교사 프로필 수정 ──────────────────────────────────────────────────
+    if (action === 'upsert_teacher_profile') {
+      var profData = body.data || body;
+      var targetTeacherId = (profData.teacher_id || profData.remote_id || '').toString().trim();
+      var tpSheet = ss.getSheetByName('계정_교사');
+      var tpRows = _readSheetAsObjects(tpSheet, SHEET_SCHEMAS['계정_교사'], tz);
+      var matchedTeacherRid = '';
+      for (var tpi = 0; tpi < tpRows.length; tpi++) {
+        if (
+          (targetTeacherId && (String(tpRows[tpi].teacher_id) === targetTeacherId || String(tpRows[tpi].remote_id) === targetTeacherId)) ||
+          (!targetTeacherId && tpi === 0)
+        ) {
+          matchedTeacherRid = tpRows[tpi].remote_id;
+          break;
+        }
+      }
+      var allowedFields = [
+        'name', 'school_name', 'grade', 'class_no', 'subject',
+        'phone', 'consultation_hours', 'neis_office_code', 'neis_school_code'
+      ];
+      var profPatch = {
+        remote_id: matchedTeacherRid || targetTeacherId || ('teacher_' + new Date().getTime())
+      };
+      if (!matchedTeacherRid && profData.teacher_id) {
+        profPatch.teacher_id = profData.teacher_id;
+      }
+      allowedFields.forEach(function (field) {
+        if (profData.hasOwnProperty(field) && profData[field] !== undefined) {
+          profPatch[field] = profData[field];
+        }
+      });
+      var savedTeacherRid = _upsertRowByRemoteId(tpSheet, SHEET_SCHEMAS['계정_교사'], profPatch, tz);
+      return _jsonResponse({ ok: true, remote_id: savedTeacherRid, profile: profPatch });
+    }
+
+    // ── 12. 교사 알림 발송 (단건 또는 다건 일괄 생성) ─────────────────────────
+    if (action === 'send_notification') {
+      var nPayload = body.data || body;
+      var nSheet = ss.getSheetByName('Notifications');
+      var stuIds = Array.isArray(nPayload.target_student_ids) ? nPayload.target_student_ids : null;
+      var createdIds = [];
+      var baseChannel = (nPayload.channel || 'teacher_notice').toString().trim();
+      var baseSender = (nPayload.sender || '담임교사').toString().trim();
+      var baseTitle = (nPayload.title || '').toString().trim();
+      var baseMessage = (nPayload.message || '').toString().trim();
+      var baseTargetRole = (nPayload.target_role || 'all').toString().trim().toLowerCase();
+      var baseGrade = (nPayload.grade || '').toString().trim();
+      var baseClassNo = (nPayload.class_no || '').toString().trim();
+
+      if (stuIds && stuIds.length > 0) {
+        stuIds.forEach(function (sid, idx) {
+          var rowId = 'noti_' + new Date().getTime() + '_' + idx + '_' + Math.floor(Math.random() * 1000);
+          _upsertRowByRemoteId(nSheet, SHEET_SCHEMAS.Notifications, {
+            remote_id: rowId,
+            channel: baseChannel,
+            sender: baseSender,
+            title: baseTitle,
+            message: baseMessage,
+            target_role: baseTargetRole,
+            target_student_id: String(sid).trim(),
+            grade: baseGrade,
+            class_no: baseClassNo,
+            created_at: nowStr,
+            is_read: 0
+          }, tz);
+          createdIds.push(rowId);
+        });
+      } else {
+        var singleId = (nPayload.remote_id || ('noti_' + new Date().getTime() + '_' + Math.floor(Math.random() * 1000))).toString().trim();
+        _upsertRowByRemoteId(nSheet, SHEET_SCHEMAS.Notifications, {
+          remote_id: singleId,
+          channel: baseChannel,
+          sender: baseSender,
+          title: baseTitle,
+          message: baseMessage,
+          target_role: baseTargetRole,
+          target_student_id: (nPayload.target_student_id || 'ALL').toString().trim(),
+          grade: baseGrade,
+          class_no: baseClassNo,
+          created_at: nowStr,
+          is_read: 0
+        }, tz);
+        createdIds.push(singleId);
+      }
+      return _jsonResponse({ ok: true, count: createdIds.length, remote_ids: createdIds });
+    }
+
+    // ── 13. Web Push 구독 저장 (user_id + endpoint 기준 업서트) ──────────────
+    if (action === 'save_push_subscription') {
+      var subData = body.data || body;
+      var subUserId = (subData.user_id || '').toString().trim();
+      var subEndpoint = (subData.endpoint || '').toString().trim();
+      if (!subEndpoint) {
+        return _jsonResponse({ ok: false, error: 'endpoint가 필요합니다.' });
+      }
+      var pushSheet = ss.getSheetByName('Push_Subscriptions');
+      var existingSubs = _readSheetAsObjects(pushSheet, SHEET_SCHEMAS.Push_Subscriptions, tz);
+      var matchedSubRid = '';
+      for (var si = 0; si < existingSubs.length; si++) {
+        if (String(existingSubs[si].user_id || '').trim() === subUserId &&
+            String(existingSubs[si].endpoint || '').trim() === subEndpoint) {
+          matchedSubRid = existingSubs[si].remote_id;
+          break;
+        }
+      }
+      var subPatch = {
+        remote_id: matchedSubRid || ('push_' + new Date().getTime() + '_' + Math.floor(Math.random() * 1000)),
+        user_id: subUserId,
+        role: (subData.role || '').toString().trim().toLowerCase(),
+        endpoint: subEndpoint,
+        p256dh: (subData.p256dh || '').toString().trim(),
+        auth: (subData.auth || '').toString().trim(),
+        user_agent: (subData.user_agent || '').toString().slice(0, 200)
+      };
+      var savedSubRid = _upsertRowByRemoteId(pushSheet, SHEET_SCHEMAS.Push_Subscriptions, subPatch, tz);
+      return _jsonResponse({ ok: true, remote_id: savedSubRid });
+    }
+
+    // ── 14. 학급회비 업서트 & 삭제 ───────────────────────────────────────────
+    if (action === 'upsert_budget') {
+      var bData = body.data || body;
+      var bRid = _upsertRowByRemoteId(ss.getSheetByName('학급회비'), SHEET_SCHEMAS['학급회비'], bData, tz);
+      return _jsonResponse({ ok: true, remote_id: bRid });
+    }
+
+    if (action === 'delete_budget') {
+      var bDeleted = _deleteRowByRemoteId(ss.getSheetByName('학급회비'), body.remote_id);
+      return _jsonResponse({ ok: true, deleted: bDeleted });
     }
 
     return _jsonResponse({ ok: false, error: 'Unsupported action: ' + action });
