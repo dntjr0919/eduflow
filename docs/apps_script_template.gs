@@ -4,18 +4,25 @@
  * 파일: docs/apps_script_template.gs
  * ============================================================================
  * [설치 및 배포 방법]
+ * ※ 주의: 교육청/기관 Google Workspace 계정은 도메인 보안 정책으로 인해
+ *    외부(PC Python / curl) 익명 요청 시 403 오류가 발생할 수 있으므로
+ *    개인 Google 계정(@gmail.com) 소유 스프레드시트에서 배포하는 것을 권장합니다.
+ *
  * 1. 연동할 Google 스프레드시트를 열고 상단 메뉴 [확장 프로그램] -> [Apps Script] 클릭
  * 2. 기존 코드를 모두 지우고 이 파일 전체 내용을 붙여넣은 뒤 저장(Ctrl+S)
  * 3. 상단 함수 드롭다운에서 `initSheets` (또는 `seedSampleData`)를 선택해 [실행]하면
  *    데스크톱(Schedules/Tasks/Notifications) + 모바일 연동용 12개 시트 탭이 자동 생성됩니다.
- * 4. (선택) 나이스(NEIS) 급식 자동 수집을 쓰려면 [프로젝트 설정] -> [스크립트 속성]에
- *    NEIS_API_KEY, NEIS_OFFICE_CODE, NEIS_SCHOOL_CODE 를 등록한 뒤
- *    `installNeisMealTrigger` 함수를 1회 실행하세요 (매일 새벽 4시 자동 수집).
- * 5. 우측 상단 [배포] -> [새 배포] -> 유형: [웹 앱] 선택
+ * 4. [프로젝트 설정] -> [스크립트 속성]에 아래 속성을 등록하세요.
+ *    - API_SECRET (강력 권장): 임의의 영문·숫자 비밀키 (Vercel `GAS_API_SECRET` 및
+ *      PC EduFlow [Apps Script API Secret]과 동일한 값 입력 시 외부 직접 요청 차단)
+ *    - (선택) 나이스(NEIS) 급식 자동 수집용: NEIS_API_KEY, NEIS_OFFICE_CODE, NEIS_SCHOOL_CODE
+ *      등록 후 `installNeisMealTrigger` 함수를 1회 실행 (매일 새벽 4시 자동 수집)
+ * 5. 우측 상단 [배포] -> [새 배포] -> 유형: [웹 앱] 선택 (업데이트 시 [배포 관리] -> [새 버전])
  *    - 다음 사용자 권한으로 실행: 나(Me)
  *    - 액세스 권한이 있는 사용자: 모든 사용자(Anyone)
  * 6. 생성된 웹 앱 URL(https://script.google.com/macros/s/.../exec)을 복사하여
- *    EduFlow PC -> [환경설정 & 명렬표] -> [외부 연동] 및 EduFlow Mobile 설정에 붙여넣으세요.
+ *    - PC EduFlow -> [환경설정 & 명렬표] -> [Apps Script 웹 앱 URL]에 입력
+ *    - Vercel 대시보드 -> [Settings] -> [Environment Variables]의 `GAS_WEB_APP_URL`에 등록
  * ============================================================================
  */
 

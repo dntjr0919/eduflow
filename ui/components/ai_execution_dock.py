@@ -10,19 +10,36 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import re
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import webbrowser
 
 import pandas as pd
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import (
+    QByteArray,
+    QEasingCurve,
+    QEvent,
+    QParallelAnimationGroup,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QKeyEvent, QPainter, QPixmap, QTextLayout
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -40,6 +57,15 @@ from PyQt6.QtWidgets import (
 )
 
 from core.base_worker import BaseWorker, TaskRunner
+from core.database import DatabaseManager
+from services.ai_agent_router import (
+    build_agent_system_prompt,
+    execute_action_tool,
+    execute_read_only_tool,
+    parse_agent_response,
+    prepare_attachments_for_mode,
+    summarize_tool_args,
+)
 from services.batch_prompt_service import (
     apply_batch_results_to_excel,
     build_student_batches,
@@ -78,8 +104,209 @@ from services.web_gemini_auto_worker import (
     WebGeminiAutoWorker,
     normalize_web_url,
 )
+from ui.components.file_drop_helper import enable_file_drop
 from ui.utils import install_no_scroll_wheel_filter
 from utils.path_helper import get_data_path
+
+
+_SVG_SESSION_MENU = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="3" y="3" width="18" height="18" rx="3"/>'
+    '<line x1="7" y1="8" x2="17" y2="8"/>'
+    '<line x1="7" y1="12" x2="17" y2="12"/>'
+    '<line x1="7" y1="16" x2="17" y2="16"/>'
+    "</svg>"
+)
+
+_SVG_COPY_ICON = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>'
+    '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>'
+    "</svg>"
+)
+
+_SVG_EDIT_PENCIL = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M12 20h9"/>'
+    '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>'
+    "</svg>"
+)
+
+_SVG_PAPERCLIP = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>'
+    "</svg>"
+)
+
+_SVG_FOLDER = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'
+    "</svg>"
+)
+
+_SVG_SETTINGS_GEAR = (
+    '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" '
+    'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
+    '<circle cx="12" cy="12" r="3"/>'
+    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>'
+    "</svg>"
+)
+
+
+def _render_inline_svg_icon(svg_markup: str, color_hex: str = "#334155", size: int = 16) -> QIcon:
+    """인라인 SVG 문자열을 지정 색상/크기의 HiDPI QIcon으로 렌더링합니다."""
+    colored = svg_markup.replace("currentColor", color_hex)
+    renderer = QSvgRenderer(QByteArray(colored.encode("utf-8")))
+    icon = QIcon()
+    for dpr in (1, 2):
+        px = size * dpr
+        pm = QPixmap(px, px)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        renderer.render(painter)
+        painter.end()
+        pm.setDevicePixelRatio(float(dpr))
+        icon.addPixmap(pm)
+    return icon
+
+
+def build_attachment_entry(path_str: str, max_folder_files: int = 200) -> Optional[Dict[str, Any]]:
+    """파일 또는 폴더 경로를 챗 첨부 메타데이터 딕셔너리로 변환합니다."""
+    raw = str(path_str or "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if p.is_dir():
+        resolved = p.resolve()
+        rel_files: List[str] = []
+        total_count = 0
+        skip_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+        for root, dirs, files in os.walk(resolved):
+            dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
+            for fname in sorted(files):
+                total_count += 1
+                if len(rel_files) < max_folder_files:
+                    try:
+                        rel = str((Path(root) / fname).relative_to(resolved)).replace("\\", "/")
+                    except ValueError:
+                        rel = fname
+                    rel_files.append(rel)
+        return {
+            "type": "dir",
+            "path": str(resolved),
+            "name": resolved.name or str(resolved),
+            "file_count": total_count,
+            "files": rel_files,
+        }
+    if p.is_file():
+        resolved = p.resolve()
+        try:
+            size = int(resolved.stat().st_size)
+        except OSError:
+            size = 0
+        return {
+            "type": "file",
+            "path": str(resolved),
+            "name": resolved.name,
+            "size": size,
+        }
+    # 가상 테스트 경로 지원
+    is_dir_hint = raw.endswith("/") or raw.endswith("\\")
+    clean = raw.rstrip("/\\")
+    return {
+        "type": "dir" if is_dir_hint else "file",
+        "path": clean,
+        "name": Path(clean).name or clean,
+        "file_count": 0,
+        "files": [],
+    }
+
+
+def format_attachments_for_prompt(attachments: List[Dict[str, Any]]) -> str:
+    """첨부 파일/폴더 메타데이터를 프롬프트 컨텍스트 문자열로 포맷팅합니다."""
+    if not attachments:
+        return ""
+    blocks: List[str] = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        atype = att.get("type", "file")
+        name = str(att.get("name", "") or "")
+        path = str(att.get("path", "") or "")
+        if atype == "dir":
+            files = att.get("files") or []
+            total = int(att.get("file_count", len(files)) or len(files))
+            lines = [f"[첨부 폴더] {name}", f"- 경로: {path}", f"- 하위 파일 목록 ({total}개):"]
+            if files:
+                for rf in files:
+                    lines.append(f"  - {rf}")
+                if total > len(files):
+                    lines.append(f"  - ... 외 {total - len(files)}개")
+            else:
+                lines.append("  - (하위 파일 없음)")
+            blocks.append("\n".join(lines))
+        else:
+            blocks.append(f"[첨부 파일] {name} ({path})")
+    return "\n\n".join(blocks)
+
+
+def elide_text_to_lines(
+    text: str, font_metrics: QFontMetrics, width: int, max_lines: int = 2, font: Any = None
+) -> Tuple[str, bool]:
+    """주어진 폭에서 최대 max_lines 줄로 텍스트를 자르고 말줄임(...) 처리합니다."""
+    raw = str(text or "")
+    if not raw.strip():
+        return "", False
+    safe_w = max(80, int(width))
+    # QTextLayout은 줄바꿈(\n)을 직접 처리하지 않으므로 단락별로 줄 수를 누적
+    paragraphs = raw.splitlines() or [raw]
+    collected_lines: List[str] = []
+    truncated = False
+    layout_font = font if font is not None else QApplication.font()
+
+    for p_idx, para in enumerate(paragraphs):
+        if len(collected_lines) >= max_lines:
+            truncated = True
+            break
+        if para == "":
+            collected_lines.append("")
+            continue
+        layout = QTextLayout(para, layout_font)
+        layout.beginLayout()
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(safe_w)
+            seg = para[line.textStart() : line.textStart() + line.textLength()]
+            collected_lines.append(seg)
+            if len(collected_lines) >= max_lines:
+                has_more_in_para = (line.textStart() + line.textLength()) < len(para)
+                has_more_paras = p_idx < len(paragraphs) - 1
+                if has_more_in_para or has_more_paras:
+                    truncated = True
+                break
+        layout.endLayout()
+        if truncated:
+            break
+
+    if truncated and collected_lines:
+        last = collected_lines[-1].rstrip()
+        elided_last = font_metrics.elidedText(
+            f"{last}..." if not last.endswith("...") else last,
+            Qt.TextElideMode.ElideRight,
+            safe_w,
+        )
+        if not elided_last.endswith("...") and not elided_last.endswith("…"):
+            elided_last = (elided_last[:-1] + "…") if len(elided_last) > 1 else "…"
+        collected_lines[-1] = elided_last
+
+    return "\n".join(collected_lines), truncated
 
 
 def _apply_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -424,6 +651,541 @@ class _DockApiCalendarTodoWorker(BaseWorker):
         }
 
 
+class _DockApiGeneralChatWorker(BaseWorker):
+    """범용 챗 (에이전트) API 모드 워커."""
+
+    def __init__(
+        self,
+        prompt: str,
+        history: Optional[List[Dict[str, Any]]] = None,
+        model_label: str = "",
+        system_prompt: Optional[str] = None,
+    ):
+        super().__init__(task_name="범용 AI 챗 응답 생성")
+        self.prompt = prompt
+        self.history = history or []
+        self.model_label = model_label
+        self.system_prompt = system_prompt
+
+    def execute(self) -> Dict[str, Any]:
+        self.emit_progress(20, "AI 응답 생성 중...")
+        sys_prompt = self.system_prompt or build_agent_system_prompt()
+        history_lines: List[str] = []
+        # 최근 대화 맥락(최대 8개) 포함
+        for msg in self.history[-8:]:
+            role_tag = "사용자" if msg.get("role") == "user" else "AI"
+            txt = str(msg.get("content", "") or "").strip()
+            if txt:
+                history_lines.append(f"[{role_tag}]\n{txt}")
+        if history_lines:
+            full_prompt = (
+                "[이전 대화 맥락]\n"
+                + "\n\n".join(history_lines)
+                + "\n\n[현재 질문]\n"
+                + self.prompt
+            )
+        else:
+            full_prompt = self.prompt
+
+        client = MultiLlmClient()
+        reply = client.generate(prompt=full_prompt, system_prompt=sys_prompt)
+        self.emit_progress(100, "AI 응답 완료")
+        return {
+            "target_id": "general_chat",
+            "mode": "api",
+            "raw_response": reply,
+            "model_name": self.model_label,
+        }
+
+
+class _ChatInputTextEdit(QTextEdit):
+    """Enter로 전송, Shift+Enter로 줄바꿈하는 챗 입력창."""
+
+    send_requested = pyqtSignal()
+
+    def keyPressEvent(self, event: Optional[QKeyEvent]) -> None:
+        if event is not None and event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                self.send_requested.emit()
+                return
+        super().keyPressEvent(event)
+
+
+class _ChatMessageCard(QFrame):
+    """아코디언 접힘/펼침(기본 2줄), 호버 체류 자동 펼침 및 길이 비례 애니메이션을 지원하는 챗 메시지 카드."""
+
+    HOVER_EXPAND_DELAY_MS = 1000
+    HOVER_COLLAPSE_DELAY_MS = 150
+    HOVER_WATCH_INTERVAL_MS = 120
+    ANIM_MIN_DURATION_MS = 220
+    ANIM_MAX_DURATION_MS = 450
+    QWIDGETSIZE_MAX = 16777215
+
+    edit_requested = pyqtSignal(int)
+    copy_requested = pyqtSignal(str)
+    toggled = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        message_id: int,
+        role: str,
+        content: str,
+        exec_mode: str = "api",
+        model_name: str = "",
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.message_id = int(message_id)
+        self.role = str(role or "user")
+        self.content = str(content or "")
+        self.exec_mode = str(exec_mode or "api")
+        self.model_name = str(model_name or "")
+        self.attachments = attachments or []
+        self._expanded = False
+        self._pinned_expanded = False
+
+        is_user = self.role == "user"
+        _apply_role(
+            self,
+            role="chatBubbleUser" if is_user else "chatBubbleAi",
+            obj_name="ChatBubbleUser" if is_user else "ChatBubbleAi",
+        )
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+
+        bg = "#EFF6FF" if is_user else "#F8FAFC"
+        border = "#BFDBFE" if is_user else "#E2E8F0"
+        self.setStyleSheet(
+            f"QFrame#{self.objectName()} {{ "
+            f"background-color: {bg}; border: 1px solid {border}; border-radius: 10px; }}"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 6)
+        lay.setSpacing(4)
+
+        # 상단 메타 행 (발화자 + 첨부 요약)
+        hdr = QHBoxLayout()
+        hdr.setSpacing(6)
+        lbl_who = QLabel("나" if is_user else "AI")
+        lbl_who.setStyleSheet(
+            "font-size: 10px; font-weight: 700; color: "
+            + ("#1D4ED8;" if is_user else "#0F172A;")
+        )
+        hdr.addWidget(lbl_who)
+        if self.attachments:
+            lbl_att = QLabel(f"첨부 {len(self.attachments)}건")
+            lbl_att.setStyleSheet(
+                "font-size: 10px; font-weight: 600; color: #475569; "
+                "background-color: #E2E8F0; border-radius: 4px; padding: 1px 5px;"
+            )
+            hdr.addWidget(lbl_att)
+        hdr.addStretch()
+        self.lbl_expand_hint = QLabel("펼치기")
+        self.lbl_expand_hint.setStyleSheet("font-size: 10px; color: #94A3B8;")
+        hdr.addWidget(self.lbl_expand_hint)
+        lay.addLayout(hdr)
+
+        # 본문 (기본 2줄 + 말줄임)
+        self.lbl_content = QLabel()
+        self.lbl_content.setWordWrap(True)
+        self.lbl_content.setTextFormat(Qt.TextFormat.PlainText)
+        self.lbl_content.setStyleSheet("font-size: 12px; color: #0F172A; line-height: 1.4;")
+        self.lbl_content.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        lay.addWidget(self.lbl_content)
+
+        # 하단 호버 액션 바 (기본 숨김)
+        self.action_bar = QWidget(self)
+        ab_lay = QHBoxLayout(self.action_bar)
+        ab_lay.setContentsMargins(0, 2, 0, 0)
+        ab_lay.setSpacing(4)
+
+        if is_user:
+            ab_lay.addStretch()
+            self.btn_edit = QPushButton()
+            self.btn_edit.setFixedSize(22, 22)
+            self.btn_edit.setIcon(_render_inline_svg_icon(_SVG_EDIT_PENCIL, "#475569", 13))
+            self.btn_edit.setIconSize(QSize(13, 13))
+            self.btn_edit.setToolTip("질문 수정 후 재전송")
+            self.btn_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_edit.setStyleSheet(
+                "QPushButton { background: transparent; border: 1px solid transparent; border-radius: 4px; }"
+                "QPushButton:hover { background: #DBEAFE; border-color: #93C5FD; }"
+            )
+            self.btn_edit.clicked.connect(lambda: self.edit_requested.emit(self.message_id))
+            ab_lay.addWidget(self.btn_edit)
+
+            self.btn_copy = QPushButton()
+            self.btn_copy.setFixedSize(22, 22)
+            self.btn_copy.setIcon(_render_inline_svg_icon(_SVG_COPY_ICON, "#475569", 13))
+            self.btn_copy.setIconSize(QSize(13, 13))
+            self.btn_copy.setToolTip("질문 복사")
+            self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_copy.setStyleSheet(
+                "QPushButton { background: transparent; border: 1px solid transparent; border-radius: 4px; }"
+                "QPushButton:hover { background: #DBEAFE; border-color: #93C5FD; }"
+            )
+            self.btn_copy.clicked.connect(self._on_copy_clicked)
+            ab_lay.addWidget(self.btn_copy)
+        else:
+            self.btn_copy = QPushButton()
+            self.btn_copy.setFixedSize(22, 22)
+            self.btn_copy.setIcon(_render_inline_svg_icon(_SVG_COPY_ICON, "#475569", 13))
+            self.btn_copy.setIconSize(QSize(13, 13))
+            self.btn_copy.setToolTip("응답 복사")
+            self.btn_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_copy.setStyleSheet(
+                "QPushButton { background: transparent; border: 1px solid transparent; border-radius: 4px; }"
+                "QPushButton:hover { background: #E2E8F0; border-color: #CBD5E1; }"
+            )
+            self.btn_copy.clicked.connect(self._on_copy_clicked)
+            ab_lay.addWidget(self.btn_copy)
+
+            badge_text = self.model_name.strip() or (
+                "수동 입력" if self.exec_mode == "manual" else "AI"
+            )
+            self.lbl_model_badge = QLabel(badge_text)
+            self.lbl_model_badge.setStyleSheet(
+                "font-size: 10px; font-weight: 600; color: #0369A1; "
+                "background-color: #E0F2FE; border: 1px solid #BAE6FD; "
+                "border-radius: 8px; padding: 1px 7px;"
+            )
+            ab_lay.addWidget(self.lbl_model_badge)
+            ab_lay.addStretch()
+
+        self.action_bar.setMaximumHeight(0)
+        self.action_bar.setVisible(False)
+        lay.addWidget(self.action_bar)
+
+        self._hover_expand_timer = QTimer(self)
+        self._hover_expand_timer.setSingleShot(True)
+        self._hover_expand_timer.setInterval(self.HOVER_EXPAND_DELAY_MS)
+        self._hover_expand_timer.timeout.connect(self._on_hover_expand_timeout)
+
+        self._hover_collapse_timer = QTimer(self)
+        self._hover_collapse_timer.setSingleShot(True)
+        self._hover_collapse_timer.setInterval(self.HOVER_COLLAPSE_DELAY_MS)
+        self._hover_collapse_timer.timeout.connect(self._on_hover_collapse_timeout)
+
+        self._hover_watch_timer = QTimer(self)
+        self._hover_watch_timer.setInterval(self.HOVER_WATCH_INTERVAL_MS)
+        self._hover_watch_timer.timeout.connect(self._on_hover_watch_tick)
+
+        self._content_anim = QPropertyAnimation(self.lbl_content, b"maximumHeight", self)
+        self._content_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._action_bar_anim = QPropertyAnimation(self.action_bar, b"maximumHeight", self)
+        self._action_bar_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._anim_group = QParallelAnimationGroup(self)
+        self._anim_group.addAnimation(self._content_anim)
+        self._anim_group.addAnimation(self._action_bar_anim)
+        self._anim_group.finished.connect(self._on_content_anim_finished)
+
+        self._refresh_display()
+
+    def _on_copy_clicked(self) -> None:
+        QApplication.clipboard().setText(self.content)
+        self.copy_requested.emit(self.content)
+
+    def is_expanded(self) -> bool:
+        return self._expanded
+
+    def is_pinned_expanded(self) -> bool:
+        return self._pinned_expanded
+
+    def _measure_content_heights(self) -> Tuple[int, int]:
+        fm = QFontMetrics(self.lbl_content.font())
+        two_line_h = max(24, fm.lineSpacing() * 2 + 4)
+        avail_w = self.lbl_content.width() if self.lbl_content.width() > 40 else max(180, (self.width() or 270) - 24)
+        if self.lbl_content.text() == self.content and self.lbl_content.hasHeightForWidth():
+            rendered_h = self.lbl_content.heightForWidth(avail_w)
+            if rendered_h > 0:
+                return two_line_h, rendered_h
+        full_rect = fm.boundingRect(0, 0, avail_w, 100000, Qt.TextFlag.TextWordWrap, self.content)
+        full_h = max(two_line_h, full_rect.height() + 4)
+        return two_line_h, full_h
+
+    def _measure_action_bar_height(self) -> int:
+        hint_h = self.action_bar.sizeHint().height()
+        return max(24, hint_h if hint_h > 0 else 24)
+
+    def _compute_anim_duration_ms(self, delta_px: int) -> int:
+        dur = int(self.ANIM_MIN_DURATION_MS + abs(delta_px) * 0.45)
+        return max(self.ANIM_MIN_DURATION_MS, min(self.ANIM_MAX_DURATION_MS, dur))
+
+    def _apply_collapsed_elided_text(self) -> None:
+        fm = QFontMetrics(self.lbl_content.font())
+        avail_w = self.lbl_content.width() if self.lbl_content.width() > 40 else max(180, (self.width() or 270) - 24)
+        elided, was_truncated = elide_text_to_lines(
+            self.content, fm, avail_w, max_lines=2, font=self.lbl_content.font()
+        )
+        self.lbl_content.setText(elided)
+        self.lbl_expand_hint.setText("펼치기" if was_truncated else "")
+
+    def set_expanded(self, expanded: bool, *, animate: bool = True, show_action_bar: Optional[bool] = None) -> None:
+        self._expanded = bool(expanded)
+        want_ab = self._expanded if show_action_bar is None else bool(show_action_bar)
+        if self._anim_group.state() == QParallelAnimationGroup.State.Running:
+            self._anim_group.stop()
+
+        two_line_h, _ = self._measure_content_heights()
+        start_content_h = self.lbl_content.height() if self.lbl_content.height() > 0 else two_line_h
+        start_ab_h = self.action_bar.height() if self.action_bar.isVisible() else 0
+
+        if self._expanded:
+            self.lbl_content.setMaximumHeight(start_content_h)
+            self.lbl_content.setText(self.content)
+            self.lbl_expand_hint.setText("접기")
+            _, full_h = self._measure_content_heights()
+            end_content_h = max(start_content_h, full_h)
+        else:
+            end_content_h = min(start_content_h, two_line_h)
+
+        end_ab_h = self._measure_action_bar_height() if want_ab else 0
+        delta_px = max(abs(end_content_h - start_content_h), abs(end_ab_h - start_ab_h))
+
+        if animate and delta_px > 1:
+            if want_ab:
+                self.action_bar.setMaximumHeight(start_ab_h)
+                self.action_bar.setVisible(True)
+            dur = self._compute_anim_duration_ms(delta_px)
+            self._content_anim.setDuration(dur)
+            self._content_anim.setStartValue(start_content_h)
+            self._content_anim.setEndValue(end_content_h)
+            self._action_bar_anim.setDuration(dur)
+            self._action_bar_anim.setStartValue(start_ab_h)
+            self._action_bar_anim.setEndValue(end_ab_h)
+            self._anim_group.start()
+        else:
+            if want_ab:
+                self.action_bar.setVisible(True)
+                self.action_bar.setMaximumHeight(self.QWIDGETSIZE_MAX)
+            else:
+                self.action_bar.setVisible(False)
+                self.action_bar.setMaximumHeight(0)
+            if self._expanded:
+                self.lbl_content.setMaximumHeight(self.QWIDGETSIZE_MAX)
+            else:
+                self._apply_collapsed_elided_text()
+                self.lbl_content.setMaximumHeight(two_line_h)
+
+        self.toggled.emit(self._expanded)
+
+    def _on_content_anim_finished(self) -> None:
+        if self._expanded:
+            self.lbl_content.setMaximumHeight(self.QWIDGETSIZE_MAX)
+            self.action_bar.setMaximumHeight(self.QWIDGETSIZE_MAX)
+        else:
+            self.action_bar.setVisible(False)
+            self.action_bar.setMaximumHeight(0)
+            self._apply_collapsed_elided_text()
+            two_line_h, _ = self._measure_content_heights()
+            self.lbl_content.setMaximumHeight(two_line_h)
+
+    def _refresh_display(self) -> None:
+        if self._expanded:
+            self.lbl_content.setText(self.content)
+            self.lbl_expand_hint.setText("접기")
+            self.lbl_content.setMaximumHeight(self.QWIDGETSIZE_MAX)
+        else:
+            two_line_h, _ = self._measure_content_heights()
+            self._apply_collapsed_elided_text()
+            self.lbl_content.setMaximumHeight(two_line_h)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if not self._expanded and self._anim_group.state() != QParallelAnimationGroup.State.Running:
+            self._refresh_display()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event is not None and event.button() == Qt.MouseButton.LeftButton:
+            self._hover_expand_timer.stop()
+            self._hover_collapse_timer.stop()
+            self._hover_watch_timer.stop()
+            new_state = not self._expanded
+            self._pinned_expanded = new_state
+            self.set_expanded(new_state, animate=True, show_action_bar=new_state)
+        super().mouseReleaseEvent(event)
+
+    def _cursor_inside_card(self) -> bool:
+        return QRect(self.mapToGlobal(QPoint(0, 0)), self.size()).contains(QCursor.pos())
+
+    def _collapse_from_hover(self) -> None:
+        self._hover_watch_timer.stop()
+        if not self._pinned_expanded:
+            if self._expanded or not self.action_bar.isHidden():
+                self.set_expanded(False, animate=True, show_action_bar=False)
+
+    def _on_hover_expand_timeout(self) -> None:
+        if self._pinned_expanded:
+            return
+        if not self._expanded or self.action_bar.isHidden():
+            self.set_expanded(True, animate=True, show_action_bar=True)
+        self._hover_watch_timer.start(self.HOVER_WATCH_INTERVAL_MS)
+
+    def _on_hover_collapse_timeout(self) -> None:
+        if self._cursor_inside_card() or self._pinned_expanded:
+            return
+        self._collapse_from_hover()
+
+    def _on_hover_watch_tick(self) -> None:
+        if self._pinned_expanded or (not self._expanded and self.action_bar.isHidden()):
+            self._hover_watch_timer.stop()
+            return
+        if not self._cursor_inside_card():
+            self._hover_expand_timer.stop()
+            self._hover_collapse_timer.stop()
+            self._collapse_from_hover()
+
+    def enterEvent(self, event) -> None:
+        self._hover_collapse_timer.stop()
+        if not self._pinned_expanded and (not self._expanded or self.action_bar.isHidden()):
+            self._hover_expand_timer.start(self.HOVER_EXPAND_DELAY_MS)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self._hover_expand_timer.stop()
+        if not self._cursor_inside_card() and not self._pinned_expanded:
+            if self._expanded or not self.action_bar.isHidden():
+                self._hover_collapse_timer.start(self.HOVER_COLLAPSE_DELAY_MS)
+        super().leaveEvent(event)
+
+
+class _SessionPopover(QFrame):
+    """저장된 AI 챗 세션 목록 및 '+ 새 대화' 팝오버."""
+
+    new_session_requested = pyqtSignal()
+    session_selected = pyqtSignal(int)
+    session_deleted = pyqtSignal(int)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("AiChatSessionPopover")
+        self.setFixedWidth(290)
+        self.setMaximumHeight(380)
+        self.setStyleSheet(
+            "QFrame#AiChatSessionPopover { "
+            "background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 10px; }"
+        )
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        hdr = QHBoxLayout()
+        hdr.setSpacing(6)
+        lbl_title = QLabel("대화 세션")
+        lbl_title.setStyleSheet("font-size: 12px; font-weight: 700; color: #0F172A;")
+        self.btn_new_session = QPushButton("+ 새 대화")
+        _apply_role(self.btn_new_session, role="primary", obj_name="BtnNewChatSession")
+        self.btn_new_session.setFixedHeight(26)
+        self.btn_new_session.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_new_session.clicked.connect(self._on_new_clicked)
+        hdr.addWidget(lbl_title)
+        hdr.addStretch()
+        hdr.addWidget(self.btn_new_session)
+        lay.addLayout(hdr)
+
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_container = QWidget()
+        self.list_lay = QVBoxLayout(self.list_container)
+        self.list_lay.setContentsMargins(0, 0, 0, 0)
+        self.list_lay.setSpacing(4)
+        self.list_lay.addStretch()
+        self.scroll.setWidget(self.list_container)
+        lay.addWidget(self.scroll, stretch=1)
+
+    def _on_new_clicked(self) -> None:
+        self.hide()
+        self.new_session_requested.emit()
+
+    def populate(self, sessions: List[Dict[str, Any]], active_session_id: Optional[int]) -> None:
+        while self.list_lay.count() > 1:
+            item = self.list_lay.takeAt(0)
+            w = item.widget() if item else None
+            if w is not None:
+                w.deleteLater()
+
+        if not sessions:
+            empty = QLabel("저장된 대화가 없습니다.")
+            empty.setStyleSheet("font-size: 11px; color: #94A3B8; padding: 12px;")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.list_lay.insertWidget(0, empty)
+            self.scroll.setMinimumHeight(68)
+            self.resize(290, 128)
+            return
+
+        for sess in sessions:
+            sid = int(sess["id"])
+            is_active = active_session_id == sid
+            row_frame = QFrame()
+            row_frame.setMinimumHeight(44)
+            row_frame.setStyleSheet(
+                "QFrame { "
+                + (
+                    "background-color: #EFF6FF; border: 1px solid #93C5FD; border-radius: 6px;"
+                    if is_active
+                    else "background-color: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 6px;"
+                )
+                + " }"
+            )
+            r_lay = QHBoxLayout(row_frame)
+            r_lay.setContentsMargins(8, 6, 6, 6)
+            r_lay.setSpacing(4)
+
+            title = str(sess.get("title", "새 대화") or "새 대화")
+            cnt = int(sess.get("message_count", 0) or 0)
+            updated = str(sess.get("updated_at", "") or "")[:16]
+            btn_sel = QPushButton(f"{title}\n{cnt}개 메시지 · {updated}", row_frame)
+            btn_sel.setMinimumWidth(0)
+            btn_sel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            btn_sel.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_sel.setStyleSheet(
+                "QPushButton { text-align: left; background: transparent; border: none; padding: 0px; "
+                f"font-size: 11px; font-weight: {'700' if is_active else '500'}; color: #0F172A; }}"
+            )
+            btn_sel.clicked.connect(lambda _c=False, s_id=sid: (self.hide(), self.session_selected.emit(s_id)))
+
+            btn_del = QPushButton("×", row_frame)
+            btn_del.setFixedSize(24, 24)
+            btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_del.setToolTip("세션 삭제")
+            btn_del.setStyleSheet(
+                "QPushButton { padding: 0px; margin: 0px; min-width: 24px; max-width: 24px; "
+                "min-height: 24px; max-height: 24px; color: #64748B; background: transparent; "
+                "border: none; font-size: 14px; font-weight: bold; }"
+                "QPushButton:hover { color: #EF4444; background-color: #FEE2E2; border-radius: 4px; }"
+            )
+            btn_del.clicked.connect(lambda _c=False, s_id=sid: self.session_deleted.emit(s_id))
+
+            r_lay.addWidget(btn_sel, stretch=1)
+            r_lay.addWidget(btn_del, stretch=0)
+            self.list_lay.insertWidget(self.list_lay.count() - 1, row_frame)
+
+        scroll_h = min(310, max(68, len(sessions) * 48 + 8))
+        self.scroll.setMinimumHeight(scroll_h)
+        self.resize(290, min(380, scroll_h + 62))
+
+
+class _ModeOptionsPopover(QFrame):
+    """API 엔진 설정/상태 및 Playwright 세션 옵션을 담은 컴팩트 팝오버."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self.setObjectName("AiDockModeOptionsPopover")
+        self.setFixedWidth(270)
+        self.setStyleSheet(
+            "QFrame#AiDockModeOptionsPopover { "
+            "background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 10px; }"
+        )
+        self.body_lay = QVBoxLayout(self)
+        self.body_lay.setContentsMargins(10, 10, 10, 10)
+        self.body_lay.setSpacing(8)
+
+
 class AiExecutionDock(QFrame):
     """EduFlow 우측 접이식 AI 실행 사이드바 위젯 (폭 340px)."""
 
@@ -436,16 +1198,34 @@ class AiExecutionDock(QFrame):
     execution_completed = pyqtSignal(str, dict)
     ai_mode_changed = pyqtSignal()
 
-    def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        task_runner: TaskRunner,
+        parent: Optional[QWidget] = None,
+        db: Optional[DatabaseManager] = None,
+    ):
         super().__init__(parent)
         _apply_role(self, obj_name="AiExecutionDock")
         self.task_runner = task_runner
+        self.db = db if db is not None else DatabaseManager()
 
         self._targets: Dict[str, Dict[str, Any]] = {}
         self._active_target_id: str = ""
         self._target_locked: bool = False
         self._last_context: Dict[str, Any] = {}
         self._last_result_excel_path: str = ""
+
+        # 챗봇 세션 & 메시지 상태
+        self._active_session_id: Optional[int] = None
+        self._chat_attachments: List[Dict[str, Any]] = []
+        self._editing_message_id: Optional[int] = None
+        self._message_cards: List[_ChatMessageCard] = []
+        self._manual_waiting_collect: bool = False
+        self._pw_waiting_collect: bool = False
+        self._pw_inline_card: Optional[QFrame] = None
+        self._last_manual_prompt: str = ""
+        self._chat_extra_instruction: str = ""
+        self._chat_extra_attachments: List[Dict[str, Any]] = []
 
         # 수동 복붙 상태
         self._manual_batches: List[Dict[str, Any]] = []
@@ -473,6 +1253,8 @@ class AiExecutionDock(QFrame):
         self.setMaximumWidth(0)
 
         self._init_ui()
+        self._register_default_general_chat_target()
+        self._init_or_restore_session()
         self.refresh_ai_info()
 
     # =========================================================================
@@ -514,22 +1296,35 @@ class AiExecutionDock(QFrame):
         lbl_target_cap = QLabel("ACTIVE AI TARGET")
         _apply_role(lbl_target_cap, role="dockSectionLabel")
 
-        self.btn_lock_target = QPushButton("타겟 고정 OFF")
-        _apply_role(self.btn_lock_target, role="lockToggleBtn", obj_name="AiDockLockBtn")
+        # 단축키 호환용 숨김 토글 버튼 유지 (MainWindow 단축키 연동)
+        self.btn_lock_target = QPushButton("타겟 고정 OFF", target_header)
         self.btn_lock_target.setCheckable(True)
-        self.btn_lock_target.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_lock_target.setToolTip("켜면 중앙 카드를 클릭해도 활성 AI 타겟이 전환되지 않습니다.")
+        self.btn_lock_target.setVisible(False)
         self.btn_lock_target.toggled.connect(self._on_lock_toggled)
+
+        # 정사각형 테두리 + 평행선 3개 가운데 정렬 SVG 세션 아이콘 버튼
+        self.btn_session_menu = QPushButton()
+        _apply_role(self.btn_session_menu, role="sessionMenuBtn", obj_name="AiDockSessionBtn")
+        self.btn_session_menu.setFixedSize(28, 28)
+        self.btn_session_menu.setIcon(_render_inline_svg_icon(_SVG_SESSION_MENU, "#334155", 16))
+        self.btn_session_menu.setIconSize(QSize(16, 16))
+        self.btn_session_menu.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_session_menu.setToolTip("저장된 대화 세션 목록 / + 새 대화")
+        self.btn_session_menu.setStyleSheet(
+            "QPushButton#AiDockSessionBtn { background-color: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 6px; }"
+            "QPushButton#AiDockSessionBtn:hover { border-color: #0B4DCB; background-color: #EFF6FF; }"
+        )
+        self.btn_session_menu.clicked.connect(self._on_session_menu_clicked)
+
+        self._session_popover = _SessionPopover(self)
+        self._session_popover.new_session_requested.connect(self.create_new_session)
+        self._session_popover.session_selected.connect(self.load_session)
+        self._session_popover.session_deleted.connect(self._on_delete_session_requested)
 
         th_top_row.addWidget(lbl_target_cap)
         th_top_row.addStretch()
-        th_top_row.addWidget(self.btn_lock_target)
+        th_top_row.addWidget(self.btn_session_menu)
         th_lay.addLayout(th_top_row)
-
-        self.lbl_active_target_box = QLabel("대상 미선택")
-        self.lbl_active_target_box.setWordWrap(True)
-        _apply_role(self.lbl_active_target_box, obj_name="ActiveTargetDisplayBox")
-        th_lay.addWidget(self.lbl_active_target_box)
 
         self.combo_target_selector = QComboBox()
         _apply_role(self.combo_target_selector, obj_name="ComboAiDockTarget")
@@ -541,8 +1336,12 @@ class AiExecutionDock(QFrame):
         root_lay.addWidget(target_header)
 
         # ---------------------------------------------------------------------
-        # [2단] 3-모드 세그먼트 컨트롤 (QButtonGroup + 고정 높이 32px)
+        # [2단] 3-모드 세그먼트 컨트롤 + ⚙ 옵션 팝오버 버튼
         # ---------------------------------------------------------------------
+        seg_row = QHBoxLayout()
+        seg_row.setContentsMargins(0, 0, 0, 0)
+        seg_row.setSpacing(6)
+
         seg_frame = QFrame(panel)
         _apply_role(seg_frame, obj_name="AiDockSegmentFrame")
         seg_lay = QHBoxLayout(seg_frame)
@@ -567,7 +1366,21 @@ class AiExecutionDock(QFrame):
 
         self.btn_mode_manual.setChecked(True)
         self.mode_btn_group.idClicked.connect(self._on_mode_segment_clicked)
-        root_lay.addWidget(seg_frame)
+
+        self.btn_mode_options = QPushButton()
+        _apply_role(self.btn_mode_options, role="outline", obj_name="AiDockModeOptionsBtn")
+        self.btn_mode_options.setFixedSize(32, 32)
+        self.btn_mode_options.setIcon(_render_inline_svg_icon(_SVG_SETTINGS_GEAR, "#475569", 15))
+        self.btn_mode_options.setIconSize(QSize(15, 15))
+        self.btn_mode_options.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_mode_options.setToolTip("API 엔진 상태 · Playwright 세션 옵션")
+        self.btn_mode_options.clicked.connect(self._on_mode_options_clicked)
+
+        self._build_mode_options_popover()
+
+        seg_row.addWidget(seg_frame, stretch=1)
+        seg_row.addWidget(self.btn_mode_options)
+        root_lay.addLayout(seg_row)
 
         # [2.3단] 미리보기 선택 인용 배지 (이모지 미사용)
         self.quote_badge_frame = QFrame(panel)
@@ -633,12 +1446,13 @@ class AiExecutionDock(QFrame):
         # ---------------------------------------------------------------------
         # [3단] 모드별 실행 컨트롤 영역 (QStackedWidget in QScrollArea)
         # ---------------------------------------------------------------------
-        body_scroll = QScrollArea(panel)
-        body_scroll.setWidgetResizable(True)
-        body_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body_scroll = QScrollArea(panel)
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.body_scroll.setMaximumHeight(220)
 
-        self.mode_stack = QStackedWidget(body_scroll)
+        self.mode_stack = QStackedWidget(self.body_scroll)
         _apply_role(self.mode_stack, obj_name="AiDockModeStack")
 
         self.mode_stack.addWidget(self._build_api_mode_page())
@@ -646,8 +1460,213 @@ class AiExecutionDock(QFrame):
         self.mode_stack.addWidget(self._build_playwright_mode_page())
         self.mode_stack.setCurrentIndex(1)
 
-        body_scroll.setWidget(self.mode_stack)
-        root_lay.addWidget(body_scroll, stretch=1)
+        self.body_scroll.setWidget(self.mode_stack)
+        root_lay.addWidget(self.body_scroll)
+
+        # ---------------------------------------------------------------------
+        # [3.5단] 챗봇 대화 타임라인 (API / 수동 복붙 / Playwright 공용 누적)
+        # ---------------------------------------------------------------------
+        self.chat_scroll = QScrollArea(panel)
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_scroll.setMinimumHeight(140)
+        _apply_role(self.chat_scroll, obj_name="AiChatTimelineScroll")
+
+        self.chat_timeline_widget = QWidget()
+        _apply_role(self.chat_timeline_widget, obj_name="AiChatTimelineBody")
+        self.chat_timeline_lay = QVBoxLayout(self.chat_timeline_widget)
+        self.chat_timeline_lay.setContentsMargins(2, 4, 2, 4)
+        self.chat_timeline_lay.setSpacing(8)
+
+        self.lbl_chat_empty = QLabel(
+            "대화를 시작해 보세요.\n질문을 입력하거나 파일·폴더를 첨부할 수 있습니다."
+        )
+        self.lbl_chat_empty.setWordWrap(True)
+        self.lbl_chat_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_chat_empty.setStyleSheet("color: #94A3B8; font-size: 11px; padding: 18px 8px;")
+        self.chat_timeline_lay.addWidget(self.lbl_chat_empty)
+        self.chat_timeline_lay.addStretch()
+
+        self.chat_scroll.setWidget(self.chat_timeline_widget)
+        root_lay.addWidget(self.chat_scroll, stretch=1)
+
+        # ---------------------------------------------------------------------
+        # [3.8단] 하단 챗 입력칸 + 파일/폴더 첨부 칩 + 드래그앤드롭
+        # ---------------------------------------------------------------------
+        self.chat_input_card = QFrame(panel)
+        _apply_role(self.chat_input_card, role="subCard", obj_name="AiChatInputCard")
+        ci_lay = QVBoxLayout(self.chat_input_card)
+        ci_lay.setContentsMargins(8, 8, 8, 8)
+        ci_lay.setSpacing(6)
+
+        # 수정-재전송 분기 배너 (기본 숨김)
+        self.edit_branch_banner = QFrame(self.chat_input_card)
+        self.edit_branch_banner.setStyleSheet(
+            "QFrame { background-color: #FEF3C7; border: 1px solid #F59E0B; border-radius: 6px; }"
+        )
+        eb_lay = QHBoxLayout(self.edit_branch_banner)
+        eb_lay.setContentsMargins(8, 4, 6, 4)
+        eb_lay.setSpacing(6)
+        lbl_eb = QLabel("질문 수정 중 (재전송 시 이후 대화 덮어씀)")
+        lbl_eb.setStyleSheet("color: #92400E; font-size: 10.5px; font-weight: 600;")
+        self.btn_cancel_edit = QPushButton("취소")
+        self.btn_cancel_edit.setFixedHeight(20)
+        self.btn_cancel_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cancel_edit.setStyleSheet(
+            "QPushButton { background: #FFFFFF; border: 1px solid #D97706; border-radius: 4px; "
+            "color: #92400E; font-size: 10px; padding: 0 6px; }"
+        )
+        self.btn_cancel_edit.clicked.connect(self._cancel_edit_message)
+        eb_lay.addWidget(lbl_eb, stretch=1)
+        eb_lay.addWidget(self.btn_cancel_edit)
+        self.edit_branch_banner.setVisible(False)
+        ci_lay.addWidget(self.edit_branch_banner)
+
+        # 첨부 칩 목록 컨테이너
+        self.attachment_chips_widget = QWidget(self.chat_input_card)
+        self.attachment_chips_lay = QVBoxLayout(self.attachment_chips_widget)
+        self.attachment_chips_lay.setContentsMargins(0, 0, 0, 0)
+        self.attachment_chips_lay.setSpacing(4)
+        self.attachment_chips_widget.setVisible(False)
+        ci_lay.addWidget(self.attachment_chips_widget)
+
+        # 직접 URL 입력란 (수동 복붙 / Playwright 자동에서 '직접 URL' 선택 시에만 표시)
+        self.edit_chat_custom_url = QLineEdit(self.chat_input_card)
+        _apply_role(self.edit_chat_custom_url, obj_name="EditChatCustomUrl")
+        self.edit_chat_custom_url.setFixedHeight(28)
+        self.edit_chat_custom_url.setPlaceholderText("https://... 접속할 웹 AI URL 입력")
+        self.edit_chat_custom_url.textChanged.connect(self._on_chat_custom_url_changed)
+        self.edit_chat_custom_url.setVisible(False)
+        self.edit_manual_custom_url = self.edit_chat_custom_url
+        self.edit_pw_custom_url = self.edit_chat_custom_url
+        ci_lay.addWidget(self.edit_chat_custom_url)
+
+        self.txt_chat_input = _ChatInputTextEdit(self.chat_input_card)
+        _apply_role(self.txt_chat_input, obj_name="AiChatInputBox")
+        self.txt_chat_input.setMinimumHeight(52)
+        self.txt_chat_input.setMaximumHeight(92)
+        self.txt_chat_input.setPlaceholderText(
+            "메시지 입력 (Enter 전송 · Shift+Enter 줄바꿈)\n파일/폴더를 여기로 드래그앤드롭할 수 있습니다."
+        )
+        self.txt_chat_input.send_requested.connect(self._on_chat_send_clicked)
+        enable_file_drop(
+            self.txt_chat_input,
+            allowed_exts=None,
+            allow_dirs=True,
+            allow_files=True,
+            on_files_dropped=self._on_chat_paths_dropped,
+            context_label="챗 첨부 파일/폴더",
+            highlight_target=self.chat_input_card,
+        )
+        enable_file_drop(
+            self.chat_input_card,
+            allowed_exts=None,
+            allow_dirs=True,
+            allow_files=True,
+            on_files_dropped=self._on_chat_paths_dropped,
+            context_label="챗 첨부 파일/폴더",
+            highlight_target=self.chat_input_card,
+        )
+        ci_lay.addWidget(self.txt_chat_input)
+
+        ci_btn_row = QHBoxLayout()
+        ci_btn_row.setSpacing(3)
+
+        self.btn_attach_file = QPushButton()
+        _apply_role(self.btn_attach_file, role="outline", obj_name="BtnChatAttachFile")
+        self.btn_attach_file.setFixedSize(28, 28)
+        self.btn_attach_file.setIcon(_render_inline_svg_icon(_SVG_PAPERCLIP, "#475569", 14))
+        self.btn_attach_file.setIconSize(QSize(14, 14))
+        self.btn_attach_file.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_attach_file.setToolTip("파일 첨부")
+        self.btn_attach_file.clicked.connect(self._on_attach_file_clicked)
+
+        self.btn_attach_folder = QPushButton()
+        _apply_role(self.btn_attach_folder, role="outline", obj_name="BtnChatAttachFolder")
+        self.btn_attach_folder.setFixedSize(28, 28)
+        self.btn_attach_folder.setIcon(_render_inline_svg_icon(_SVG_FOLDER, "#475569", 14))
+        self.btn_attach_folder.setIconSize(QSize(14, 14))
+        self.btn_attach_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_attach_folder.setToolTip("폴더 첨부 (경로 및 하위 파일 목록 컨텍스트 포함)")
+        self.btn_attach_folder.clicked.connect(self._on_attach_folder_clicked)
+
+        self.combo_web_provider = QComboBox(self.chat_input_card)
+        _apply_role(self.combo_web_provider, obj_name="ComboChatWebProvider")
+        self.combo_web_provider.setFixedHeight(28)
+        self.combo_web_provider.setMaximumWidth(104)
+        self.combo_web_provider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        for p_key, p_lbl in (
+            ("gemini", "Gemini"),
+            ("chatgpt", "ChatGPT"),
+            ("claude", "Claude"),
+            ("custom", "직접 URL"),
+        ):
+            self.combo_web_provider.addItem(p_lbl, p_key)
+        self.combo_web_provider.currentIndexChanged.connect(self._on_chat_web_provider_changed)
+
+        self.lbl_chat_api_badge = QLabel("Gemini")
+        self.lbl_chat_api_badge.setStyleSheet(
+            "font-size: 10.5px; font-weight: 600; color: #0369A1; "
+            "background-color: #E0F2FE; border: 1px solid #BAE6FD; "
+            "border-radius: 6px; padding: 2px 7px;"
+        )
+        self.lbl_chat_api_badge.setVisible(False)
+
+        self.btn_chat_send = QPushButton("전송")
+        _apply_role(self.btn_chat_send, role="primary", obj_name="BtnChatSend")
+        self.btn_chat_send.setFixedHeight(28)
+        self.btn_chat_send.setMinimumWidth(56)
+        self.btn_chat_send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_chat_send.clicked.connect(self._on_chat_send_clicked)
+
+        self.btn_chat_cancel_collect = QPushButton("×")
+        _apply_role(self.btn_chat_cancel_collect, role="outline", obj_name="BtnChatCancelCollect")
+        self.btn_chat_cancel_collect.setFixedSize(24, 28)
+        self.btn_chat_cancel_collect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_chat_cancel_collect.setToolTip("응답 회수 대기 취소")
+        self.btn_chat_cancel_collect.setVisible(False)
+        self.btn_chat_cancel_collect.clicked.connect(self._cancel_manual_collect_waiting)
+
+        ci_btn_row.addWidget(self.btn_attach_file)
+        ci_btn_row.addWidget(self.btn_attach_folder)
+        ci_btn_row.addStretch()
+        ci_btn_row.addWidget(self.lbl_chat_api_badge)
+        ci_btn_row.addWidget(self.combo_web_provider)
+        ci_btn_row.addWidget(self.btn_chat_send)
+        ci_btn_row.addWidget(self.btn_chat_cancel_collect)
+        ci_lay.addLayout(ci_btn_row)
+
+        # 수동 복붙 모드 분할 배치 바 (하단 입력창 바로 위, 다중 배치 시에만 표시)
+        self.batch_bar_widget = QFrame(panel)
+        _apply_role(self.batch_bar_widget, role="subCard", obj_name="AiBatchBar")
+        bb_lay = QHBoxLayout(self.batch_bar_widget)
+        bb_lay.setContentsMargins(8, 5, 8, 5)
+        bb_lay.setSpacing(6)
+
+        self.combo_manual_batch = QComboBox(self.batch_bar_widget)
+        _apply_role(self.combo_manual_batch, obj_name="ComboDockManualBatch")
+        self.combo_manual_batch.setFixedHeight(26)
+        self.combo_manual_batch.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.combo_manual_batch.currentIndexChanged.connect(self._on_manual_batch_changed)
+
+        self.btn_batch_copy = QPushButton("현재 배치 프롬프트 복사", self.batch_bar_widget)
+        _apply_role(self.btn_batch_copy, role="outline", obj_name="BtnBatchCopyPrompt")
+        self.btn_batch_copy.setFixedHeight(26)
+        self.btn_batch_copy.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_copy.clicked.connect(self._on_manual_copy_only)
+
+        self.lbl_batch_progress = QLabel("0/0", self.batch_bar_widget)
+        _apply_role(self.lbl_batch_progress, role="mutedText")
+        self.lbl_batch_progress.setStyleSheet("font-size: 11px; font-weight: 600;")
+
+        bb_lay.addWidget(self.combo_manual_batch, stretch=1)
+        bb_lay.addWidget(self.btn_batch_copy)
+        bb_lay.addWidget(self.lbl_batch_progress)
+        self.batch_bar_widget.setVisible(False)
+        root_lay.addWidget(self.batch_bar_widget)
+
+        root_lay.addWidget(self.chat_input_card)
 
         # ---------------------------------------------------------------------
         # [4단] 하단 고정 상태 푸터
@@ -668,39 +1687,22 @@ class AiExecutionDock(QFrame):
         self.lbl_dock_progress_meta.setWordWrap(True)
         _apply_role(self.lbl_dock_progress_meta, role="mutedText")
 
-        self.btn_dock_open_excel = QPushButton("생성된 결과 엑셀 열기 (.xlsx)")
-        _apply_role(self.btn_dock_open_excel, role="success", obj_name="BtnDockOpenResultExcel")
-        self.btn_dock_open_excel.setFixedHeight(32)
-        self.btn_dock_open_excel.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_dock_open_excel.setEnabled(False)
-        self.btn_dock_open_excel.setVisible(False)
-        self.btn_dock_open_excel.clicked.connect(self._on_open_result_excel)
-
         ft_lay.addWidget(self.progress_dock)
         ft_lay.addWidget(self.lbl_dock_progress_meta)
-        ft_lay.addWidget(self.btn_dock_open_excel)
         root_lay.addWidget(footer)
 
         clip_scroll.setWidget(panel)
         outer_lay.addWidget(clip_scroll)
 
     # =========================================================================
-    # Page 0: API 모드
+    # 모드 옵션 팝오버 (API 엔진 / Playwright 세션 체크박스)
     # =========================================================================
-    def _build_api_mode_page(self) -> QWidget:
-        page = QWidget()
-        lay = QVBoxLayout(page)
-        lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(10)
+    def _build_mode_options_popover(self) -> None:
+        self._mode_options_popover = _ModeOptionsPopover(self)
+        lay = self._mode_options_popover.body_lay
 
-        model_card = QFrame()
-        _apply_role(model_card, role="subCard")
-        mc_lay = QVBoxLayout(model_card)
-        mc_lay.setContentsMargins(10, 10, 10, 10)
-        mc_lay.setSpacing(6)
-
-        lbl_cap = QLabel("연결 AI 엔진")
-        _apply_role(lbl_cap, role="fieldLabel")
+        lbl_api_cap = QLabel("연결 API 엔진")
+        _apply_role(lbl_api_cap, role="fieldLabel")
         self.lbl_api_model_badge = QLabel("확인 중...")
         self.lbl_api_model_badge.setWordWrap(True)
         _apply_role(self.lbl_api_model_badge, role="statusBanner")
@@ -711,7 +1713,9 @@ class AiExecutionDock(QFrame):
         _apply_role(self.btn_api_go_settings, role="secondary")
         self.btn_api_go_settings.setFixedHeight(28)
         self.btn_api_go_settings.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_api_go_settings.clicked.connect(self.go_to_settings_requested.emit)
+        self.btn_api_go_settings.clicked.connect(
+            lambda: (self._mode_options_popover.hide(), self.go_to_settings_requested.emit())
+        )
 
         self.btn_api_refresh = QPushButton("상태 갱신")
         _apply_role(self.btn_api_refresh, role="outline")
@@ -721,15 +1725,58 @@ class AiExecutionDock(QFrame):
 
         link_row.addWidget(self.btn_api_go_settings, stretch=1)
         link_row.addWidget(self.btn_api_refresh)
-        mc_lay.addWidget(lbl_cap)
-        mc_lay.addWidget(self.lbl_api_model_badge)
-        mc_lay.addLayout(link_row)
-        lay.addWidget(model_card)
+
+        lay.addWidget(lbl_api_cap)
+        lay.addWidget(self.lbl_api_model_badge)
+        lay.addLayout(link_row)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color: #E2E8F0;")
+        lay.addWidget(sep)
+
+        lbl_pw_cap = QLabel("Playwright 브라우저 옵션")
+        _apply_role(lbl_pw_cap, role="fieldLabel")
+        self.lbl_pw_exec_mode = QLabel("실행 방식")
+        _apply_role(self.lbl_pw_exec_mode, role="mutedText")
+        self.combo_pw_exec_mode = QComboBox()
+        _apply_role(self.combo_pw_exec_mode, obj_name="ComboPlaywrightExecMode")
+        self.combo_pw_exec_mode.setFixedHeight(28)
+        self.combo_pw_exec_mode.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.combo_pw_exec_mode.addItem("완전 자동: 배치 무인 반복", "auto")
+        self.combo_pw_exec_mode.addItem("반자동: 프롬프트 자동 입력 · 수동 전송", "semi_auto")
+
+        self.chk_pw_keep_login = QCheckBox("로그인 세션 유지")
+        self.chk_pw_keep_login.setChecked(True)
+        self.chk_pw_temp_chat = QCheckBox("임시 채팅으로 실행")
+        self.chk_pw_temp_chat.setChecked(True)
+
+        lay.addWidget(lbl_pw_cap)
+        lay.addWidget(self.lbl_pw_exec_mode)
+        lay.addWidget(self.combo_pw_exec_mode)
+        lay.addWidget(self.chk_pw_keep_login)
+        lay.addWidget(self.chk_pw_temp_chat)
+
+    def _on_mode_options_clicked(self) -> None:
+        btn_pos = self.btn_mode_options.mapToGlobal(self.btn_mode_options.rect().bottomRight())
+        pop_x = max(0, btn_pos.x() - self._mode_options_popover.width())
+        pop_y = btn_pos.y() + 4
+        self._mode_options_popover.move(pop_x, pop_y)
+        self._mode_options_popover.show()
+
+    # =========================================================================
+    # Page 0: API 모드
+    # =========================================================================
+    def _build_api_mode_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(8)
 
         self.api_summary_card = QFrame()
         _apply_role(self.api_summary_card, role="subCard")
         sc_lay = QVBoxLayout(self.api_summary_card)
-        sc_lay.setContentsMargins(10, 10, 10, 10)
+        sc_lay.setContentsMargins(10, 8, 10, 8)
         sc_lay.setSpacing(6)
 
         lbl_sum_cap = QLabel("미완료 현황 요약")
@@ -748,15 +1795,16 @@ class AiExecutionDock(QFrame):
 
         self.btn_api_start = QPushButton("API 일괄 생성 시작")
         _apply_role(self.btn_api_start, role="primary", obj_name="BtnDockApiStart")
-        self.btn_api_start.setFixedHeight(36)
+        self.btn_api_start.setFixedHeight(34)
         self.btn_api_start.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_api_start.clicked.connect(self._on_api_start_clicked)
 
         self.btn_api_stop = QPushButton("작업 중지")
         _apply_role(self.btn_api_stop, role="danger", obj_name="BtnDockApiStop")
-        self.btn_api_stop.setFixedHeight(34)
+        self.btn_api_stop.setFixedHeight(32)
         self.btn_api_stop.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_api_stop.setEnabled(False)
+        self.btn_api_stop.setVisible(False)
         self.btn_api_stop.clicked.connect(self._on_api_stop_clicked)
 
         lay.addWidget(self.btn_api_start)
@@ -809,21 +1857,11 @@ class AiExecutionDock(QFrame):
         split_row.addWidget(self.spin_manual_tokens, stretch=1)
         split_row.addWidget(self.btn_manual_resplit)
 
-        lbl_batch_sel = QLabel("배치 선택")
-        _apply_role(lbl_batch_sel, role="fieldLabel")
-        self.combo_manual_batch = QComboBox()
-        _apply_role(self.combo_manual_batch, obj_name="ComboDockManualBatch")
-        self.combo_manual_batch.setFixedHeight(30)
-        self.combo_manual_batch.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.combo_manual_batch.currentIndexChanged.connect(self._on_manual_batch_changed)
-
         self.lbl_manual_batch_meta = QLabel("대상 엑셀 파일을 선택하면 배치가 생성됩니다.")
         self.lbl_manual_batch_meta.setWordWrap(True)
         _apply_role(self.lbl_manual_batch_meta, role="mutedText")
 
         mb_lay.addLayout(split_row)
-        mb_lay.addWidget(lbl_batch_sel)
-        mb_lay.addWidget(self.combo_manual_batch)
         mb_lay.addWidget(self.lbl_manual_batch_meta)
         lay.addWidget(self.manual_batch_card)
 
@@ -874,190 +1912,78 @@ class AiExecutionDock(QFrame):
         self.manual_attachment_card.setVisible(False)
         lay.addWidget(self.manual_attachment_card)
 
-        # 대상 웹 AI 선택 칩 4종 + 커스텀 URL
-        web_card = QFrame()
-        _apply_role(web_card, role="subCard")
-        wc_lay = QVBoxLayout(web_card)
-        wc_lay.setContentsMargins(10, 8, 10, 8)
-        wc_lay.setSpacing(6)
+        # 특수 타겟용 프롬프트 복사 버튼 행 (범용 챗에서는 숨김)
+        self.manual_copy_card = QFrame()
+        _apply_role(self.manual_copy_card, role="subCard")
+        mc_copy_lay = QHBoxLayout(self.manual_copy_card)
+        mc_copy_lay.setContentsMargins(8, 6, 8, 6)
+        mc_copy_lay.setSpacing(6)
 
-        lbl_chips = QLabel("대상 웹 AI 선택")
-        _apply_role(lbl_chips, role="fieldLabel")
-        wc_lay.addWidget(lbl_chips)
-
-        (
-            chip_lay,
-            self.manual_chip_group,
-            self.manual_provider_chips,
-        ) = self._create_provider_chips(self._on_manual_provider_chip_clicked)
-        wc_lay.addLayout(chip_lay)
-
-        self.edit_manual_custom_url = QLineEdit()
-        _apply_role(self.edit_manual_custom_url, obj_name="EditManualCustomUrl")
-        self.edit_manual_custom_url.setFixedHeight(30)
-        self.edit_manual_custom_url.setPlaceholderText("https://... 직접 URL 선택 시 웹 주소 입력")
-        self.edit_manual_custom_url.setEnabled(False)
-        self.edit_manual_custom_url.textChanged.connect(self._on_manual_custom_url_changed)
-        wc_lay.addWidget(self.edit_manual_custom_url)
-
-        copy_row = QHBoxLayout()
-        copy_row.setSpacing(6)
         self.btn_manual_copy_open = QPushButton("프롬프트 복사 & 웹 열기")
         _apply_role(self.btn_manual_copy_open, role="primary", obj_name="BtnDockManualCopyOpen")
-        self.btn_manual_copy_open.setFixedHeight(34)
+        self.btn_manual_copy_open.setFixedHeight(32)
         self.btn_manual_copy_open.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_manual_copy_open.clicked.connect(self._on_manual_copy_and_open)
 
         self.btn_manual_copy_only = QPushButton("복사만")
         _apply_role(self.btn_manual_copy_only, role="outline")
-        self.btn_manual_copy_only.setFixedHeight(34)
+        self.btn_manual_copy_only.setFixedHeight(32)
         self.btn_manual_copy_only.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_manual_copy_only.clicked.connect(self._on_manual_copy_only)
 
-        copy_row.addWidget(self.btn_manual_copy_open, stretch=1)
-        copy_row.addWidget(self.btn_manual_copy_only)
-        wc_lay.addLayout(copy_row)
-        lay.addWidget(web_card)
+        mc_copy_lay.addWidget(self.btn_manual_copy_open, stretch=1)
+        mc_copy_lay.addWidget(self.btn_manual_copy_only)
+        lay.addWidget(self.manual_copy_card)
 
-        # 웹 AI 응답 JSON 붙여넣기
-        resp_card = QFrame()
-        _apply_role(resp_card, role="subCard")
-        rc_lay = QVBoxLayout(resp_card)
-        rc_lay.setContentsMargins(10, 8, 10, 8)
-        rc_lay.setSpacing(6)
-
-        resp_hdr = QHBoxLayout()
-        lbl_resp_cap = QLabel("웹 AI 응답 JSON 붙여넣기")
-        _apply_role(lbl_resp_cap, role="fieldLabel")
-        self.btn_manual_paste_clip = QPushButton("붙여넣기")
-        _apply_role(self.btn_manual_paste_clip, role="outline")
-        self.btn_manual_paste_clip.setFixedHeight(24)
-        self.btn_manual_paste_clip.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_manual_paste_clip.clicked.connect(self._on_manual_paste_from_clipboard)
-        resp_hdr.addWidget(lbl_resp_cap)
-        resp_hdr.addStretch()
-        resp_hdr.addWidget(self.btn_manual_paste_clip)
-        rc_lay.addLayout(resp_hdr)
-
-        self.txt_manual_response = QTextEdit()
-        _apply_role(self.txt_manual_response, obj_name="WebAiInputBox")
-        self.txt_manual_response.setMinimumHeight(100)
-        self.txt_manual_response.setMaximumHeight(130)
-        self.txt_manual_response.setPlaceholderText(
-            "웹 AI에서 복사한 ```json ... ``` 응답을 붙여넣으세요 (Ctrl+V)."
-        )
+        # 내부/테스트 호환용 숨김 위젯 (중간 붙여넣기 UI 제거, 하단 전송↔응답 회수로 통합)
+        self.txt_manual_response = QTextEdit(page)
+        self.txt_manual_response.setVisible(False)
         self.txt_manual_response.textChanged.connect(self._on_manual_response_changed)
-        rc_lay.addWidget(self.txt_manual_response)
-
-        self.lbl_manual_verify = QLabel("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
-        self.lbl_manual_verify.setWordWrap(True)
-        _apply_role(self.lbl_manual_verify, role="mutedText")
-        rc_lay.addWidget(self.lbl_manual_verify)
-
-        self.btn_manual_apply_next = QPushButton("검증 후 엑셀 반영 · 다음 묶음 복사")
-        _apply_role(self.btn_manual_apply_next, role="primary", obj_name="BtnDockManualApplyNext")
-        self.btn_manual_apply_next.setFixedHeight(36)
-        self.btn_manual_apply_next.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.lbl_manual_verify = QLabel(page)
+        self.lbl_manual_verify.setVisible(False)
+        self.btn_manual_apply_next = QPushButton(page)
+        self.btn_manual_apply_next.setVisible(False)
         self.btn_manual_apply_next.clicked.connect(self._on_manual_apply_and_next)
-        rc_lay.addWidget(self.btn_manual_apply_next)
 
-        lay.addWidget(resp_card)
         lay.addStretch()
         return page
 
     # =========================================================================
-    # Page 2: Playwright 자동 / 반자동 모드
+    # Page 2: Playwright 자동 / 반자동 모드 (실행·대기 중 미니 바만 표시)
     # =========================================================================
     def _build_playwright_mode_page(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
         lay.setContentsMargins(2, 2, 2, 2)
-        lay.setSpacing(8)
+        lay.setSpacing(6)
 
-        web_card = QFrame()
-        _apply_role(web_card, role="subCard")
-        wc_lay = QVBoxLayout(web_card)
-        wc_lay.setContentsMargins(10, 8, 10, 8)
-        wc_lay.setSpacing(6)
-
-        lbl_chips = QLabel("대상 웹 AI 선택")
-        _apply_role(lbl_chips, role="fieldLabel")
-        wc_lay.addWidget(lbl_chips)
-
-        (
-            chip_lay,
-            self.pw_chip_group,
-            self.pw_provider_chips,
-        ) = self._create_provider_chips(self._on_pw_provider_chip_clicked)
-        wc_lay.addLayout(chip_lay)
-
-        self.edit_pw_custom_url = QLineEdit()
-        _apply_role(self.edit_pw_custom_url, obj_name="EditPlaywrightCustomUrl")
-        self.edit_pw_custom_url.setFixedHeight(30)
-        self.edit_pw_custom_url.setPlaceholderText("https://... 직접 URL 선택 시 접속 주소 입력")
-        self.edit_pw_custom_url.setEnabled(False)
-        wc_lay.addWidget(self.edit_pw_custom_url)
-        lay.addWidget(web_card)
-
-        opt_card = QFrame()
-        _apply_role(opt_card, role="subCard")
-        oc_lay = QVBoxLayout(opt_card)
-        oc_lay.setContentsMargins(10, 8, 10, 8)
-        oc_lay.setSpacing(6)
-
-        self.lbl_pw_exec_mode = QLabel("실행 방식")
-        _apply_role(self.lbl_pw_exec_mode, role="fieldLabel")
-        self.combo_pw_exec_mode = QComboBox()
-        _apply_role(self.combo_pw_exec_mode, obj_name="ComboPlaywrightExecMode")
-        self.combo_pw_exec_mode.setFixedHeight(30)
-        self.combo_pw_exec_mode.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.combo_pw_exec_mode.addItem("반자동: 프롬프트 자동 입력 · 수동 전송", "semi_auto")
-        self.combo_pw_exec_mode.addItem("완전 자동: 배치 무인 반복", "auto")
-
-        self.chk_pw_keep_login = QCheckBox("로그인 세션 유지")
-        self.chk_pw_keep_login.setChecked(True)
-        self.chk_pw_temp_chat = QCheckBox("임시 채팅으로 실행")
-        self.chk_pw_temp_chat.setChecked(True)
-
-        self.lbl_pw_summary = QLabel("미완료 배치 준비 상태가 여기에 표시됩니다.")
-        self.lbl_pw_summary.setWordWrap(True)
-        _apply_role(self.lbl_pw_summary, role="mutedText")
-
-        oc_lay.addWidget(self.lbl_pw_exec_mode)
-        oc_lay.addWidget(self.combo_pw_exec_mode)
-        oc_lay.addWidget(self.chk_pw_keep_login)
-        oc_lay.addWidget(self.chk_pw_temp_chat)
-        oc_lay.addWidget(self.lbl_pw_summary)
-        lay.addWidget(opt_card)
-
-        self.btn_pw_start = QPushButton("브라우저 열기 & 프롬프트 입력")
-        _apply_role(self.btn_pw_start, role="primary", obj_name="BtnDockPwStart")
-        self.btn_pw_start.setFixedHeight(36)
-        self.btn_pw_start.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_pw_start.clicked.connect(self._on_pw_start_clicked)
+        self.lbl_pw_summary = QLabel(page)
+        self.lbl_pw_summary.setVisible(False)
 
         self.btn_pw_collect_next = QPushButton("응답 회수 · 다음 배치")
         _apply_role(self.btn_pw_collect_next, role="secondary", obj_name="BtnDockPwCollectNext")
-        self.btn_pw_collect_next.setFixedHeight(34)
+        self.btn_pw_collect_next.setFixedHeight(32)
         self.btn_pw_collect_next.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_pw_collect_next.setEnabled(False)
+        self.btn_pw_collect_next.setVisible(False)
         self.btn_pw_collect_next.clicked.connect(self._on_pw_collect_next_clicked)
 
         self.btn_pw_confirm_login = QPushButton("인증/로그인 완료 · 작업 재개")
         _apply_role(self.btn_pw_confirm_login, role="teal", obj_name="BtnDockPwConfirmLogin")
-        self.btn_pw_confirm_login.setFixedHeight(34)
+        self.btn_pw_confirm_login.setFixedHeight(32)
         self.btn_pw_confirm_login.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_pw_confirm_login.setEnabled(False)
+        self.btn_pw_confirm_login.setVisible(False)
         self.btn_pw_confirm_login.clicked.connect(self._on_pw_confirm_login_clicked)
 
         self.btn_pw_stop = QPushButton("작업 중지")
         _apply_role(self.btn_pw_stop, role="danger", obj_name="BtnDockPwStop")
-        self.btn_pw_stop.setFixedHeight(34)
+        self.btn_pw_stop.setFixedHeight(32)
         self.btn_pw_stop.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_pw_stop.setEnabled(False)
+        self.btn_pw_stop.setVisible(False)
         self.btn_pw_stop.clicked.connect(self._on_pw_stop_clicked)
 
-        lay.addWidget(self.btn_pw_start)
         lay.addWidget(self.btn_pw_collect_next)
         lay.addWidget(self.btn_pw_confirm_login)
         lay.addWidget(self.btn_pw_stop)
@@ -1095,6 +2021,14 @@ class AiExecutionDock(QFrame):
     # =========================================================================
     # 타겟 등록 및 실시간 컨텍스트 동기화
     # =========================================================================
+    def _register_default_general_chat_target(self) -> None:
+        self.register_target(
+            target_id="general_chat",
+            label="범용 챗 (에이전트)",
+            context_getter=lambda: {"target_id": "general_chat", "kind": "general_chat"},
+            on_result=None,
+        )
+
     def register_target(
         self,
         target_id: str,
@@ -1111,6 +2045,8 @@ class AiExecutionDock(QFrame):
         existing_idx = self.combo_target_selector.findData(target_id)
         if existing_idx >= 0:
             self.combo_target_selector.setItemText(existing_idx, label)
+        elif target_id == "general_chat":
+            self.combo_target_selector.insertItem(0, label, target_id)
         else:
             self.combo_target_selector.addItem(label, target_id)
         self.combo_target_selector.blockSignals(False)
@@ -1172,10 +2108,13 @@ class AiExecutionDock(QFrame):
 
     def set_mode_index(self, index: int) -> None:
         if 0 <= index < self.mode_stack.count():
+            self._cancel_manual_collect_waiting()
             self.mode_stack.setCurrentIndex(index)
             btn = self.mode_btn_group.button(index)
             if btn is not None:
                 btn.setChecked(True)
+            self._sync_chat_input_provider_ui()
+            self._sync_body_scroll_visibility()
             self.ai_mode_changed.emit()
 
     def reset_target_state(self) -> None:
@@ -1188,8 +2127,6 @@ class AiExecutionDock(QFrame):
         self._hwpx_ref_chunks = []
         self._hwpx_ref_signature = ()
         self._hwpx_ref_error = ""
-        if hasattr(self, "btn_dock_open_excel"):
-            self.btn_dock_open_excel.setEnabled(False)
         if hasattr(self, "txt_manual_response"):
             self.txt_manual_response.blockSignals(True)
             self.txt_manual_response.clear()
@@ -1198,6 +2135,7 @@ class AiExecutionDock(QFrame):
             self.combo_manual_batch.blockSignals(True)
             self.combo_manual_batch.clear()
             self.combo_manual_batch.blockSignals(False)
+        self._sync_batch_bar_visibility()
         if hasattr(self, "manual_attachment_card"):
             self.manual_attachment_card.setVisible(False)
         if hasattr(self, "lbl_manual_attachment_names"):
@@ -1234,19 +2172,29 @@ class AiExecutionDock(QFrame):
             self.quote_badge_frame.setVisible(False)
 
     def _append_quote_to_prompt(self, prompt_text: str) -> str:
-        """선택된 인용 텍스트가 있으면 프롬프트 끝에 표준 인용 블록을 자동 첨부합니다."""
-        if not self._quoted_text:
-            return prompt_text
-        loc_str = self._quoted_target_id or "미지정"
-        quote_block = (
-            "\n\n[선택된 인용 영역]\n"
-            f"- 위치 ID: {loc_str}\n"
-            "- 선택 원문:\n"
-            '"""\n'
-            f"{self._quoted_text}\n"
-            '"""'
-        )
-        return f"{prompt_text}{quote_block}"
+        """선택된 인용 텍스트 및 하단 추가 지시·첨부 컨텍스트를 프롬프트 끝에 자동 첨부합니다."""
+        out = prompt_text
+        if self._quoted_text:
+            loc_str = self._quoted_target_id or "미지정"
+            quote_block = (
+                "\n\n[선택된 인용 영역]\n"
+                f"- 위치 ID: {loc_str}\n"
+                "- 선택 원문:\n"
+                '"""\n'
+                f"{self._quoted_text}\n"
+                '"""'
+            )
+            out = f"{out}{quote_block}"
+        if (
+            self._chat_extra_instruction
+            and self._active_target_id not in ("hwpx_agent", "calendar_todo")
+        ):
+            out = f"{out}\n\n[추가 지시사항]\n{self._chat_extra_instruction}"
+        if self._chat_extra_attachments:
+            att_block = format_attachments_for_prompt(self._chat_extra_attachments)
+            if att_block:
+                out = f"{out}\n\n{att_block}"
+        return out
 
     def set_target(self, target_id: str, force: bool = False) -> bool:
         """활성 AI 타겟을 전환합니다. 잠금 상태에서는 force=True일 때만 전환됩니다."""
@@ -1259,10 +2207,9 @@ class AiExecutionDock(QFrame):
 
         if self._active_target_id != target_id:
             self.reset_target_state()
+            self._cancel_manual_collect_waiting()
 
         self._active_target_id = target_id
-        meta = self._targets[target_id]
-        self.lbl_active_target_box.setText(meta["label"])
 
         self.combo_target_selector.blockSignals(True)
         idx = self.combo_target_selector.findData(target_id)
@@ -1291,8 +2238,106 @@ class AiExecutionDock(QFrame):
             self.set_target(tid, force=True)
 
     def _on_mode_segment_clicked(self, mode_idx: int) -> None:
+        self._cancel_manual_collect_waiting()
         self.mode_stack.setCurrentIndex(mode_idx)
+        self._sync_chat_input_provider_ui()
         self.sync_from_context(self._fetch_fresh_context())
+        self.ai_mode_changed.emit()
+
+    def _sync_body_scroll_visibility(self, _kind: str = "") -> None:
+        """모든 타겟을 챗봇 타임라인 중심으로 통합하여 중간 레거시 컨트롤 영역을 항상 숨깁니다."""
+        self.body_scroll.setVisible(False)
+        self._sync_batch_bar_visibility()
+        self._sync_chat_send_button_state()
+
+    def _sync_batch_bar_visibility(self) -> None:
+        """수동 복붙 모드이면서 분할 배치가 2개 이상 존재할 때만 하단 1줄 배치 바를 표시합니다."""
+        if not hasattr(self, "batch_bar_widget"):
+            return
+        mode_idx = self.current_mode_index()
+        total = self.combo_manual_batch.count()
+        show_bar = mode_idx == 1 and total > 1
+        self.batch_bar_widget.setVisible(show_bar)
+        if show_bar:
+            cur_idx = max(0, self.combo_manual_batch.currentIndex())
+            self.lbl_batch_progress.setText(f"{cur_idx + 1}/{total}")
+        else:
+            self.lbl_batch_progress.setText(f"0/{total}" if total == 0 else f"1/{total}")
+
+    def _sync_chat_send_button_state(self) -> None:
+        """활성 타겟과 회수 대기 상태에 맞춰 하단 입력창 placeholder 및 전송/작업 시작/응답 회수 버튼을 갱신합니다."""
+        if not hasattr(self, "btn_chat_send"):
+            return
+        self.txt_chat_input.setEnabled(True)
+        tid = self._active_target_id or "general_chat"
+        if tid in ("agg_step2", "ocr"):
+            self.txt_chat_input.setPlaceholderText(
+                "추가 지시 입력 (비워두고 바로 [작업 시작] 가능)"
+            )
+            default_label = "작업 시작"
+        elif tid == "hwpx_agent":
+            self.txt_chat_input.setPlaceholderText(
+                "예: 2026년 일정으로 바꾸고 중화적정 시험문항 1개 추가해줘\n"
+                "(Enter 전송 · Shift+Enter 줄바꿈)"
+            )
+            default_label = "전송"
+        elif tid == "calendar_todo":
+            self.txt_chat_input.setPlaceholderText(
+                "예: 내일 오전 10시 교무회의, 11월 25일까지 2학년 수행평가 채점 완료\n"
+                "또는 공문·안내문 본문을 그대로 붙여넣으세요."
+            )
+            default_label = "전송"
+        else:
+            self.txt_chat_input.setPlaceholderText(
+                "메시지 입력 (Enter 전송 · Shift+Enter 줄바꿈)\n파일/폴더를 여기로 드래그앤드롭할 수 있습니다."
+            )
+            default_label = "전송"
+
+        if self._manual_waiting_collect:
+            self.btn_chat_send.setText("응답 회수")
+            self.btn_chat_send.setToolTip("입력창 또는 클립보드의 웹 AI 응답을 회수하여 등록합니다.")
+            self.btn_chat_cancel_collect.setVisible(True)
+        elif self._pw_waiting_collect:
+            self.btn_chat_send.setText("응답 회수")
+            self.btn_chat_send.setToolTip("Playwright 브라우저에서 웹 AI 응답을 회수합니다.")
+            self.btn_chat_cancel_collect.setVisible(False)
+        else:
+            self.btn_chat_send.setText(default_label)
+            self.btn_chat_send.setToolTip("")
+            self.btn_chat_cancel_collect.setVisible(False)
+
+    def _sync_chat_input_provider_ui(self) -> None:
+        """현재 실행 모드(API / 수동 / Playwright)에 맞춰 하단 모델 콤보/배지 및 직접 URL 입력란을 동기화합니다."""
+        mode_idx = self.current_mode_index()
+        if mode_idx == 0:
+            self.combo_web_provider.setVisible(False)
+            self.edit_chat_custom_url.setVisible(False)
+            self.lbl_chat_api_badge.setVisible(True)
+            return
+
+        self.lbl_chat_api_badge.setVisible(False)
+        self.combo_web_provider.setVisible(True)
+        active_key = self._manual_provider if mode_idx == 1 else self._pw_provider
+        self.combo_web_provider.blockSignals(True)
+        idx = self.combo_web_provider.findData(active_key)
+        if idx >= 0:
+            self.combo_web_provider.setCurrentIndex(idx)
+        self.combo_web_provider.blockSignals(False)
+        self.edit_chat_custom_url.setVisible(active_key == "custom")
+
+    def _on_chat_web_provider_changed(self, _index: int) -> None:
+        key = str(self.combo_web_provider.currentData() or "gemini")
+        mode_idx = self.current_mode_index()
+        if mode_idx == 1:
+            self._manual_provider = key
+        elif mode_idx == 2:
+            self._pw_provider = key
+        self.edit_chat_custom_url.setVisible(key == "custom")
+        if key == "custom":
+            self.edit_chat_custom_url.setFocus()
+        self.ai_mode_changed.emit()
+
+    def _on_chat_custom_url_changed(self, _text: str) -> None:
         self.ai_mode_changed.emit()
 
     def _fetch_fresh_context(self, target_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1321,7 +2366,6 @@ class AiExecutionDock(QFrame):
         self.calendar_instruction_card.setVisible(False)
         self.api_summary_card.setVisible(False)
         self.chk_api_run_integrated.setVisible(False)
-        self.btn_dock_open_excel.setVisible(False)
         self.manual_batch_card.setVisible(False)
         if hasattr(self, "spin_manual_students"):
             self.spin_manual_students.setVisible(False)
@@ -1331,23 +2375,31 @@ class AiExecutionDock(QFrame):
             self.btn_manual_resplit.setVisible(False)
         self.manual_ocr_card.setVisible(False)
         self.manual_attachment_card.setVisible(False)
-        self.combo_pw_exec_mode.setVisible(False)
+        self.manual_copy_card.setVisible(True)
+        self.combo_pw_exec_mode.setVisible(True)
+        self.btn_manual_apply_next.setVisible(True)
+        self.btn_api_start.setVisible(True)
 
         # 2) 현재 타겟에 해당하는 전용 위젯만 활성화
-        if kind == "calendar_todo":
-            self.calendar_instruction_card.setVisible(True)
-            self.txt_calendar_instruction.setVisible(True)
+        if kind == "general_chat":
+            self.manual_copy_card.setVisible(False)
+            self.btn_manual_apply_next.setVisible(False)
+            self.btn_api_start.setVisible(False)
+            self.combo_pw_exec_mode.setVisible(True)
+            self.lbl_pw_exec_mode.setText("Playwright 실행 방식")
+            self.btn_pw_collect_next.setText("응답 회수")
+            self.lbl_pw_summary.setText("하단 입력창에서 메시지를 전송하면 브라우저로 자동 입력됩니다.")
+        elif kind == "calendar_todo":
             self.btn_api_start.setText("일정·할일 AI 추출 실행")
             self.btn_manual_apply_next.setText("JSON 검증 후 일정·할일 확인")
-            self.lbl_pw_exec_mode.setText("실행 방식: 단일 프롬프트")
+            self.lbl_pw_exec_mode.setText("Playwright 실행 방식 (단일)")
             self.btn_pw_collect_next.setText("응답 회수")
         elif kind == "hwpx_agent":
-            self.hwpx_instruction_card.setVisible(True)
             self.api_summary_card.setVisible(True)
             self.combo_pw_exec_mode.setVisible(True)
             self.manual_batch_card.setVisible(hwpx_multi_parts)
             self.btn_api_start.setText("API 일괄 생성 시작")
-            self.lbl_pw_exec_mode.setText("실행 방식")
+            self.lbl_pw_exec_mode.setText("Playwright 실행 방식")
             self.btn_pw_collect_next.setText("응답 회수 · 다음 배치")
             self.btn_manual_apply_next.setText(
                 "JSON Patch 검증 후 적용 · 다음 파트 복사"
@@ -1360,13 +2412,12 @@ class AiExecutionDock(QFrame):
             self.manual_attachment_card.setVisible(has_atts)
             self.combo_pw_exec_mode.setVisible(True)
             self.btn_api_start.setText("API 일괄 생성 시작")
-            self.lbl_pw_exec_mode.setText("실행 방식")
+            self.lbl_pw_exec_mode.setText("Playwright 실행 방식")
             self.btn_pw_collect_next.setText("응답 회수 · 다음 배치")
             self.btn_manual_apply_next.setText("검증 후 OCR 결과 반영")
         else:  # excel_batch (과제 파이프라인 > 2단계 세특 생성)
             self.api_summary_card.setVisible(True)
             self.chk_api_run_integrated.setVisible(True)
-            self.btn_dock_open_excel.setVisible(True)
             self.manual_batch_card.setVisible(True)
             if hasattr(self, "spin_manual_students"):
                 self.spin_manual_students.setVisible(True)
@@ -1377,7 +2428,7 @@ class AiExecutionDock(QFrame):
             self.manual_attachment_card.setVisible(has_atts)
             self.combo_pw_exec_mode.setVisible(True)
             self.btn_api_start.setText("API 일괄 생성 시작")
-            self.lbl_pw_exec_mode.setText("실행 방식")
+            self.lbl_pw_exec_mode.setText("Playwright 실행 방식")
             self.btn_pw_collect_next.setText("응답 회수 · 다음 배치")
             self.btn_manual_apply_next.setText("검증 후 엑셀 반영 · 다음 묶음 복사")
 
@@ -1388,7 +2439,7 @@ class AiExecutionDock(QFrame):
         if not ctx and self._active_target_id:
             fallback_kind = (
                 self._active_target_id
-                if self._active_target_id in ("ocr", "hwpx_agent", "calendar_todo")
+                if self._active_target_id in ("general_chat", "ocr", "hwpx_agent", "calendar_todo")
                 else "excel_batch"
             )
             ctx = {"target_id": self._active_target_id, "kind": fallback_kind}
@@ -1404,7 +2455,7 @@ class AiExecutionDock(QFrame):
         if not kind:
             kind = (
                 tid
-                if tid in ("ocr", "hwpx_agent", "calendar_todo")
+                if tid in ("general_chat", "ocr", "hwpx_agent", "calendar_todo")
                 else "excel_batch"
             )
         if prev_tid and tid and prev_tid != tid:
@@ -1421,6 +2472,7 @@ class AiExecutionDock(QFrame):
                 self.reset_target_state()
 
         self._last_context = dict(ctx)
+        is_general = kind == "general_chat"
         is_excel = kind == "excel_batch"
         is_hwpx = kind == "hwpx_agent"
         is_cal = kind == "calendar_todo"
@@ -1429,8 +2481,8 @@ class AiExecutionDock(QFrame):
         hwpx_total_parts = len(hwpx_chunks)
         hwpx_multi_parts = is_hwpx and hwpx_total_parts >= 2
 
-        # 첨부파일 목록 추출 및 수동 복붙 안내 배너 토글 (hwpx_agent / calendar_todo는 제외)
-        if is_hwpx or is_cal:
+        # 첨부파일 목록 추출 및 수동 복붙 안내 배너 토글 (general_chat / hwpx_agent / calendar_todo는 제외)
+        if is_general or is_hwpx or is_cal:
             attachment_paths: List[str] = []
         else:
             raw_atts = ctx.get("attachment_paths")
@@ -1455,6 +2507,11 @@ class AiExecutionDock(QFrame):
                 names_preview += f" 외 {len(attachment_paths) - 3}건"
             self.lbl_manual_attachment_names.setText(f"대상 파일: {names_preview}")
 
+        if is_general:
+            self._sync_body_scroll_visibility("general_chat")
+            self.lbl_dock_progress_meta.setText("범용 챗 · 준비 완료")
+            return
+        self._sync_body_scroll_visibility(kind)
         if is_hwpx:
             dom_map = ctx.get("dom_map")
             hwpx_path = str(ctx.get("hwpx_path", "") or "").strip()
@@ -1481,9 +2538,6 @@ class AiExecutionDock(QFrame):
             self.lbl_pw_summary.setText(msg)
             self.lbl_dock_progress_meta.setText(msg)
         elif is_excel:
-            last_res = str(ctx.get("last_result_excel_path", "") or "").strip()
-            if last_res and Path(last_res).exists():
-                self._set_result_excel_path(last_res)
             self._rebuild_manual_batches(copy_first=False, ctx=ctx, quiet=True)
             if has_atts:
                 cur_pw = self.lbl_pw_summary.text().strip()
@@ -1526,6 +2580,8 @@ class AiExecutionDock(QFrame):
             self.lbl_api_model_badge.setText(f"{p_name} · {model_disp} ({tag})")
         else:
             self.lbl_api_model_badge.setText(f"{p_name} · {model_disp} (API Key 미등록)")
+        if hasattr(self, "lbl_chat_api_badge"):
+            self.lbl_chat_api_badge.setText(model_disp or p_name)
         self.ai_mode_changed.emit()
 
     # =========================================================================
@@ -1535,6 +2591,8 @@ class AiExecutionDock(QFrame):
         self._is_api_running = busy
         self.btn_api_start.setEnabled(not busy)
         self.btn_api_stop.setEnabled(busy)
+        self.btn_api_stop.setVisible(busy)
+        self._sync_body_scroll_visibility()
 
     def _on_api_start_clicked(self) -> None:
         if self._is_api_running:
@@ -1600,30 +2658,6 @@ class AiExecutionDock(QFrame):
             worker = _DockApiCalendarTodoWorker(
                 instruction=self._append_quote_to_prompt(inst),
             )
-        elif kind == "calendar_todo":
-            inst = self.txt_calendar_instruction.toPlainText().strip()
-            if not inst:
-                QMessageBox.warning(
-                    self,
-                    "입력 확인",
-                    "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요.",
-                )
-                self.txt_calendar_instruction.setFocus()
-                return
-            prompt_text = self._build_current_manual_prompt()
-            worker = WebGeminiAutoWorker(
-                excel_path=None,
-                single_prompt=prompt_text,
-                attachment_paths=attachment_paths,
-                provider=self._pw_provider,
-                custom_url=custom_url,
-                execution_mode=exec_mode,
-                require_login=False,
-                keep_login_session=keep_login,
-                use_temp_chat=use_temp_chat,
-                headless=False,
-                task_label=task_label,
-            )
         elif kind == "ocr":
             files = ctx.get("ocr_files") or []
             if not files:
@@ -1672,9 +2706,6 @@ class AiExecutionDock(QFrame):
         target_id = str(ctx.get("target_id", self._active_target_id))
 
         def _on_res(res: Dict[str, Any]) -> None:
-            out_path = str(res.get("output_path", "") or "")
-            if out_path:
-                self._set_result_excel_path(out_path)
             if not res.get("already_applied_parts"):
                 self._dispatch_result(target_id, res)
             self.sync_from_context(self._fetch_fresh_context(target_id))
@@ -1758,6 +2789,7 @@ class AiExecutionDock(QFrame):
             self.combo_manual_batch.blockSignals(True)
             self.combo_manual_batch.clear()
             self.combo_manual_batch.blockSignals(False)
+            self._sync_batch_bar_visibility()
             self.lbl_manual_batch_meta.setText("대상 엑셀 파일(.xlsx)을 선택하면 배치가 계산됩니다.")
             self.lbl_api_summary.setText("대상 엑셀 파일(.xlsx)이 선택되지 않았습니다.")
             self.lbl_pw_summary.setText("대상 엑셀 파일(.xlsx)이 선택되지 않았습니다.")
@@ -1838,6 +2870,7 @@ class AiExecutionDock(QFrame):
                 batch,
             )
         self.combo_manual_batch.blockSignals(False)
+        self._sync_batch_bar_visibility()
 
         if total_b == 0:
             self.lbl_manual_batch_meta.setText("모든 학생의 결과가 이미 작성되어 있습니다.")
@@ -1903,6 +2936,7 @@ class AiExecutionDock(QFrame):
                 self.combo_manual_batch.blockSignals(True)
                 self.combo_manual_batch.clear()
                 self.combo_manual_batch.blockSignals(False)
+                self._sync_batch_bar_visibility()
             return
 
         already_matches = (
@@ -1942,6 +2976,7 @@ class AiExecutionDock(QFrame):
         elif total_p > 0:
             self.combo_manual_batch.setCurrentIndex(0)
         self.combo_manual_batch.blockSignals(False)
+        self._sync_batch_bar_visibility()
         self._update_manual_batch_meta_label()
 
     def _on_api_hwpx_part_completed(self, target_id: str, payload: Dict[str, Any]) -> None:
@@ -1971,6 +3006,7 @@ class AiExecutionDock(QFrame):
 
     def _on_manual_batch_changed(self, _idx: int) -> None:
         self._update_manual_batch_meta_label()
+        self._sync_batch_bar_visibility()
 
     def _build_current_manual_prompt(self) -> str:
         """실행 시점의 최신 컨텍스트를 읽어 현재 대상의 프롬프트를 생성합니다."""
@@ -2311,9 +3347,6 @@ class AiExecutionDock(QFrame):
             )
             return
 
-        if saved_path:
-            self._set_result_excel_path(saved_path)
-
         self.txt_manual_response.blockSignals(True)
         self.txt_manual_response.clear()
         self.txt_manual_response.blockSignals(False)
@@ -2352,18 +3385,87 @@ class AiExecutionDock(QFrame):
             self.edit_pw_custom_url.setFocus()
         self.ai_mode_changed.emit()
 
+    def _ensure_pw_inline_card(self, message: str = "Playwright 브라우저 작업 진행 중...", *, needs_login: bool = False) -> QFrame:
+        if self._pw_inline_card is None:
+            card = QFrame(self.chat_timeline_widget)
+            _apply_role(card, obj_name="PwInlineStatusCard")
+            lay = QVBoxLayout(card)
+            lay.setContentsMargins(10, 8, 10, 8)
+            lay.setSpacing(6)
+
+            lbl = QLabel(message, card)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("font-size: 11.5px; color: #1E293B; border: none; background: transparent;")
+            lay.addWidget(lbl)
+
+            btn_row = QHBoxLayout()
+            btn_row.setSpacing(6)
+
+            btn_login = QPushButton("인증/로그인 완료 · 작업 재개", card)
+            _apply_role(btn_login, role="primary", obj_name="BtnInlinePwConfirmLogin")
+            btn_login.setFixedHeight(26)
+            btn_login.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_login.setVisible(False)
+            btn_login.clicked.connect(self._on_pw_confirm_login_clicked)
+
+            btn_stop = QPushButton("작업 중지", card)
+            _apply_role(btn_stop, role="danger", obj_name="BtnInlinePwStop")
+            btn_stop.setFixedHeight(26)
+            btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_stop.clicked.connect(self._on_pw_stop_clicked)
+
+            btn_row.addWidget(btn_login)
+            btn_row.addWidget(btn_stop)
+            btn_row.addStretch()
+            lay.addLayout(btn_row)
+
+            card.lbl_status = lbl  # type: ignore[attr-defined]
+            card.btn_confirm_login = btn_login  # type: ignore[attr-defined]
+            card.btn_stop = btn_stop  # type: ignore[attr-defined]
+            self._pw_inline_card = card
+            self.lbl_chat_empty.setVisible(False)
+            insert_idx = max(0, self.chat_timeline_lay.count() - 1)
+            self.chat_timeline_lay.insertWidget(insert_idx, card)
+
+        card = self._pw_inline_card
+        card.lbl_status.setText(message)  # type: ignore[attr-defined]
+        card.btn_confirm_login.setVisible(needs_login)  # type: ignore[attr-defined]
+        card.btn_confirm_login.setEnabled(needs_login)  # type: ignore[attr-defined]
+        if needs_login:
+            card.setStyleSheet(
+                "QFrame#PwInlineStatusCard { background-color: #FFFBEB; border: 1px solid #F59E0B; border-radius: 10px; }"
+            )
+        else:
+            card.setStyleSheet(
+                "QFrame#PwInlineStatusCard { background-color: #F8FAFC; border: 1px solid #CBD5E1; border-radius: 10px; }"
+            )
+        self._scroll_timeline_to_bottom()
+        return card
+
+    def _remove_pw_inline_card(self) -> None:
+        if self._pw_inline_card is not None:
+            self._pw_inline_card.setVisible(False)
+            self._pw_inline_card.deleteLater()
+            self._pw_inline_card = None
+
     def _set_pw_running_state(self, running: bool) -> None:
-        for chip in self.pw_provider_chips.values():
-            chip.setEnabled(not running)
-        self.edit_pw_custom_url.setEnabled((not running) and self._pw_provider == "custom")
+        self.combo_web_provider.setEnabled(not running)
+        self.edit_chat_custom_url.setEnabled(not running)
         self.combo_pw_exec_mode.setEnabled(not running)
         self.chk_pw_keep_login.setEnabled(not running)
         self.chk_pw_temp_chat.setEnabled(not running)
-        self.btn_pw_start.setEnabled(not running)
         self.btn_pw_stop.setEnabled(running)
-        if not running:
+        self.btn_pw_stop.setVisible(running)
+        if running:
+            self._ensure_pw_inline_card("Playwright 브라우저 작업 진행 중...", needs_login=False)
+        else:
+            self._pw_waiting_collect = False
             self.btn_pw_collect_next.setEnabled(False)
+            self.btn_pw_collect_next.setVisible(False)
             self.btn_pw_confirm_login.setEnabled(False)
+            self.btn_pw_confirm_login.setVisible(False)
+            self._remove_pw_inline_card()
+        self._sync_body_scroll_visibility()
 
     def _on_pw_start_clicked(self) -> None:
         if self._active_pw_worker is not None:
@@ -2380,7 +3482,7 @@ class AiExecutionDock(QFrame):
                 self.edit_pw_custom_url.setFocus()
                 return
 
-        exec_mode = str(self.combo_pw_exec_mode.currentData() or "semi_auto")
+        exec_mode = str(self.combo_pw_exec_mode.currentData() or "auto")
         keep_login = bool(self.chk_pw_keep_login.isChecked())
         use_temp_chat = bool(self.chk_pw_temp_chat.isChecked())
         kind = str(ctx.get("kind", "excel_batch"))
@@ -2480,19 +3582,6 @@ class AiExecutionDock(QFrame):
                     headless=False,
                     task_label=task_label,
                 )
-        elif kind == "calendar_todo":
-            inst = self.txt_calendar_instruction.toPlainText().strip()
-            if not inst:
-                QMessageBox.information(
-                    self,
-                    "입력 확인",
-                    "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요.",
-                )
-                self.txt_calendar_instruction.setFocus()
-                return
-            worker = _DockApiCalendarTodoWorker(
-                instruction=self._append_quote_to_prompt(inst),
-            )
         elif kind == "calendar_todo":
             inst = self.txt_calendar_instruction.toPlainText().strip()
             if not inst:
@@ -2610,51 +3699,67 @@ class AiExecutionDock(QFrame):
 
     def _on_pw_waiting_for_login(self, provider_name: str = "") -> None:
         self.btn_pw_confirm_login.setText("인증/로그인 완료 · 작업 재개")
+        self.btn_pw_confirm_login.setVisible(True)
         self.btn_pw_confirm_login.setEnabled(True)
+        self._sync_body_scroll_visibility()
         prefix = f"[{provider_name}] " if provider_name else ""
         msg = (
             f"{prefix}브라우저에서 로그인·약관 동의·봇 인증 완료 후 [인증/로그인 완료 · 작업 재개] 버튼을 눌러주세요."
         )
+        self._ensure_pw_inline_card(msg, needs_login=True)
         self._set_progress_meta_alert(msg, alert=True)
         self._notify_attention("EduFlow 웹 AI 로그인/인증 대기", msg)
 
     def _on_pw_waiting_for_click(self, domain: str = "") -> None:
         msg = f"[{domain}] 입력창을 자동 탐지하지 못했습니다. 브라우저에서 입력창을 1회 클릭하세요."
+        self._ensure_pw_inline_card(msg, needs_login=False)
         self._set_progress_meta_alert(msg, alert=True)
         self._notify_attention("EduFlow 웹 AI 입력창 클릭 대기", msg)
 
     def _on_pw_waiting_for_collect(self, batch_idx: int, total_batches: int) -> None:
+        self.btn_pw_collect_next.setVisible(True)
         self.btn_pw_collect_next.setEnabled(True)
-        self.lbl_dock_progress_meta.setText(
-            f"Batch {batch_idx}/{total_batches} 입력됨 · 웹에서 전송·완료 후 [응답 회수 · 다음 배치] 클릭"
-        )
+        self._pw_waiting_collect = True
+        self._sync_chat_send_button_state()
+        self._sync_body_scroll_visibility()
+        msg = f"Batch {batch_idx}/{total_batches} 입력됨 · 웹에서 전송·완료 후 하단 [응답 회수] 버튼을 눌러 주세요."
+        self._ensure_pw_inline_card(msg, needs_login=False)
+        self.lbl_dock_progress_meta.setText(msg)
 
     def _on_pw_confirm_login_clicked(self) -> None:
         if self._active_pw_worker is not None:
             self._active_pw_worker.confirm_login()
         self.btn_pw_confirm_login.setEnabled(False)
+        self.btn_pw_confirm_login.setVisible(False)
+        self._ensure_pw_inline_card("로그인 확인 완료 — 프롬프트 입력 진행 중...", needs_login=False)
         self._set_progress_meta_alert("로그인 확인 완료 — 프롬프트 입력 진행 중...", alert=False)
 
     def _on_pw_collect_next_clicked(self) -> None:
         if self._active_pw_worker is not None:
             manual_txt = self.txt_manual_response.toPlainText().strip()
             self._active_pw_worker.trigger_collect_and_next(manual_txt)
+        self._pw_waiting_collect = False
+        self._sync_chat_send_button_state()
         self.btn_pw_collect_next.setEnabled(False)
-        self.lbl_dock_progress_meta.setText("응답 회수 및 엑셀 반영 중...")
+        self.btn_pw_collect_next.setVisible(False)
+        self._ensure_pw_inline_card("응답 회수 및 반영 중...", needs_login=False)
+        self.lbl_dock_progress_meta.setText("응답 회수 및 반영 중...")
 
     def _on_pw_stop_clicked(self) -> None:
         if self._active_pw_worker is not None:
             self._active_pw_worker.request_stop()
         self.task_runner.stop_task(self.TASK_DOCK_PLAYWRIGHT)
+        self._pw_waiting_collect = False
+        self._sync_chat_send_button_state()
         self.btn_pw_stop.setEnabled(False)
         self.btn_pw_collect_next.setEnabled(False)
         self.btn_pw_confirm_login.setEnabled(False)
+        if self._pw_inline_card is not None:
+            self._pw_inline_card.btn_stop.setEnabled(False)  # type: ignore[attr-defined]
+            self._pw_inline_card.lbl_status.setText("Playwright 작업 중지 요청됨...")  # type: ignore[attr-defined]
         self.lbl_dock_progress_meta.setText("Playwright 작업 중지 요청됨...")
 
     def _on_pw_batch_completed(self, target_id: str, payload: Dict[str, Any]) -> None:
-        out_path = str(payload.get("output_path", "") or "")
-        if out_path:
-            self._set_result_excel_path(out_path)
         if payload.get("is_single_prompt"):
             self._pw_single_batches_applied = True
         self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **payload})
@@ -2669,12 +3774,19 @@ class AiExecutionDock(QFrame):
                 "터미널에서 'pip install playwright && playwright install chromium'을 실행해 주세요.",
             )
             return
-        out_path = str(res.get("output_path", "") or "")
-        if out_path:
-            self._set_result_excel_path(out_path)
         if not self._pw_single_batches_applied:
             self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **res})
         self._pw_single_batches_applied = False
+        reply_txt = str(res.get("raw_response", "") or res.get("summary", "") or "").strip()
+        if reply_txt:
+            provider_label = self.playwright_provider_display()
+            self._append_chat_message(
+                role="assistant",
+                content=reply_txt,
+                exec_mode="playwright",
+                model_name=f"{provider_label} Web" if provider_label else "Playwright",
+                tool_name=target_id or self._active_target_id or "general_chat",
+            )
         self.sync_from_context(self._fetch_fresh_context(target_id))
 
     def _on_pw_error(self, err: str) -> None:
@@ -2694,6 +3806,11 @@ class AiExecutionDock(QFrame):
         self.progress_dock.setValue(max(0, min(100, int(percent))))
         if message:
             self.lbl_dock_progress_meta.setText(message)
+            if (
+                self._pw_inline_card is not None
+                and not self._pw_inline_card.btn_confirm_login.isVisible()  # type: ignore[attr-defined]
+            ):
+                self._pw_inline_card.lbl_status.setText(message)  # type: ignore[attr-defined]
 
     def _dispatch_result(self, target_id: str, payload: Dict[str, Any]) -> None:
         meta = self._targets.get(target_id)
@@ -2704,13 +3821,734 @@ class AiExecutionDock(QFrame):
                 self.lbl_dock_progress_meta.setText(f"결과 반영 경고: {exc}")
         self.execution_completed.emit(target_id, payload)
 
-    def _set_result_excel_path(self, path_str: str) -> None:
-        if path_str and Path(path_str).exists():
-            self._last_result_excel_path = str(Path(path_str).resolve())
-            self.btn_dock_open_excel.setEnabled(True)
-
-    def _on_open_result_excel(self) -> None:
-        if self._last_result_excel_path and Path(self._last_result_excel_path).exists():
-            os.startfile(self._last_result_excel_path)
+    # =========================================================================
+    # 로컬 DB 기반 챗봇 세션 / 타임라인 / 첨부 / 수정 분기
+    # =========================================================================
+    def _init_or_restore_session(self) -> None:
+        sessions = self.db.get_ai_chat_sessions(limit=1)
+        if sessions:
+            self.load_session(int(sessions[0]["id"]))
         else:
-            QMessageBox.information(self, "안내", "아직 생성된 결과 엑셀 파일이 없습니다.")
+            self.create_new_session()
+
+    def create_new_session(self, title: str = "새 대화") -> int:
+        target_mode = self._active_target_id or "general_chat"
+        sid = self.db.create_ai_chat_session(title=title, target_mode=target_mode)
+        self._active_session_id = sid
+        self._cancel_edit_message()
+        self._cancel_manual_collect_waiting()
+        self._clear_timeline()
+        self.lbl_dock_progress_meta.setText("새 대화 세션이 시작되었습니다.")
+        return sid
+
+    def load_session(self, session_id: int) -> None:
+        sess = self.db.get_ai_chat_session(int(session_id))
+        if sess is None:
+            return
+        self._active_session_id = int(sess["id"])
+        self._cancel_edit_message()
+        self._cancel_manual_collect_waiting()
+        self._clear_timeline()
+        messages = self.db.get_ai_chat_messages(self._active_session_id)
+        for msg in messages:
+            self._render_message_card(msg)
+        self._scroll_timeline_to_bottom()
+
+    def _on_session_menu_clicked(self) -> None:
+        sessions = self.db.get_ai_chat_sessions(limit=100)
+        self._session_popover.populate(sessions, self._active_session_id)
+        btn_pos = self.btn_session_menu.mapToGlobal(self.btn_session_menu.rect().bottomRight())
+        pop_x = max(0, btn_pos.x() - self._session_popover.width())
+        pop_y = btn_pos.y() + 4
+        self._session_popover.move(pop_x, pop_y)
+        self._session_popover.show()
+
+    def _on_delete_session_requested(self, session_id: int) -> None:
+        self.db.delete_ai_chat_session(int(session_id))
+        if self._active_session_id == int(session_id):
+            remaining = self.db.get_ai_chat_sessions(limit=1)
+            if remaining:
+                self.load_session(int(remaining[0]["id"]))
+            else:
+                self.create_new_session()
+        sessions = self.db.get_ai_chat_sessions(limit=100)
+        self._session_popover.populate(sessions, self._active_session_id)
+
+    def _clear_timeline(self) -> None:
+        self._remove_pw_inline_card()
+        for card in self._message_cards:
+            card.deleteLater()
+        self._message_cards.clear()
+        self.lbl_chat_empty.setVisible(True)
+
+    def _render_message_card(self, msg: Dict[str, Any]) -> _ChatMessageCard:
+        self.lbl_chat_empty.setVisible(False)
+        card = _ChatMessageCard(
+            message_id=int(msg.get("id", 0)),
+            role=str(msg.get("role", "user")),
+            content=str(msg.get("content", "")),
+            exec_mode=str(msg.get("exec_mode", "api")),
+            model_name=str(msg.get("model_name", "")),
+            attachments=msg.get("attachments") if isinstance(msg.get("attachments"), list) else [],
+            parent=self.chat_timeline_widget,
+        )
+        card.edit_requested.connect(self._start_edit_message)
+        card.copy_requested.connect(
+            lambda _txt: self.lbl_dock_progress_meta.setText("메시지가 클립보드에 복사되었습니다.")
+        )
+        self._message_cards.append(card)
+        # 마지막 stretch 직전에 삽입
+        insert_idx = max(0, self.chat_timeline_lay.count() - 1)
+        self.chat_timeline_lay.insertWidget(insert_idx, card)
+        return card
+
+    def _scroll_timeline_to_bottom(self) -> None:
+        sb = self.chat_scroll.verticalScrollBar()
+        if sb is not None:
+            sb.setValue(sb.maximum())
+
+    def _append_chat_message(
+        self,
+        role: str,
+        content: str,
+        exec_mode: str = "api",
+        model_name: str = "",
+        tool_name: str = "",
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> int:
+        if self._active_session_id is None:
+            self.create_new_session()
+        sid = int(self._active_session_id or 0)
+        atts = attachments or []
+        msg_id = self.db.add_ai_chat_message(
+            session_id=sid,
+            role=role,
+            content=content,
+            exec_mode=exec_mode,
+            model_name=model_name,
+            tool_name=tool_name,
+            attachments=atts,
+        )
+        # 첫 사용자 질문 시 세션 제목 자동 요약
+        if role == "user":
+            sess = self.db.get_ai_chat_session(sid)
+            if sess and str(sess.get("title", "")) == "새 대화":
+                first_line = re.sub(r"\s+", " ", (content or "").strip())
+                new_title = (first_line[:24] + "...") if len(first_line) > 24 else (first_line or "새 대화")
+                self.db.update_ai_chat_session(sid, title=new_title)
+        self._render_message_card(
+            {
+                "id": msg_id,
+                "role": role,
+                "content": content,
+                "exec_mode": exec_mode,
+                "model_name": model_name,
+                "tool_name": tool_name,
+                "attachments": atts,
+            }
+        )
+        self._scroll_timeline_to_bottom()
+        return msg_id
+
+    def _start_edit_message(self, message_id: int) -> None:
+        if self._active_session_id is None:
+            return
+        messages = self.db.get_ai_chat_messages(self._active_session_id)
+        target_msg = next((m for m in messages if int(m["id"]) == int(message_id)), None)
+        if target_msg is None:
+            return
+        self._editing_message_id = int(message_id)
+        self.txt_chat_input.setPlainText(str(target_msg.get("content", "")))
+        self.txt_chat_input.setFocus()
+        self._chat_attachments = list(target_msg.get("attachments") or [])
+        self._refresh_attachment_chips()
+        self.edit_branch_banner.setVisible(True)
+
+    def _cancel_edit_message(self) -> None:
+        self._editing_message_id = None
+        if hasattr(self, "edit_branch_banner"):
+            self.edit_branch_banner.setVisible(False)
+
+    # -------------------------------------------------------------------------
+    # 첨부 파일 / 폴더 칩 관리
+    # -------------------------------------------------------------------------
+    def _on_attach_file_clicked(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "첨부할 파일 선택")
+        for p in paths:
+            self._add_attachment_path(p)
+
+    def _on_attach_folder_clicked(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "첨부할 폴더 선택")
+        if folder:
+            self._add_attachment_path(folder)
+
+    def _on_chat_paths_dropped(self, paths: List[str]) -> None:
+        for p in paths:
+            self._add_attachment_path(p)
+
+    def _add_attachment_path(self, path_str: str) -> None:
+        entry = build_attachment_entry(path_str)
+        if entry is None:
+            return
+        existing_paths = {str(a.get("path", "")) for a in self._chat_attachments}
+        if entry["path"] in existing_paths:
+            return
+        self._chat_attachments.append(entry)
+        self._refresh_attachment_chips()
+
+    def _remove_attachment(self, idx: int) -> None:
+        if 0 <= idx < len(self._chat_attachments):
+            self._chat_attachments.pop(idx)
+            self._refresh_attachment_chips()
+
+    def _refresh_attachment_chips(self) -> None:
+        while self.attachment_chips_lay.count():
+            item = self.attachment_chips_lay.takeAt(0)
+            w = item.widget() if item else None
+            if w is not None:
+                w.deleteLater()
+
+        if not self._chat_attachments:
+            self.attachment_chips_widget.setVisible(False)
+            return
+
+        self.attachment_chips_widget.setVisible(True)
+        for idx, att in enumerate(self._chat_attachments):
+            chip = QFrame(self.attachment_chips_widget)
+            chip.setStyleSheet(
+                "QFrame { background-color: #F1F5F9; border: 1px solid #CBD5E1; border-radius: 6px; }"
+            )
+            c_lay = QHBoxLayout(chip)
+            c_lay.setContentsMargins(6, 2, 4, 2)
+            c_lay.setSpacing(4)
+            is_dir = att.get("type") == "dir"
+            prefix = "[폴더]" if is_dir else "[파일]"
+            cnt_suffix = f" ({att.get('file_count', 0)}개)" if is_dir else ""
+            lbl = QLabel(f"{prefix} {att.get('name', '')}{cnt_suffix}")
+            lbl.setToolTip(str(att.get("path", "")))
+            lbl.setStyleSheet("font-size: 10.5px; color: #334155;")
+            btn_rm = QPushButton("×")
+            btn_rm.setFixedSize(16, 16)
+            btn_rm.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn_rm.setStyleSheet(
+                "QPushButton { background: transparent; border: none; color: #64748B; font-weight: 700; }"
+                "QPushButton:hover { color: #DC2626; }"
+            )
+            btn_rm.clicked.connect(lambda _c=False, i=idx: self._remove_attachment(i))
+            c_lay.addWidget(lbl, stretch=1)
+            c_lay.addWidget(btn_rm)
+            self.attachment_chips_lay.addWidget(chip)
+
+    # -------------------------------------------------------------------------
+    # 챗 입력 전송 및 3-모드 실행 (범용 챗 & 타겟 연동)
+    # -------------------------------------------------------------------------
+    def _current_api_model_label(self) -> str:
+        info = get_active_ai_info()
+        model = str(info.get("responded_model") or info.get("model") or "").strip()
+        p_disp = str(info.get("provider_display", "Gemini") or "Gemini").strip()
+        if model:
+            return model if p_disp.lower() in model.lower() else f"{p_disp} {model}"
+        return p_disp
+
+    def _build_chat_prompt_with_attachments(
+        self,
+        text: str,
+        attachments: List[Dict[str, Any]],
+        mode_idx: Optional[int] = None,
+    ) -> str:
+        eff_mode = self.current_mode_index() if mode_idx is None else int(mode_idx)
+        prep = prepare_attachments_for_mode(attachments, mode_idx=eff_mode)
+        att_ctx = str(prep.get("prompt_context", "") or "").strip()
+        base = self._append_quote_to_prompt(text)
+        if att_ctx:
+            return f"{base}\n\n[첨부 컨텍스트]\n{att_ctx}"
+        return base
+
+    def _append_action_approval_card(
+        self,
+        tool_name: str,
+        tool_label: str,
+        args: Dict[str, Any],
+    ) -> QFrame:
+        card = QFrame(self.chat_timeline_widget)
+        _apply_role(card, obj_name="AgentActionApprovalCard")
+        card.setStyleSheet(
+            "QFrame#AgentActionApprovalCard { "
+            "background-color: #EFF6FF; border: 1px solid #93C5FD; border-radius: 10px; }"
+        )
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(6)
+
+        arg_summary = summarize_tool_args(tool_name, args)
+        lbl = QLabel(
+            f"[실행 승인 필요] {tool_label} ({tool_name})\n인자: {arg_summary}",
+            card,
+        )
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("font-size: 11.5px; color: #1E3A8A; border: none; background: transparent;")
+        lay.addWidget(lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        btn_approve = QPushButton("실행 승인", card)
+        _apply_role(btn_approve, role="primary", obj_name="BtnAgentApproveTool")
+        btn_approve.setFixedHeight(26)
+        btn_approve.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        btn_cancel = QPushButton("취소", card)
+        _apply_role(btn_cancel, role="outline", obj_name="BtnAgentCancelTool")
+        btn_cancel.setFixedHeight(26)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        btn_row.addWidget(btn_approve)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        lay.addLayout(btn_row)
+
+        def _on_approve() -> None:
+            btn_approve.setEnabled(False)
+            btn_cancel.setEnabled(False)
+            res = execute_action_tool(tool_name, args, db=self.db)
+            if tool_name == "process_hwpx_or_ocr" and res.get("ok"):
+                tgt = str((res.get("data") or {}).get("target_id", "") or "").strip()
+                if tgt:
+                    self.set_target(tgt, force=True)
+            card.setVisible(False)
+            card.deleteLater()
+            self._append_chat_message(
+                role="assistant",
+                content=f"[{tool_label} 실행 결과]\n{res.get('summary', '')}",
+                exec_mode="agent_tool",
+                model_name="EduFlow Tool",
+                tool_name=tool_name,
+            )
+            self.lbl_dock_progress_meta.setText(str(res.get("summary", "도구 실행 완료")))
+
+        def _on_cancel() -> None:
+            card.setVisible(False)
+            card.deleteLater()
+            self.lbl_dock_progress_meta.setText(f"[{tool_label}] 실행이 취소되었습니다.")
+
+        btn_approve.clicked.connect(_on_approve)
+        btn_cancel.clicked.connect(_on_cancel)
+
+        card.lbl_summary = lbl  # type: ignore[attr-defined]
+        card.btn_approve = btn_approve  # type: ignore[attr-defined]
+        card.btn_cancel = btn_cancel  # type: ignore[attr-defined]
+
+        self.lbl_chat_empty.setVisible(False)
+        insert_idx = max(0, self.chat_timeline_lay.count() - 1)
+        self.chat_timeline_lay.insertWidget(insert_idx, card)
+        self._scroll_timeline_to_bottom()
+        return card
+
+    def _handle_agent_response(
+        self,
+        raw_reply: str,
+        *,
+        exec_mode: str,
+        model_name: str,
+        tool_name_default: str = "general_chat",
+        allow_followup: bool = True,
+    ) -> None:
+        txt = str(raw_reply or "").strip()
+        if not txt:
+            return
+        if (self._active_target_id or "general_chat") != "general_chat":
+            self._append_chat_message(
+                role="assistant",
+                content=txt,
+                exec_mode=exec_mode,
+                model_name=model_name,
+                tool_name=tool_name_default,
+            )
+            return
+
+        parsed = parse_agent_response(txt)
+        if not parsed.get("is_tool_call"):
+            self._append_chat_message(
+                role="assistant",
+                content=txt,
+                exec_mode=exec_mode,
+                model_name=model_name,
+                tool_name="general_chat",
+            )
+            return
+
+        t_name = str(parsed.get("tool_name", ""))
+        t_kind = str(parsed.get("tool_kind", "read"))
+        t_label = str(parsed.get("tool_label", t_name))
+        args = parsed.get("args") or {}
+        reply_intro = str(parsed.get("reply", "") or "").strip()
+
+        if t_kind == "read":
+            tool_res = execute_read_only_tool(
+                t_name,
+                args,
+                db=self.db,
+                session_id=self._active_session_id,
+            )
+            data_str = json.dumps(tool_res.get("data", {}), ensure_ascii=False, indent=2)[:2500]
+            if exec_mode in ("api", "playwright") and allow_followup:
+                followup_prompt = (
+                    f"[조회형 도구 실행 완료: {t_label} ({t_name})]\n"
+                    f"요약: {tool_res.get('summary', '')}\n"
+                    f"조회 데이터:\n{data_str}\n\n"
+                    "위 실제 조회 결과를 바탕으로 사용자 질문에 최종 답변을 한국어로 작성하세요. (더 이상 도구 JSON을 출력하지 마세요.)"
+                )
+                if exec_mode == "api":
+                    self._execute_general_chat_api(
+                        followup_prompt,
+                        allow_followup=False,
+                        tool_name_override=t_name,
+                    )
+                else:
+                    self._active_pw_worker = None
+                    self._execute_general_chat_playwright(
+                        followup_prompt,
+                        allow_followup=False,
+                        tool_name_override=t_name,
+                    )
+                return
+
+            combined = (
+                f"{reply_intro}\n\n" if reply_intro else ""
+            ) + f"[도구 자동 조회: {t_label}]\n{tool_res.get('summary', '')}\n{data_str}"
+            self._append_chat_message(
+                role="assistant",
+                content=combined.strip(),
+                exec_mode=exec_mode,
+                model_name=model_name,
+                tool_name=t_name,
+            )
+            return
+
+        # 실행/변경형 도구: 안내 문구 말풍선(선택) + 인라인 승인 카드
+        if reply_intro:
+            self._append_chat_message(
+                role="assistant",
+                content=reply_intro,
+                exec_mode=exec_mode,
+                model_name=model_name,
+                tool_name=t_name,
+            )
+        self._append_action_approval_card(t_name, t_label, args)
+
+    def _copy_and_open_manual_web(self, prompt_text: str) -> None:
+        QApplication.clipboard().setText(prompt_text)
+        self._enter_manual_collect_waiting(prompt_text)
+        provider_key = str(self.combo_web_provider.currentData() or self._manual_provider or "gemini")
+        url = self._resolve_target_web_url(provider_key, self.edit_chat_custom_url)
+        if not url:
+            QMessageBox.information(
+                self,
+                "URL 확인",
+                "직접 URL 모드에서는 접속할 웹 AI 주소를 입력해 주세요.\n프롬프트는 클립보드에 복사되었습니다.",
+            )
+            self.edit_chat_custom_url.setFocus()
+            self.lbl_dock_progress_meta.setText(
+                "프롬프트가 복사되었습니다. 웹 AI 주소를 입력하거나 붙여넣기 후 [응답 회수]를 눌러주세요."
+            )
+            return
+        webbrowser.open(url)
+        self.lbl_dock_progress_meta.setText(
+            "프롬프트가 복사되었습니다. 열린 웹 AI 창에 붙여넣기(Ctrl+V)한 뒤, 답변을 복사해 [응답 회수]를 눌러주세요."
+        )
+
+    def _enter_manual_collect_waiting(self, prompt_text: str) -> None:
+        self._last_manual_prompt = str(prompt_text or "")
+        self._manual_waiting_collect = True
+        self.btn_chat_send.setText("응답 회수")
+        self.btn_chat_send.setToolTip("입력창 또는 클립보드의 웹 AI 응답을 회수하여 등록합니다.")
+        self.btn_chat_cancel_collect.setVisible(True)
+
+    def _cancel_manual_collect_waiting(self) -> None:
+        self._manual_waiting_collect = False
+        self.btn_chat_send.setText("전송")
+        self.btn_chat_send.setToolTip("")
+        self.btn_chat_cancel_collect.setVisible(False)
+
+    def _on_manual_collect_from_chat(self) -> None:
+        input_txt = self.txt_chat_input.toPlainText().strip()
+        from_input = bool(input_txt)
+        candidate = input_txt if from_input else (QApplication.clipboard().text() or "").strip()
+        if not candidate:
+            self.lbl_dock_progress_meta.setText(
+                "회수할 응답이 없습니다. 웹 AI 응답을 복사하거나 입력창에 붙여넣어 주세요."
+            )
+            return
+        if not from_input and self._last_manual_prompt and candidate == self._last_manual_prompt.strip():
+            self.lbl_dock_progress_meta.setText(
+                "클립보드에 직전 전송 프롬프트가 그대로 있습니다. 웹 AI 응답을 복사한 뒤 다시 눌러 주세요."
+            )
+            return
+
+        if from_input:
+            self.txt_chat_input.clear()
+
+        provider_label = self.manual_provider_display()
+        model_label = f"{provider_label} Web" if provider_label else "수동 입력"
+        tid = self._active_target_id or "general_chat"
+        self._handle_agent_response(
+            candidate,
+            exec_mode="manual",
+            model_name=model_label,
+            tool_name_default=tid,
+            allow_followup=False,
+        )
+        self._cancel_manual_collect_waiting()
+        if tid != "general_chat":
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.setPlainText(candidate)
+            self.txt_manual_response.blockSignals(False)
+            self._on_manual_apply_and_next()
+        self.lbl_dock_progress_meta.setText("수동 응답 회수 완료")
+
+    def _on_chat_send_clicked(self) -> None:
+        if self._pw_waiting_collect:
+            self._on_pw_collect_next_clicked()
+            return
+        if self._manual_waiting_collect:
+            self._on_manual_collect_from_chat()
+            return
+
+        tid = self._active_target_id or "general_chat"
+        raw_text = self.txt_chat_input.toPlainText().strip()
+        attachments = list(self._chat_attachments)
+        if not raw_text and not attachments and tid == "general_chat":
+            return
+
+        # 수정-재전송 분기 처리: 해당 메시지 포함 이후 대화 삭제 후 재구성
+        if self._editing_message_id is not None and self._active_session_id is not None:
+            self.db.delete_ai_chat_messages_from(
+                self._active_session_id, self._editing_message_id, inclusive=True
+            )
+            self._cancel_edit_message()
+            self.load_session(self._active_session_id)
+
+        # 특수 타겟의 지시사항 입력창과 연동
+        if tid == "hwpx_agent":
+            self.txt_hwpx_instruction.setPlainText(raw_text)
+        elif tid == "calendar_todo":
+            self.txt_calendar_instruction.setPlainText(raw_text)
+
+        self._chat_extra_instruction = raw_text
+        self._chat_extra_attachments = list(attachments)
+
+        self.txt_chat_input.clear()
+        self._chat_attachments.clear()
+        self._refresh_attachment_chips()
+
+        mode_idx = self.current_mode_index()
+        exec_mode = {0: "api", 1: "manual", 2: "playwright"}.get(mode_idx, "api")
+
+        # 사용자 말풍선 DB 저장 & 타임라인 추가
+        self._append_chat_message(
+            role="user",
+            content=raw_text or ("(첨부 컨텍스트 전송)" if attachments else f"[{tid}] 실행 요청"),
+            exec_mode=exec_mode,
+            tool_name=tid,
+            attachments=attachments,
+        )
+
+        if tid != "general_chat":
+            if mode_idx == 0:
+                self._on_api_start_clicked()
+            elif mode_idx == 1:
+                prompt_text = self._build_current_manual_prompt()
+                if not prompt_text:
+                    QMessageBox.information(
+                        self,
+                        "프롬프트 확인",
+                        "복사할 프롬프트가 없습니다. 대상 파일과 배치를 확인해 주세요.",
+                    )
+                    return
+                self._copy_and_open_manual_web(prompt_text)
+            else:
+                self._on_pw_start_clicked()
+            return
+
+        full_prompt = self._build_chat_prompt_with_attachments(raw_text, attachments, mode_idx=mode_idx)
+        if mode_idx == 0:
+            self._execute_general_chat_api(full_prompt)
+        elif mode_idx == 1:
+            self._execute_general_chat_manual(full_prompt)
+        else:
+            prep = prepare_attachments_for_mode(attachments, mode_idx=2)
+            self._execute_general_chat_playwright(full_prompt, prep.get("pw_attach_paths") or [])
+
+    def _execute_general_chat_api(
+        self,
+        full_prompt: str,
+        *,
+        allow_followup: bool = True,
+        tool_name_override: str = "general_chat",
+    ) -> None:
+        if self._is_api_running and allow_followup:
+            return
+        info = get_active_ai_info()
+        if not info.get("has_key", False):
+            reply = QMessageBox.warning(
+                self,
+                "API Key 필요",
+                f"현재 선택된 AI 공급자({info.get('provider_display')})의 API Key가 등록되어 있지 않습니다.\n"
+                "환경설정 탭으로 이동하여 API Key를 등록하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.go_to_settings_requested.emit()
+            return
+
+        history = (
+            self.db.get_ai_chat_messages(self._active_session_id)[:-1]
+            if self._active_session_id is not None
+            else []
+        )
+        model_label = self._current_api_model_label()
+        sys_p = (
+            None
+            if allow_followup
+            else "당신은 EduFlow AI 어시스턴트입니다. 제공된 도구 조회 결과를 바탕으로 사용자에게 최종 한국어 답변만 작성하세요."
+        )
+        worker = _DockApiGeneralChatWorker(
+            prompt=full_prompt,
+            history=history,
+            model_label=model_label,
+            system_prompt=sys_p,
+        )
+        worker.signals.progress.connect(self._on_dock_worker_progress)
+        self._set_api_busy(True)
+        self.progress_dock.setValue(0)
+        self.lbl_dock_progress_meta.setText("범용 챗 API 응답 생성 중...")
+
+        def _on_res(res: Dict[str, Any]) -> None:
+            reply_txt = str(res.get("raw_response", "") or "").strip()
+            self._set_api_busy(False)
+            if reply_txt:
+                self._handle_agent_response(
+                    reply_txt,
+                    exec_mode="api",
+                    model_name=str(res.get("model_name", "") or model_label),
+                    tool_name_default=tool_name_override,
+                    allow_followup=allow_followup,
+                )
+            self.lbl_dock_progress_meta.setText("범용 챗 API 응답 완료")
+
+        def _on_err(err: str) -> None:
+            first = (err or "").strip().split("\n")[0]
+            self.lbl_dock_progress_meta.setText(f"오류: {first}")
+            QMessageBox.critical(self, "API 실행 오류", first)
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key=self.TASK_DOCK_API,
+            on_result=_on_res,
+            on_error=_on_err,
+            on_finished=lambda: self._set_api_busy(False),
+        )
+
+    def _execute_general_chat_manual(self, full_prompt: str) -> None:
+        agent_prompt = f"{build_agent_system_prompt()}\n\n[사용자 요청]\n{full_prompt}"
+        self._copy_and_open_manual_web(agent_prompt)
+
+    def _on_manual_register_chat_response(self) -> None:
+        raw_resp = self.txt_manual_response.toPlainText().strip()
+        if not raw_resp:
+            QMessageBox.warning(self, "응답 확인", "등록할 AI 응답 텍스트를 먼저 붙여넣어 주세요.")
+            return
+        provider_label = self.manual_provider_display()
+        model_label = f"{provider_label} Web" if provider_label else "수동 입력"
+        self.txt_manual_response.blockSignals(True)
+        self.txt_manual_response.clear()
+        self.txt_manual_response.blockSignals(False)
+        self._append_chat_message(
+            role="assistant",
+            content=raw_resp,
+            exec_mode="manual",
+            model_name=model_label,
+            tool_name=self._active_target_id or "general_chat",
+        )
+        self.lbl_manual_verify.setText("AI 응답이 대화 타임라인에 등록되었습니다.")
+        self.lbl_dock_progress_meta.setText("수동 응답 등록 완료")
+
+    def _execute_general_chat_playwright(
+        self,
+        full_prompt: str,
+        attachment_paths: Optional[List[str]] = None,
+        *,
+        allow_followup: bool = True,
+        tool_name_override: str = "general_chat",
+    ) -> None:
+        if self._active_pw_worker is not None and allow_followup:
+            return
+        custom_url = ""
+        if self._pw_provider == "custom":
+            custom_url = normalize_web_url(self.edit_pw_custom_url.text())
+            if not custom_url:
+                QMessageBox.warning(self, "URL 확인", "직접 URL 모드에서는 접속할 웹 AI 주소를 입력해 주세요.")
+                self.edit_pw_custom_url.setFocus()
+                return
+
+        exec_mode = str(self.combo_pw_exec_mode.currentData() or "auto")
+        keep_login = bool(self.chk_pw_keep_login.isChecked())
+        use_temp_chat = bool(self.chk_pw_temp_chat.isChecked())
+        provider_label = self.playwright_provider_display()
+
+        single_p = (
+            f"{build_agent_system_prompt()}\n\n[사용자 요청]\n{full_prompt}"
+            if allow_followup
+            else full_prompt
+        )
+        worker = WebGeminiAutoWorker(
+            excel_path=None,
+            single_prompt=single_p,
+            attachment_paths=attachment_paths or [],
+            provider=self._pw_provider,
+            custom_url=custom_url,
+            execution_mode=exec_mode,
+            require_login=False,
+            keep_login_session=keep_login,
+            use_temp_chat=use_temp_chat,
+            headless=False,
+            task_label="범용 AI 챗",
+        )
+        worker.signals.progress.connect(self._on_dock_worker_progress)
+        worker.waiting_for_login.connect(self._on_pw_waiting_for_login)
+        worker.waiting_for_semi_auto_collect.connect(self._on_pw_waiting_for_collect)
+        worker.waiting_for_element_click.connect(self._on_pw_waiting_for_click)
+
+        self._active_pw_worker = worker
+        self._pw_single_batches_applied = False
+        self._set_pw_running_state(True)
+        self.progress_dock.setValue(0)
+        self.lbl_dock_progress_meta.setText("[범용 AI 챗] Playwright 브라우저 실행 중...")
+
+        def _on_pw_chat_res(res: Dict[str, Any]) -> None:
+            if res.get("missing_playwright"):
+                QMessageBox.warning(
+                    self,
+                    "Playwright 패키지 필요",
+                    "Playwright가 설치되어 있지 않습니다.\n"
+                    "터미널에서 'pip install playwright && playwright install chromium'을 실행해 주세요.",
+                )
+                return
+            reply_txt = str(res.get("raw_response", "") or res.get("response_text", "") or "").strip()
+            if reply_txt:
+                self._handle_agent_response(
+                    reply_txt,
+                    exec_mode="playwright",
+                    model_name=f"{provider_label} Web",
+                    tool_name_default=tool_name_override,
+                    allow_followup=allow_followup,
+                )
+            self.lbl_dock_progress_meta.setText("Playwright 범용 챗 완료")
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key=self.TASK_DOCK_PLAYWRIGHT,
+            on_result=_on_pw_chat_res,
+            on_error=self._on_pw_error,
+            on_finished=self._on_pw_finished,
+        )

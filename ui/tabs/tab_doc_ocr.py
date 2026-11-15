@@ -2341,6 +2341,16 @@ class DocOcrTab(QWidget):
         self.card_agg_step3.setProperty("aiTargetSelected", "false")
         lay_step3 = self.card_agg_step3.body_layout()
 
+        excel_open_row = QHBoxLayout()
+        excel_open_row.addStretch()
+        self.btn_open_result_excel = QPushButton("생성된 결과 엑셀 열기 (.xlsx)")
+        self.btn_open_result_excel.setMinimumHeight(32)
+        apply_qss_role(self.btn_open_result_excel, role="success")
+        self.btn_open_result_excel.setVisible(False)
+        self.btn_open_result_excel.clicked.connect(self._on_open_last_result_excel)
+        excel_open_row.addWidget(self.btn_open_result_excel)
+        lay_step3.addLayout(excel_open_row)
+
         preview_hdr = QHBoxLayout()
         preview_hdr.setSpacing(8)
         self.lbl_agg_preview_summary = QLabel(
@@ -2385,20 +2395,13 @@ class DocOcrTab(QWidget):
         apply_qss_role(lbl_dock_exec_hint, role="infoBanner")
         lay_step3.addWidget(lbl_dock_exec_hint)
 
-        # 피드백 & 결과 열기 상태 영역
+        # 피드백 상태 영역
         box_feedback = QHBoxLayout()
         self.lbl_agg_status = QLabel("대기 중: 1단계 추출 또는 우측 AI 실행 패널에서 작업을 실행해 주세요.")
         self.lbl_agg_status.setWordWrap(True)
         apply_qss_role(self.lbl_agg_status, role="mutedText")
 
-        self.btn_open_result_excel = QPushButton("생성된 결과 엑셀 열기 (.xlsx)")
-        self.btn_open_result_excel.setMinimumHeight(32)
-        apply_qss_role(self.btn_open_result_excel, role="success")
-        self.btn_open_result_excel.setVisible(False)
-        self.btn_open_result_excel.clicked.connect(self._on_open_last_result_excel)
-
         box_feedback.addWidget(self.lbl_agg_status, stretch=1)
-        box_feedback.addWidget(self.btn_open_result_excel)
         lay_step3.addLayout(box_feedback)
 
         lay.addWidget(self.card_agg_step3)

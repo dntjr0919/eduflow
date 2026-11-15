@@ -423,8 +423,8 @@ class TestSidebarUnreadBadgesAndMainWindow(unittest.TestCase):
             self.assertFalse(win.windowIcon().isNull())
             self.assertFalse(win.tray_icon.icon().isNull())
             self.assertEqual(win.brand_logo_badge.size(), QSize(32, 32))
-            self.assertIsNotNone(win.brand_logo_badge.pixmap())
-            self.assertFalse(win.brand_logo_badge.pixmap().isNull())
+            self.assertFalse(win.brand_logo_badge.icon().isNull())
+            self.assertFalse(hasattr(win, "btn_sidebar_toggle"))
             self.assertEqual(win.brand_text_layout.spacing(), 1)
             self.assertEqual(win.brand_text_layout.contentsMargins().top(), 0)
             self.assertEqual(win.brand_text_layout.contentsMargins().bottom(), 0)
@@ -501,13 +501,13 @@ class TestSidebarUnreadBadgesAndMainWindow(unittest.TestCase):
             win.btn_toggle_ai_dock.click()
             self.assertTrue(win._ai_dock_expanded)
             self.assertFalse(win._sidebar_collapsed)
-            win.btn_sidebar_toggle.click()
+            win.brand_logo_badge.click()
             self.assertTrue(win._sidebar_collapsed)
             self.assertTrue(win._ai_dock_expanded)
             win.btn_toggle_ai_dock.click()
             self.assertFalse(win._ai_dock_expanded)
             self.assertTrue(win._sidebar_collapsed)
-            win.btn_sidebar_toggle.click()
+            win.brand_logo_badge.click()
             self.assertFalse(win._sidebar_collapsed)
             self.assertFalse(win._ai_dock_expanded)
 
@@ -909,29 +909,25 @@ class TestSidebarUnreadBadgesAndMainWindow(unittest.TestCase):
                 on_result=lambda _r: None,
             )
 
-            # 1) agg_step2에서만 결과 엑셀 버튼 & 배치 선택 영역 표시
+            # 1) agg_step2에서는 작업 시작 버튼 라벨 & btn_dock_open_excel 제거 확인
             dock.set_target("agg_step2", force=True)
-            self.assertFalse(dock.btn_dock_open_excel.isHidden())
-            self.assertFalse(dock.manual_batch_card.isHidden())
-            self.assertFalse(dock.api_summary_card.isHidden())
-            self.assertTrue(dock.calendar_instruction_card.isHidden())
+            self.assertFalse(hasattr(dock, "btn_dock_open_excel"))
+            self.assertEqual(dock.btn_chat_send.text(), "작업 시작")
+            self.assertTrue(dock.body_scroll.isHidden())
 
-            # 2) ocr / hwpx_agent에서는 결과 엑셀 버튼 & 배치 선택 영역 숨김
+            # 2) ocr / hwpx_agent에서는 배치 바 숨김
             for tid in ("ocr", "hwpx_agent"):
                 dock.set_target(tid, force=True)
-                self.assertTrue(dock.btn_dock_open_excel.isHidden(), f"{tid}에서 엑셀 버튼이 보임")
-                self.assertTrue(dock.manual_batch_card.isHidden(), f"{tid}에서 배치 카드가 보임")
+                self.assertTrue(dock.batch_bar_widget.isHidden(), f"{tid}에서 배치 바가 보임")
 
-            # 3) calendar_todo에서는 3개 모드 모두에서 txt_calendar_instruction 표시, 엑셀/배치/과제요약 숨김
+            # 3) calendar_todo에서는 3개 모드 모두 body_scroll 숨김, combo_pw_exec_mode는 항상 선택 가능
             dock.set_target("calendar_todo", force=True)
             for mode_idx in (0, 1, 2):
                 dock.set_mode_index(mode_idx)
-                self.assertFalse(dock.calendar_instruction_card.isHidden())
-                self.assertFalse(dock.txt_calendar_instruction.isHidden())
-                self.assertTrue(dock.btn_dock_open_excel.isHidden())
-                self.assertTrue(dock.manual_batch_card.isHidden())
-                self.assertTrue(dock.api_summary_card.isHidden())
-                self.assertTrue(dock.combo_pw_exec_mode.isHidden())
+                self.assertTrue(dock.body_scroll.isHidden())
+                self.assertTrue(dock.batch_bar_widget.isHidden())
+                self.assertFalse(dock.combo_pw_exec_mode.isHidden())
+                self.assertEqual(dock.btn_chat_send.text(), "전송")
         finally:
             dock.deleteLater()
             self.app.processEvents()
@@ -979,19 +975,17 @@ class TestSidebarUnreadBadgesAndMainWindow(unittest.TestCase):
                 self.app.processEvents()
                 self.assertEqual(dock.active_target_id(), tid)
 
-            # 최종 calendar_todo 상태에서 3개 모드 모두 이전 타겟 위젯은 False, 캘린더 입력창은 True
+            # 최종 calendar_todo 상태에서 3개 모드 모두 body_scroll 및 레거시 위젯 숨김 확인
             for mode_idx in (0, 1, 2):
                 dock.set_mode_index(mode_idx)
                 self.app.processEvents()
-                self.assertTrue(dock.txt_calendar_instruction.isVisible())
-                self.assertTrue(dock.calendar_instruction_card.isVisible())
+                self.assertFalse(dock.body_scroll.isVisible())
                 self.assertFalse(dock.hwpx_instruction_card.isVisible())
                 self.assertFalse(dock.api_summary_card.isVisible())
                 self.assertFalse(dock.chk_api_run_integrated.isVisible())
-                self.assertFalse(dock.btn_dock_open_excel.isVisible())
                 self.assertFalse(dock.manual_batch_card.isVisible())
                 self.assertFalse(dock.manual_ocr_card.isVisible())
-                self.assertFalse(dock.combo_pw_exec_mode.isVisible())
+                self.assertFalse(dock.combo_pw_exec_mode.isHidden())
         finally:
             dock.close()
             dock.deleteLater()

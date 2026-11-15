@@ -383,6 +383,39 @@ class DatabaseManager:
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(is_read, id DESC)"
                 )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_chat_sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        title TEXT NOT NULL DEFAULT '새 대화',
+                        target_mode TEXT NOT NULL DEFAULT 'general_chat',
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_updated ON ai_chat_sessions(updated_at DESC, id DESC)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_chat_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL DEFAULT '',
+                        exec_mode TEXT NOT NULL DEFAULT 'api',
+                        model_name TEXT NOT NULL DEFAULT '',
+                        tool_name TEXT NOT NULL DEFAULT '',
+                        attachments_json TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY(session_id) REFERENCES ai_chat_sessions(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ai_chat_messages_session ON ai_chat_messages(session_id, id ASC)"
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -2932,6 +2965,257 @@ class DatabaseManager:
                 )
                 conn.commit()
                 return total
+            finally:
+                conn.close()
+
+    # =========================================================================
+    # AI 챗봇 세션 & 메시지 (ai_chat_sessions / ai_chat_messages)
+    # =========================================================================
+    def create_ai_chat_session(
+        self, title: str = "새 대화", target_mode: str = "general_chat"
+    ) -> int:
+        now_str = self._now_str()
+        clean_title = (title or "").strip() or "새 대화"
+        clean_mode = (target_mode or "").strip() or "general_chat"
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO ai_chat_sessions (title, target_mode, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (clean_title, clean_mode, now_str, now_str),
+                )
+                conn.commit()
+                return int(cur.lastrowid or 0)
+            finally:
+                conn.close()
+
+    def get_ai_chat_sessions(self, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT s.*,
+                           (SELECT COUNT(*) FROM ai_chat_messages m WHERE m.session_id = s.id) AS message_count
+                    FROM ai_chat_sessions s
+                    ORDER BY s.updated_at DESC, s.id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def get_ai_chat_session(self, session_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM ai_chat_sessions WHERE id = ?",
+                    (int(session_id),),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def update_ai_chat_session(
+        self,
+        session_id: int,
+        title: Optional[str] = None,
+        target_mode: Optional[str] = None,
+    ) -> None:
+        now_str = self._now_str()
+        fields: List[str] = ["updated_at = ?"]
+        params: List[Any] = [now_str]
+        if title is not None:
+            fields.append("title = ?")
+            params.append(title.strip() or "새 대화")
+        if target_mode is not None:
+            fields.append("target_mode = ?")
+            params.append(target_mode.strip() or "general_chat")
+        params.append(int(session_id))
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    f"UPDATE ai_chat_sessions SET {', '.join(fields)} WHERE id = ?",
+                    tuple(params),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_ai_chat_session(self, session_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM ai_chat_messages WHERE session_id = ?",
+                    (int(session_id),),
+                )
+                cur.execute(
+                    "DELETE FROM ai_chat_sessions WHERE id = ?",
+                    (int(session_id),),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _serialize_attachments_json(
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        attachments_json: Optional[str] = None,
+    ) -> str:
+        if attachments_json is not None:
+            return str(attachments_json or "[]")
+        if attachments is not None:
+            return json.dumps(attachments, ensure_ascii=False)
+        return "[]"
+
+    def add_ai_chat_message(
+        self,
+        session_id: int,
+        role: str,
+        content: str,
+        exec_mode: str = "api",
+        model_name: str = "",
+        tool_name: str = "",
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        attachments_json: Optional[str] = None,
+    ) -> int:
+        now_str = self._now_str()
+        att_str = self._serialize_attachments_json(attachments, attachments_json)
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO ai_chat_messages (
+                        session_id, role, content, exec_mode, model_name, tool_name, attachments_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(session_id),
+                        str(role or "user"),
+                        str(content or ""),
+                        str(exec_mode or "api"),
+                        str(model_name or ""),
+                        str(tool_name or ""),
+                        att_str,
+                        now_str,
+                    ),
+                )
+                new_id = int(cur.lastrowid or 0)
+                cur.execute(
+                    "UPDATE ai_chat_sessions SET updated_at = ? WHERE id = ?",
+                    (now_str, int(session_id)),
+                )
+                conn.commit()
+                return new_id
+            finally:
+                conn.close()
+
+    def get_ai_chat_messages(self, session_id: int) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT * FROM ai_chat_messages WHERE session_id = ? ORDER BY id ASC",
+                    (int(session_id),),
+                )
+                rows: List[Dict[str, Any]] = []
+                for r in cur.fetchall():
+                    item = dict(r)
+                    try:
+                        parsed = json.loads(item.get("attachments_json") or "[]")
+                        item["attachments"] = parsed if isinstance(parsed, list) else []
+                    except Exception:
+                        item["attachments"] = []
+                    rows.append(item)
+                return rows
+            finally:
+                conn.close()
+
+    def update_ai_chat_message(
+        self,
+        message_id: int,
+        content: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        attachments_json: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ) -> None:
+        fields: List[str] = []
+        params: List[Any] = []
+        if content is not None:
+            fields.append("content = ?")
+            params.append(str(content))
+        if attachments is not None or attachments_json is not None:
+            fields.append("attachments_json = ?")
+            params.append(self._serialize_attachments_json(attachments, attachments_json))
+        if model_name is not None:
+            fields.append("model_name = ?")
+            params.append(str(model_name))
+        if not fields:
+            return
+        params.append(int(message_id))
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    f"UPDATE ai_chat_messages SET {', '.join(fields)} WHERE id = ?",
+                    tuple(params),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def delete_ai_chat_messages_from(
+        self, session_id: int, from_message_id: int, inclusive: bool = True
+    ) -> int:
+        op = ">=" if inclusive else ">"
+        now_str = self._now_str()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    f"DELETE FROM ai_chat_messages WHERE session_id = ? AND id {op} ?",
+                    (int(session_id), int(from_message_id)),
+                )
+                deleted = int(cur.rowcount or 0)
+                cur.execute(
+                    "UPDATE ai_chat_sessions SET updated_at = ? WHERE id = ?",
+                    (now_str, int(session_id)),
+                )
+                conn.commit()
+                return deleted
+            finally:
+                conn.close()
+
+    def delete_ai_chat_message(self, message_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM ai_chat_messages WHERE id = ?",
+                    (int(message_id),),
+                )
+                conn.commit()
             finally:
                 conn.close()
 

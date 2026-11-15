@@ -77,11 +77,19 @@ QFrame#SidebarBrandHeader {
     padding-bottom: 4px;
 }
 
-QLabel#SidebarBrandLogoBadge {
+QPushButton#SidebarBrandLogoBadge {
     background-color: #0B4DCB;
     border: none;
     border-radius: 8px;
     padding: 0px;
+    min-width: 32px;
+    max-width: 32px;
+    min-height: 32px;
+    max-height: 32px;
+}
+
+QPushButton#SidebarBrandLogoBadge:hover {
+    background-color: #1D4ED8;
 }
 
 QLabel#SidebarBrandTitle {

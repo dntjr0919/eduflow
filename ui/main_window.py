@@ -188,20 +188,23 @@ class MainWindow(QMainWindow):
         self.sidebar_layout.setContentsMargins(10, 18, 10, 16)
         self.sidebar_layout.setSpacing(6)
 
-        # 사이드바 상단: 32x32 학사모 로고 배지 + EduFlow/Teacher Workstation + [ = ] 토글 버튼
+        # 사이드바 상단: 32x32 학사모 로고 토글 버튼 + EduFlow/Teacher Workstation
         self.brand_header_frame = QFrame()
         polish_widget(self.brand_header_frame, obj_name="SidebarBrandHeader")
         self.brand_top_row = QBoxLayout(QBoxLayout.Direction.LeftToRight, self.brand_header_frame)
         self.brand_top_row.setContentsMargins(0, 0, 0, 0)
         self.brand_top_row.setSpacing(10)
 
-        self.brand_logo_badge = QLabel()
+        self.brand_logo_badge = QPushButton()
         polish_widget(self.brand_logo_badge, obj_name="SidebarBrandLogoBadge")
         self.brand_logo_badge.setFixedSize(32, 32)
-        self.brand_logo_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.brand_logo_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.brand_logo_badge.setToolTip("사이드바 접기 / 펼치기")
         cap_pix = load_svg_pixmap("graduation-cap", "#FFFFFF", 18)
         if not cap_pix.isNull():
-            self.brand_logo_badge.setPixmap(cap_pix)
+            self.brand_logo_badge.setIcon(QIcon(cap_pix))
+            self.brand_logo_badge.setIconSize(QSize(18, 18))
+        self.brand_logo_badge.clicked.connect(self.toggle_sidebar)
 
         self.brand_text_container = QWidget()
         self.brand_text_layout = QVBoxLayout(self.brand_text_container)
@@ -217,19 +220,10 @@ class MainWindow(QMainWindow):
         self.brand_text_layout.addWidget(self.brand_title)
         self.brand_text_layout.addWidget(self.brand_sub)
 
-        self.btn_sidebar_toggle = QPushButton("≡")
-        polish_widget(self.btn_sidebar_toggle, obj_name="SidebarToggleBtn")
-        self.btn_sidebar_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 접기 / 펼치기")
-        self.btn_sidebar_toggle.clicked.connect(self.toggle_sidebar)
-
         self.brand_top_row.addWidget(
             self.brand_logo_badge, alignment=Qt.AlignmentFlag.AlignVCenter
         )
         self.brand_top_row.addWidget(self.brand_text_container, stretch=1)
-        self.brand_top_row.addWidget(
-            self.btn_sidebar_toggle, alignment=Qt.AlignmentFlag.AlignCenter
-        )
 
         self.nav_section_lbl = QLabel("NAVIGATION")
         polish_widget(self.nav_section_lbl, obj_name="SidebarSectionLabel")
@@ -501,7 +495,7 @@ class MainWindow(QMainWindow):
             self.brand_title.hide()
             self.brand_sub.hide()
             self.nav_section_lbl.hide()
-            self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 펼치기")
+            self.brand_logo_badge.setToolTip("사이드바 메뉴 펼치기")
             self.lbl_ai_badge.hide()
             self.sidebar_ai_badge_layout.setContentsMargins(0, 0, 0, 0)
             self.sidebar_ai_badge_layout.setSpacing(0)
@@ -536,7 +530,7 @@ class MainWindow(QMainWindow):
             self.brand_title.show()
             self.brand_sub.show()
             self.nav_section_lbl.show()
-            self.btn_sidebar_toggle.setToolTip("사이드바 메뉴 접기")
+            self.brand_logo_badge.setToolTip("사이드바 메뉴 접기")
             self.lbl_ai_badge.show()
             self.sidebar_ai_badge_layout.setContentsMargins(10, 0, 10, 0)
             self.sidebar_ai_badge_layout.setSpacing(8)
@@ -704,7 +698,7 @@ class MainWindow(QMainWindow):
 
         sidebar_seq = self._get_shortcut_str("toggle_left_sidebar")
         sidebar_base = "사이드바 메뉴 펼치기" if self._sidebar_collapsed else "사이드바 메뉴 접기"
-        self.btn_sidebar_toggle.setToolTip(self._format_tooltip(sidebar_base, sidebar_seq))
+        self.brand_logo_badge.setToolTip(self._format_tooltip(sidebar_base, sidebar_seq))
 
         lock_seq = self._get_shortcut_str("toggle_ai_target_lock")
         self.ai_dock.btn_lock_target.setToolTip(
@@ -892,12 +886,13 @@ class MainWindow(QMainWindow):
             on_result=self.tab_calendar.apply_ai_dock_result,
         )
         self.ai_dock.target_changed.connect(self.tab_doc_ocr.set_active_ai_target)
+        self.ai_dock.target_changed.connect(self._on_ai_dock_target_changed_nav)
         self.ai_dock.go_to_settings_requested.connect(self.switch_to_settings_tab)
         self.tab_doc_ocr.ai_target_requested.connect(self._on_central_ai_target_requested)
         self.tab_doc_ocr.ai_context_changed.connect(self.ai_dock.sync_from_context)
         self.tab_doc_ocr.ai_quote_selected.connect(self.ai_dock.set_quoted_selection)
         self.tab_grade.ai_reference_requested.connect(self._on_grade_material_send_to_ai)
-        self.ai_dock.set_target("agg_step2", force=True)
+        self.ai_dock.set_target("general_chat", force=True)
 
         self.sidebar_nav.setCurrentRow(0)
         self.refresh_sidebar_unread_badges()
@@ -1012,6 +1007,22 @@ class MainWindow(QMainWindow):
         else:
             self.ai_dock.sync_from_context()
         self.append_log("INFO", summary_msg)
+
+    def _on_ai_dock_target_changed_nav(self, target_id: str) -> None:
+        tid = str(target_id or "").strip()
+        if not tid or tid == "general_chat":
+            return
+        if tid in ("agg_step2", "ocr", "hwpx_agent"):
+            doc_idx = self.stacked_widget.indexOf(self.tab_doc_ocr)
+            if doc_idx >= 0 and self.sidebar_nav.currentRow() != doc_idx:
+                self.sidebar_nav.setCurrentRow(doc_idx)
+            sub_idx = {"agg_step2": 0, "ocr": 1, "hwpx_agent": 3}.get(tid, 0)
+            if hasattr(self.tab_doc_ocr, "sub_tabs") and self.tab_doc_ocr.sub_tabs.currentIndex() != sub_idx:
+                self.tab_doc_ocr.sub_tabs.setCurrentIndex(sub_idx)
+        elif tid == "calendar_todo":
+            cal_idx = self.stacked_widget.indexOf(self.tab_calendar)
+            if cal_idx >= 0 and self.sidebar_nav.currentRow() != cal_idx:
+                self.sidebar_nav.setCurrentRow(cal_idx)
 
     def _on_sidebar_nav_changed(self, row: int) -> None:
         if 0 <= row < self.stacked_widget.count():

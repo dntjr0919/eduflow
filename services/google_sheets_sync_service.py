@@ -9,10 +9,32 @@ Google Sheets + Google Apps Script 웹 앱 JSON API 양방향 동기화 서비�
 from __future__ import annotations
 
 import json
+import logging
 import re
+import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+_LOGGER = logging.getLogger(__name__)
+
+DEFAULT_BROWSER_HEADERS: Dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+}
+
+
+def _mask_sensitive_url(raw_url: str) -> str:
+    """로그 출력 시 URL 쿼리의 api_secret / password / token 값을 마스킹합니다."""
+    return re.sub(
+        r"([?&](?:api_secret|password|secret|token)=)([^&]+)",
+        r"\1***",
+        str(raw_url or ""),
+        flags=re.IGNORECASE,
+    )
 
 from core.base_worker import BaseWorker
 from core.config_manager import ConfigManager
@@ -47,22 +69,47 @@ def _is_truthy(val: Any) -> bool:
 
 
 def _http_get_json(url: str, params: Dict[str, str], timeout: float = 10.0) -> Dict[str, Any]:
+    clean_url = str(url or "").strip()
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v != ""})
-    full_url = f"{url}{'&' if '?' in url else '?'}{query}" if query else url
+    full_url = f"{clean_url}{'&' if '?' in clean_url else '?'}{query}" if query else clean_url
 
     try:
         import requests
 
-        resp = requests.get(full_url, timeout=timeout, allow_redirects=True)
+        resp = requests.get(
+            full_url,
+            headers=dict(DEFAULT_BROWSER_HEADERS),
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if resp.status_code == 403:
+            _LOGGER.warning(
+                "Google Sheets GET 403 Forbidden | url=%s | headers=%s",
+                _mask_sensitive_url(full_url),
+                dict(resp.headers),
+            )
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
             raise ValueError("Apps Script 응답이 JSON 객체 형식이 아닙니다.")
         return data
     except ImportError:
-        req = urllib.request.Request(full_url, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        req = urllib.request.Request(
+            full_url,
+            headers=dict(DEFAULT_BROWSER_HEADERS),
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 403:
+                _LOGGER.warning(
+                    "Google Sheets GET 403 Forbidden (urllib) | url=%s | headers=%s",
+                    _mask_sensitive_url(full_url),
+                    dict(exc.headers or {}),
+                )
+            raise
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("Apps Script 응답이 JSON 객체 형식이 아닙니다.")
@@ -70,16 +117,27 @@ def _http_get_json(url: str, params: Dict[str, str], timeout: float = 10.0) -> D
 
 
 def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 10.0) -> Dict[str, Any]:
+    clean_url = str(url or "").strip()
+    post_headers = {
+        **DEFAULT_BROWSER_HEADERS,
+        "Content-Type": "application/json; charset=utf-8",
+    }
     try:
         import requests
 
         resp = requests.post(
-            url,
+            clean_url,
             json=payload,
-            headers={"Content-Type": "application/json; charset=utf-8"},
+            headers=post_headers,
             timeout=timeout,
             allow_redirects=True,
         )
+        if resp.status_code == 403:
+            _LOGGER.warning(
+                "Google Sheets POST 403 Forbidden | url=%s | headers=%s",
+                _mask_sensitive_url(clean_url),
+                dict(resp.headers),
+            )
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict):
@@ -88,13 +146,22 @@ def _http_post_json(url: str, payload: Dict[str, Any], timeout: float = 10.0) ->
     except ImportError:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            url,
+            clean_url,
             data=body,
-            headers={"Content-Type": "application/json; charset=utf-8"},
+            headers=post_headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 403:
+                _LOGGER.warning(
+                    "Google Sheets POST 403 Forbidden (urllib) | url=%s | headers=%s",
+                    _mask_sensitive_url(clean_url),
+                    dict(exc.headers or {}),
+                )
+            raise
         data = json.loads(raw)
         return data if isinstance(data, dict) else {"ok": True}
 
