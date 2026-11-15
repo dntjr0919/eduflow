@@ -358,26 +358,81 @@ class GoogleSheetsSyncService:
         apps_script_url: str = "",
         sheet_url: str = "",
         timeout: float = 8.0,
+        memo: Optional[str] = None,
     ) -> bool:
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         rid = str(remote_id or "").strip()
         if not gas_url or not rid:
             return False
+        payload: Dict[str, Any] = {
+            "action": "update_task_status",
+            "sheetId": sheet_id,
+            "remote_id": rid,
+            "exec_status": exec_status,
+            "is_done": bool(is_done),
+        }
+        if memo is not None:
+            payload["memo"] = str(memo)
         try:
             res = _http_post_json(
                 gas_url,
-                {
-                    "action": "update_task_status",
-                    "sheetId": sheet_id,
-                    "remote_id": rid,
-                    "exec_status": exec_status,
-                    "is_done": bool(is_done),
-                },
+                payload,
                 timeout=timeout,
             )
             return bool(res.get("ok", True))
         except Exception as exc:
             self.db.add_log("WARN", "GoogleSheetsSync", f"상태 Push 실패 ({rid}): {exc}")
+            return False
+
+    def fetch_sheet_rows(
+        self,
+        sheet_name: str,
+        apps_script_url: str = "",
+        sheet_url: str = "",
+        timeout: float = 10.0,
+    ) -> List[Dict[str, Any]]:
+        """지정한 시트(예: 가정통신문_회신, 시간표_변동 등)의 행 목록을 조회합니다."""
+        gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
+        if not gas_url or not sheet_name:
+            return []
+        try:
+            res = _http_get_json(
+                gas_url,
+                {"action": "list_sheet", "sheet": sheet_name, "sheetId": sheet_id},
+                timeout=timeout,
+            )
+            if not res.get("ok"):
+                return []
+            rows = res.get("rows", [])
+            return rows if isinstance(rows, list) else []
+        except Exception as exc:
+            self.db.add_log("WARN", "GoogleSheetsSync", f"시트 조회 실패 ({sheet_name}): {exc}")
+            return []
+
+    def push_timetable_changes(
+        self,
+        rows: List[Dict[str, Any]],
+        apps_script_url: str = "",
+        sheet_url: str = "",
+        timeout: float = 10.0,
+    ) -> bool:
+        """컴시간 알리미 등에서 파싱한 시간표 변동 내역을 시간표_변동 시트로 Push합니다."""
+        gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
+        if not gas_url or not rows:
+            return False
+        try:
+            res = _http_post_json(
+                gas_url,
+                {
+                    "action": "push_timetable_changes",
+                    "sheetId": sheet_id,
+                    "rows": rows,
+                },
+                timeout=timeout,
+            )
+            return bool(res.get("ok", True))
+        except Exception as exc:
+            self.db.add_log("WARN", "GoogleSheetsSync", f"시간표 변동 Push 실패: {exc}")
             return False
 
     def push_local_item(

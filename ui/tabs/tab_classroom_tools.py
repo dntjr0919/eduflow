@@ -15,8 +15,16 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from PyQt6.QtCore import QDate, Qt
-from PyQt6.QtGui import QClipboard, QColor, QFont, QGuiApplication, QMouseEvent, QTextCharFormat
+from PyQt6.QtCore import QDate, QRect, Qt
+from PyQt6.QtGui import (
+    QClipboard,
+    QColor,
+    QFont,
+    QGuiApplication,
+    QMouseEvent,
+    QPainter,
+    QPen,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -390,6 +398,88 @@ class ClickablePeriodLineEdit(QLineEdit):
         super().mousePressEvent(event)
 
 
+class _MultiSelectCalendarWidget(QCalendarWidget):
+    """QSS 배경 무시를 우회해 다중 선택/기준일/오늘/주말 셀을 직접 렌더링하는 달력 위젯."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._selected_dates: Set[date] = set()
+        self._range_anchor: Optional[date] = None
+        self.setStyleSheet(
+            "QCalendarWidget QAbstractItemView:enabled {"
+            "  selection-background-color: transparent;"
+            "  selection-color: inherit;"
+            "}"
+        )
+
+    def set_selection_state(
+        self,
+        selected_dates: Set[date],
+        range_anchor: Optional[date] = None,
+    ) -> None:
+        self._selected_dates = set(selected_dates)
+        self._range_anchor = range_anchor
+        self.updateCells()
+
+    def paintCell(self, painter: QPainter, rect: QRect, qdate: QDate) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        py_date = date(qdate.year(), qdate.month(), qdate.day())
+        is_anchor = self._range_anchor is not None and py_date == self._range_anchor
+        is_selected = py_date in self._selected_dates
+        is_qt_selected = qdate == self.selectedDate()
+        is_today = py_date == date.today()
+        is_current_month = (
+            qdate.month() == self.monthShown() and qdate.year() == self.yearShown()
+        )
+
+        # 기본 셀 배경(흰색) 채우기
+        painter.fillRect(rect, QColor("#FFFFFF"))
+
+        pill_rect = rect.adjusted(3, 3, -3, -3)
+        font = QFont(self.font())
+
+        if is_anchor:
+            painter.setBrush(QColor("#DBEAFE"))
+            painter.setPen(QPen(QColor("#2563EB"), 1.5))
+            painter.drawRoundedRect(pill_rect, 6, 6)
+            font.setWeight(QFont.Weight.Bold)
+            text_color = QColor("#1D4ED8")
+        elif is_selected:
+            painter.setBrush(QColor("#2563EB"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(pill_rect, 6, 6)
+            font.setWeight(QFont.Weight.Bold)
+            text_color = QColor("#FFFFFF")
+        elif is_qt_selected:
+            painter.setBrush(QColor("#EFF6FF"))
+            painter.setPen(QPen(QColor("#93C5FD"), 1.0))
+            painter.drawRoundedRect(pill_rect, 6, 6)
+            font.setWeight(QFont.Weight.DemiBold)
+            text_color = QColor("#1D4ED8")
+        else:
+            if is_today:
+                painter.setBrush(QColor("#F1F5F9"))
+                painter.setPen(QPen(QColor("#94A3B8"), 1.0))
+                painter.drawRoundedRect(pill_rect, 6, 6)
+                font.setWeight(QFont.Weight.Bold)
+
+            if not is_current_month:
+                text_color = QColor("#94A3B8")
+            elif qdate.dayOfWeek() == 6:
+                text_color = QColor("#2563EB")
+            elif qdate.dayOfWeek() == 7:
+                text_color = QColor("#DC2626")
+            else:
+                text_color = QColor("#0F172A")
+
+        painter.setFont(font)
+        painter.setPen(text_color)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(qdate.day()))
+        painter.restore()
+
+
 class DutyPeriodPickerDialog(QDialog):
     """
     당번 안내 기간 달력 선택 대화상자.
@@ -483,8 +573,8 @@ class DutyPeriodPickerDialog(QDialog):
         preset_row.addWidget(btn_next_wk)
         lay.addLayout(preset_row)
 
-        # 3) 달력 위젯
-        self.calendar = QCalendarWidget(self)
+        # 3) 달력 위젯 (다중 선택 셀 직접 렌더링)
+        self.calendar = _MultiSelectCalendarWidget(self)
         self.calendar.setGridVisible(True)
         self.calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
         self.calendar.setSelectionMode(QCalendarWidget.SelectionMode.SingleSelection)
@@ -607,25 +697,8 @@ class DutyPeriodPickerDialog(QDialog):
             self._refresh_calendar_formats(sync_text=True)
 
     def _refresh_calendar_formats(self, sync_text: bool = True) -> None:
-        default_fmt = QTextCharFormat()
-        for old_d in list(self._painted_dates):
-            self.calendar.setDateTextFormat(QDate(old_d.year, old_d.month, old_d.day), default_fmt)
-        self._painted_dates.clear()
-
-        sel_fmt = QTextCharFormat()
-        sel_fmt.setBackground(QColor("#2563EB"))
-        sel_fmt.setForeground(QColor("#FFFFFF"))
-        sel_fmt.setFontWeight(QFont.Weight.Bold)
-
-        anchor_fmt = QTextCharFormat()
-        anchor_fmt.setBackground(QColor("#93C5FD"))
-        anchor_fmt.setForeground(QColor("#0F172A"))
-        anchor_fmt.setFontWeight(QFont.Weight.Bold)
-
-        for d in sorted(self._selected_set):
-            fmt = anchor_fmt if (self._range_anchor is not None and d == self._range_anchor) else sel_fmt
-            self.calendar.setDateTextFormat(QDate(d.year, d.month, d.day), fmt)
-            self._painted_dates.add(d)
+        self._painted_dates = set(self._selected_set)
+        self.calendar.set_selection_state(self._selected_set, self._range_anchor)
 
         iso_list = self.selected_iso_dates()
         if sync_text:

@@ -1178,11 +1178,56 @@ class CalendarTodoTab(QWidget):
         task = self.db.get_mobile_task(task_id)
         if not task:
             return
+        title = str(task.get("title", "모바일 예약 작업"))
+        task_type = str(task.get("task_type", "general")).strip().lower()
+        rid = str(task.get("remote_id") or "").strip()
+
+        def _dispatch(_worker: FunctionWorker) -> Dict[str, Any]:
+            from services.mobile_integration_worker import MobileRemoteTaskDispatcher
+
+            dispatcher = MobileRemoteTaskDispatcher(
+                db=self.db,
+                config=self.config,
+                sync_service=self.sync_service,
+            )
+            return dispatcher.dispatch_task(task)
+
+        def _on_done(res: Dict[str, Any]) -> None:
+            summary = str(res.get("summary") or f"'{title}' 작업 완료")
+            self.db.add_notification(
+                title="모바일 예약 작업 실행 완료",
+                message=summary,
+                channel="mobile_task",
+                sender="EduFlow",
+                is_read=1,
+            )
+            self.notifier.notify("모바일 예약 작업 실행", summary)
+            self.mobile_task_execute_requested.emit(task)
+            self.refresh_mobile_tasks()
+            self.unread_changed.emit()
+
+        def _on_err(err_msg: str) -> None:
+            if rid:
+                self._push_mobile_status_async(rid, "error", is_done=False)
+            self.db.add_log("ERROR", "MobileRemoteTask", f"원격 작업 실패 ({title}): {err_msg}")
+            self.notifier.notify("모바일 예약 작업 오류", f"'{title}' 실행 실패: {err_msg.splitlines()[0]}")
+
+        # 로컬 실행 대상(file_sort/excel_merge/web_llm/notice_extract/signature_pdf/comcigan_sync)은 백그라운드 워커로 실행
+        if task_type in ("file_sort", "excel_merge", "web_llm", "notice_extract", "signature_pdf", "comcigan_sync"):
+            self.db.acknowledge_mobile_task(task_id)
+            worker = FunctionWorker(f"모바일 원격 작업: {title}", _dispatch)
+            self.task_runner.start_worker(
+                worker,
+                on_result=_on_done,
+                on_error=_on_err,
+            )
+            self.refresh_mobile_tasks()
+            return
+
         rid = self.db.complete_mobile_task(task_id)
         if rid:
             self._push_mobile_status_async(rid, "done", is_done=True)
 
-        title = str(task.get("title", "모바일 예약 작업"))
         self.db.add_notification(
             title="모바일 예약 작업 실행 완료",
             message=f"'{title}' 작업을 즉시 실행 및 완료 처리했습니다.",
