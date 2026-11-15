@@ -347,7 +347,301 @@ function ensureAllSheets(sheetId) {
  */
 function initSheets() {
   ensureAllSheets('');
+  populateGuideSheet('');
 }
+
+/**
+ * 시트1 탭에 전체 시트 및 변수(컬럼) 설명서를 자동으로 작성합니다.
+ * Apps Script 편집기에서 `initSheets` 또는 `populateGuideSheet`를 1회 실행하세요.
+ */
+function populateGuideSheet(sheetId) {
+  var ss = _getSpreadsheet(sheetId);
+  if (!ss) {
+    throw new Error('연결된 Google 스프레드시트를 찾을 수 없습니다.');
+  }
+  var guideSheet = ss.getSheetByName('시트1') || ss.getSheets()[0];
+  if (!guideSheet) {
+    guideSheet = ss.insertSheet('시트1', 0);
+  }
+  guideSheet.clear();
+
+  var rows = [
+    ['EduFlow 통합 DB 시트 및 변수(컬럼) 설명서', '', '', '', ''],
+    ['분류 / 시트명', '컬럼명(변수)', '설명', '예시값 / 허용값', '관리 주체'],
+    // 스크립트 속성 안내
+    ['[스크립트 속성]', 'API_SECRET', '외부 요청 인증용 비밀키 (Vercel GAS_API_SECRET 및 PC 앱 설정과 동일)', 'my-secret-key-1234', '사용자 설정'],
+    ['[스크립트 속성]', 'NEIS_API_KEY', '나이스 교육정보 개방 포털 급식 API 인증키', 'abcdef123456...', '사용자 설정'],
+    ['[스크립트 속성]', 'NEIS_OFFICE_CODE', '시도교육청 코드 (충청남도교육청: N10)', 'N10', '사용자 설정'],
+    ['[스크립트 속성]', 'NEIS_SCHOOL_CODE', '나이스 7자리 표준학교코드 (천안오성고: 8140246)', '8140246', '사용자 설정'],
+
+    // 1. Schedules
+    ['Schedules', 'remote_id', '행 고유 식별자 (비워두지 말 것)', 'sch_20261116_01', 'PC / GAS 자동'],
+    ['Schedules', 'title', '일정 제목', '2학기 기말고사', 'PC 앱'],
+    ['Schedules', 'category', '일정 분류', '학사일정 / 개인 / 행사', 'PC 앱'],
+    ['Schedules', 'start_date', '시작일 (YYYY-MM-DD)', '2026-12-14', 'PC 앱'],
+    ['Schedules', 'end_date', '종료일 (YYYY-MM-DD)', '2026-12-17', 'PC 앱'],
+    ['Schedules', 'start_time', '시작 시각 (HH:MM)', '09:00', 'PC 앱'],
+    ['Schedules', 'reminder_type', '알림 방식', 'none / toast / push', 'PC 앱'],
+    ['Schedules', 'memo', '일정 메모', '감독 배정 확인', 'PC 앱'],
+    ['Schedules', 'updated_at', '최종 수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 2. Tasks
+    ['Tasks', 'remote_id', '할 일 고유 식별자', 'task_101', 'PC / 모바일'],
+    ['Tasks', 'task_type', '작업 유형 (일반 할 일 / 원격 자동화 작업)', 'todo / file_sort / excel_merge / comcigan_sync', 'PC / 모바일'],
+    ['Tasks', 'title', '할 일 제목', '화학 수행평가 채점', 'PC / 모바일'],
+    ['Tasks', 'due_date', '마감일 (YYYY-MM-DD)', '2026-11-20', 'PC / 모바일'],
+    ['Tasks', 'priority', '우선순위', 'high / normal / low', 'PC / 모바일'],
+    ['Tasks', 'is_mobile_task', '모바일에서 요청한 원격 작업 여부', 'TRUE / FALSE', '모바일'],
+    ['Tasks', 'scheduled_time', '예약 실행 시각', '16:30', '모바일 / PC'],
+    ['Tasks', 'target_info', '작업 대상 폴더 또는 파일 경로', 'C:/Users/...', '모바일 / PC'],
+    ['Tasks', 'action_payload', '원격 작업 실행용 JSON 데이터', '{"grade":1,"class":5}', '모바일 / PC'],
+    ['Tasks', 'exec_status', '원격 작업 실행 상태', 'pending / running / done / error', 'PC 앱'],
+    ['Tasks', 'is_done', '완료 여부', 'TRUE / FALSE', 'PC / 모바일'],
+    ['Tasks', 'memo', '비고 / 실행 결과 요약', '처리 완료', 'PC / 모바일'],
+    ['Tasks', 'updated_at', '최종 수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 3. Notifications
+    ['Notifications', 'remote_id', '알림 고유 식별자', 'noti_1731700000', 'GAS / PC / 모바일'],
+    ['Notifications', 'channel', '알림 채널/유형 구분', 'mobile_notice / mobile_doc_reminder / desktop', 'GAS / 모바일'],
+    ['Notifications', 'sender', '발신자 이름', '유우석 선생님', '교사 / PC'],
+    ['Notifications', 'title', '알림 제목', '[서류 안내] 체험학습 신청서 제출', '교사 / PC'],
+    ['Notifications', 'message', '알림 본문 내용', '금요일까지 제출 바랍니다.', '교사 / PC'],
+    ['Notifications', 'created_at', '생성 시각', '2026-11-16 09:00:00', '자동'],
+    ['Notifications', 'is_read', '읽음 여부', 'TRUE / FALSE', '모바일 / PC'],
+    ['Notifications', 'target_role', '수신 대상 역할', 'all / student / parent / teacher', '모바일'],
+    ['Notifications', 'target_student_id', '특정 학생 학번 (전체일 경우 ALL)', '10501 / ALL', '모바일'],
+    ['Notifications', 'grade', '대상 학년 (전체면 빈칸)', '1', '모바일'],
+    ['Notifications', 'class_no', '대상 반 (전체면 빈칸)', '5', '모바일'],
+
+    // 4. 계정_교사
+    ['계정_교사', 'remote_id', '행 고유 ID (수동 입력 시 teacher_id와 동일 권장)', 'dntjr0919', '수동 / GAS'],
+    ['계정_교사', 'teacher_id', '교사 로그인 아이디', 'dntjr0919', '수동 입력'],
+    ['계정_교사', 'name', '교사 실명 (컴시간 교사 시간표 매칭에 사용)', '유우석', '수동 / 프로필 수정'],
+    ['계정_교사', 'password_hash', '비밀번호 (평문 또는 SHA-256 해시 모두 로그인 지원)', '1234 또는 sha256값', '수동 입력'],
+    ['계정_교사', 'school_name', '소속 학교명', '천안오성고', '수동 / 프로필 수정'],
+    ['계정_교사', 'grade', '담임 학년 (담임 반 시간표/학급비 매칭)', '1', '수동 / 프로필 수정'],
+    ['계정_교사', 'class_no', '담임 반 (담임 반 시간표/학급비 매칭)', '5', '수동 / 프로필 수정'],
+    ['계정_교사', 'subject', '담당 과목', '화학', '수동 / 프로필 수정'],
+    ['계정_교사', 'phone', '연락처', '010-0000-0000', '수동 / 프로필 수정'],
+    ['계정_교사', 'consultation_enabled', '1:1 상담 채팅 허용 여부', 'TRUE / FALSE', '모바일 설정'],
+    ['계정_교사', 'consultation_hours', '상담 가능 시간 안내 문구', '평일 16:30~18:00', '모바일 설정'],
+    ['계정_교사', 'neis_office_code', '나이스 교육청 코드 (스크립트 속성 없을 시 폴백)', 'N10', '수동 / 프로필 수정'],
+    ['계정_교사', 'neis_school_code', '나이스 7자리 학교코드 (스크립트 속성 없을 시 폴백)', '8140246', '수동 / 프로필 수정'],
+    ['계정_교사', 'updated_at', '최종 수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 5. 계정_학생
+    ['계정_학생', 'remote_id', '행 고유 ID (student_id와 동일 권장)', '10501', '수동 입력'],
+    ['계정_학생', 'student_id', '학생 로그인 ID (학년*10000+반*100+번호 권장)', '10501', '수동 입력'],
+    ['계정_학생', 'name', '학생 이름', '홍길동', '수동 입력'],
+    ['계정_학생', 'password_hash', '비밀번호 (평문 또는 SHA-256 해시)', '1234', '수동 입력'],
+    ['계정_학생', 'grade', '학년', '1', '수동 입력'],
+    ['계정_학생', 'class_no', '반', '5', '수동 입력'],
+    ['계정_학생', 'student_no', '번호', '1', '수동 입력'],
+    ['계정_학생', 'parent_id', '연결된 학부모 로그인 ID', 'p10501', '수동 입력'],
+    ['계정_학생', 'phone', '학생 연락처', '010-1111-2222', '수동 입력'],
+    ['계정_학생', 'status', '학적 상태', '재학 / 전출 / 휴학', '수동 입력'],
+    ['계정_학생', 'updated_at', '최종 수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 6. 계정_학부모
+    ['계정_학부모', 'remote_id', '행 고유 ID (parent_id와 동일 권장)', 'p10501', '수동 입력'],
+    ['계정_학부모', 'parent_id', '학부모 로그인 ID', 'p10501', '수동 입력'],
+    ['계정_학부모', 'name', '학부모 성함', '홍판서', '수동 입력'],
+    ['계정_학부모', 'password_hash', '비밀번호 (평문 또는 SHA-256 해시)', '1234', '수동 입력'],
+    ['계정_학부모', 'student_id', '자녀 학번 (계정_학생.student_id와 매칭)', '10501', '수동 입력'],
+    ['계정_학부모', 'student_name', '자녀 이름', '홍길동', '수동 입력'],
+    ['계정_학부모', 'relation', '학생과의 관계', '부 / 모 / 보호자', '수동 입력'],
+    ['계정_학부모', 'phone', '학부모 연락처', '010-3333-4444', '수동 입력'],
+    ['계정_학부모', 'updated_at', '최종 수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 7. 일일_출결
+    ['일일_출결', 'remote_id', '출결 신고 고유 ID', 'att_1731700000', '모바일 자동'],
+    ['일일_출결', 'date', '해당 날짜 (YYYY-MM-DD)', '2026-11-16', '모바일'],
+    ['일일_출결', 'student_id', '학생 학번', '10501', '모바일'],
+    ['일일_출결', 'student_name', '학생 이름', '홍길동', '모바일'],
+    ['일일_출결', 'grade', '학년', '1', '모바일'],
+    ['일일_출결', 'class_no', '반', '5', '모바일'],
+    ['일일_출결', 'student_no', '번호', '1', '모바일'],
+    ['일일_출결', 'attendance_type', '출결 구분', '병결 / 인정결 / 지각 / 조퇴 / 체험학습', '모바일'],
+    ['일일_출결', 'reason', '사유', '감기 몸살', '모바일'],
+    ['일일_출결', 'submitted_by', '제출자 이름', '홍판서', '모바일'],
+    ['일일_출결', 'role', '제출자 역할', 'student / parent', '모바일'],
+    ['일일_출결', 'teacher_confirmed', '교사 확인 여부', 'TRUE / FALSE', '모바일(교사)'],
+    ['일일_출결', 'memo', '교사 메모', '진단서 필요 안내함', '모바일(교사)'],
+    ['일일_출결', 'created_at', '신고 시각', '2026-11-16 08:15:00', '자동'],
+    ['일일_출결', 'updated_at', '수정 시각', '2026-11-16 08:20:00', '자동'],
+
+    // 8. 설정_서류규정
+    ['설정_서류규정', 'remote_id', '규정 고유 ID', 'rule_field_trip', '교사 / GAS'],
+    ['설정_서류규정', 'rule_code', '규정 코드 (서류_추적과 연결 키)', 'FIELD_TRIP / MEDICAL', '교사'],
+    ['설정_서류규정', 'doc_name', '서류명', '교외체험학습 신청서', '교사'],
+    ['설정_서류규정', 'category', '서류 분류', '체험학습 / 출결증빙 / 동의서', '교사'],
+    ['설정_서류규정', 'due_business_days', '기준일로부터 제출 마감 영업일수', '5', '교사'],
+    ['설정_서류규정', 'target_roles', '대상 역할', 'student,parent', '교사'],
+    ['설정_서류규정', 'description', '규정 안내 설명', '복귀 후 5영업일 이내 제출', '교사'],
+    ['설정_서류규정', 'is_active', '사용 여부', 'TRUE / FALSE', '교사'],
+    ['설정_서류규정', 'updated_at', '수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 9. 서류_추적
+    ['서류_추적', 'remote_id', '서류 제출 건 고유 ID', 'doc_1731700000', '모바일 자동'],
+    ['서류_추적', 'doc_type', '서류명', '교외체험학습 보고서', '모바일'],
+    ['서류_추적', 'rule_code', '연결된 서류 규정 코드', 'FIELD_TRIP', '모바일'],
+    ['서류_추적', 'student_id', '학생 학번', '10501', '모바일'],
+    ['서류_추적', 'student_name', '학생 이름', '홍길동', '모바일'],
+    ['서류_추적', 'base_date', '사유 발생일 / 기준일 (YYYY-MM-DD)', '2026-11-13', '모바일'],
+    ['서류_추적', 'due_date', '자동 계산된 제출 마감일', '2026-11-20', 'GAS 자동'],
+    ['서류_추적', 'status', '진행 상태', '미제출 / 제출완료 / 승인완료', '모바일'],
+    ['서류_추적', 'submitted_at', '제출 일시', '2026-11-16 10:00:00', '모바일'],
+    ['서류_추적', 'submitted_by', '제출자 이름', '홍길동', '모바일'],
+    ['서류_추적', 'file_url', '첨부 증빙 파일 Drive URL', 'https://drive.google.com/...', 'GAS 자동'],
+    ['서류_추적', 'memo', '비고', '교사 확인 완료', '교사'],
+    ['서류_추적', 'updated_at', '수정 시각', '2026-11-16 10:05:00', '자동'],
+
+    // 10. 가정통신문_목록
+    ['가정통신문_목록', 'remote_id', '가정통신문 고유 ID', 'cir_202611_01', '교사 / GAS'],
+    ['가정통신문_목록', 'title', '통신문 제목', '2학기 현장체험학습 안내', '교사'],
+    ['가정통신문_목록', 'category', '분류', '안내 / 동의서 / 설문', '교사'],
+    ['가정통신문_목록', 'content', '본문 내용', '일시 및 준비물 안내...', '교사'],
+    ['가정통신문_목록', 'target_grade', '대상 학년 (전체면 빈칸)', '1', '교사'],
+    ['가정통신문_목록', 'target_class', '대상 반 (전체면 빈칸)', '5', '교사'],
+    ['가정통신문_목록', 'due_date', '회신 마감일 (YYYY-MM-DD)', '2026-11-22', '교사'],
+    ['가정통신문_목록', 'requires_reply', '회신/서명 필요 여부', 'TRUE / FALSE', '교사'],
+    ['가정통신문_목록', 'reply_schema_json', '동적 회신 항목 JSON 스키마', '[{"key":"meal","label":"중식신청"}]', '교사'],
+    ['가정통신문_목록', 'attachment_url', '원본 PDF/첨부 파일 URL', 'https://drive.google.com/...', '교사'],
+    ['가정통신문_목록', 'author_name', '작성 교사명', '유우석', '교사'],
+    ['가정통신문_목록', 'is_published', '게시(공개) 여부', 'TRUE / FALSE', '교사'],
+    ['가정통신문_목록', 'created_at', '작성 시각', '2026-11-16 09:00:00', '자동'],
+    ['가정통신문_목록', 'updated_at', '수정 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 11. 가정통신문_회신
+    ['가정통신문_회신', 'remote_id', '회신 건 고유 ID', 'rep_1731700000', '모바일 자동'],
+    ['가정통신문_회신', 'notice_id', '대상 가정통신문 ID', 'cir_202611_01', '모바일'],
+    ['가정통신문_회신', 'student_id', '학생 학번', '10501', '모바일'],
+    ['가정통신문_회신', 'student_name', '학생 이름', '홍길동', '모바일'],
+    ['가정통신문_회신', 'parent_id', '제출 학부모 ID', 'p10501', '모바일'],
+    ['가정통신문_회신', 'parent_name', '제출 학부모 이름', '홍판서', '모바일'],
+    ['가정통신문_회신', 'consent', '동의 여부', '동의 / 미동의', '모바일'],
+    ['가정통신문_회신', 'reply_data_json', '추가 회신 응답 JSON', '{"meal":"신청"}', '모바일'],
+    ['가정통신문_회신', 'signature_drive_url', '전자서명 PNG Drive 보기 URL', 'https://drive.google.com/...', 'GAS 자동'],
+    ['가정통신문_회신', 'signature_file_id', '전자서명 Drive 파일 ID', '1AbCdEf...', 'GAS 자동'],
+    ['가정통신문_회신', 'signed_at', '서명 일시', '2026-11-16 20:10:00', '자동'],
+    ['가정통신문_회신', 'updated_at', '수정 시각', '2026-11-16 20:10:00', '자동'],
+
+    // 12. 시간표_기본
+    ['시간표_기본', 'remote_id', '고유 키 (tb_학년_반_요일_교시)', 'tb_1_5_월_2', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'grade', '학년', '1', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'class_no', '반', '5', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'day_of_week', '요일 (월~토)', '월', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'period', '교시 (숫자)', '2', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'subject', '과목명', '통과2', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'teacher_name', '담당 교사 실명 (교사 시간표 필터 키)', '유우석', 'PC(컴시간) 자동'],
+    ['시간표_기본', 'room', '교실/특별실', '화학실', 'PC(컴시간) / 수동'],
+    ['시간표_기본', 'updated_at', '동기화 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 13. 시간표_변동
+    ['시간표_변동', 'remote_id', '고유 키 (tc_날짜_학년_반_교시)', 'tc_20261116_1_5_3', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'date', '변동 적용 날짜 (YYYY-MM-DD)', '2026-11-16', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'grade', '학년', '1', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'class_no', '반', '5', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'period', '교시', '3', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'original_subject', '기존 과목', '통과2', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'changed_subject', '변경된 과목', '자율', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'original_teacher', '기존 교사', '김현우', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'changed_teacher', '변경된 교사', '유우석', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'reason', '변동 사유', '수업 교체 / 컴시간 웹 자동 감지', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'source', '수집 출처', 'comcigan_playwright', 'PC(컴시간) 자동'],
+    ['시간표_변동', 'updated_at', '동기화 시각', '2026-11-16 09:00:00', '자동'],
+
+    // 14. 급식_식단표
+    ['급식_식단표', 'remote_id', '고유 키 (meal_날짜_식사구분)', 'meal_20261116_중식', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'meal_date', '급식 날짜 (YYYY-MM-DD)', '2026-11-16', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'meal_type', '식사 구분', '조식 / 중식 / 석식', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'menu_text', '메뉴 목록 (줄바꿈 구분)', '현미밥\n미역국...', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'allergy_info', '알레르기 유발 정보 번호', '1.2.5.6.10', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'calories', '칼로리 정보', '785.4 Kcal', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'origin_info', '원산지 정보', '쌀:국내산...', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'nutrients_info', '영양소 정보', '탄수화물/단백질...', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'source', '수집 출처', 'NEIS_API', 'GAS(NEIS) 자동'],
+    ['급식_식단표', 'updated_at', '동기화 시각', '2026-11-16 04:00:00', '자동'],
+
+    // 15. 1:1_상담채팅
+    ['1:1_상담채팅', 'remote_id', '메시지 고유 ID', 'chat_1731700000', '모바일 자동'],
+    ['1:1_상담채팅', 'room_id', '채팅방 ID (학생ID 또는 학부모_학생ID)', 'room_10501', '모바일 자동'],
+    ['1:1_상담채팅', 'sender_id', '보낸 사람 ID', 'p10501', '모바일'],
+    ['1:1_상담채팅', 'sender_name', '보낸 사람 이름', '홍판서', '모바일'],
+    ['1:1_상담채팅', 'sender_role', '보낸 사람 역할', 'teacher / student / parent', '모바일'],
+    ['1:1_상담채팅', 'receiver_id', '받는 사람 ID', 'dntjr0919', '모바일'],
+    ['1:1_상담채팅', 'message', '채팅 메시지 본문', '내일 진로 상담 문의드립니다.', '모바일'],
+    ['1:1_상담채팅', 'is_read', '읽음 여부', 'TRUE / FALSE', '모바일'],
+    ['1:1_상담채팅', 'created_at', '전송 시각', '2026-11-16 14:20:00', '자동'],
+
+    // 16. 학급회비
+    ['학급회비', 'remote_id', '회비 내역 고유 ID', 'bdg_1731700000', '모바일 자동'],
+    ['학급회비', 'grade', '해당 학년', '1', '모바일(교사)'],
+    ['학급회비', 'class_no', '해당 반', '5', '모바일(교사)'],
+    ['학급회비', 'date', '거래 날짜 (YYYY-MM-DD)', '2026-11-16', '모바일(교사)'],
+    ['학급회비', 'title', '항목명 / 내역 제목', '체육대회 간식 구입', '모바일(교사)'],
+    ['학급회비', 'type', '입금 / 출금 구분', '수입 / 지출 (또는 income / expense)', '모바일(교사)'],
+    ['학급회비', 'amount', '금액 (숫자, 원)', '45000', '모바일(교사)'],
+    ['학급회비', 'store', '사용처 / 거래처', '파리바게뜨', '모바일(교사)'],
+    ['학급회비', 'card', '결제 수단 / 카드명', '학급카드 / 현금', '모바일(교사)'],
+    ['학급회비', 'receipt_url', '영수증 이미지/Drive URL', 'https://drive.google.com/...', '모바일(교사)'],
+    ['학급회비', 'updated_at', '수정 시각', '2026-11-16 15:00:00', '자동'],
+
+    // 17. Push_Subscriptions
+    ['Push_Subscriptions', 'remote_id', '구독 고유 ID', 'push_1731700000', '모바일 자동'],
+    ['Push_Subscriptions', 'user_id', '구독한 사용자 로그인 ID', 'p10501 / dntjr0919', '모바일 자동'],
+    ['Push_Subscriptions', 'role', '사용자 역할 (학부모 매칭에 사용)', 'teacher / student / parent', '모바일 자동'],
+    ['Push_Subscriptions', 'endpoint', '브라우저 푸시 서버 엔드포인트 URL', 'https://fcm.googleapis.com/fcm/send/...', '브라우저 자동'],
+    ['Push_Subscriptions', 'p256dh', 'Web Push 암호화 공개키', 'BEl62i...', '브라우저 자동'],
+    ['Push_Subscriptions', 'auth', 'Web Push 인증 시크릿', 'tBHItJ...', '브라우저 자동'],
+    ['Push_Subscriptions', 'user_agent', '구독한 기기/브라우저 정보', 'Mozilla/5.0 (Linux; Android...)', '브라우저 자동'],
+    ['Push_Subscriptions', 'updated_at', '구독 갱신 시각', '2026-11-16 09:00:00', '자동']
+  ];
+
+  // 1행 타이틀 병합 및 스타일링
+  guideSheet.getRange(1, 1, rows.length, 5).setValues(rows);
+  guideSheet.getRange(1, 1, 1, 5).merge()
+    .setBackground('#1E293B')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setFontSize(13)
+    .setVerticalAlignment('middle');
+  guideSheet.setRowHeight(1, 34);
+
+  // 2행 테이블 헤더 스타일링
+  guideSheet.getRange(2, 1, 1, 5)
+    .setBackground('#0F172A')
+    .setFontColor('#FFFFFF')
+    .setFontWeight('bold')
+    .setVerticalAlignment('middle');
+  guideSheet.setRowHeight(2, 26);
+
+  // 시트 그룹이 바뀔 때마다 옅은 배경색 교차 적용
+  var prevSheet = '';
+  var toggle = false;
+  for (var r = 2; r < rows.length; r++) {
+    var sheetLabel = rows[r][0];
+    if (sheetLabel !== prevSheet) {
+      toggle = !toggle;
+      prevSheet = sheetLabel;
+    }
+    var bg = sheetLabel === '[스크립트 속성]' ? '#FEF3C7' : (toggle ? '#F8FAFC' : '#FFFFFF');
+    guideSheet.getRange(r + 1, 1, 1, 5).setBackground(bg);
+  }
+
+  guideSheet.getRange(2, 1, rows.length - 1, 5)
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+  guideSheet.getRange(3, 1, rows.length - 2, 2).setFontWeight('bold');
+  guideSheet.setFrozenRows(2);
+
+  guideSheet.setColumnWidth(1, 150);
+  guideSheet.setColumnWidth(2, 180);
+  guideSheet.setColumnWidth(3, 420);
+  guideSheet.setColumnWidth(4, 240);
+  guideSheet.setColumnWidth(5, 130);
+}
+
 
 /**
  * SHA-256 해시 유틸리티 (소문자 64자리 Hex 반환)
