@@ -1137,9 +1137,33 @@ function doPost(e) {
     }
     var action = (body.action || '').toString().trim();
     var sheetId = (body.sheetId || '').toString().trim();
-    var info = ensureAllSheets(sheetId);
-    var ss = info.ss;
-    var tz = info.timezone;
+    var singleSheetActionMap = {
+      save_push_subscription: 'Push_Subscriptions',
+      send_notification: 'Notifications',
+      mark_notification_read: 'Notifications',
+      upsert_teacher_profile: '계정_교사',
+      set_consultation_status: '계정_교사',
+      upsert_budget: '학급회비',
+      delete_budget: '학급회비',
+      send_chat_message: '1:1_상담채팅',
+      mark_chat_read: '1:1_상담채팅',
+      confirm_attendance: '일일_출결',
+      confirm_document: '서류_추적'
+    };
+    var ss = null;
+    var tz = Session.getScriptTimeZone() || 'Asia/Seoul';
+    var fastSheetName = singleSheetActionMap[action];
+    if (fastSheetName) {
+      var fastSs = _getSpreadsheet(sheetId);
+      if (fastSs && fastSs.getSheetByName(fastSheetName)) {
+        ss = fastSs;
+      }
+    }
+    if (!ss) {
+      var info = ensureAllSheets(sheetId);
+      ss = info.ss;
+      tz = info.timezone;
+    }
     var nowStr = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
 
     // ── 1. 기존 데스크톱 액션 ────────────────────────────────────────────────
