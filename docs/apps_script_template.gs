@@ -241,6 +241,8 @@ var KR_HOLIDAYS = [
 ];
 
 var SIGNATURE_DRIVE_FOLDER = 'EduFlow_Signatures';
+// 선택적 API 비밀키 (스크립트 속성 API_SECRET 또는 여기에 설정; 비워두면 검증 생략)
+var API_SECRET = '';
 
 /**
  * 대상 스프레드시트 객체 반환 (sheetId 파라미터가 있으면 해당 시트, 없으면 활성 시트)
@@ -813,6 +815,33 @@ function installNeisMealTrigger() {
 }
 
 /**
+ * 선택적 API_SECRET 검증 (PropertiesService 'API_SECRET' 우선, 없으면 상단 API_SECRET 사용)
+ * - 미설정(빈 문자열) 시 하위 호환을 위해 통과
+ * - 설정 시 GET e.parameter.api_secret 또는 POST body.api_secret 일치 여부 검증
+ */
+function _verifyApiSecret(e, body) {
+  var expected = '';
+  try {
+    expected = (PropertiesService.getScriptProperties().getProperty('API_SECRET') || '').toString().trim();
+  } catch (err) {
+    expected = '';
+  }
+  if (!expected) {
+    expected = (API_SECRET || '').toString().trim();
+  }
+  if (!expected) {
+    return true;
+  }
+  var provided = '';
+  if (body && body.api_secret !== undefined && body.api_secret !== null) {
+    provided = body.api_secret.toString().trim();
+  } else if (e && e.parameter && e.parameter.api_secret !== undefined && e.parameter.api_secret !== null) {
+    provided = e.parameter.api_secret.toString().trim();
+  }
+  return provided === expected;
+}
+
+/**
  * GET 엔드포인트
  * - 기존 호환: ?action=ping, ?action=pull_all (기본값)
  * - 모바일 확장: ?action=get_mobile_bundle, ?action=get_chat_messages,
@@ -821,6 +850,9 @@ function installNeisMealTrigger() {
  */
 function doGet(e) {
   try {
+    if (!_verifyApiSecret(e, null)) {
+      return _jsonResponse({ ok: false, error: 'Unauthorized' });
+    }
     var params = (e && e.parameter) ? e.parameter : {};
     var action = (params.action || 'pull_all').toString().trim();
     var sheetId = (params.sheetId || '').toString().trim();
@@ -1016,6 +1048,9 @@ function doPost(e) {
   try {
     var raw = (e && e.postData && e.postData.contents) ? e.postData.contents : '{}';
     var body = JSON.parse(raw);
+    if (!_verifyApiSecret(e, body)) {
+      return _jsonResponse({ ok: false, error: 'Unauthorized' });
+    }
     var action = (body.action || '').toString().trim();
     var sheetId = (body.sheetId || '').toString().trim();
     var info = ensureAllSheets(sheetId);

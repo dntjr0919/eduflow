@@ -113,6 +113,34 @@ class TestAppsScriptTemplateAndSyncExtensions(unittest.TestCase):
         self.assertTrue(ok2)
         self.assertEqual(mock_post.call_count, 2)
 
+    @patch("services.google_sheets_sync_service._http_post_json")
+    @patch("services.google_sheets_sync_service._http_get_json")
+    def test_api_secret_included_only_when_configured(self, mock_get, mock_post):
+        self.assertIn("_verifyApiSecret", self.gs_text)
+        self.assertIn("Unauthorized", self.gs_text)
+
+        mock_get.return_value = {"ok": True, "spreadsheet_name": "Test", "counts": {}}
+        mock_post.return_value = {"ok": True}
+
+        # 1) 미설정 시 api_secret 미포함
+        self.sync.test_connection(apps_script_url="https://script.google.com/macros/s/test/exec")
+        self.assertNotIn("api_secret", mock_get.call_args[0][1])
+
+        # 2) 설정 시 GET/POST 모두 api_secret 자동 포함
+        self.cfg.get.side_effect = lambda sec, key, default="": (
+            "my_secret_123" if (sec, key) == ("api_and_integrations", "gas_api_secret") else default
+        )
+        self.sync.test_connection(apps_script_url="https://script.google.com/macros/s/test/exec")
+        self.assertEqual(mock_get.call_args[0][1].get("api_secret"), "my_secret_123")
+
+        self.sync.push_task_status(
+            "mob_002",
+            "done",
+            is_done=True,
+            apps_script_url="https://script.google.com/macros/s/test/exec",
+        )
+        self.assertEqual(mock_post.call_args[0][1].get("api_secret"), "my_secret_123")
+
 
 if __name__ == "__main__":
     unittest.main()

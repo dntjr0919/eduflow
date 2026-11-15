@@ -125,20 +125,38 @@ class GoogleSheetsSyncService:
         ).strip()
         return gas_url, extract_spreadsheet_id(s_url)
 
+    def _resolve_api_secret(self, api_secret: str = "") -> str:
+        return str(
+            api_secret
+            or self.config.get("api_and_integrations", "gas_api_secret", "")
+            or ""
+        ).strip()
+
+    def _with_api_secret(self, payload: Dict[str, Any], api_secret: str = "") -> Dict[str, Any]:
+        secret = self._resolve_api_secret(api_secret)
+        if secret:
+            payload["api_secret"] = secret
+        return payload
+
     def test_connection(
         self,
         apps_script_url: str = "",
         sheet_url: str = "",
         timeout: float = 8.0,
+        api_secret: str = "",
     ) -> Tuple[bool, str, Dict[str, Any]]:
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         if not gas_url:
             return False, "Google Apps Script 웹 앱 URL이 입력되지 않았습니다.", {}
 
         try:
+            params = self._with_api_secret(
+                {"action": "ping", "sheetId": sheet_id},
+                api_secret=api_secret,
+            )
             data = _http_get_json(
                 gas_url,
-                {"action": "ping", "sheetId": sheet_id},
+                params,
                 timeout=timeout,
             )
             if not data.get("ok"):
@@ -314,6 +332,7 @@ class GoogleSheetsSyncService:
         apps_script_url: str = "",
         sheet_url: str = "",
         timeout: float = 10.0,
+        api_secret: str = "",
     ) -> Dict[str, Any]:
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         if not gas_url:
@@ -324,9 +343,13 @@ class GoogleSheetsSyncService:
                 "pending_mobile_tasks": self.db.get_mobile_tasks(pending_only=True),
             }
 
+        params = self._with_api_secret(
+            {"action": "pull_all", "sheetId": sheet_id},
+            api_secret=api_secret,
+        )
         payload = _http_get_json(
             gas_url,
-            {"action": "pull_all", "sheetId": sheet_id},
+            params,
             timeout=timeout,
         )
         if not payload.get("ok"):
@@ -359,18 +382,22 @@ class GoogleSheetsSyncService:
         sheet_url: str = "",
         timeout: float = 8.0,
         memo: Optional[str] = None,
+        api_secret: str = "",
     ) -> bool:
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         rid = str(remote_id or "").strip()
         if not gas_url or not rid:
             return False
-        payload: Dict[str, Any] = {
-            "action": "update_task_status",
-            "sheetId": sheet_id,
-            "remote_id": rid,
-            "exec_status": exec_status,
-            "is_done": bool(is_done),
-        }
+        payload: Dict[str, Any] = self._with_api_secret(
+            {
+                "action": "update_task_status",
+                "sheetId": sheet_id,
+                "remote_id": rid,
+                "exec_status": exec_status,
+                "is_done": bool(is_done),
+            },
+            api_secret=api_secret,
+        )
         if memo is not None:
             payload["memo"] = str(memo)
         try:
@@ -390,15 +417,20 @@ class GoogleSheetsSyncService:
         apps_script_url: str = "",
         sheet_url: str = "",
         timeout: float = 10.0,
+        api_secret: str = "",
     ) -> List[Dict[str, Any]]:
         """지정한 시트(예: 가정통신문_회신, 시간표_변동 등)의 행 목록을 조회합니다."""
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         if not gas_url or not sheet_name:
             return []
         try:
+            params = self._with_api_secret(
+                {"action": "list_sheet", "sheet": sheet_name, "sheetId": sheet_id},
+                api_secret=api_secret,
+            )
             res = _http_get_json(
                 gas_url,
-                {"action": "list_sheet", "sheet": sheet_name, "sheetId": sheet_id},
+                params,
                 timeout=timeout,
             )
             if not res.get("ok"):
@@ -415,19 +447,24 @@ class GoogleSheetsSyncService:
         apps_script_url: str = "",
         sheet_url: str = "",
         timeout: float = 10.0,
+        api_secret: str = "",
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 시간표 변동 내역을 시간표_변동 시트로 Push합니다."""
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         if not gas_url or not rows:
             return False
         try:
-            res = _http_post_json(
-                gas_url,
+            payload = self._with_api_secret(
                 {
                     "action": "push_timetable_changes",
                     "sheetId": sheet_id,
                     "rows": rows,
                 },
+                api_secret=api_secret,
+            )
+            res = _http_post_json(
+                gas_url,
+                payload,
                 timeout=timeout,
             )
             return bool(res.get("ok", True))
@@ -442,18 +479,23 @@ class GoogleSheetsSyncService:
         apps_script_url: str = "",
         sheet_url: str = "",
         timeout: float = 8.0,
+        api_secret: str = "",
     ) -> bool:
         gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
         if not gas_url:
             return False
         try:
-            res = _http_post_json(
-                gas_url,
+            payload = self._with_api_secret(
                 {
                     "action": action,
                     "sheetId": sheet_id,
                     "data": item_data,
                 },
+                api_secret=api_secret,
+            )
+            res = _http_post_json(
+                gas_url,
+                payload,
                 timeout=timeout,
             )
             return bool(res.get("ok", True))

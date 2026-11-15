@@ -738,6 +738,13 @@ class SettingsTab(QWidget):
             "https://script.google.com/macros/s/.../exec (Apps Script 웹 앱 URL)"
         )
 
+        self.edit_gas_api_secret = QLineEdit()
+        configure_input_widget(self.edit_gas_api_secret)
+        self.edit_gas_api_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_gas_api_secret.setPlaceholderText(
+            "선택 사항: Apps Script API_SECRET과 동일한 비밀키 (미사용 시 비워두세요)"
+        )
+
         gas_btn_container = QWidget()
         gas_btn_row = QHBoxLayout(gas_btn_container)
         gas_btn_row.setContentsMargins(0, 0, 0, 0)
@@ -801,6 +808,7 @@ class SettingsTab(QWidget):
         ext_form.addRow("credentials.json:", cred_container)
         ext_form.addRow("Google 시트 URL:", self.edit_sheet_url)
         ext_form.addRow("Apps Script 웹 앱 URL:", self.edit_apps_script_url)
+        ext_form.addRow("Apps Script API Secret:", self.edit_gas_api_secret)
         ext_form.addRow("Apps Script 동기화:", gas_btn_container)
         ext_form.addRow("", self.chk_sync_on_startup)
         ext_form.addRow("구글 시트 감시 주기:", self.spin_sheet_interval)
@@ -1499,6 +1507,7 @@ class SettingsTab(QWidget):
             self.edit_google_cred.setText(api.get("google_credentials_path", ""))
             self.edit_sheet_url.setText(api.get("google_sheet_url", ""))
             self.edit_apps_script_url.setText(api.get("google_apps_script_url", ""))
+            self.edit_gas_api_secret.setText(api.get("gas_api_secret", ""))
             self.chk_sync_on_startup.setChecked(bool(api.get("sync_on_startup", True)))
             self.spin_sheet_interval.setValue(
                 int(api.get("google_sheet_poll_interval_sec", 30))
@@ -1562,6 +1571,7 @@ class SettingsTab(QWidget):
                 "google_credentials_path": self.edit_google_cred.text().strip(),
                 "google_sheet_url": self.edit_sheet_url.text().strip(),
                 "google_apps_script_url": self.edit_apps_script_url.text().strip(),
+                "gas_api_secret": self.edit_gas_api_secret.text().strip(),
                 "sync_on_startup": self.chk_sync_on_startup.isChecked(),
                 "google_sheet_poll_interval_sec": self.spin_sheet_interval.value(),
                 "kakao_notify_mode": self.combo_kakao_mode.currentData(),
