@@ -329,7 +329,7 @@ class ComciganPlaywrightFetcher:
 
             if header_idx < 0:
                 continue
-
+                     
             if mode == "teacher":
                 caption_grade, caption_class = "", ""
             else:
@@ -353,6 +353,10 @@ class ComciganPlaywrightFetcher:
                     raw_text = cell.full_text()
                     deleted_txt = cell.deleted_text()
                     is_changed = cell.has_change_hint()
+
+                    # 교사 시간표(mode="teacher")의 빈 셀(원래 공강)은 변동으로 기록하지 않음
+                    if mode == "teacher" and not raw_text and not deleted_txt:
+                        continue
 
                     # 텍스트가 비어 있어도 class="변경" 등 변동 힌트가 있으면 수업 취소/공강으로 처리
                     if not raw_text and not deleted_txt and not is_changed:
