@@ -22,7 +22,7 @@ from core.database import DatabaseManager
 from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
 from services.excel_merger_service import merge_excel_assignments
 from services.file_sorter_service import BatchSortWorker, FileSorterService
-from services.google_sheets_sync_service import GoogleSheetsSyncService
+from services.firestore_sync_service import FirestoreSyncService
 from services.web_gemini_auto_worker import WebGeminiAutoWorker
 
 _LOGGER = logging.getLogger(__name__)
@@ -114,13 +114,13 @@ def parse_comcigan_payload(
 
 def push_comcigan_changes(
     raw_data: Any,
-    sync_service: Optional[GoogleSheetsSyncService] = None,
+    sync_service: Optional[FirestoreSyncService] = None,
     target_date: str = "",
     grade: str = "",
     class_no: str = "",
 ) -> Dict[str, Any]:
     """컴시간 변동 내역을 파싱해 시간표_변동 시트로 Push합니다."""
-    svc = sync_service or GoogleSheetsSyncService()
+    svc = sync_service or FirestoreSyncService()
     rows = parse_comcigan_payload(raw_data, target_date=target_date, grade=grade, class_no=class_no)
     if not rows:
         return {"ok": False, "pushed": 0, "error": "파싱된 시간표 변동 항목이 없습니다."}
@@ -150,7 +150,7 @@ def sync_comcigan_from_web(
     target_class: str = "",
     scope: str = "homeroom_and_teacher",
     headless: bool = True,
-    sync_service: Optional[GoogleSheetsSyncService] = None,
+    sync_service: Optional[FirestoreSyncService] = None,
     fetcher: Optional[ComciganPlaywrightFetcher] = None,
     prev_snapshot_hash: str = "",
     skip_if_unchanged: bool = False,
@@ -222,7 +222,7 @@ def sync_comcigan_from_web(
             "error": "",
         }
 
-    svc = sync_service or GoogleSheetsSyncService()
+    svc = sync_service or FirestoreSyncService()
 
     # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 보완 (entry_type == "class" 우선)
     if change_rows:
@@ -500,11 +500,11 @@ class MobileRemoteTaskDispatcher:
         self,
         db: Optional[DatabaseManager] = None,
         config: Optional[ConfigManager] = None,
-        sync_service: Optional[GoogleSheetsSyncService] = None,
+        sync_service: Optional[FirestoreSyncService] = None,
     ):
         self.db = db or DatabaseManager()
         self.config = config or ConfigManager()
-        self.sync_service = sync_service or GoogleSheetsSyncService(db=self.db, config=self.config)
+        self.sync_service = sync_service or FirestoreSyncService(db=self.db, config=self.config)
 
     @staticmethod
     def _parse_payload(raw_payload: Any) -> Dict[str, Any]:

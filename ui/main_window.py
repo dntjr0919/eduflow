@@ -59,9 +59,9 @@ from PyQt6.QtWidgets import (
 from core.base_worker import TaskRunner
 from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
-from services.google_sheets_sync_service import (
-    GoogleSheetsSyncService,
-    GoogleSheetsSyncWorker,
+from services.firestore_sync_service import (
+    FirestoreSyncService,
+    FirestoreSyncWorker,
 )
 from services.notifier import NotificationService
 from services.record_generator_service import get_active_ai_info
@@ -949,26 +949,20 @@ class MainWindow(QMainWindow):
                 self.sidebar_nav.setCurrentRow(doc_idx)
 
     def run_startup_sheets_sync(self) -> None:
-        """앱 시작 시 백그라운드 QThread로 Google Apps Script 웹 앱 데이터를 동기화합니다."""
+        """앱 시작 시 백그라운드 QThread로 Cloud Firestore 데이터를 동기화합니다."""
         api = self.config.get_section("api_and_integrations")
         if not bool(api.get("sync_on_startup", True)):
             return
-        gas_url = str(api.get("google_apps_script_url", "") or "").strip()
-        if not gas_url:
-            return
-        sheet_url = str(api.get("google_sheet_url", "") or "").strip()
-        svc = GoogleSheetsSyncService(db=self.db, config=self.config)
-        worker = GoogleSheetsSyncWorker(
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        worker = FirestoreSyncWorker(
             sync_service=svc,
-            apps_script_url=gas_url,
-            sheet_url=sheet_url,
-            task_name="시작 시 Google Sheets 자동 동기화",
+            task_name="시작 시 Cloud Firestore 자동 동기화",
         )
         self.task_runner.start_worker(
             worker,
             task_key="startup_google_sheets_sync",
             on_result=lambda res: isinstance(res, dict) and self._on_sheets_sync_completed(res),
-            on_error=lambda err: self.append_log("WARN", f"시작 시 Google Sheets 동기화 실패: {err}"),
+            on_error=lambda err: self.append_log("WARN", f"시작 시 Firestore 동기화 실패: {err}"),
         )
 
     def _on_sheets_sync_completed(self, result: dict) -> None:

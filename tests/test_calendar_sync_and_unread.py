@@ -24,9 +24,8 @@ from PyQt6.QtWidgets import QApplication, QComboBox
 
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
-from services.google_sheets_sync_service import (
-    GoogleSheetsSyncService,
-    extract_spreadsheet_id,
+from services.firestore_sync_service import (
+    FirestoreSyncService as GoogleSheetsSyncService,
 )
 from services.schedule_parser_service import (
     ScheduleReminderChecker,
@@ -285,10 +284,10 @@ class TestGoogleSheetsSyncAndDedup(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp_dir.cleanup()
 
-    def test_extract_spreadsheet_id(self) -> None:
-        url = "https://docs.google.com/spreadsheets/d/1AbCDefGhIJkLmNoPqRsTuVwXyZ_01234/edit#gid=0"
-        self.assertEqual(extract_spreadsheet_id(url), "1AbCDefGhIJkLmNoPqRsTuVwXyZ_01234")
-        self.assertEqual(extract_spreadsheet_id("raw_sheet_id_123"), "raw_sheet_id_123")
+    def test_firestore_batch_limit_constant(self) -> None:
+        from services.firestore_sync_service import FIRESTORE_BATCH_LIMIT
+
+        self.assertLessEqual(FIRESTORE_BATCH_LIMIT, 500)
 
     def test_sync_from_payload_and_remote_id_deduplication(self) -> None:
         svc = GoogleSheetsSyncService(db=self.db)

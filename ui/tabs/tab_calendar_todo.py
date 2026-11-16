@@ -38,9 +38,9 @@ from PyQt6.QtWidgets import (
 from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
-from services.google_sheets_sync_service import (
-    GoogleSheetsSyncService,
-    GoogleSheetsSyncWorker,
+from services.firestore_sync_service import (
+    FirestoreSyncService,
+    FirestoreSyncWorker,
 )
 from services.notifier import NotificationService
 from services.schedule_parser_service import (
@@ -249,7 +249,7 @@ class CalendarTodoTab(QWidget):
         self.db = db or DatabaseManager()
         self.config = config or ConfigManager()
         self.notifier = notifier or NotificationService()
-        self.sync_service = GoogleSheetsSyncService(db=self.db, config=self.config)
+        self.sync_service = FirestoreSyncService(db=self.db, config=self.config)
 
         today = date.today()
         self._current_year = today.year
@@ -1243,8 +1243,7 @@ class CalendarTodoTab(QWidget):
         self.unread_changed.emit()
 
     def _push_mobile_status_async(self, remote_id: str, exec_status: str, is_done: bool) -> None:
-        gas_url = str(self.config.get("api_and_integrations", "google_apps_script_url", "") or "").strip()
-        if not gas_url or not remote_id:
+        if not remote_id:
             return
 
         def _push(_worker: FunctionWorker) -> bool:
@@ -1254,7 +1253,7 @@ class CalendarTodoTab(QWidget):
                 is_done=is_done,
             )
 
-        worker = FunctionWorker("Google Sheets 작업 상태 반영", _push)
+        worker = FunctionWorker("Cloud Firestore 작업 상태 반영", _push)
         self.task_runner.start_worker(worker)
 
     def refresh_todos(self) -> None:
@@ -1589,7 +1588,7 @@ class CalendarTodoTab(QWidget):
 
         self.btn_sync_sheets.setEnabled(False)
         self.btn_sync_sheets.setText("동기화 중...")
-        worker = GoogleSheetsSyncWorker(sync_service=self.sync_service)
+        worker = FirestoreSyncWorker(sync_service=self.sync_service)
         self.task_runner.start_worker(
             worker,
             task_key=self.SYNC_TASK_KEY,

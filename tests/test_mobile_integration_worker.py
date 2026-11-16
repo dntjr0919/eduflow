@@ -133,33 +133,24 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         )
 
     def test_google_sheets_timetable_timeouts_and_gas_error_logging(self) -> None:
-        import inspect
-        from services.google_sheets_sync_service import GoogleSheetsSyncService
-
-        sig_base = inspect.signature(GoogleSheetsSyncService.upsert_timetable_base)
-        sig_chg = inspect.signature(GoogleSheetsSyncService.push_timetable_changes)
-        self.assertGreaterEqual(sig_base.parameters["timeout"].default, 30.0)
-        self.assertGreaterEqual(sig_chg.parameters["timeout"].default, 30.0)
+        from services.firestore_sync_service import FirestoreSyncService
 
         mock_db = MagicMock()
-        svc = GoogleSheetsSyncService(db=mock_db)
-        with patch.object(
-            svc,
-            "_resolve_urls",
-            return_value=("https://script.google.com/macros/s/demo/exec", "sheet123"),
-        ), patch(
-            "services.google_sheets_sync_service._http_post_json",
-            return_value={"ok": False, "error": "GAS quota exceeded"},
-        ):
-            ok_base = svc.upsert_timetable_base([{"remote_id": "tb_c_1_1_월_1"}])
-            ok_chg = svc.push_timetable_changes([{"remote_id": "tc_20261116_1_1_1"}])
+        fake_fs = MagicMock()
+        fake_batch = MagicMock()
+        fake_batch.commit.side_effect = RuntimeError("Firestore quota exceeded")
+        fake_fs.batch.return_value = fake_batch
+        svc = FirestoreSyncService(db=mock_db, firestore_client=fake_fs)
+
+        ok_base = svc.upsert_timetable_base([{"remote_id": "tb_c_1_1_월_1"}])
+        ok_chg = svc.push_timetable_changes([{"remote_id": "tc_20261116_1_1_1"}])
 
         self.assertFalse(ok_base)
         self.assertFalse(ok_chg)
         warn_calls = [c for c in mock_db.add_log.call_args_list if c.args[0] == "WARN"]
         self.assertEqual(len(warn_calls), 2)
-        self.assertIn("GAS quota exceeded", warn_calls[0].args[2])
-        self.assertIn("GAS quota exceeded", warn_calls[1].args[2])
+        self.assertIn("Firestore quota exceeded", warn_calls[0].args[2])
+        self.assertIn("Firestore quota exceeded", warn_calls[1].args[2])
 
     def test_comcigan_teacher_mode_empty_change_and_no_caption_leak(self) -> None:
         from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
@@ -289,9 +280,8 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         self.assertEqual(pushed_changes[0]["original_teacher"], "이담임")
 
     def test_extract_grade_class_variants_and_chunked_sync_with_progress(self) -> None:
-        import inspect
         from services.comcigan_playwright_fetcher import _extract_grade_class
-        from services.google_sheets_sync_service import GoogleSheetsSyncService
+        from services.firestore_sync_service import FirestoreSyncService
         from services.mobile_integration_worker import sync_comcigan_from_web
 
         self.assertEqual(_extract_grade_class("1-05", "", ""), ("1", "5"))
@@ -299,30 +289,20 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         self.assertEqual(_extract_grade_class("105", "", ""), ("1", "5"))
         self.assertEqual(_extract_grade_class("105반", "", ""), ("1", "5"))
 
-        sig_base = inspect.signature(GoogleSheetsSyncService.upsert_timetable_base)
-        sig_chg = inspect.signature(GoogleSheetsSyncService.push_timetable_changes)
-        self.assertGreaterEqual(sig_base.parameters["timeout"].default, 60.0)
-        self.assertGreaterEqual(sig_chg.parameters["timeout"].default, 60.0)
-
-        svc = GoogleSheetsSyncService(db=MagicMock())
+        fake_fs = MagicMock()
+        fake_batch = MagicMock()
+        fake_fs.batch.return_value = fake_batch
+        svc = FirestoreSyncService(db=MagicMock(), firestore_client=fake_fs)
         rows = [{"remote_id": f"tb_c_1_5_월_{i}"} for i in range(250)]
         batch_events = []
-        with patch.object(
-            svc,
-            "_resolve_urls",
-            return_value=("https://script.google.com/macros/s/demo/exec", "sheet123"),
-        ), patch(
-            "services.google_sheets_sync_service._http_post_json",
-            return_value={"ok": True},
-        ) as mock_post:
-            ok = svc.upsert_timetable_base(
-                rows,
-                chunk_size=100,
-                progress_callback=lambda b, tot: batch_events.append((b, tot)),
-            )
+        ok = svc.upsert_timetable_base(
+            rows,
+            chunk_size=100,
+            progress_callback=lambda b, tot: batch_events.append((b, tot)),
+        )
 
         self.assertTrue(ok)
-        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(fake_batch.commit.call_count, 3)
         self.assertEqual(batch_events, [(1, 3), (2, 3), (3, 3)])
 
         progress_msgs = []

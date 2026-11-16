@@ -51,9 +51,9 @@ from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
 from services.ai_agent_router import TOOL_REGISTRY
-from services.google_sheets_sync_service import (
-    GoogleSheetsSyncService,
-    GoogleSheetsSyncWorker,
+from services.firestore_sync_service import (
+    FirestoreSyncService,
+    FirestoreSyncWorker,
 )
 from services.llm_client import (
     MultiLlmClient,
@@ -849,6 +849,71 @@ class SettingsTab(QWidget):
         self.chk_tray_notify = QCheckBox("작업 완료 시 윈도우 트레이 토스트 알림 표시")
         self.chk_tray_notify.setMinimumHeight(28)
 
+        # 교사 프로필 및 학교·NEIS 설정 (멀티 테넌트 계정_교사 연동)
+        self.edit_teacher_id = QLineEdit()
+        configure_input_widget(self.edit_teacher_id)
+        self.edit_teacher_id.setPlaceholderText("예: 유우석 (계정_교사 ID)")
+
+        self.edit_teacher_name = QLineEdit()
+        configure_input_widget(self.edit_teacher_name)
+        self.edit_teacher_name.setPlaceholderText("교사 이름")
+
+        self.edit_school_name = QLineEdit()
+        configure_input_widget(self.edit_school_name)
+        self.edit_school_name.setPlaceholderText("예: 천안오성고")
+
+        class_container = QWidget()
+        class_row = QHBoxLayout(class_container)
+        class_row.setContentsMargins(0, 0, 0, 0)
+        class_row.setSpacing(8)
+        self.spin_teacher_grade = QSpinBox()
+        configure_input_widget(self.spin_teacher_grade)
+        self.spin_teacher_grade.setRange(1, 6)
+        self.spin_teacher_grade.setSuffix(" 학년")
+        self.spin_teacher_class = QSpinBox()
+        configure_input_widget(self.spin_teacher_class)
+        self.spin_teacher_class.setRange(1, 30)
+        self.spin_teacher_class.setSuffix(" 반")
+        class_row.addWidget(self.spin_teacher_grade)
+        class_row.addWidget(self.spin_teacher_class)
+        class_row.addStretch(1)
+
+        neis_container = QWidget()
+        neis_row = QHBoxLayout(neis_container)
+        neis_row.setContentsMargins(0, 0, 0, 0)
+        neis_row.setSpacing(8)
+        self.edit_neis_office_code = QLineEdit()
+        configure_input_widget(self.edit_neis_office_code)
+        self.edit_neis_office_code.setPlaceholderText("교육청코드 (예: N10)")
+        self.edit_neis_school_code = QLineEdit()
+        configure_input_widget(self.edit_neis_school_code)
+        self.edit_neis_school_code.setPlaceholderText("학교코드 (예: 8140246)")
+        neis_row.addWidget(self.edit_neis_office_code)
+        neis_row.addWidget(self.edit_neis_school_code)
+
+        tp_btn_container = QWidget()
+        tp_btn_row = QHBoxLayout(tp_btn_container)
+        tp_btn_row.setContentsMargins(0, 0, 0, 0)
+        tp_btn_row.setSpacing(8)
+        self.btn_load_teacher_profile = QPushButton("Firestore에서 불러오기")
+        apply_qss_role(self.btn_load_teacher_profile, role="secondary")
+        self.btn_load_teacher_profile.setMinimumHeight(34)
+        self.btn_load_teacher_profile.clicked.connect(self._on_load_teacher_profile)
+        self.btn_save_teacher_profile = QPushButton("교사 프로필 저장")
+        apply_qss_role(self.btn_save_teacher_profile, role="primary")
+        self.btn_save_teacher_profile.setMinimumHeight(34)
+        self.btn_save_teacher_profile.clicked.connect(self._on_save_teacher_profile)
+        tp_btn_row.addWidget(self.btn_load_teacher_profile)
+        tp_btn_row.addWidget(self.btn_save_teacher_profile)
+        tp_btn_row.addStretch(1)
+
+        ext_form.addRow("교사 계정 ID:", self.edit_teacher_id)
+        ext_form.addRow("교사 이름:", self.edit_teacher_name)
+        ext_form.addRow("소속 학교명:", self.edit_school_name)
+        ext_form.addRow("담당 학년/반:", class_container)
+        ext_form.addRow("NEIS 코드:", neis_container)
+        ext_form.addRow("교사 프로필 동기화:", tp_btn_container)
+
         ext_form.addRow("credentials.json:", cred_container)
         ext_form.addRow("Google 시트 URL:", self.edit_sheet_url)
         ext_form.addRow("Apps Script 웹 앱 URL:", self.edit_apps_script_url)
@@ -1562,6 +1627,17 @@ class SettingsTab(QWidget):
             self.chk_ignore_temp.setChecked(bool(fs.get("ignore_temp_files", True)))
 
             # 3) 외부 연동 및 트레이 설정 로드
+            tp_sec = self.config.get_section("teacher_profile")
+            self.edit_teacher_id.setText(
+                str(tp_sec.get("teacher_id") or api.get("comcigan_teacher_name", "") or "")
+            )
+            self.edit_teacher_name.setText(str(tp_sec.get("name") or api.get("comcigan_teacher_name", "") or ""))
+            self.edit_school_name.setText(str(tp_sec.get("school_name") or ""))
+            self.spin_teacher_grade.setValue(int(tp_sec.get("grade") or 1))
+            self.spin_teacher_class.setValue(int(tp_sec.get("class_no") or 1))
+            self.edit_neis_office_code.setText(str(tp_sec.get("neis_office_code") or ""))
+            self.edit_neis_school_code.setText(str(tp_sec.get("neis_school_code") or ""))
+
             self.edit_google_cred.setText(api.get("google_credentials_path", ""))
             self.edit_sheet_url.setText(api.get("google_sheet_url", ""))
             self.edit_apps_script_url.setText(api.get("google_apps_script_url", ""))
@@ -1644,6 +1720,19 @@ class SettingsTab(QWidget):
             auto_save=False,
         )
         self.config.update_section(
+            "teacher_profile",
+            {
+                "teacher_id": self.edit_teacher_id.text().strip(),
+                "name": self.edit_teacher_name.text().strip(),
+                "school_name": self.edit_school_name.text().strip(),
+                "grade": self.spin_teacher_grade.value(),
+                "class_no": self.spin_teacher_class.value(),
+                "neis_office_code": self.edit_neis_office_code.text().strip(),
+                "neis_school_code": self.edit_neis_school_code.text().strip(),
+            },
+            auto_save=False,
+        )
+        self.config.update_section(
             "system",
             {
                 "minimize_to_tray_on_close": self.chk_minimize_to_tray.isChecked(),
@@ -1655,6 +1744,145 @@ class SettingsTab(QWidget):
     def save_ui_to_settings(self) -> None:
         self._persist_settings_silently()
         QMessageBox.information(self, "저장 완료", "환경설정이 config.json에 안전하게 저장되었습니다.")
+
+    def _on_provision_homeroom_accounts(self) -> None:
+        hr_group = self.db.get_homeroom_group()
+        if not hr_group:
+            QMessageBox.warning(self, "모바일 계정 발급", "먼저 나이스 학급명렬표를 등록해 주세요.")
+            return
+        students = self.db.get_students(group_id=hr_group["id"])
+        if not students:
+            QMessageBox.warning(self, "모바일 계정 발급", "등록된 학생이 없습니다.")
+            return
+        school_code = self.edit_neis_school_code.text().strip()
+        school_name = self.edit_school_name.text().strip()
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        try:
+            res = svc.provision_homeroom_accounts(
+                students=students,
+                school_code=school_code,
+                school_name=school_name,
+            )
+            QMessageBox.information(
+                self,
+                "모바일 계정 일괄 발급 완료",
+                f"학생 신규 생성: {res['students_created']}명 (기존 보호 {res['students_skipped']}명)\n"
+                f"학부모 신규 생성: {res['parents_created']}명 (기존 보호 {res['parents_skipped']}명)",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "모바일 계정 발급 오류", str(exc))
+
+    def _on_open_pending_approvals(self) -> None:
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        requester_id = self.edit_teacher_id.text().strip()
+        grade_val = self.spin_teacher_grade.value()
+        class_val = self.spin_teacher_class.value()
+        school_code = self.edit_neis_school_code.text().strip()
+        school_name = self.edit_school_name.text().strip()
+        try:
+            pending = svc.get_pending_registrations(
+                grade=grade_val,
+                class_no=class_val,
+                school_code=school_code,
+                school_name=school_name,
+                requester_id=requester_id,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "가입 승인 대기 목록 오류", str(exc))
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"가입 승인 대기 목록 ({grade_val}학년 {class_val}반)")
+        dlg.resize(620, 420)
+        lay = QVBoxLayout(dlg)
+        if not pending:
+            lay.addWidget(QLabel("현재 승인 대기 중인 가입 신청이 없습니다."))
+            btn_ok = QPushButton("닫기")
+            btn_ok.clicked.connect(dlg.accept)
+            lay.addWidget(btn_ok)
+            dlg.exec()
+            return
+
+        for item in pending:
+            row_w = QWidget()
+            row_l = QHBoxLayout(row_w)
+            if item.get("role") == "teacher":
+                code_info = "/".join(
+                    x for x in (str(item.get("neis_office_code") or "").strip(), str(item.get("neis_school_code") or "").strip()) if x
+                )
+                info_txt = (
+                    f"[교사 가입 신청] {item.get('name', '')} | ID: {item.get('teacher_id') or item.get('remote_id')} | "
+                    f"{item.get('school_name', '')}{f' ({code_info})' if code_info else ''} "
+                    f"{item.get('grade', '-')}학년 {item.get('class_no', '-')}반 · {item.get('subject', '')}"
+                )
+            else:
+                role_lbl = "학생" if item.get("role") == "student" else "학부모"
+                info_txt = (
+                    f"[{role_lbl}] {item.get('name', '')} | ID: {item.get('login_id') or item.get('remote_id')} "
+                    f"({item.get('grade', '')}학년 {item.get('class_no', '')}반)"
+                )
+            row_l.addWidget(QLabel(info_txt), stretch=1)
+            btn_app = QPushButton("승인")
+            btn_rej = QPushButton("반려")
+            btn_app.clicked.connect(
+                lambda _c=False, it=item, w=row_w: (
+                    svc.review_registration(it["role"], it["remote_id"], approve=True, requester_id=requester_id),
+                    w.setEnabled(False),
+                )
+            )
+            btn_rej.clicked.connect(
+                lambda _c=False, it=item, w=row_w: (
+                    svc.review_registration(it["role"], it["remote_id"], approve=False, requester_id=requester_id),
+                    w.setEnabled(False),
+                )
+            )
+            row_l.addWidget(btn_app)
+            row_l.addWidget(btn_rej)
+            lay.addWidget(row_w)
+        lay.addStretch(1)
+        dlg.exec()
+
+    def _on_load_teacher_profile(self) -> None:
+        tid = self.edit_teacher_id.text().strip()
+        if not tid:
+            QMessageBox.warning(self, "교사 프로필 불러오기", "교사 계정 ID를 먼저 입력하세요.")
+            return
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        profile = svc.get_teacher_profile(tid)
+        if not profile:
+            QMessageBox.information(self, "교사 프로필 불러오기", f"Firestore에서 '{tid}' 계정을 찾지 못했습니다.")
+            return
+        self.edit_teacher_name.setText(str(profile.get("name") or tid))
+        self.edit_school_name.setText(str(profile.get("school_name") or ""))
+        if profile.get("grade"):
+            self.spin_teacher_grade.setValue(int(profile["grade"]))
+        if profile.get("class_no"):
+            self.spin_teacher_class.setValue(int(profile["class_no"]))
+        self.edit_neis_office_code.setText(str(profile.get("neis_office_code") or ""))
+        self.edit_neis_school_code.setText(str(profile.get("neis_school_code") or ""))
+        self._persist_settings_silently()
+        QMessageBox.information(self, "교사 프로필 불러오기", f"'{tid}' 교사 프로필을 불러왔습니다.")
+
+    def _on_save_teacher_profile(self) -> None:
+        self._persist_settings_silently()
+        tid = self.edit_teacher_id.text().strip()
+        if not tid:
+            QMessageBox.warning(self, "교사 프로필 저장", "교사 계정 ID를 먼저 입력하세요.")
+            return
+        payload = {
+            "teacher_id": tid,
+            "name": self.edit_teacher_name.text().strip() or tid,
+            "school_name": self.edit_school_name.text().strip(),
+            "grade": self.spin_teacher_grade.value(),
+            "class_no": self.spin_teacher_class.value(),
+            "neis_office_code": self.edit_neis_office_code.text().strip(),
+            "neis_school_code": self.edit_neis_school_code.text().strip(),
+        }
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        if svc.upsert_teacher_profile(payload):
+            QMessageBox.information(self, "교사 프로필 저장", "Firestore 계정_교사 컬렉션에 저장되었습니다.")
+        else:
+            QMessageBox.warning(self, "교사 프로필 저장", "Firestore 저장에 실패했습니다. 로그를 확인하세요.")
 
     def _set_default_target_dir(self, folder: str) -> None:
         if not folder:
@@ -1697,8 +1925,8 @@ class SettingsTab(QWidget):
         apply_qss_role(self.lbl_gas_status, role="badgeNeutral", obj_name="LblGasStatus")
 
         def _run_test(_worker: Any) -> tuple:
-            svc = GoogleSheetsSyncService(db=self.db, config=self.config)
-            return svc.test_connection(apps_script_url=apps_script_url, sheet_url=sheet_url)
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.test_connection()
 
         def _on_result(res: Any) -> None:
             ok, msg, _data = res if isinstance(res, tuple) and len(res) >= 3 else (False, str(res), {})
@@ -1743,11 +1971,9 @@ class SettingsTab(QWidget):
         self.lbl_gas_status.setText("동기화 중...")
         apply_qss_role(self.lbl_gas_status, role="badgePrimary", obj_name="LblGasStatus")
 
-        svc = GoogleSheetsSyncService(db=self.db, config=self.config)
-        worker = GoogleSheetsSyncWorker(
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        worker = FirestoreSyncWorker(
             sync_service=svc,
-            apps_script_url=apps_script_url,
-            sheet_url=sheet_url,
         )
 
         def _on_result(result: Any) -> None:
@@ -1925,9 +2151,20 @@ class SettingsTab(QWidget):
         apply_qss_role(btn_reset_hr, role="warningOutline", obj_name="BtnResetHomeroom")
         btn_reset_hr.clicked.connect(self._on_reset_homeroom)
 
+        self.btn_sync_mobile_accounts = QPushButton("모바일 계정 일괄 발급")
+        apply_qss_role(self.btn_sync_mobile_accounts, role="secondary", obj_name="BtnProvisionMobileAccounts")
+        self.btn_sync_mobile_accounts.setToolTip("등록된 담임학급 명렬표로 학생·학부모 초기 계정을 Firestore에 일괄 생성합니다.")
+        self.btn_sync_mobile_accounts.clicked.connect(self._on_provision_homeroom_accounts)
+
+        self.btn_pending_approvals = QPushButton("가입 승인 대기 목록")
+        apply_qss_role(self.btn_pending_approvals, role="secondary", obj_name="BtnPendingApprovals")
+        self.btn_pending_approvals.clicked.connect(self._on_open_pending_approvals)
+
         t1_top.addWidget(self.lbl_homeroom_badge)
         t1_top.addStretch()
         t1_top.addWidget(self.btn_import_hr)
+        t1_top.addWidget(self.btn_sync_mobile_accounts)
+        t1_top.addWidget(self.btn_pending_approvals)
         t1_top.addWidget(btn_add_hr_stu)
         t1_top.addWidget(btn_export_hr)
         t1_top.addWidget(btn_reset_hr)

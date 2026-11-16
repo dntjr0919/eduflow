@@ -80,66 +80,48 @@ class TestAppsScriptTemplateAndSyncExtensions(unittest.TestCase):
         for action in required_actions:
             self.assertIn(action, self.gs_text, f"누락된 액션/함수: {action}")
 
-    @patch("services.google_sheets_sync_service._http_get_json")
-    def test_fetch_sheet_rows(self, mock_get):
-        mock_get.return_value = {
-            "ok": True,
-            "sheet": "가정통신문_회신",
-            "rows": [{"remote_id": "reply_1", "student_name": "김민준"}],
-        }
-        rows = self.sync.fetch_sheet_rows(
-            "가정통신문_회신",
-            apps_script_url="https://script.google.com/macros/s/test/exec",
-        )
+    def test_fetch_sheet_rows(self):
+        fake_doc = MagicMock()
+        fake_doc.id = "reply_1"
+        fake_doc.to_dict.return_value = {"remote_id": "reply_1", "student_name": "김민준"}
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.stream.return_value = [fake_doc]
+        self.sync._firestore_client = fake_fs
+
+        rows = self.sync.fetch_sheet_rows("가정통신문_회신")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["student_name"], "김민준")
-        mock_get.assert_called_once()
+        fake_fs.collection.assert_called_with("가정통신문_회신")
 
-    @patch("services.google_sheets_sync_service._http_post_json")
-    def test_push_timetable_changes_and_task_memo(self, mock_post):
-        mock_post.return_value = {"ok": True}
+    def test_push_timetable_changes_and_task_memo(self):
+        fake_fs = MagicMock()
+        fake_batch = MagicMock()
+        fake_fs.batch.return_value = fake_batch
+        self.sync._firestore_client = fake_fs
+
         ok1 = self.sync.push_timetable_changes(
             [{"remote_id": "tc_1", "date": "2026-11-16", "period": 3, "changed_subject": "수학"}],
-            apps_script_url="https://script.google.com/macros/s/test/exec",
         )
         ok2 = self.sync.push_task_status(
             "mob_001",
             "done",
             is_done=True,
             memo="자동 분류 12건 완료",
-            apps_script_url="https://script.google.com/macros/s/test/exec",
         )
         self.assertTrue(ok1)
         self.assertTrue(ok2)
-        self.assertEqual(mock_post.call_count, 2)
+        fake_batch.commit.assert_called_once()
+        fake_fs.collection.return_value.document.assert_any_call("mob_001")
 
-    @patch("services.google_sheets_sync_service._http_post_json")
-    @patch("services.google_sheets_sync_service._http_get_json")
-    def test_api_secret_included_only_when_configured(self, mock_get, mock_post):
-        self.assertIn("_verifyApiSecret", self.gs_text)
-        self.assertIn("Unauthorized", self.gs_text)
+    def test_firestore_test_connection(self):
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.limit.return_value.stream.return_value = []
+        self.sync._firestore_client = fake_fs
 
-        mock_get.return_value = {"ok": True, "spreadsheet_name": "Test", "counts": {}}
-        mock_post.return_value = {"ok": True}
-
-        # 1) 미설정 시 api_secret 미포함
-        self.sync.test_connection(apps_script_url="https://script.google.com/macros/s/test/exec")
-        self.assertNotIn("api_secret", mock_get.call_args[0][1])
-
-        # 2) 설정 시 GET/POST 모두 api_secret 자동 포함
-        self.cfg.get.side_effect = lambda sec, key, default="": (
-            "my_secret_123" if (sec, key) == ("api_and_integrations", "gas_api_secret") else default
-        )
-        self.sync.test_connection(apps_script_url="https://script.google.com/macros/s/test/exec")
-        self.assertEqual(mock_get.call_args[0][1].get("api_secret"), "my_secret_123")
-
-        self.sync.push_task_status(
-            "mob_002",
-            "done",
-            is_done=True,
-            apps_script_url="https://script.google.com/macros/s/test/exec",
-        )
-        self.assertEqual(mock_post.call_args[0][1].get("api_secret"), "my_secret_123")
+        ok, msg, data = self.sync.test_connection()
+        self.assertTrue(ok)
+        self.assertEqual(data.get("backend"), "firestore")
+        self.assertIn("Cloud Firestore", msg)
 
 
 if __name__ == "__main__":

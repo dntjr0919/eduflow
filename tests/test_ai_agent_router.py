@@ -281,23 +281,14 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
             self.assertFalse(mock_pw.call_args.kwargs["allow_followup"])
             self.assertIn("생활지도 및 평가 계획", mock_pw.call_args[0][0])
 
-    def test_google_sheets_sync_browser_headers_and_403_masking(self) -> None:
-        from unittest.mock import MagicMock, patch
-        from services.google_sheets_sync_service import _http_get_json, _mask_sensitive_url
+    def test_firestore_sync_normalization_and_doc_id(self) -> None:
+        from services.firestore_sync_service import _normalize_doc_fields, _resolve_doc_id
 
-        masked = _mask_sensitive_url("https://script.google.com/macros/s/abc/exec?action=ping&api_secret=my_pw_123")
-        self.assertIn("api_secret=***", masked)
-        self.assertNotIn("my_pw_123", masked)
-
-        fake_resp = MagicMock()
-        fake_resp.status_code = 200
-        fake_resp.json.return_value = {"ok": True}
-        with patch("requests.get", return_value=fake_resp) as mock_get:
-            res = _http_get_json("  https://script.google.com/macros/s/abc/exec  ", {"action": "ping"})
-            self.assertTrue(res["ok"])
-            called_url = mock_get.call_args[0][0]
-            self.assertTrue(called_url.startswith("https://script.google.com/"))
-            self.assertIn("User-Agent", mock_get.call_args.kwargs["headers"])
+        normalized = _normalize_doc_fields({"grade": "1", "class_no": "5", "is_done": "true", "title": "테스트"})
+        self.assertEqual(normalized["grade"], 1)
+        self.assertEqual(normalized["class_no"], 5)
+        self.assertIs(normalized["is_done"], True)
+        self.assertEqual(_resolve_doc_id("Tasks", {"remote_id": "a/b"}), "a_b")
 
     def test_external_integration_action_tools(self) -> None:
         from unittest.mock import MagicMock, patch

@@ -55,3 +55,9 @@ data/
 !assets/cleaning_notice_template.hwpx
 *.xlsx
 *.pdf
+
+#firebase db key
+eduflow-db-b44f3-5692e5dea8c3.json
+#firebaseconfig
+eduflow-mobile-firebaseconfig.json
+
