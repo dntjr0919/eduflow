@@ -208,9 +208,52 @@ def sync_comcigan_from_web(
         }
 
     svc = sync_service or GoogleSheetsSyncService()
+
+    # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 보완
+    if change_rows:
+        base_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
+        try:
+            existing_base = svc.fetch_sheet_rows("시간표_기본") or []
+        except Exception:
+            existing_base = []
+        for b in list(existing_base) + list(base_rows):
+            if not isinstance(b, dict):
+                continue
+            key = (
+                str(b.get("grade") or "").strip(),
+                str(b.get("class_no") or "").strip(),
+                str(b.get("day_of_week") or "").strip(),
+                str(b.get("period") or "").strip(),
+            )
+            subj = str(b.get("subject") or "").strip()
+            tchr = str(b.get("teacher_name") or b.get("teacher") or "").strip()
+            if all(key) and subj:
+                base_lookup[key] = (subj, tchr)
+
+        weekday_ko = ("월", "화", "수", "목", "금", "토", "일")
+        for chg in change_rows:
+            orig_s = str(chg.get("original_subject") or "").strip()
+            if orig_s and orig_s != "(기존수업)":
+                continue
+            d_str = str(chg.get("date") or chg.get("target_date") or "").strip()
+            try:
+                day_name = weekday_ko[datetime.strptime(d_str, "%Y-%m-%d").weekday()]
+            except ValueError:
+                day_name = ""
+            key = (
+                str(chg.get("grade") or "").strip(),
+                str(chg.get("class_no") or "").strip(),
+                day_name,
+                str(chg.get("period") or "").strip(),
+            )
+            if key in base_lookup:
+                chg["original_subject"] = base_lookup[key][0]
+                if not chg.get("original_teacher"):
+                    chg["original_teacher"] = base_lookup[key][1]
+
     base_ok = svc.upsert_timetable_base(base_rows) if base_rows else True
     chg_ok = svc.push_timetable_changes(change_rows) if change_rows else True
-    ok = bool(base_ok and chg_ok)
+    ok = base_ok and chg_ok
 
     return {
         "ok": ok,

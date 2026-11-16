@@ -349,17 +349,24 @@ class ComciganPlaywrightFetcher:
                     cell = row[c_idx]
                     raw_text = cell.full_text()
                     deleted_txt = cell.deleted_text()
-                    if not raw_text and not deleted_txt:
+                    is_changed = cell.has_change_hint()
+
+                    # 텍스트가 비어 있어도 class="변경" 등 변동 힌트가 있으면 수업 취소/공강으로 처리
+                    if not raw_text and not deleted_txt and not is_changed:
                         continue
 
-                    # 교사 필터가 지정된 경우 해당 교사가 포함된 셀 강조/필터 여부 확인용 메타
-                    is_changed = cell.has_change_hint()
                     arrow_match = re.search(
                         r"([^\s\-→>]+)\s*(?:->|→)\s*([^\n(]+)(?:\(([^)]+)\))?",
                         raw_text,
                     )
 
-                    if arrow_match:
+                    if not raw_text and not deleted_txt and is_changed:
+                        row_grade, row_class = caption_grade, caption_class
+                        orig_subj = ""
+                        orig_teacher = ""
+                        chg_subj = "수업없음(휴업/공강)"
+                        chg_teacher = ""
+                    elif arrow_match:
                         is_changed = True
                         orig_subj = arrow_match.group(1).strip()
                         chg_subj = arrow_match.group(2).strip()
@@ -399,19 +406,21 @@ class ComciganPlaywrightFetcher:
                         else f"tb_t_{eff_teacher}_{day_name}_{period}"
                     )
 
-                    base_rows.append(
-                        {
-                            "remote_id": remote_base_id,
-                            "grade": eff_grade,
-                            "class_no": eff_class,
-                            "day_of_week": day_name,
-                            "period": period,
-                            "subject": chg_subj,
-                            "teacher_name": eff_teacher,
-                            "teacher": eff_teacher,
-                            "room": "",
-                        }
-                    )
+                    # 변동 셀(class="변경")은 기본 시간표(시간표_기본)를 덮어쓰지 않음
+                    if not is_changed:
+                        base_rows.append(
+                            {
+                                "remote_id": remote_base_id,
+                                "grade": eff_grade,
+                                "class_no": eff_class,
+                                "day_of_week": day_name,
+                                "period": period,
+                                "subject": chg_subj,
+                                "teacher_name": eff_teacher,
+                                "teacher": eff_teacher,
+                                "room": "",
+                            }
+                        )
 
                     if is_changed:
                         row_date = _resolve_day_date(date_str, day_name)
