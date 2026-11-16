@@ -131,7 +131,10 @@ var SHEET_SCHEMAS = {
     'teacher_confirmed',
     'memo',
     'created_at',
-    'updated_at'
+    'updated_at',
+    'att_category',
+    'att_sub_type',
+    'period_info'
   ],
   '설정_서류규정': [
     'remote_id',
@@ -1484,8 +1487,8 @@ function doGet(e) {
           var roleMatch = (!tRole || tRole === role || tRole === 'all');
           var isAllStu = (!tStu || tStu.toUpperCase() === 'ALL');
           var stuMatch = isAllStu || (normStudentId !== '' && tStu === normStudentId);
-          var classMatch = (!nGrade && !nClass) || (!normGrade && !normClass) ||
-            (nGrade === normGrade && nClass === normClass);
+          var classMatch = (!nGrade && !nClass) || (!normGrade && !normClassNo) ||
+            (nGrade === normGrade && nClass === normClassNo);
           return roleMatch && stuMatch && classMatch;
         });
       }
@@ -1728,6 +1731,50 @@ function doPost(e) {
         memo: body.memo
       }, tz);
       return _jsonResponse({ ok: true, remote_id: confId });
+    }
+
+    if (action === 'save_class_attendance') {
+      var payloadData = body.data || body;
+      var rawRecords = Array.isArray(payloadData.records) ? payloadData.records : [];
+      var targetDate = (payloadData.date || Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd')).toString().trim();
+      var targetGrade = (payloadData.grade !== undefined && payloadData.grade !== null) ? String(payloadData.grade) : '';
+      var targetClassNo = (payloadData.class_no !== undefined && payloadData.class_no !== null) ? String(payloadData.class_no) : '';
+      var teacherName = (payloadData.submitted_by || '담임교사').toString();
+
+      var attSheet = ss.getSheetByName('일일_출결');
+      var existingAtt = _readSheetAsObjects(attSheet, SHEET_SCHEMAS['일일_출결'], tz);
+      var existingByStu = {};
+      existingAtt.forEach(function (row) {
+        if (String(row.date || '').trim() === targetDate && row.student_id) {
+          existingByStu[String(row.student_id).trim()] = String(row.remote_id || '').trim();
+        }
+      });
+
+      var bulkItems = rawRecords.map(function (rec) {
+        var sid = String(rec.student_id || '').trim();
+        var rid = (rec.remote_id || existingByStu[sid] || ('ATT_CHK_' + targetDate + '_' + sid)).toString().trim();
+        return {
+          remote_id: rid,
+          date: targetDate,
+          student_id: sid,
+          student_name: rec.student_name || '',
+          grade: rec.grade !== undefined && rec.grade !== '' ? rec.grade : targetGrade,
+          class_no: rec.class_no !== undefined && rec.class_no !== '' ? rec.class_no : targetClassNo,
+          student_no: rec.student_no !== undefined ? rec.student_no : '',
+          attendance_type: rec.attendance_type || '출석',
+          att_category: rec.att_category || '',
+          att_sub_type: rec.att_sub_type || '',
+          period_info: rec.period_info || '',
+          reason: rec.reason || '',
+          submitted_by: rec.submitted_by || teacherName,
+          role: 'teacher',
+          teacher_confirmed: 1,
+          memo: rec.memo || ''
+        };
+      });
+
+      var savedCount = _bulkUpsertRowsByRemoteId(attSheet, SHEET_SCHEMAS['일일_출결'], bulkItems, tz);
+      return _jsonResponse({ ok: true, count: savedCount, date: targetDate });
     }
 
     // ── 4. 서류 규정 & 영업일 마감 계산 & "제출했습니다" 상태 전환 ───────────
