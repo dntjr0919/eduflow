@@ -132,6 +132,148 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             "mob_1001", "done", is_done=True, memo="웹 LLM 작업 완료 (세특 초안 생성)"
         )
 
+    def test_google_sheets_timetable_timeouts_and_gas_error_logging(self) -> None:
+        import inspect
+        from services.google_sheets_sync_service import GoogleSheetsSyncService
+
+        sig_base = inspect.signature(GoogleSheetsSyncService.upsert_timetable_base)
+        sig_chg = inspect.signature(GoogleSheetsSyncService.push_timetable_changes)
+        self.assertGreaterEqual(sig_base.parameters["timeout"].default, 30.0)
+        self.assertGreaterEqual(sig_chg.parameters["timeout"].default, 30.0)
+
+        mock_db = MagicMock()
+        svc = GoogleSheetsSyncService(db=mock_db)
+        with patch.object(
+            svc,
+            "_resolve_urls",
+            return_value=("https://script.google.com/macros/s/demo/exec", "sheet123"),
+        ), patch(
+            "services.google_sheets_sync_service._http_post_json",
+            return_value={"ok": False, "error": "GAS quota exceeded"},
+        ):
+            ok_base = svc.upsert_timetable_base([{"remote_id": "tb_c_1_1_월_1"}])
+            ok_chg = svc.push_timetable_changes([{"remote_id": "tc_20261116_1_1_1"}])
+
+        self.assertFalse(ok_base)
+        self.assertFalse(ok_chg)
+        warn_calls = [c for c in mock_db.add_log.call_args_list if c.args[0] == "WARN"]
+        self.assertEqual(len(warn_calls), 2)
+        self.assertIn("GAS quota exceeded", warn_calls[0].args[2])
+        self.assertIn("GAS quota exceeded", warn_calls[1].args[2])
+
+    def test_comcigan_teacher_mode_empty_change_and_no_caption_leak(self) -> None:
+        from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
+
+        teacher_html = """
+        <html><body>
+          <table>
+            <caption>홍길동 시간표</caption>
+            <tr><th>교시</th><th>월</th><th>화</th></tr>
+            <tr>
+              <td>1</td>
+              <td class="변경"></td>
+              <td>2-3<br>수학</td>
+            </tr>
+            <tr>
+              <td>2</td>
+              <td class="변경"><del>2-4 수학</del> 자습</td>
+              <td class="변경">과학 -> 보강</td>
+            </tr>
+          </table>
+        </body></html>
+        """
+        t_base, t_chg = ComciganPlaywrightFetcher.parse_html(
+            teacher_html,
+            grade_hint="1",
+            class_hint="1",
+            target_date="2026-11-16",
+            teacher_name="홍길동",
+            mode="teacher",
+        )
+        self.assertEqual(len(t_base), 1)
+        self.assertEqual(t_base[0]["remote_id"], "tb_t_홍길동_화_1")
+
+        self.assertEqual(len(t_chg), 3)
+        # 1) 빈 <td class="변경"></td> in teacher mode -> no homeroom grade/class leak
+        empty_chg = [c for c in t_chg if c["period"] == "1"][0]
+        self.assertEqual(empty_chg["grade"], "")
+        self.assertEqual(empty_chg["class_no"], "")
+        self.assertEqual(empty_chg["changed_subject"], "수업없음(휴업/공강)")
+        self.assertEqual(empty_chg["remote_id"], "tc_t_20261116_홍길동_1")
+        # 2) <del>2-4 수학</del> 자습 -> preserves grade/class from deleted_txt
+        del_chg = [c for c in t_chg if c["period"] == "2" and c["changed_subject"] == "자습"][0]
+        self.assertEqual(del_chg["grade"], "2")
+        self.assertEqual(del_chg["class_no"], "4")
+        self.assertEqual(del_chg["original_subject"], "수학")
+        # 3) arrow_match without grade/class in teacher mode -> no homeroom leak
+        arrow_chg = [c for c in t_chg if c["period"] == "2" and c["changed_subject"] == "보강"][0]
+        self.assertEqual(arrow_chg["grade"], "")
+        self.assertEqual(arrow_chg["class_no"], "")
+        self.assertEqual(arrow_chg["remote_id"], "tc_t_20261117_홍길동_2")
+
+    def test_sync_comcigan_from_web_prefers_class_entry_and_reports_step_errors(self) -> None:
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch.return_value = {
+            "ok": True,
+            "base_rows": [
+                {
+                    "remote_id": "tb_t_김교사_월_1",
+                    "entry_type": "teacher",
+                    "grade": "1",
+                    "class_no": "3",
+                    "day_of_week": "월",
+                    "period": "1",
+                    "subject": "교사시트과목",
+                    "teacher_name": "김교사",
+                }
+            ],
+            "change_rows": [
+                {
+                    "remote_id": "tc_20261116_1_3_1",
+                    "date": "2026-11-16",
+                    "grade": "1",
+                    "class_no": "3",
+                    "period": "1",
+                    "original_subject": "(기존수업)",
+                    "changed_subject": "자습",
+                    "original_teacher": "",
+                    "changed_teacher": "",
+                }
+            ],
+        }
+        fake_sync = MagicMock()
+        fake_sync.fetch_sheet_rows.return_value = [
+            {
+                "remote_id": "tb_c_1_3_월_1",
+                "entry_type": "class",
+                "grade": "1",
+                "class_no": "3",
+                "day_of_week": "월",
+                "period": "1",
+                "subject": "학급기본수학",
+                "teacher_name": "이담임",
+            }
+        ]
+        fake_sync.upsert_timetable_base.return_value = True
+        fake_sync.push_timetable_changes.return_value = False
+
+        res = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            sync_service=fake_sync,
+            fetcher=fake_fetcher,
+        )
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["base_pushed"], 1)
+        self.assertEqual(res["changes_pushed"], 0)
+        self.assertIn("시간표_변동 Push 실패", res["error"])
+        self.assertNotIn("시간표_기본 Upsert 실패", res["error"])
+        pushed_changes = fake_sync.push_timetable_changes.call_args.args[0]
+        self.assertEqual(pushed_changes[0]["original_subject"], "학급기본수학")
+        self.assertEqual(pushed_changes[0]["original_teacher"], "이담임")
+
 
 if __name__ == "__main__":
     unittest.main()

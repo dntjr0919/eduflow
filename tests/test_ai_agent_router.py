@@ -428,13 +428,15 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
             sample_html,
             target_date="2026-11-16",
         )
-        self.assertEqual(len(base_rows), 6)
+        self.assertEqual(len(base_rows), 4)
         self.assertEqual(base_rows[0]["grade"], "1")
         self.assertEqual(base_rows[0]["class_no"], "3")
         self.assertEqual(base_rows[0]["day_of_week"], "월")
         self.assertEqual(base_rows[0]["period"], "1")
         self.assertEqual(base_rows[0]["subject"], "국어")
         self.assertEqual(base_rows[0]["teacher_name"], "김철수")
+        self.assertEqual(base_rows[0]["entry_type"], "class")
+        self.assertEqual(base_rows[0]["remote_id"], "tb_c_1_3_월_1")
 
         self.assertEqual(len(change_rows), 2)
         self.assertEqual(change_rows[0]["original_subject"], "수학Ⅰ")
@@ -462,7 +464,7 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
             fetcher=fake_fetcher,
         )
         self.assertTrue(sync_res["ok"])
-        self.assertEqual(sync_res["base_count"], 6)
+        self.assertEqual(sync_res["base_count"], 4)
         self.assertEqual(sync_res["change_count"], 2)
         fake_sync.upsert_timetable_base.assert_called_once_with(base_rows)
         fake_sync.push_timetable_changes.assert_called_once_with(change_rows)
@@ -513,17 +515,18 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
             teacher_name="홍길동",
             mode="teacher",
         )
-        self.assertEqual(len(t_base), 4)
+        self.assertEqual(len(t_base), 3)
         self.assertEqual(t_base[0]["grade"], "2")
         self.assertEqual(t_base[0]["class_no"], "1")
         self.assertEqual(t_base[0]["subject"], "수학Ⅰ")
         self.assertEqual(t_base[0]["teacher_name"], "홍길동")
+        self.assertEqual(t_base[0]["entry_type"], "teacher")
 
         self.assertEqual(t_base[1]["grade"], "1")
         self.assertEqual(t_base[1]["class_no"], "3")
-        self.assertEqual(t_base[3]["grade"], "3")
-        self.assertEqual(t_base[3]["class_no"], "2")
-        self.assertEqual(t_base[3]["subject"], "수학Ⅱ")
+        self.assertEqual(t_base[2]["grade"], "3")
+        self.assertEqual(t_base[2]["class_no"], "2")
+        self.assertEqual(t_base[2]["subject"], "수학Ⅱ")
 
         self.assertEqual(len(t_chg), 1)
         self.assertEqual(t_chg[0]["grade"], "2")
@@ -564,7 +567,7 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
             week_html,
             target_date="2026-11-18",
         )
-        self.assertEqual([r["day_of_week"] for r in base_rows], ["월", "화", "수", "목", "금"])
+        self.assertEqual(base_rows, [])
         self.assertEqual(
             [r["date"] for r in change_rows],
             ["2026-11-16", "2026-11-17", "2026-11-18", "2026-11-19", "2026-11-20"],
@@ -590,7 +593,7 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
         )
         self.assertTrue(first["ok"])
         self.assertFalse(first["skipped"])
-        self.assertEqual(fake_sync.upsert_timetable_base.call_count, 1)
+        self.assertEqual(fake_sync.upsert_timetable_base.call_count, 0)
         self.assertEqual(fake_sync.push_timetable_changes.call_count, 1)
 
         second = sync_comcigan_from_web(
@@ -603,7 +606,7 @@ class TestAiAgentRouterAndDockPhase2(unittest.TestCase):
         )
         self.assertTrue(second["ok"])
         self.assertTrue(second["skipped"])
-        self.assertEqual(fake_sync.upsert_timetable_base.call_count, 1)
+        self.assertEqual(fake_sync.upsert_timetable_base.call_count, 0)
         self.assertEqual(fake_sync.push_timetable_changes.call_count, 1)
 
 

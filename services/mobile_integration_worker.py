@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import urllib.request
 from datetime import datetime
@@ -23,6 +24,8 @@ from services.excel_merger_service import merge_excel_assignments
 from services.file_sorter_service import BatchSortWorker, FileSorterService
 from services.google_sheets_sync_service import GoogleSheetsSyncService
 from services.web_gemini_auto_worker import WebGeminiAutoWorker
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def parse_comcigan_payload(
@@ -209,9 +212,11 @@ def sync_comcigan_from_web(
 
     svc = sync_service or GoogleSheetsSyncService()
 
-    # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 보완
+    # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 보완 (entry_type == "class" 우선)
     if change_rows:
-        base_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
+        class_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
+        fallback_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
+        teacher_lookup: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
         try:
             existing_base = svc.fetch_sheet_rows("시간표_기본") or []
         except Exception:
@@ -219,16 +224,25 @@ def sync_comcigan_from_web(
         for b in list(existing_base) + list(base_rows):
             if not isinstance(b, dict):
                 continue
-            key = (
-                str(b.get("grade") or "").strip(),
-                str(b.get("class_no") or "").strip(),
-                str(b.get("day_of_week") or "").strip(),
-                str(b.get("period") or "").strip(),
-            )
+            g_val = str(b.get("grade") or "").strip()
+            c_val = str(b.get("class_no") or "").strip()
+            d_val = str(b.get("day_of_week") or "").strip()
+            p_val = str(b.get("period") or "").strip()
             subj = str(b.get("subject") or "").strip()
             tchr = str(b.get("teacher_name") or b.get("teacher") or "").strip()
-            if all(key) and subj:
-                base_lookup[key] = (subj, tchr)
+            if not subj or not d_val or not p_val:
+                continue
+            e_type = str(b.get("entry_type") or "").strip().lower()
+            key = (g_val, c_val, d_val, p_val)
+            if g_val and c_val:
+                if e_type in ("", "class"):
+                    class_lookup[key] = (subj, tchr)
+                else:
+                    fallback_lookup[key] = (subj, tchr)
+            if tchr:
+                t_key = (tchr, d_val, p_val)
+                if e_type == "teacher" or t_key not in teacher_lookup:
+                    teacher_lookup[t_key] = (subj, tchr)
 
         weekday_ko = ("월", "화", "수", "목", "금", "토", "일")
         for chg in change_rows:
@@ -240,20 +254,35 @@ def sync_comcigan_from_web(
                 day_name = weekday_ko[datetime.strptime(d_str, "%Y-%m-%d").weekday()]
             except ValueError:
                 day_name = ""
+            p_val = str(chg.get("period") or "").strip()
             key = (
                 str(chg.get("grade") or "").strip(),
                 str(chg.get("class_no") or "").strip(),
                 day_name,
-                str(chg.get("period") or "").strip(),
+                p_val,
             )
-            if key in base_lookup:
-                chg["original_subject"] = base_lookup[key][0]
+            matched = class_lookup.get(key) or fallback_lookup.get(key)
+            if not matched:
+                chg_tchr = str(chg.get("original_teacher") or chg.get("changed_teacher") or "").strip()
+                if chg_tchr and day_name and p_val:
+                    matched = teacher_lookup.get((chg_tchr, day_name, p_val))
+            if matched:
+                chg["original_subject"] = matched[0]
                 if not chg.get("original_teacher"):
-                    chg["original_teacher"] = base_lookup[key][1]
+                    chg["original_teacher"] = matched[1]
 
     base_ok = svc.upsert_timetable_base(base_rows) if base_rows else True
     chg_ok = svc.push_timetable_changes(change_rows) if change_rows else True
     ok = base_ok and chg_ok
+
+    failed_steps: List[str] = []
+    if not base_ok:
+        failed_steps.append(f"시간표_기본 Upsert 실패 ({len(base_rows)}건)")
+    if not chg_ok:
+        failed_steps.append(f"시간표_변동 Push 실패 ({len(change_rows)}건)")
+    error_msg = ", ".join(failed_steps)
+    if error_msg:
+        _LOGGER.warning("컴시간 Google Sheets 동기화 실패: %s", error_msg)
 
     return {
         "ok": ok,
@@ -269,7 +298,7 @@ def sync_comcigan_from_web(
         "change_count": len(change_rows),
         "base_pushed": len(base_rows) if base_ok else 0,
         "changes_pushed": len(change_rows) if chg_ok else 0,
-        "error": "" if ok else "Google Sheets 시트 반영 중 일부 또는 전체가 실패했습니다.",
+        "error": error_msg,
     }
 
 

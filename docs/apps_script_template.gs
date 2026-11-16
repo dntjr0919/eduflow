@@ -198,7 +198,10 @@ var SHEET_SCHEMAS = {
     'subject',
     'teacher_name',
     'room',
-    'updated_at'
+    'updated_at',
+    'entry_type',
+    'week_start',
+    'date'
   ],
   '시간표_변동': [
     'remote_id',
@@ -788,6 +791,7 @@ function _formatCellValue(key, val, tz) {
       key === 'end_date' ||
       key === 'due_date' ||
       key === 'date' ||
+      key === 'week_start' ||
       key === 'base_date' ||
       key === 'meal_date'
     ) {
@@ -1396,7 +1400,8 @@ function doGet(e) {
       }
       if (role !== 'teacher' && grade && classNo) {
         timetableBase = timetableBase.filter(function (tb) {
-          return String(tb.grade) === grade && String(tb.class_no) === classNo;
+          var typeOk = !tb.entry_type || String(tb.entry_type) === 'class';
+          return typeOk && String(tb.grade) === grade && String(tb.class_no) === classNo;
         });
         timetableChanges = timetableChanges.filter(function (tc) {
           return String(tc.grade) === grade && String(tc.class_no) === classNo;

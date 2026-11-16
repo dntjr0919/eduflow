@@ -330,9 +330,12 @@ class ComciganPlaywrightFetcher:
             if header_idx < 0:
                 continue
 
-            caption_grade, caption_class = _extract_grade_class(
-                tbl.get("caption", ""), default_grade=grade_hint, default_class=class_hint
-            )
+            if mode == "teacher":
+                caption_grade, caption_class = "", ""
+            else:
+                caption_grade, caption_class = _extract_grade_class(
+                    tbl.get("caption", ""), default_grade=grade_hint, default_class=class_hint
+                )
 
             for row in rows[header_idx + 1 :]:
                 if not row:
@@ -363,7 +366,18 @@ class ComciganPlaywrightFetcher:
                     if not raw_text and not deleted_txt and is_changed:
                         row_grade, row_class = caption_grade, caption_class
                         orig_subj = ""
-                        orig_teacher = ""
+                        orig_teacher = teacher_name if mode == "teacher" else ""
+                        chg_subj = "수업없음(휴업/공강)"
+                        chg_teacher = ""
+                    elif deleted_txt and not raw_text:
+                        is_changed = True
+                        if mode == "teacher":
+                            row_grade, row_class, orig_subj, orig_teacher = _parse_teacher_cell(
+                                deleted_txt, teacher_name
+                            )
+                        else:
+                            orig_subj, orig_teacher = _parse_subject_teacher(deleted_txt)
+                            row_grade, row_class = caption_grade, caption_class
                         chg_subj = "수업없음(휴업/공강)"
                         chg_teacher = ""
                     elif arrow_match:
@@ -371,13 +385,23 @@ class ComciganPlaywrightFetcher:
                         orig_subj = arrow_match.group(1).strip()
                         chg_subj = arrow_match.group(2).strip()
                         chg_teacher = (arrow_match.group(3) or "").strip()
-                        orig_teacher = ""
-                        row_grade, row_class = caption_grade, caption_class
+                        if mode == "teacher":
+                            row_grade, row_class, _, _ = _parse_teacher_cell(raw_text, teacher_name)
+                            orig_teacher = teacher_name
+                        else:
+                            row_grade, row_class = caption_grade, caption_class
+                            orig_teacher = ""
                     elif deleted_txt and raw_text:
                         is_changed = True
                         if mode == "teacher":
-                            _, _, orig_subj, orig_teacher = _parse_teacher_cell(deleted_txt, teacher_name)
-                            row_grade, row_class, chg_subj, chg_teacher = _parse_teacher_cell(raw_text, teacher_name)
+                            del_grade, del_class, orig_subj, orig_teacher = _parse_teacher_cell(
+                                deleted_txt, teacher_name
+                            )
+                            row_grade, row_class, chg_subj, chg_teacher = _parse_teacher_cell(
+                                raw_text, teacher_name
+                            )
+                            row_grade = row_grade or del_grade
+                            row_class = row_class or del_class
                         else:
                             orig_subj, orig_teacher = _parse_subject_teacher(deleted_txt)
                             chg_subj, chg_teacher = _parse_subject_teacher(raw_text)
@@ -393,6 +417,8 @@ class ComciganPlaywrightFetcher:
                         if "[변경]" in chg_subj or "(변경)" in chg_subj:
                             is_changed = True
                             chg_subj = chg_subj.replace("[변경]", "").replace("(변경)", "").strip()
+                        if is_changed and mode == "teacher" and not orig_teacher:
+                            orig_teacher = teacher_name
 
                     if not chg_subj:
                         continue
@@ -400,10 +426,14 @@ class ComciganPlaywrightFetcher:
                     eff_grade = row_grade or caption_grade
                     eff_class = row_class or caption_class
                     eff_teacher = chg_teacher or teacher_name
+                    entry_type = "teacher" if mode == "teacher" else "class"
+                    row_date = _resolve_day_date(date_str, day_name)
+                    week_start = _resolve_day_date(date_str, "월")
+
                     remote_base_id = (
-                        f"tb_{eff_grade}_{eff_class}_{day_name}_{period}"
-                        if (mode != "teacher" or (row_grade and row_class))
-                        else f"tb_t_{eff_teacher}_{day_name}_{period}"
+                        f"tb_t_{eff_teacher}_{day_name}_{period}"
+                        if entry_type == "teacher"
+                        else f"tb_c_{eff_grade}_{eff_class}_{day_name}_{period}"
                     )
 
                     # 변동 셀(class="변경")은 기본 시간표(시간표_기본)를 덮어쓰지 않음
@@ -411,6 +441,9 @@ class ComciganPlaywrightFetcher:
                         base_rows.append(
                             {
                                 "remote_id": remote_base_id,
+                                "entry_type": entry_type,
+                                "week_start": week_start,
+                                "date": row_date,
                                 "grade": eff_grade,
                                 "class_no": eff_class,
                                 "day_of_week": day_name,
@@ -424,9 +457,13 @@ class ComciganPlaywrightFetcher:
 
                     if is_changed:
                         row_date = _resolve_day_date(date_str, day_name)
+                        if mode == "teacher" and (not eff_grade or not eff_class):
+                            chg_remote_id = f"tc_t_{row_date.replace('-', '')}_{eff_teacher}_{period}"
+                        else:
+                            chg_remote_id = f"tc_{row_date.replace('-', '')}_{eff_grade}_{eff_class}_{period}"
                         change_rows.append(
                             {
-                                "remote_id": f"tc_{row_date.replace('-', '')}_{eff_grade}_{eff_class}_{period}",
+                                "remote_id": chg_remote_id,
                                 "date": row_date,
                                 "target_date": row_date,
                                 "grade": eff_grade,

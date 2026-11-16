@@ -513,7 +513,7 @@ class GoogleSheetsSyncService:
         rows: List[Dict[str, Any]],
         apps_script_url: str = "",
         sheet_url: str = "",
-        timeout: float = 15.0,
+        timeout: float = 30.0,
         api_secret: str = "",
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 기본 시간표를 시간표_기본 시트로 Upsert합니다."""
@@ -534,7 +534,11 @@ class GoogleSheetsSyncService:
                 payload,
                 timeout=timeout,
             )
-            return bool(res.get("ok", True))
+            ok = bool(res.get("ok", True))
+            if not ok:
+                err_msg = res.get("error") or res.get("message") or str(res)
+                self.db.add_log("WARN", "GoogleSheetsSync", f"기본 시간표 Upsert GAS 오류: {err_msg}")
+            return ok
         except Exception as exc:
             self.db.add_log("WARN", "GoogleSheetsSync", f"기본 시간표 Upsert 실패: {exc}")
             return False
@@ -544,7 +548,7 @@ class GoogleSheetsSyncService:
         rows: List[Dict[str, Any]],
         apps_script_url: str = "",
         sheet_url: str = "",
-        timeout: float = 10.0,
+        timeout: float = 30.0,
         api_secret: str = "",
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 시간표 변동 내역을 시간표_변동 시트로 Push합니다."""
@@ -565,7 +569,11 @@ class GoogleSheetsSyncService:
                 payload,
                 timeout=timeout,
             )
-            return bool(res.get("ok", True))
+            ok = bool(res.get("ok", True))
+            if not ok:
+                err_msg = res.get("error") or res.get("message") or str(res)
+                self.db.add_log("WARN", "GoogleSheetsSync", f"시간표 변동 Push GAS 오류: {err_msg}")
+            return ok
         except Exception as exc:
             self.db.add_log("WARN", "GoogleSheetsSync", f"시간표 변동 Push 실패: {exc}")
             return False
