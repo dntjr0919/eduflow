@@ -334,7 +334,24 @@ def sync_comcigan_from_web(
     base_rows = list(fetched.get("base_rows") or [])
     change_rows = list(fetched.get("change_rows") or [])
 
+    import re
     from services.timetable_manual_service import normalize_teacher_name
+
+    def _resolve_row_teacher(raw_t: Any, raw_subj: Any = "", fallback: str = "") -> str:
+        for cand, is_subj in ((raw_t, False), (raw_subj, True)):
+            txt = str(cand or "").strip()
+            if not txt:
+                continue
+            m = re.match(r"^.+?\(([^)]+)\)$", txt)
+            if m:
+                norm = normalize_teacher_name(m.group(1).strip())
+                if norm:
+                    return norm
+            elif not is_subj:
+                norm = normalize_teacher_name(txt)
+                if norm:
+                    return norm
+        return normalize_teacher_name(fallback)
 
     for b_row in base_rows:
         if not isinstance(b_row, dict):
@@ -347,10 +364,14 @@ def sync_comcigan_from_web(
             b_row["school_name"] = eff_school_name
         if not b_row.get("source"):
             b_row["source"] = "comcigan"
-        if b_row.get("teacher_name"):
-            norm_t = normalize_teacher_name(b_row["teacher_name"])
-            b_row["teacher_name"] = norm_t
-            b_row["teacher"] = norm_t
+        fallback_t = eff_teacher if str(b_row.get("entry_type") or "").strip().lower() == "teacher" else ""
+        norm_t = _resolve_row_teacher(
+            b_row.get("teacher_name") or b_row.get("teacher"),
+            b_row.get("subject"),
+            fallback_t,
+        )
+        b_row["teacher_name"] = norm_t
+        b_row["teacher"] = norm_t
 
     for c_row in change_rows:
         if not isinstance(c_row, dict):
@@ -363,10 +384,14 @@ def sync_comcigan_from_web(
             c_row["school_name"] = eff_school_name
         if not c_row.get("source") or c_row.get("source") == "comcigan_playwright":
             c_row["source"] = "comcigan"
-        if c_row.get("original_teacher"):
-            c_row["original_teacher"] = normalize_teacher_name(c_row["original_teacher"])
-        if c_row.get("changed_teacher"):
-            c_row["changed_teacher"] = normalize_teacher_name(c_row["changed_teacher"])
+        if c_row.get("original_teacher") or c_row.get("original_subject"):
+            c_row["original_teacher"] = _resolve_row_teacher(
+                c_row.get("original_teacher"), c_row.get("original_subject")
+            )
+        if c_row.get("changed_teacher") or c_row.get("changed_subject"):
+            c_row["changed_teacher"] = _resolve_row_teacher(
+                c_row.get("changed_teacher"), c_row.get("changed_subject")
+            )
 
     cls_cnt = int(fetched.get("class_base_count", len(base_rows)) or 0)
     tch_cnt = int(fetched.get("teacher_base_count", 0) or 0)

@@ -232,10 +232,26 @@ def _parse_subject_teacher(text: str) -> Tuple[str, str]:
         teacher = re.sub(r"[()]", "", lines[1]).strip()
         return subj, teacher
     single = lines[0]
-    m = re.match(r"^([^\s(]+(?:\s+[^\s(]+)?)\s*\(([^)]+)\)$", single)
+    m = re.match(r"^(.+?)\s*\(([^)]+)\)$", single)
     if m:
         return m.group(1).strip(), m.group(2).strip()
     return single, ""
+
+
+def _resolve_normalized_teacher(raw_teacher: Any, raw_subject: Any = "") -> str:
+    """교사명('유우석T', '통과2(유우석)' 등) 또는 과목 괄호 안 교사명을 추출해 정규화합니다."""
+    for candidate in (raw_teacher, raw_subject):
+        text = str(candidate or "").strip()
+        if not text:
+            continue
+        m = re.match(r"^.+?\(([^)]+)\)$", text)
+        extracted = m.group(1).strip() if m else text
+        norm = normalize_teacher_name(extracted)
+        if norm and candidate is raw_teacher:
+            return norm
+        if m and norm:
+            return norm
+    return ""
 
 
 def _parse_teacher_cell(text: str, default_teacher: str = "") -> Tuple[str, str, str, str]:
@@ -444,8 +460,8 @@ class ComciganPlaywrightFetcher:
 
                     eff_grade = row_grade or caption_grade
                     eff_class = row_class or caption_class
-                    eff_teacher = normalize_teacher_name(chg_teacher or teacher_name)
-                    orig_teacher = normalize_teacher_name(orig_teacher)
+                    eff_teacher = _resolve_normalized_teacher(chg_teacher or teacher_name, chg_subj)
+                    orig_teacher = _resolve_normalized_teacher(orig_teacher, orig_subj)
                     entry_type = "teacher" if mode == "teacher" else "class"
                     row_date = _resolve_day_date(date_str, day_name)
                     week_start = _resolve_day_date(date_str, "월")
