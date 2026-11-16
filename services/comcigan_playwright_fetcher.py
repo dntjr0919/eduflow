@@ -14,6 +14,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from services.timetable_manual_service import normalize_teacher_name
 from utils.path_helper import get_data_path
 
 DAY_NAMES = ("월", "화", "수", "목", "금", "토")
@@ -272,6 +273,7 @@ class ComciganPlaywrightFetcher:
         self,
         url: str = "",
         school_code: str = "",
+        school_name: str = "",
         target_date: str = "",
         teacher_name: str = "",
         target_grade: str = "",
@@ -283,8 +285,9 @@ class ComciganPlaywrightFetcher:
     ) -> None:
         self.url = str(url or "").strip()
         self.school_code = str(school_code or "").strip()
+        self.school_name = str(school_name or "").strip()
         self.target_date = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()
-        self.teacher_name = str(teacher_name or "").strip()
+        self.teacher_name = normalize_teacher_name(teacher_name)
         self.target_grade = str(target_grade or "").strip()
         self.target_class = str(target_class or "").strip()
         self.scope = str(scope or "homeroom_and_teacher").strip()
@@ -439,7 +442,8 @@ class ComciganPlaywrightFetcher:
 
                     eff_grade = row_grade or caption_grade
                     eff_class = row_class or caption_class
-                    eff_teacher = chg_teacher or teacher_name
+                    eff_teacher = normalize_teacher_name(chg_teacher or teacher_name)
+                    orig_teacher = normalize_teacher_name(orig_teacher)
                     entry_type = "teacher" if mode == "teacher" else "class"
                     row_date = _resolve_day_date(date_str, day_name)
                     week_start = _resolve_day_date(date_str, "월")
@@ -466,6 +470,7 @@ class ComciganPlaywrightFetcher:
                                 "teacher_name": eff_teacher,
                                 "teacher": eff_teacher,
                                 "room": "",
+                                "source": "comcigan",
                             }
                         )
 
@@ -488,7 +493,7 @@ class ComciganPlaywrightFetcher:
                                 "original_teacher": orig_teacher,
                                 "changed_teacher": eff_teacher,
                                 "reason": "컴시간 웹 자동 감지",
-                                "source": "comcigan_playwright",
+                                "source": "comcigan",
                             }
                         )
 

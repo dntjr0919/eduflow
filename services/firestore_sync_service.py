@@ -183,6 +183,8 @@ class FirestoreSyncService:
             return False, None, "담임 교사(또는 관리자) 승인 대기 중인 계정입니다."
         if status == "rejected":
             return False, None, "가입 신청이 반려된 계정입니다."
+        if status not in ("", "active"):
+            return False, None, "비활성화된 계정입니다."
         if bool(user_doc.get("custom_id_changed")) and user_doc.get("custom_id"):
             if str(user_id).strip() != str(user_doc.get("custom_id")).strip():
                 return False, None, "커스텀 ID로 변경된 계정입니다. 변경한 ID로 로그인해 주세요."
@@ -507,20 +509,70 @@ class FirestoreSyncService:
         )
         return True
 
+    def fetch_homeroom_students(
+        self,
+        school_code: str = "",
+        school_name: str = "",
+        grade: Optional[int] = None,
+        class_no: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Firestore `계정_학생` 컬렉션에서 교사 소속 학교·학년·반 명렬표를 조회합니다."""
+        fs = self._get_client()
+        ref: Any = fs.collection("계정_학생")
+        if grade is not None and class_no is not None:
+            ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
+        sc = str(school_code or "").strip()
+        sn = str(school_name or "").strip()
+        rows: List[Dict[str, Any]] = []
+        for doc in ref.stream():
+            d = doc.to_dict() or {}
+            d.setdefault("remote_id", doc.id)
+            status = str(d.get("status") or "active").strip().lower()
+            if status in ("pending", "rejected", "inactive", "disabled"):
+                continue
+            doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
+            doc_sn = str(d.get("school_name") or "").strip()
+            if sc and doc_sc and doc_sc != sc:
+                continue
+            if sn and doc_sn and doc_sn != sn:
+                continue
+            if grade is not None and d.get("grade") is not None and _to_int_or_none(d.get("grade")) != int(grade):
+                continue
+            if class_no is not None and d.get("class_no") is not None and _to_int_or_none(d.get("class_no")) != int(class_no):
+                continue
+            rows.append(d)
+
+        def _sort_key(item: Dict[str, Any]) -> Tuple[int, str]:
+            num = _to_int_or_none(item.get("student_no") or item.get("number"))
+            return (num if num is not None else 9999, str(item.get("student_id") or item.get("name") or ""))
+
+        rows.sort(key=_sort_key)
+        return rows
+
     def fetch_homeroom_attendance(
         self,
         grade: Optional[int] = None,
         class_no: Optional[int] = None,
+        school_code: str = "",
+        school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `일일_출결` 컬렉션에서 해당 학급의 모바일 출결 내역을 조회합니다."""
         fs = self._get_client()
         ref: Any = fs.collection("일일_출결")
         if grade is not None and class_no is not None:
             ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
+        sc = str(school_code or "").strip()
+        sn = str(school_name or "").strip()
         rows: List[Dict[str, Any]] = []
         for doc in ref.stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
+            doc_sn = str(d.get("school_name") or "").strip()
+            if sc and doc_sc and doc_sc != sc:
+                continue
+            if sn and doc_sn and doc_sn != sn:
+                continue
             rows.append(d)
         rows.sort(key=lambda x: str(x.get("date") or x.get("updated_at") or ""), reverse=True)
         return rows
@@ -603,13 +655,23 @@ class FirestoreSyncService:
         grade: Optional[int] = None,
         class_no: Optional[int] = None,
         limit: int = 50,
+        school_code: str = "",
+        school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `Notifications` 발송 이력을 조회합니다."""
         fs = self._get_client()
+        sc = str(school_code or "").strip()
+        sn = str(school_name or "").strip()
         rows: List[Dict[str, Any]] = []
         for doc in fs.collection("Notifications").limit(limit).stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
+            doc_sn = str(d.get("school_name") or "").strip()
+            if sc and doc_sc and doc_sc != sc:
+                continue
+            if sn and doc_sn and doc_sn != sn:
+                continue
             if grade is not None and d.get("grade") is not None and int(d["grade"]) != int(grade):
                 continue
             if class_no is not None and d.get("class_no") is not None and int(d["class_no"]) != int(class_no):
@@ -623,6 +685,8 @@ class FirestoreSyncService:
         grade: Optional[int] = None,
         class_no: Optional[int] = None,
         student_id: str = "",
+        school_code: str = "",
+        school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `1:1_상담채팅` 대화 내역을 조회합니다."""
         fs = self._get_client()
@@ -632,10 +696,18 @@ class FirestoreSyncService:
             ref = ref.where("room_id", "==", f"ROOM-{sid}")
         elif grade is not None and class_no is not None:
             ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
+        sc = str(school_code or "").strip()
+        sn = str(school_name or "").strip()
         rows: List[Dict[str, Any]] = []
         for doc in ref.stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
+            doc_sn = str(d.get("school_name") or "").strip()
+            if sc and doc_sc and doc_sc != sc:
+                continue
+            if sn and doc_sn and doc_sn != sn:
+                continue
             rows.append(d)
         rows.sort(key=lambda x: str(x.get("created_at") or ""))
         return rows

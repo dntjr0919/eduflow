@@ -440,6 +440,8 @@ class _DockApiOcrWorker(BaseWorker):
         llm_client = MultiLlmClient()
         total = len(self.file_paths)
         results: List[str] = []
+        last_parsed_json: Any = None
+        last_raw_response: str = ""
 
         for idx, fp in enumerate(self.file_paths, start=1):
             if self.is_stop_requested():
@@ -475,11 +477,13 @@ class _DockApiOcrWorker(BaseWorker):
                     image_bytes=image_bytes,
                     mime_type=mime_type,
                 )
+                last_raw_response = str(raw_reply or "").strip()
                 try:
                     parsed = extract_json_from_llm_response(raw_reply)
+                    last_parsed_json = parsed
                     formatted = format_parsed_json_to_readable_text(parsed)
                 except Exception:
-                    formatted = raw_reply.strip()
+                    formatted = last_raw_response
                 results.append(
                     f"=== [{fname}] ({llm_client.provider.upper()} / {llm_client.model_name}) ===\n{formatted}\n"
                 )
@@ -493,6 +497,8 @@ class _DockApiOcrWorker(BaseWorker):
             "mode": "api",
             "count": len(results),
             "formatted_text": "\n".join(results),
+            "parsed_json": last_parsed_json,
+            "raw_response": last_raw_response,
         }
 
 

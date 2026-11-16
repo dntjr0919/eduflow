@@ -8,14 +8,16 @@
 """
 
 import csv
+import json
 import os
 import random
+import re
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from PyQt6.QtCore import QDate, QRect, Qt
+from PyQt6.QtCore import QDate, QRect, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QClipboard,
     QColor,
@@ -31,6 +33,7 @@ from PyQt6.QtWidgets import (
     QCalendarWidget,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QDialog,
     QFileDialog,
     QFrame,
@@ -60,7 +63,12 @@ from PyQt6.QtWidgets import (
 from core.base_worker import TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from services.batch_prompt_service import extract_json_from_llm_response
 from services.firestore_sync_service import FirestoreSyncService
+from services.timetable_manual_service import (
+    build_manual_timetable_change,
+    parse_weekly_timetable_file,
+)
 from services.hwpx_agent_service import (
     HwpxDocument,
     apply_hwpx_operations,
@@ -85,6 +93,53 @@ def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     if st is not None:
         st.unpolish(widget)
         st.polish(widget)
+
+
+NOTICE_OCR_JSON_PROMPT = (
+    "첨부된 가정통신문 PDF(또는 이미지)를 정확히 판독하여 아래 JSON 스키마로만 응답하세요.\n"
+    "코드블록(```json ... ```)을 포함해도 되며, 다른 설명 문장은 출력하지 마세요.\n"
+    "{\n"
+    '  "title": "가정통신문 제목",\n'
+    '  "deadline": "YYYY-MM-DD",\n'
+    '  "body": "핵심 안내 본문 요약 및 원문 정리",\n'
+    '  "reply_fields": ["참가 동의 여부 (동의/미동의)", "비상연락처"]\n'
+    "}"
+)
+
+
+def parse_notice_ai_json(raw_or_dict: Any) -> Dict[str, Any]:
+    """AiExecutionDock(API/수동복붙/Playwright) 가정통신문 OCR JSON 응답을 정규화합니다."""
+    if isinstance(raw_or_dict, dict):
+        data = dict(raw_or_dict)
+    else:
+        raw_text = str(raw_or_dict or "").strip()
+        if not raw_text:
+            raise ValueError("가정통신문 JSON 응답이 비어 있습니다.")
+        try:
+            data = extract_json_from_llm_response(raw_text)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", raw_text)
+            if not m:
+                raise ValueError("응답에서 JSON 객체를 찾을 수 없습니다.")
+            data = json.loads(m.group(0))
+
+    if not isinstance(data, dict):
+        raise ValueError("가정통신문 JSON 응답은 객체(dict) 형태여야 합니다.")
+
+    raw_fields = data.get("reply_fields")
+    if isinstance(raw_fields, list):
+        reply_fields = [str(x).strip() for x in raw_fields if str(x).strip()]
+    elif isinstance(raw_fields, str):
+        reply_fields = [x.strip() for x in raw_fields.split(",") if x.strip()]
+    else:
+        reply_fields = []
+
+    return {
+        "title": str(data.get("title") or "").strip(),
+        "deadline": str(data.get("deadline") or data.get("due_date") or "").strip(),
+        "body": str(data.get("body") or data.get("content") or "").strip(),
+        "reply_fields": reply_fields,
+    }
 
 
 SAMPLE_ROSTER: List[Tuple[str, str]] = [
@@ -1500,11 +1555,19 @@ class FrontCareStudentsDialog(QDialog):
 class ClassroomToolsTab(QWidget):
     """[탭 4] 학급 경영 도구함 2x2 Instrument Station 탭 위젯."""
 
+    ai_target_requested = pyqtSignal(str)
+    ai_context_changed = pyqtSignal()
+
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
         apply_qss_role(self, obj_name="ClassroomToolsTabPage")
         self.task_runner = task_runner
         self.db = DatabaseManager()
+        self.config = ConfigManager()
+        self._logged_in_teacher: Optional[Dict[str, Any]] = None
+        self._firebase_roster: List[Tuple[str, str]] = []
+        self._selected_notice_pdf_path: str = ""
+        self._parsed_excel_timetable_rows: List[Dict[str, Any]] = []
         self._seat_cells: List[ClickableSeatCell] = []
         self._seat_labels: List[Tuple[QLabel, QLabel]] = []
         self._current_seating: List[Tuple[str, str, str]] = []
@@ -1520,9 +1583,12 @@ class ClassroomToolsTab(QWidget):
         self._custom_duty_template_path: Optional[Path] = None
 
         self._init_ui()
+        self.restore_saved_teacher_session()
         self._refresh_roster_dependent_views()
 
     def _get_active_roster(self) -> List[Tuple[str, str]]:
+        if self._firebase_roster:
+            return list(self._firebase_roster)
         students = self.db.get_active_homeroom_students()
         if students:
             return [(str(s["student_id"]), str(s["name"])) for s in students]
@@ -1570,6 +1636,92 @@ class ClassroomToolsTab(QWidget):
         layout.setContentsMargins(16, 16, 20, 20)
         layout.setSpacing(14)
 
+        # 최상단 EduFlow Mobile 교사 계정 로그인 바 / 게이트
+        self.teacher_auth_bar = QFrame()
+        apply_qss_role(self.teacher_auth_bar, role="instrumentCard", obj_name="ClassroomTeacherAuthBar")
+        auth_outer = QVBoxLayout(self.teacher_auth_bar)
+        auth_outer.setContentsMargins(16, 10, 16, 10)
+        auth_outer.setSpacing(6)
+
+        self.auth_login_widget = QWidget()
+        login_row = QHBoxLayout(self.auth_login_widget)
+        login_row.setContentsMargins(0, 0, 0, 0)
+        login_row.setSpacing(8)
+        lbl_auth_title = QLabel("EduFlow Mobile 교사 계정 로그인:")
+        apply_qss_role(lbl_auth_title, role="fieldLabel")
+        self.edit_teacher_login_id = QLineEdit()
+        self.edit_teacher_login_id.setMinimumHeight(32)
+        self.edit_teacher_login_id.setPlaceholderText("교사 로그인 ID (예: 유우석)")
+        self.edit_teacher_login_pw = QLineEdit()
+        self.edit_teacher_login_pw.setMinimumHeight(32)
+        self.edit_teacher_login_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_teacher_login_pw.setPlaceholderText("비밀번호")
+        self.edit_teacher_login_pw.returnPressed.connect(self._on_teacher_login_clicked)
+        self.btn_toggle_pw_vis = QPushButton("👁")
+        self.btn_toggle_pw_vis.setCheckable(True)
+        self.btn_toggle_pw_vis.setFixedSize(34, 32)
+        self.btn_toggle_pw_vis.setToolTip("비밀번호 표시/숨김")
+        self.btn_toggle_pw_vis.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_pw_vis.toggled.connect(
+            lambda checked: self.edit_teacher_login_pw.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        self.btn_teacher_login = QPushButton("로그인")
+        apply_qss_role(self.btn_teacher_login, role="primary", obj_name="BtnTeacherLogin")
+        self.btn_teacher_login.setMinimumHeight(32)
+        self.btn_teacher_login.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_teacher_login.clicked.connect(self._on_teacher_login_clicked)
+
+        login_row.addWidget(lbl_auth_title)
+        login_row.addWidget(self.edit_teacher_login_id, stretch=1)
+        login_row.addWidget(self.edit_teacher_login_pw, stretch=1)
+        login_row.addWidget(self.btn_toggle_pw_vis)
+        login_row.addWidget(self.btn_teacher_login)
+        auth_outer.addWidget(self.auth_login_widget)
+
+        self.auth_status_widget = QWidget()
+        status_row = QHBoxLayout(self.auth_status_widget)
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(8)
+        self.lbl_teacher_auth_status = QLabel("[교사] 미로그인")
+        self.lbl_teacher_auth_status.setStyleSheet("color: #0F172A; font-weight: 700; font-size: 13px;")
+        self.btn_teacher_refresh = QPushButton("새로고침")
+        apply_qss_role(self.btn_teacher_refresh, role="secondary", obj_name="BtnTeacherRefresh")
+        self.btn_teacher_refresh.setMinimumHeight(30)
+        self.btn_teacher_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_teacher_refresh.clicked.connect(lambda: self.refresh_firebase_roster(silent=False))
+        self.btn_teacher_logout = QPushButton("로그아웃")
+        apply_qss_role(self.btn_teacher_logout, role="secondary", obj_name="BtnTeacherLogout")
+        self.btn_teacher_logout.setMinimumHeight(30)
+        self.btn_teacher_logout.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_teacher_logout.clicked.connect(self.logout_teacher)
+
+        status_row.addWidget(self.lbl_teacher_auth_status, stretch=1)
+        status_row.addWidget(self.btn_teacher_refresh)
+        status_row.addWidget(self.btn_teacher_logout)
+        auth_outer.addWidget(self.auth_status_widget)
+        self.auth_status_widget.setVisible(False)
+        layout.addWidget(self.teacher_auth_bar)
+
+        self.auth_lock_overlay = QFrame()
+        apply_qss_role(self.auth_lock_overlay, role="subCard", obj_name="ClassroomAuthLockOverlay")
+        lock_lay = QVBoxLayout(self.auth_lock_overlay)
+        lock_lay.setContentsMargins(24, 36, 24, 36)
+        lock_lay.setSpacing(8)
+        lbl_lock_title = QLabel("학급 경영 도구함 잠금 상태")
+        lbl_lock_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_lock_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #1E293B;")
+        lbl_lock_desc = QLabel(
+            "상단 로그인 바에서 EduFlow Mobile 교사 계정으로 로그인하면\n"
+            "소속 학교·학년·반 명렬표가 자동으로 연동되며 6개 학급 경영 도구가 활성화됩니다."
+        )
+        lbl_lock_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_lock_desc.setStyleSheet("font-size: 12.5px; color: #475569;")
+        lock_lay.addWidget(lbl_lock_title)
+        lock_lay.addWidget(lbl_lock_desc)
+        layout.addWidget(self.auth_lock_overlay)
+
         # 상단 학급 운영 스테이션 상태 스트립
         header_bar = QFrame()
         apply_qss_role(header_bar, role="instrumentCard", obj_name="ClassroomHeaderBar")
@@ -1611,8 +1763,8 @@ class ClassroomToolsTab(QWidget):
         layout.addWidget(header_bar)
 
         # 확장 가능한 상단 필(Pill) 탭 바 + 하단 단일 전체 폭 QStackedWidget
-        pill_bar = QFrame()
-        pill_bar_lay = QHBoxLayout(pill_bar)
+        self.pill_bar = QFrame()
+        pill_bar_lay = QHBoxLayout(self.pill_bar)
         pill_bar_lay.setContentsMargins(0, 0, 0, 0)
         pill_bar_lay.setSpacing(8)
         self.pill_btn_group = QButtonGroup(self)
@@ -1624,6 +1776,7 @@ class ClassroomToolsTab(QWidget):
             "3. 모바일 가정통신문·서명 취합 센터",
             "4. 학급 공지·긴급 알림 일괄 발송기",
             "5. 1:1 상담 내역·누가기록 뷰어",
+            "6. 시간표 관리 (수동·엑셀)",
         ]
         for idx, p_title in enumerate(pill_titles):
             pill = QPushButton(p_title)
@@ -1641,7 +1794,7 @@ class ClassroomToolsTab(QWidget):
             pill_bar_lay.addWidget(pill)
             self.tool_pills.append(pill)
         pill_bar_lay.addStretch(1)
-        layout.addWidget(pill_bar)
+        layout.addWidget(self.pill_bar)
 
         self.tool_stack = QStackedWidget()
         self.pill_btn_group.idClicked.connect(self.tool_stack.setCurrentIndex)
@@ -1884,8 +2037,9 @@ class ClassroomToolsTab(QWidget):
         self.edit_notice_due = QLineEdit()
         self.edit_notice_due.setPlaceholderText("마감일 (예: 2026-11-25)")
         self.edit_notice_due.setFixedWidth(150)
-        self.btn_load_notice_pdf = QPushButton("PDF 불러오기 (자동 추출)")
+        self.btn_load_notice_pdf = QPushButton("PDF 선택 → AI OCR 추출")
         apply_qss_role(self.btn_load_notice_pdf, role="secondary")
+        self.btn_load_notice_pdf.setToolTip("PDF 파일을 선택하면 우측 AI 실행 패널(API/수동복붙/Playwright)로 구조화 JSON을 추출합니다.")
         self.btn_load_notice_pdf.clicked.connect(self._on_load_notice_pdf)
         self.btn_publish_mobile_notice = QPushButton("모바일 배포")
         apply_qss_role(self.btn_publish_mobile_notice, role="primary")
@@ -1895,6 +2049,10 @@ class ClassroomToolsTab(QWidget):
         notice_top.addWidget(self.btn_load_notice_pdf)
         notice_top.addWidget(self.btn_publish_mobile_notice)
         c3_lay.addLayout(notice_top)
+
+        self.lbl_notice_pdf_status = QLabel("선택된 PDF: 없음 (PDF를 선택하면 우측 AI 실행 패널이 열립니다)")
+        self.lbl_notice_pdf_status.setStyleSheet("color: #64748B; font-size: 11.5px;")
+        c3_lay.addWidget(self.lbl_notice_pdf_status)
 
         self.txt_notice_content = QPlainTextEdit()
         self.txt_notice_content.setPlaceholderText("가정통신문 본문 내용이 여기에 표시됩니다.")
@@ -1999,51 +2157,320 @@ class ClassroomToolsTab(QWidget):
         self.txt_chat_history_viewer.setMinimumHeight(260)
         c5_lay.addWidget(self.txt_chat_history_viewer, stretch=1)
 
+        # =====================================================================
+        # TOOL 6: 시간표 관리 (컴시간 미지원 학교 수동·엑셀 업로드 & 변동/보강 입력)
+        # =====================================================================
+        self.card_timetable_manual = HoverZoomCard(
+            title="6. 시간표 관리 (수동 · 엑셀/CSV 일괄 업로드 & 변동/보강)",
+            parent=container,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        c6_lay = self.card_timetable_manual.body_layout()
+
+        # 6-1. 주간 기본 시간표 엑셀/CSV 일괄 업로드
+        tt_excel_bar = QHBoxLayout()
+        tt_excel_bar.setSpacing(6)
+        self.combo_tt_excel_type = QComboBox()
+        self.combo_tt_excel_type.addItem("학급 기본 시간표 (class)", "class")
+        self.combo_tt_excel_type.addItem("교사 개인 시간표 (teacher)", "teacher")
+        self.btn_tt_load_excel = QPushButton("엑셀/CSV 파일 선택 (.xlsx, .csv)")
+        apply_qss_role(self.btn_tt_load_excel, role="secondary")
+        self.btn_tt_load_excel.clicked.connect(self._on_load_timetable_excel)
+        self.btn_tt_upload_excel = QPushButton("Firestore 시간표_기본 업로드")
+        apply_qss_role(self.btn_tt_upload_excel, role="primary")
+        self.btn_tt_upload_excel.clicked.connect(self._on_upload_timetable_excel)
+        self.lbl_tt_excel_status = QLabel("파일 미선택")
+        self.lbl_tt_excel_status.setStyleSheet("color: #64748B; font-size: 12px;")
+        tt_excel_bar.addWidget(QLabel("구분:"))
+        tt_excel_bar.addWidget(self.combo_tt_excel_type)
+        tt_excel_bar.addWidget(self.btn_tt_load_excel)
+        tt_excel_bar.addWidget(self.btn_tt_upload_excel)
+        tt_excel_bar.addWidget(self.lbl_tt_excel_status, stretch=1)
+        c6_lay.addLayout(tt_excel_bar)
+
+        self.table_tt_excel_preview = QTableWidget(0, 6)
+        self.table_tt_excel_preview.setHorizontalHeaderLabels(
+            ["구분", "학년-반", "요일", "교시", "과목", "교사명"]
+        )
+        self.table_tt_excel_preview.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_tt_excel_preview.setMinimumHeight(140)
+        c6_lay.addWidget(self.table_tt_excel_preview, stretch=1)
+
+        # 6-2. 특정 날짜·교시 변동/보강 수동 추가·수정
+        lbl_chg_sec = QLabel("특정 날짜 · 교시 변동/보강 수동 입력 (Firestore 시간표_변동 반영)")
+        lbl_chg_sec.setStyleSheet("font-weight: 700; color: #1E293B; margin-top: 6px;")
+        c6_lay.addWidget(lbl_chg_sec)
+
+        chg_row1 = QHBoxLayout()
+        chg_row1.setSpacing(6)
+        self.date_tt_chg = QDateEdit(QDate.currentDate())
+        self.date_tt_chg.setCalendarPopup(True)
+        self.date_tt_chg.setDisplayFormat("yyyy-MM-dd")
+        self.spin_tt_chg_grade = QSpinBox()
+        self.spin_tt_chg_grade.setRange(1, 6)
+        self.spin_tt_chg_grade.setSuffix("학년")
+        self.spin_tt_chg_class = QSpinBox()
+        self.spin_tt_chg_class.setRange(1, 30)
+        self.spin_tt_chg_class.setSuffix("반")
+        self.spin_tt_chg_period = QSpinBox()
+        self.spin_tt_chg_period.setRange(1, 10)
+        self.spin_tt_chg_period.setValue(7)
+        self.spin_tt_chg_period.setSuffix("교시")
+        chg_row1.addWidget(QLabel("날짜:"))
+        chg_row1.addWidget(self.date_tt_chg)
+        chg_row1.addWidget(self.spin_tt_chg_grade)
+        chg_row1.addWidget(self.spin_tt_chg_class)
+        chg_row1.addWidget(self.spin_tt_chg_period)
+        chg_row1.addStretch(1)
+        c6_lay.addLayout(chg_row1)
+
+        chg_row2 = QHBoxLayout()
+        chg_row2.setSpacing(6)
+        self.edit_tt_chg_orig_subj = QLineEdit()
+        self.edit_tt_chg_orig_subj.setPlaceholderText("원래 과목 (보강/신규 시 비워둠)")
+        self.edit_tt_chg_new_subj = QLineEdit()
+        self.edit_tt_chg_new_subj.setPlaceholderText("변경/보강 과목 *")
+        self.edit_tt_chg_orig_teacher = QLineEdit()
+        self.edit_tt_chg_orig_teacher.setPlaceholderText("원래 교사명")
+        self.edit_tt_chg_new_teacher = QLineEdit()
+        self.edit_tt_chg_new_teacher.setPlaceholderText("변경 교사명")
+        self.edit_tt_chg_reason = QLineEdit()
+        self.edit_tt_chg_reason.setPlaceholderText("사유 (예: 보강, 자습, 출장)")
+        self.btn_tt_save_change = QPushButton("변동/보강 Firestore 저장")
+        apply_qss_role(self.btn_tt_save_change, role="primary")
+        self.btn_tt_save_change.clicked.connect(self._on_save_manual_timetable_change)
+        chg_row2.addWidget(self.edit_tt_chg_orig_subj)
+        chg_row2.addWidget(self.edit_tt_chg_new_subj)
+        chg_row2.addWidget(self.edit_tt_chg_orig_teacher)
+        chg_row2.addWidget(self.edit_tt_chg_new_teacher)
+        chg_row2.addWidget(self.edit_tt_chg_reason)
+        chg_row2.addWidget(self.btn_tt_save_change)
+        c6_lay.addLayout(chg_row2)
+
         self.tool_stack.addWidget(self.card_attendance)
         self.tool_stack.addWidget(self.card_cleaning)
         self.tool_stack.addWidget(self.card_mobile_notice)
         self.tool_stack.addWidget(self.card_class_notify)
         self.tool_stack.addWidget(self.card_chat_viewer)
+        self.tool_stack.addWidget(self.card_timetable_manual)
 
         layout.addWidget(self.tool_stack, stretch=1)
         scroll.setWidget(container)
         outer_lay.addWidget(scroll)
 
     # =========================================================================
+    # 교사 계정 로그인 / 세션 복원 / Firebase 명렬표 동적 연동
+    # =========================================================================
+    def _apply_teacher_auth_state(self) -> None:
+        logged_in = bool(self._logged_in_teacher)
+        self.auth_login_widget.setVisible(not logged_in)
+        self.auth_status_widget.setVisible(logged_in)
+        self.auth_lock_overlay.setVisible(not logged_in)
+        self.pill_bar.setVisible(logged_in)
+        self.tool_stack.setVisible(logged_in)
+
+        if logged_in and self._logged_in_teacher:
+            meta = self._teacher_meta()
+            name = meta["teacher_name"]
+            school_name = meta["school_name"] or meta["school_code"] or "소속학교"
+            g = meta["grade"]
+            c = meta["class_no"]
+            cls_part = f"{school_name} {g}학년 {c}반" if (g and c) else school_name
+            roster_cnt = len(self._firebase_roster) if self._firebase_roster else len(self.db.get_active_homeroom_students())
+            self.lbl_teacher_auth_status.setText(
+                f"[교사] {name} ({cls_part}) · 연동 명렬표 ({roster_cnt}명)"
+            )
+            if hasattr(self, "spin_tt_chg_grade") and g:
+                self.spin_tt_chg_grade.setValue(int(g))
+            if hasattr(self, "spin_tt_chg_class") and c:
+                self.spin_tt_chg_class.setValue(int(c))
+        else:
+            self.lbl_teacher_auth_status.setText("[교사] 미로그인")
+
+    def _on_teacher_login_clicked(self) -> None:
+        uid = self.edit_teacher_login_id.text().strip()
+        pw = self.edit_teacher_login_pw.text()
+        if not uid:
+            QMessageBox.warning(self, "로그인 확인", "교사 로그인 ID를 입력해 주세요.")
+            self.edit_teacher_login_id.setFocus()
+            return
+        ok, err = self.login_teacher(uid, pw)
+        if not ok:
+            QMessageBox.warning(self, "로그인 실패", err or "로그인에 실패했습니다.")
+            return
+        self.edit_teacher_login_pw.clear()
+
+    def login_teacher(
+        self,
+        user_id: str,
+        password: str,
+        sync_service: Optional[FirestoreSyncService] = None,
+    ) -> Tuple[bool, str]:
+        svc = sync_service or FirestoreSyncService(db=self.db, config=self.config)
+        try:
+            ok, user_doc, err = svc.authenticate_account("teacher", user_id, password)
+        except Exception as exc:
+            return False, f"Firestore 인증 오류: {exc}"
+        if not ok or not user_doc:
+            return False, err or "교사 계정을 확인할 수 없습니다."
+
+        school_code = str(user_doc.get("school_code") or user_doc.get("neis_school_code") or "").strip()
+        school_name = str(user_doc.get("school_name") or "").strip()
+        grade_val = user_doc.get("grade")
+        class_val = user_doc.get("class_no")
+        teacher_name = str(user_doc.get("name") or user_doc.get("teacher_id") or user_id).strip()
+        teacher_id = str(user_doc.get("teacher_id") or user_doc.get("remote_id") or user_id).strip()
+        login_id = str(user_doc.get("login_id") or user_id).strip()
+        is_admin = bool(user_doc.get("is_admin") is True)
+
+        self._logged_in_teacher = {
+            "teacher_id": teacher_id,
+            "login_id": login_id,
+            "name": teacher_name,
+            "school_code": school_code,
+            "neis_school_code": school_code,
+            "school_name": school_name,
+            "grade": int(grade_val) if str(grade_val or "").isdigit() else None,
+            "class_no": int(class_val) if str(class_val or "").isdigit() else None,
+            "is_admin": is_admin,
+        }
+
+        tp_sec = dict(self.config.get_section("teacher_profile") or {})
+        tp_sec.update(self._logged_in_teacher)
+        tp_sec["session_logged_in"] = True
+        self.config.update_section("teacher_profile", tp_sec)
+
+        self.refresh_firebase_roster(sync_service=svc, silent=True)
+        self._apply_teacher_auth_state()
+        return True, ""
+
+    def logout_teacher(self) -> None:
+        self._logged_in_teacher = None
+        self._firebase_roster = []
+        self.config.update_section("teacher_profile", {"session_logged_in": False})
+        self._apply_teacher_auth_state()
+        self._refresh_roster_dependent_views()
+
+    def restore_saved_teacher_session(
+        self,
+        sync_service: Optional[FirestoreSyncService] = None,
+    ) -> bool:
+        tp_sec = dict(self.config.get_section("teacher_profile") or {})
+        if not tp_sec.get("session_logged_in"):
+            self._logged_in_teacher = None
+            self._apply_teacher_auth_state()
+            return False
+        tid = str(tp_sec.get("teacher_id") or tp_sec.get("login_id") or tp_sec.get("name") or "").strip()
+        if not tid:
+            self._logged_in_teacher = None
+            self._apply_teacher_auth_state()
+            return False
+
+        self._logged_in_teacher = {
+            "teacher_id": tid,
+            "login_id": str(tp_sec.get("login_id") or tid).strip(),
+            "name": str(tp_sec.get("name") or tid).strip(),
+            "school_code": str(tp_sec.get("school_code") or tp_sec.get("neis_school_code") or "").strip(),
+            "neis_school_code": str(tp_sec.get("neis_school_code") or tp_sec.get("school_code") or "").strip(),
+            "school_name": str(tp_sec.get("school_name") or "").strip(),
+            "grade": int(tp_sec["grade"]) if str(tp_sec.get("grade") or "").isdigit() else None,
+            "class_no": int(tp_sec["class_no"]) if str(tp_sec.get("class_no") or "").isdigit() else None,
+            "is_admin": bool(tp_sec.get("is_admin") is True),
+        }
+        self._apply_teacher_auth_state()
+        if sync_service is not None:
+            self.refresh_firebase_roster(sync_service=sync_service, silent=True)
+        return True
+
+    def refresh_firebase_roster(
+        self,
+        sync_service: Optional[FirestoreSyncService] = None,
+        silent: bool = False,
+    ) -> int:
+        if not self._logged_in_teacher:
+            return 0
+        meta = self._teacher_meta()
+        svc = sync_service or FirestoreSyncService(db=self.db, config=self.config)
+        try:
+            students = svc.fetch_homeroom_students(
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+                grade=meta["grade"],
+                class_no=meta["class_no"],
+            )
+            self._firebase_roster = [
+                (str(s.get("student_id") or s.get("remote_id") or "").strip(), str(s.get("name") or "").strip())
+                for s in students
+                if str(s.get("student_id") or s.get("remote_id") or "").strip()
+            ]
+        except Exception as exc:
+            if not silent:
+                QMessageBox.warning(self, "명렬표 동기화 오류", f"Firestore 명렬표 조회 실패:\n{exc}")
+            return 0
+
+        self._apply_teacher_auth_state()
+        self._refresh_roster_dependent_views()
+        return len(self._firebase_roster)
+
+    # =========================================================================
     # 데이터 연동 및 액션 핸들러
     # =========================================================================
     def _current_homeroom_key(self) -> str:
+        if self._logged_in_teacher:
+            meta = self._teacher_meta()
+            sn = meta["school_name"] or meta["school_code"] or "school"
+            g = meta["grade"]
+            c = meta["class_no"]
+            if g and c:
+                return f"{sn}_{g}학년_{c}반"
+            return f"{sn}_{meta['teacher_name']}"
         hr = self.db.get_active_homeroom_group()
         if hr and str(hr.get("group_name", "")).strip():
             return str(hr["group_name"]).strip()
         return "__sample__"
 
     def _current_homeroom_label(self) -> str:
+        if self._logged_in_teacher:
+            meta = self._teacher_meta()
+            g = meta["grade"]
+            c = meta["class_no"]
+            if g and c:
+                return f"{g}학년 {c}반"
+            return meta["school_name"] or meta["teacher_name"]
         hr = self.db.get_active_homeroom_group()
         if hr and str(hr.get("group_name", "")).strip():
             return str(hr["group_name"]).strip()
         return "예시 학급"
 
     def _refresh_roster_dependent_views(self) -> None:
-        hr_group = self.db.get_active_homeroom_group()
-        homeroom_students = self.db.get_active_homeroom_students()
-
-        if hr_group and homeroom_students:
+        if self._logged_in_teacher and self._firebase_roster:
+            label = self._current_homeroom_label()
             self.lbl_roster_status_badge.setText(
-                f"연동 명렬표: [담임 학급] {hr_group['group_name']} ({len(homeroom_students)}명)"
+                f"연동 명렬표: [Firebase] {label} ({len(self._firebase_roster)}명)"
             )
             apply_qss_role(self.lbl_roster_status_badge, role="badgeSuccess")
-            self.lbl_roster_status_badge.setToolTip("나이스 학급담임 명렬표와 정상 연동되었습니다.")
-        elif hr_group:
-            self.lbl_roster_status_badge.setText(
-                f"연동 명렬표: [담임 학급] {hr_group['group_name']} (0명)"
-            )
-            apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
-            self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
+            self.lbl_roster_status_badge.setToolTip("로그인한 교사 계정의 Firestore 학급 명렬표와 연동되었습니다.")
         else:
-            self.lbl_roster_status_badge.setText("연동 명렬표: [담임 학급] 등록된 담임 학급 없음")
-            apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
-            self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
+            hr_group = self.db.get_active_homeroom_group()
+            homeroom_students = self.db.get_active_homeroom_students()
+
+            if hr_group and homeroom_students:
+                self.lbl_roster_status_badge.setText(
+                    f"연동 명렬표: [담임 학급] {hr_group['group_name']} ({len(homeroom_students)}명)"
+                )
+                apply_qss_role(self.lbl_roster_status_badge, role="badgeSuccess")
+                self.lbl_roster_status_badge.setToolTip("나이스 학급담임 명렬표와 정상 연동되었습니다.")
+            elif hr_group:
+                self.lbl_roster_status_badge.setText(
+                    f"연동 명렬표: [담임 학급] {hr_group['group_name']} (0명)"
+                )
+                apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
+                self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
+            else:
+                self.lbl_roster_status_badge.setText("연동 명렬표: [담임 학급] 등록된 담임 학급 없음")
+                apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
+                self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
 
         roster = self._get_active_roster()
         self.combo_chat_student.blockSignals(True)
@@ -2058,44 +2485,185 @@ class ClassroomToolsTab(QWidget):
         self._update_duty_preview()
 
     def _teacher_meta(self) -> Dict[str, Any]:
-        cfg = ConfigManager()
-        tp = cfg.get_section("teacher_profile")
+        if self._logged_in_teacher:
+            t = self._logged_in_teacher
+            return {
+                "teacher_id": str(t.get("teacher_id") or "").strip(),
+                "grade": t.get("grade"),
+                "class_no": t.get("class_no"),
+                "school_code": str(t.get("school_code") or t.get("neis_school_code") or "").strip(),
+                "school_name": str(t.get("school_name") or "").strip(),
+                "teacher_name": str(t.get("name") or "담임교사").strip(),
+                "is_admin": bool(t.get("is_admin") is True),
+            }
+        tp = self.config.get_section("teacher_profile") or {}
         return {
-            "grade": tp.get("grade") or 1,
-            "class_no": tp.get("class_no") or 1,
-            "school_code": str(tp.get("neis_school_code") or "").strip(),
+            "teacher_id": str(tp.get("teacher_id") or "").strip(),
+            "grade": tp.get("grade"),
+            "class_no": tp.get("class_no"),
+            "school_code": str(tp.get("school_code") or tp.get("neis_school_code") or "").strip(),
             "school_name": str(tp.get("school_name") or "").strip(),
             "teacher_name": str(tp.get("name") or "담임교사").strip(),
+            "is_admin": bool(tp.get("is_admin") is True),
         }
 
     def _on_sync_mobile_attendance(self) -> None:
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db)
+        svc = FirestoreSyncService(db=self.db, config=self.config)
         try:
-            rows = svc.fetch_homeroom_attendance(grade=meta["grade"], class_no=meta["class_no"])
+            rows = svc.fetch_homeroom_attendance(
+                grade=meta["grade"],
+                class_no=meta["class_no"],
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+            )
             QMessageBox.information(self, "모바일 출결 동기화", f"Firestore에서 {len(rows)}건의 출결 기록을 조회했습니다.")
         except Exception as exc:
             QMessageBox.warning(self, "모바일 출결 동기화 오류", str(exc))
 
-    def _on_load_notice_pdf(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(self, "가정통신문 PDF 선택", "", "PDF Files (*.pdf)")
-        if not file_path:
+    # =========================================================================
+    # 가정통신문 PDF -> AiExecutionDock 구조화 JSON OCR 연동 (pypdf 미사용)
+    # =========================================================================
+    def get_ai_context(self) -> Dict[str, Any]:
+        files = [self._selected_notice_pdf_path] if self._selected_notice_pdf_path else []
+        return {
+            "target_id": "notice_ocr",
+            "kind": "ocr",
+            "task_label": "가정통신문 PDF 구조화 JSON 추출",
+            "ocr_files": files,
+            "attachment_paths": files,
+            "ocr_prompt": NOTICE_OCR_JSON_PROMPT,
+        }
+
+    def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        raw_source = payload.get("parsed_json")
+        if not isinstance(raw_source, dict):
+            raw_source = payload.get("raw_response") or payload.get("formatted_text") or ""
+        if not raw_source:
             return
         try:
-            from pypdf import PdfReader
-            reader = PdfReader(file_path)
-            text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            if lines and not self.edit_notice_title.text().strip():
-                self.edit_notice_title.setText(lines[0][:60])
-            self.txt_notice_content.setPlainText(text[:4000])
-            fields = ["참가/동의 여부"]
-            for kw in ("연락처", "전화", "사유", "희망", "신청"):
-                if kw in text:
-                    fields.append(kw)
-            self.edit_notice_fields.setText(", ".join(dict.fromkeys(fields)))
+            parsed = parse_notice_ai_json(raw_source)
         except Exception as exc:
-            QMessageBox.warning(self, "PDF 파싱 오류", f"PDF를 읽을 수 없습니다: {exc}")
+            QMessageBox.warning(
+                self,
+                "가정통신문 JSON 파싱 오류",
+                f"AI 응답에서 가정통신문 JSON을 해석하지 못했습니다:\n{exc}",
+            )
+            return
+
+        if parsed["title"]:
+            self.edit_notice_title.setText(parsed["title"])
+        if parsed["deadline"]:
+            self.edit_notice_due.setText(parsed["deadline"])
+        if parsed["body"]:
+            self.txt_notice_content.setPlainText(parsed["body"])
+        if parsed["reply_fields"]:
+            self.edit_notice_fields.setText(", ".join(parsed["reply_fields"]))
+        self.lbl_notice_pdf_status.setText("AI 구조화 JSON 반영 완료 — 내용 확인 후 [모바일 배포]를 클릭하세요.")
+
+    def _on_load_notice_pdf(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "가정통신문 PDF 선택",
+            "",
+            "PDF & Image Files (*.pdf *.png *.jpg *.jpeg *.webp)",
+        )
+        if not file_path:
+            return
+        self._selected_notice_pdf_path = str(file_path).strip()
+        self.lbl_notice_pdf_status.setText(
+            f"선택된 파일: {Path(file_path).name} → 우측 AI 실행 패널에서 API / 수동 복붙 / Playwright로 추출하세요."
+        )
+        self.ai_context_changed.emit()
+        self.ai_target_requested.emit("notice_ocr")
+
+    def _on_load_timetable_excel(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "주간 시간표 엑셀/CSV 선택",
+            "",
+            "Spreadsheet Files (*.xlsx *.xlsm *.csv)",
+        )
+        if not file_path:
+            return
+        meta = self._teacher_meta()
+        entry_type = str(self.combo_tt_excel_type.currentData() or "class")
+        try:
+            rows = parse_weekly_timetable_file(
+                file_path,
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+                default_grade=meta["grade"],
+                default_class=meta["class_no"],
+                default_teacher=meta["teacher_name"],
+                entry_type=entry_type,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "시간표 파일 파싱 오류", str(exc))
+            return
+
+        self._parsed_excel_timetable_rows = rows
+        self.table_tt_excel_preview.setRowCount(0)
+        for item in rows:
+            r = self.table_tt_excel_preview.rowCount()
+            self.table_tt_excel_preview.insertRow(r)
+            gc = f"{item.get('grade') or '-'}-{item.get('class_no') or '-'}"
+            self.table_tt_excel_preview.setItem(r, 0, QTableWidgetItem(str(item.get("entry_type") or "")))
+            self.table_tt_excel_preview.setItem(r, 1, QTableWidgetItem(gc))
+            self.table_tt_excel_preview.setItem(r, 2, QTableWidgetItem(str(item.get("day_of_week") or "")))
+            self.table_tt_excel_preview.setItem(r, 3, QTableWidgetItem(str(item.get("period") or "")))
+            self.table_tt_excel_preview.setItem(r, 4, QTableWidgetItem(str(item.get("subject") or "")))
+            self.table_tt_excel_preview.setItem(r, 5, QTableWidgetItem(str(item.get("teacher_name") or "")))
+        self.lbl_tt_excel_status.setText(f"{Path(file_path).name} ({len(rows)}건 파싱됨)")
+
+    def _on_upload_timetable_excel(self) -> None:
+        if not self._parsed_excel_timetable_rows:
+            QMessageBox.information(self, "업로드 안내", "먼저 엑셀/CSV 시간표 파일을 선택해 주세요.")
+            return
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        ok = svc.upsert_timetable_base(self._parsed_excel_timetable_rows)
+        if ok:
+            QMessageBox.information(
+                self,
+                "업로드 완료",
+                f"Firestore `시간표_기본`에 {len(self._parsed_excel_timetable_rows)}건(source=excel)이 반영되었습니다.",
+            )
+        else:
+            QMessageBox.warning(self, "업로드 실패", "Firestore 시간표_기본 반영에 실패했습니다.")
+
+    def _on_save_manual_timetable_change(self) -> None:
+        new_subj = self.edit_tt_chg_new_subj.text().strip()
+        if not new_subj:
+            QMessageBox.warning(self, "입력 확인", "변경/보강 과목명을 입력해 주세요.")
+            self.edit_tt_chg_new_subj.setFocus()
+            return
+        meta = self._teacher_meta()
+        row = build_manual_timetable_change(
+            date_str=self.date_tt_chg.date().toString("yyyy-MM-dd"),
+            period=self.spin_tt_chg_period.value(),
+            changed_subject=new_subj,
+            grade=self.spin_tt_chg_grade.value(),
+            class_no=self.spin_tt_chg_class.value(),
+            original_subject=self.edit_tt_chg_orig_subj.text().strip(),
+            original_teacher=self.edit_tt_chg_orig_teacher.text().strip() or meta["teacher_name"],
+            changed_teacher=self.edit_tt_chg_new_teacher.text().strip() or meta["teacher_name"],
+            reason=self.edit_tt_chg_reason.text().strip() or "수동 변동",
+            school_code=meta["school_code"],
+            school_name=meta["school_name"],
+            source="manual",
+        )
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        ok = svc.push_timetable_changes([row])
+        if ok:
+            QMessageBox.information(
+                self,
+                "저장 완료",
+                f"{row['date']} {row['period']}교시 변동/보강({row['changed_subject']})이 Firestore에 저장되었습니다.",
+            )
+        else:
+            QMessageBox.warning(self, "저장 실패", "Firestore 시간표_변동 저장에 실패했습니다.")
 
     def _on_publish_mobile_notice(self) -> None:
         title = self.edit_notice_title.text().strip()
@@ -2184,8 +2752,13 @@ class ClassroomToolsTab(QWidget):
 
     def _on_refresh_broadcast_history(self) -> None:
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db)
-        rows = svc.fetch_sent_notifications(grade=meta["grade"], class_no=meta["class_no"])
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        rows = svc.fetch_sent_notifications(
+            grade=meta["grade"],
+            class_no=meta["class_no"],
+            school_code=meta["school_code"],
+            school_name=meta["school_name"],
+        )
         self.table_broadcast_history.setRowCount(0)
         for item in rows:
             r = self.table_broadcast_history.rowCount()
@@ -2198,8 +2771,14 @@ class ClassroomToolsTab(QWidget):
     def _on_load_chat_history(self) -> None:
         sid = str(self.combo_chat_student.currentData() or "").strip()
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db)
-        rows = svc.fetch_chat_history(grade=meta["grade"], class_no=meta["class_no"], student_id=sid)
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        rows = svc.fetch_chat_history(
+            grade=meta["grade"],
+            class_no=meta["class_no"],
+            student_id=sid,
+            school_code=meta["school_code"],
+            school_name=meta["school_name"],
+        )
         if not rows:
             self.txt_chat_history_viewer.setPlainText("조회된 1:1 상담 대화 내역이 없습니다.")
             return

@@ -164,10 +164,23 @@ def sync_comcigan_from_web(
             except Exception:
                 pass
 
-    cfg_sec = ConfigManager().get_section("api_and_integrations") or {}
+    cfg_mgr = ConfigManager()
+    cfg_sec = cfg_mgr.get_section("api_and_integrations") or {}
+    tp_sec = cfg_mgr.get_section("teacher_profile") or {}
     eff_url = str(url or cfg_sec.get("comcigan_url", "") or "").strip()
-    eff_code = str(school_code or cfg_sec.get("comcigan_school_code", "") or "").strip()
-    eff_teacher = str(teacher_name or cfg_sec.get("comcigan_teacher_name", "") or "").strip()
+    eff_code = str(
+        school_code
+        or tp_sec.get("neis_school_code")
+        or cfg_sec.get("comcigan_school_code", "")
+        or ""
+    ).strip()
+    eff_school_name = str(tp_sec.get("school_name") or "").strip()
+    eff_teacher = str(
+        teacher_name
+        or cfg_sec.get("comcigan_teacher_name")
+        or tp_sec.get("name")
+        or ""
+    ).strip()
     eff_date = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()
 
     if not eff_url and fetcher is None:
@@ -200,6 +213,37 @@ def sync_comcigan_from_web(
     )
     base_rows = list(fetched.get("base_rows") or [])
     change_rows = list(fetched.get("change_rows") or [])
+
+    from services.timetable_manual_service import normalize_teacher_name
+
+    for b_row in base_rows:
+        if not isinstance(b_row, dict):
+            continue
+        if eff_code and not b_row.get("school_code"):
+            b_row["school_code"] = eff_code
+        if eff_school_name and not b_row.get("school_name"):
+            b_row["school_name"] = eff_school_name
+        if not b_row.get("source"):
+            b_row["source"] = "comcigan"
+        if b_row.get("teacher_name"):
+            norm_t = normalize_teacher_name(b_row["teacher_name"])
+            b_row["teacher_name"] = norm_t
+            b_row["teacher"] = norm_t
+
+    for c_row in change_rows:
+        if not isinstance(c_row, dict):
+            continue
+        if eff_code and not c_row.get("school_code"):
+            c_row["school_code"] = eff_code
+        if eff_school_name and not c_row.get("school_name"):
+            c_row["school_name"] = eff_school_name
+        if not c_row.get("source") or c_row.get("source") == "comcigan_playwright":
+            c_row["source"] = "comcigan"
+        if c_row.get("original_teacher"):
+            c_row["original_teacher"] = normalize_teacher_name(c_row["original_teacher"])
+        if c_row.get("changed_teacher"):
+            c_row["changed_teacher"] = normalize_teacher_name(c_row["changed_teacher"])
+
     cls_cnt = int(fetched.get("class_base_count", len(base_rows)) or 0)
     tch_cnt = int(fetched.get("teacher_base_count", 0) or 0)
     snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows)
