@@ -12,7 +12,7 @@ import re
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from utils.path_helper import get_data_path
 
@@ -119,15 +119,25 @@ class _TimetableHTMLParser(HTMLParser):
             self._cur_cell.append_text(data)
 
 
+def _norm_num(val: str) -> str:
+    """'05반', '1학년', '01' 등에서 선행 0을 제거한 순수 숫자 문자열을 반환합니다."""
+    digits = re.sub(r"\D+", "", str(val or "").strip())
+    return str(int(digits)) if digits else ""
+
+
 def _extract_grade_class(text: str, default_grade: str = "1", default_class: str = "1") -> Tuple[str, str]:
-    """문자열('1학년 3반', '2-5', '3반' 등)에서 학년/반 숫자를 추출합니다."""
+    """문자열('1학년 3반', '2-5', '105', '3반' 등)에서 학년/반 숫자를 추출합니다."""
     s = str(text or "").strip()
     m = re.search(r"(\d+)\s*(?:학년|[-/])\s*(\d+)\s*반?", s)
     if m:
-        return m.group(1), m.group(2)
+        return str(int(m.group(1))), str(int(m.group(2)))
+    m_3 = re.match(r"^(\d)(\d{2})\s*반?$", s)
+    if m_3:
+        return str(int(m_3.group(1))), str(int(m_3.group(2)))
     m_cls = re.search(r"(\d+)\s*반", s)
     if m_cls:
-        return default_grade, m_cls.group(1)
+        dg = _norm_num(default_grade) or default_grade
+        return dg, str(int(m_cls.group(1)))
     return default_grade, default_class
 
 
@@ -558,10 +568,20 @@ class ComciganPlaywrightFetcher:
         except Exception:
             pass
 
-    def fetch(self) -> Dict[str, Any]:
+    def fetch(
+        self,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Dict[str, Any]:
         """Playwright로 컴시간 페이지에 접속해 시간표를 파싱합니다."""
         if not self.url:
             raise ValueError("컴시간 접속 URL이 비어 있습니다.")
+
+        def _report(pct: int, msg: str) -> None:
+            if progress_callback is not None:
+                try:
+                    progress_callback(max(0, min(100, int(pct))), msg)
+                except Exception:
+                    pass
 
         try:
             from playwright.sync_api import sync_playwright  # type: ignore
@@ -578,6 +598,7 @@ class ComciganPlaywrightFetcher:
         change_rows: List[Dict[str, Any]] = []
 
         try:
+            _report(5, "컴시간 웹 페이지 접속 중...")
             playwright_obj = sync_playwright().start()
             browser = playwright_obj.chromium.launch(headless=self.headless)
             context = browser.new_context()
@@ -613,13 +634,14 @@ class ComciganPlaywrightFetcher:
                 for o_idx in range(opts.count()):
                     opt = opts.nth(o_idx)
                     txt = (opt.inner_text() or "").strip()
-                    val = str(opt.get_attribute("value") or txt)
+                    raw_val = opt.get_attribute("value")
+                    val = txt if raw_val is None else str(raw_val)
                     if not txt or txt.startswith("-") or "선택" in txt:
                         continue
                     valid_opts.append((val, txt))
                     if re.search(r"\d{4}[-./]\d{1,2}[-./]\d{1,2}|~", txt):
                         matched_date.append((val, txt))
-                    elif re.search(r"\d+\s*(?:학년|[-/])\s*\d+", txt):
+                    elif re.search(r"\d+\s*(?:학년|[-/])\s*\d+|^\d{3}\s*반?$", txt):
                         matched_class.append((val, txt))
 
                 if matched_date and date_select is None:
@@ -647,11 +669,13 @@ class ComciganPlaywrightFetcher:
             # 1) 학급 시간표 추출 (담임반 지정 시 해당 반 우선, 전체 학급 모드면 전체 순회)
             if class_select is not None and class_options:
                 target_class_opts = class_options
-                if self.scope != "all_classes_and_teacher" and self.target_grade and self.target_class:
+                norm_tg = _norm_num(self.target_grade)
+                norm_tc = _norm_num(self.target_class)
+                if self.scope != "all_classes_and_teacher" and norm_tg and norm_tc:
                     filtered = [
                         (v, t)
                         for v, t in class_options
-                        if _extract_grade_class(t, "", "") == (self.target_grade, self.target_class)
+                        if _extract_grade_class(t, "", "") == (norm_tg, norm_tc)
                     ]
                     if filtered:
                         target_class_opts = filtered
@@ -660,7 +684,10 @@ class ComciganPlaywrightFetcher:
                 elif self.scope != "all_classes_and_teacher":
                     target_class_opts = class_options[:1]
 
-                for val, txt in target_class_opts[:60]:
+                total_cls = len(target_class_opts[:60])
+                for idx, (val, txt) in enumerate(target_class_opts[:60], start=1):
+                    pct = 10 + int(55 * idx / max(1, total_cls))
+                    _report(pct, f"학급 시간표 파싱 중 ({idx}/{total_cls}: {txt})")
                     class_select.select_option(val)
                     target_frame.wait_for_timeout(350)
                     g, c = _extract_grade_class(txt)
@@ -678,6 +705,7 @@ class ComciganPlaywrightFetcher:
                     for row in c_list:
                         seen_chg[row["remote_id"]] = row
             else:
+                _report(35, f"학급 시간표 파싱 중 ({self.target_grade or '1'}학년 {self.target_class or '1'}반)")
                 b_list, c_list = self.parse_html(
                     target_frame.content(),
                     grade_hint=self.target_grade or "1",
@@ -698,6 +726,7 @@ class ComciganPlaywrightFetcher:
                 partial = [(v, t) for v, t in teacher_options if self.teacher_name in t]
                 chosen = exact or partial
                 if chosen:
+                    _report(70, f"교사 시간표 파싱 중 ({self.teacher_name})")
                     teacher_select.select_option(chosen[0][0])
                     target_frame.wait_for_timeout(450)
                     b_t_list, c_t_list = self.parse_html(
@@ -718,6 +747,7 @@ class ComciganPlaywrightFetcher:
 
             base_rows = list(seen_base.values())
             change_rows = list(seen_chg.values())
+            _report(75, f"시간표 파싱 완료 (기본 {len(base_rows)}건, 변동 {len(change_rows)}건)")
 
             if not base_rows and not change_rows:
                 self._save_debug_snapshot(page)

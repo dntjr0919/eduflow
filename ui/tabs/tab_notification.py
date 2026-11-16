@@ -404,15 +404,21 @@ class NotificationCenterTab(QWidget):
         if self.date_comcigan.calendarWidget() is not None:
             self.date_comcigan.calendarWidget().setMinimumSize(320, 260)
 
-        self.edit_comcigan_grade = QLineEdit()
+        self.edit_comcigan_grade = QLineEdit(
+            str(self.config.get("api_and_integrations", "comcigan_target_grade", ""))
+        )
         self.edit_comcigan_grade.setMinimumHeight(34)
         self.edit_comcigan_grade.setFixedWidth(90)
         self.edit_comcigan_grade.setPlaceholderText("학년 (예: 1)")
+        self.edit_comcigan_grade.textChanged.connect(self._on_comcigan_config_changed)
 
-        self.edit_comcigan_class = QLineEdit()
+        self.edit_comcigan_class = QLineEdit(
+            str(self.config.get("api_and_integrations", "comcigan_target_class", ""))
+        )
         self.edit_comcigan_class.setMinimumHeight(34)
         self.edit_comcigan_class.setFixedWidth(90)
         self.edit_comcigan_class.setPlaceholderText("반 (예: 3)")
+        self.edit_comcigan_class.textChanged.connect(self._on_comcigan_config_changed)
 
         meta_row.addWidget(self.date_comcigan)
         meta_row.addWidget(QLabel("기본 학년:"))
@@ -737,6 +743,8 @@ class NotificationCenterTab(QWidget):
                 "comcigan_url": self.edit_comcigan_url.text().strip(),
                 "comcigan_school_code": self.edit_comcigan_school_code.text().strip(),
                 "comcigan_teacher_name": self.edit_comcigan_teacher_name.text().strip(),
+                "comcigan_target_grade": self.edit_comcigan_grade.text().strip(),
+                "comcigan_target_class": self.edit_comcigan_class.text().strip(),
                 "comcigan_auto_sync_enabled": self.chk_comcigan_auto_sync.isChecked(),
                 "comcigan_auto_sync_interval_min": int(
                     self.combo_comcigan_interval.currentData() or 30
@@ -786,6 +794,7 @@ class NotificationCenterTab(QWidget):
                 headless=True,
                 prev_snapshot_hash=self._last_comcigan_snapshot_hash,
                 skip_if_unchanged=True,
+                progress_callback=lambda pct, msg: _worker.emit_progress(pct, msg),
             )
 
         def _on_result(res: dict) -> None:
@@ -837,6 +846,9 @@ class NotificationCenterTab(QWidget):
             self.btn_auto_sync_comcigan.setEnabled(True)
 
         worker = FunctionWorker("컴시간 주기 자동 동기화", _run_periodic)
+        worker.signals.progress.connect(
+            lambda pct, msg: self.lbl_comcigan_auto_status.setText(f"진행 중 ({pct}%): {msg}")
+        )
         self.task_runner.start_worker(
             worker=worker,
             task_key="comcigan_auto_sync",
@@ -869,6 +881,7 @@ class NotificationCenterTab(QWidget):
         self.btn_auto_sync_comcigan.setEnabled(False)
         self._append_log(
             f"[컴시간 웹 자동 파싱 시작] URL={url}, 학교={school_code or '(미지정)'}, "
+            f"학년={grade or '(미지정)'}, 반={class_no or '(미지정)'}, "
             f"교사={teacher_name or '(미지정)'}, 범위={scope}, 날짜={target_date}"
         )
 
@@ -882,6 +895,7 @@ class NotificationCenterTab(QWidget):
                 target_class=class_no,
                 scope=scope,
                 headless=True,
+                progress_callback=lambda pct, msg: _worker.emit_progress(pct, msg),
             )
 
         def _on_result(res: dict) -> None:
@@ -927,7 +941,12 @@ class NotificationCenterTab(QWidget):
             self._comcigan_sync_running = False
             self.btn_auto_sync_comcigan.setEnabled(True)
 
+        def _on_progress(pct: int, msg: str) -> None:
+            self.lbl_comcigan_auto_status.setText(f"진행 중 ({pct}%): {msg}")
+            self._append_log(f"[진행 {pct}%] {msg}")
+
         worker = FunctionWorker("컴시간 웹 자동 파싱 및 시트 반영", _run_auto)
+        worker.signals.progress.connect(_on_progress)
         self.task_runner.start_worker(
             worker=worker,
             task_key="comcigan_auto_sync",

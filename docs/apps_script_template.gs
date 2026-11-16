@@ -895,6 +895,102 @@ function _upsertRowByRemoteId(sheet, schemaHeaders, data, tz) {
   return rid;
 }
 
+/**
+ * remote_id 기준으로 다수 행을 1회 일괄 조회 + setValues()로 대량 업서트(Bulk Upsert)
+ */
+function _bulkUpsertRowsByRemoteId(sheet, schemaHeaders, items, tz) {
+  if (!sheet || !Array.isArray(items) || items.length === 0) {
+    return 0;
+  }
+  var numCols = schemaHeaders.length;
+  var lastRow = sheet.getLastRow();
+  var existingValues = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, numCols).getValues() : [];
+
+  var ridToIndex = {};
+  for (var i = 0; i < existingValues.length; i++) {
+    var existingRid = (existingValues[i][0] || '').toString().trim();
+    if (existingRid) {
+      ridToIndex[existingRid] = i;
+    }
+  }
+
+  var nowStr = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd HH:mm:ss');
+  var hasUpdatedAt = schemaHeaders.indexOf('updated_at') >= 0;
+  var hasCreatedAt = schemaHeaders.indexOf('created_at') >= 0;
+  var newRows = [];
+  var newRidToIndex = {};
+  var hasUpdates = false;
+  var processed = 0;
+
+  for (var k = 0; k < items.length; k++) {
+    var rawItem = items[k];
+    if (!rawItem || typeof rawItem !== 'object') {
+      continue;
+    }
+    processed++;
+    var rid = (rawItem.remote_id || '').toString().trim();
+    if (!rid) {
+      rid = sheet.getName().toLowerCase() + '_' + new Date().getTime() + '_' + k + '_' + Math.floor(Math.random() * 1000);
+    }
+
+    if (ridToIndex.hasOwnProperty(rid)) {
+      var exIdx = ridToIndex[rid];
+      var exRow = existingValues[exIdx];
+      for (var j = 0; j < numCols; j++) {
+        var colName = schemaHeaders[j];
+        if (colName === 'remote_id') {
+          exRow[j] = rid;
+        } else if (colName === 'updated_at' && !rawItem.updated_at) {
+          exRow[j] = nowStr;
+        } else if (rawItem.hasOwnProperty(colName) && rawItem[colName] !== undefined && rawItem[colName] !== null) {
+          exRow[j] = typeof rawItem[colName] === 'object' ? JSON.stringify(rawItem[colName]) : rawItem[colName];
+        }
+      }
+      hasUpdates = true;
+    } else if (newRidToIndex.hasOwnProperty(rid)) {
+      var nrIdx = newRidToIndex[rid];
+      var nrRow = newRows[nrIdx];
+      for (var j2 = 0; j2 < numCols; j2++) {
+        var col2 = schemaHeaders[j2];
+        if (col2 === 'remote_id') {
+          nrRow[j2] = rid;
+        } else if (col2 === 'updated_at' && !rawItem.updated_at) {
+          nrRow[j2] = nowStr;
+        } else if (rawItem.hasOwnProperty(col2) && rawItem[col2] !== undefined && rawItem[col2] !== null) {
+          nrRow[j2] = typeof rawItem[col2] === 'object' ? JSON.stringify(rawItem[col2]) : rawItem[col2];
+        }
+      }
+    } else {
+      var rowValues = schemaHeaders.map(function (cName) {
+        if (cName === 'remote_id') {
+          return rid;
+        }
+        if (cName === 'updated_at' && hasUpdatedAt && !rawItem.updated_at) {
+          return nowStr;
+        }
+        if (cName === 'created_at' && hasCreatedAt && !rawItem.created_at) {
+          return nowStr;
+        }
+        if (rawItem.hasOwnProperty(cName) && rawItem[cName] !== undefined && rawItem[cName] !== null) {
+          return typeof rawItem[cName] === 'object' ? JSON.stringify(rawItem[cName]) : rawItem[cName];
+        }
+        return '';
+      });
+      newRidToIndex[rid] = newRows.length;
+      newRows.push(rowValues);
+    }
+  }
+
+  if (hasUpdates && existingValues.length > 0) {
+    sheet.getRange(2, 1, existingValues.length, numCols).setValues(existingValues);
+  }
+  if (newRows.length > 0) {
+    var startNewRow = Math.max(2, lastRow + 1);
+    sheet.getRange(startNewRow, 1, newRows.length, numCols).setValues(newRows);
+  }
+  return processed;
+}
+
 function _deleteRowByRemoteId(sheet, remoteId) {
   var rid = (remoteId || '').toString().trim();
   if (!rid || sheet.getLastRow() <= 1) {
@@ -1725,19 +1821,15 @@ function doPost(e) {
     if (action === 'upsert_timetable_base') {
       var tbList = Array.isArray(body.rows) ? body.rows : [body.data || body];
       var tbSheet = ss.getSheetByName('시간표_기본');
-      tbList.forEach(function (item) {
-        _upsertRowByRemoteId(tbSheet, SHEET_SCHEMAS['시간표_기본'], item, tz);
-      });
-      return _jsonResponse({ ok: true, upserted: tbList.length });
+      var tbCount = _bulkUpsertRowsByRemoteId(tbSheet, SHEET_SCHEMAS['시간표_기본'], tbList, tz);
+      return _jsonResponse({ ok: true, upserted: tbCount });
     }
 
     if (action === 'push_timetable_changes') {
       var tcList = Array.isArray(body.rows) ? body.rows : [body.data || body];
       var tcSheet = ss.getSheetByName('시간표_변동');
-      tcList.forEach(function (item) {
-        _upsertRowByRemoteId(tcSheet, SHEET_SCHEMAS['시간표_변동'], item, tz);
-      });
-      return _jsonResponse({ ok: true, upserted: tcList.length });
+      var tcCount = _bulkUpsertRowsByRemoteId(tcSheet, SHEET_SCHEMAS['시간표_변동'], tcList, tz);
+      return _jsonResponse({ ok: true, upserted: tcCount });
     }
 
     // ── 7. 1:1 상담 채팅 & 상담 ON/OFF 상태 동기화 ───────────────────────────

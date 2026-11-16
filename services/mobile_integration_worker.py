@@ -15,7 +15,7 @@ import re
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
@@ -154,8 +154,16 @@ def sync_comcigan_from_web(
     fetcher: Optional[ComciganPlaywrightFetcher] = None,
     prev_snapshot_hash: str = "",
     skip_if_unchanged: bool = False,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
     """Playwright로 컴시간 웹 시간표를 파싱한 뒤 시간표_기본 및 시간표_변동 시트로 반영합니다."""
+    def _report(pct: int, msg: str) -> None:
+        if progress_callback is not None:
+            try:
+                progress_callback(max(0, min(100, int(pct))), msg)
+            except Exception:
+                pass
+
     cfg_sec = ConfigManager().get_section("api_and_integrations") or {}
     eff_url = str(url or cfg_sec.get("comcigan_url", "") or "").strip()
     eff_code = str(school_code or cfg_sec.get("comcigan_school_code", "") or "").strip()
@@ -185,7 +193,11 @@ def sync_comcigan_from_web(
         scope=scope,
         headless=headless,
     )
-    fetched = active_fetcher.fetch()
+    fetched = (
+        active_fetcher.fetch(progress_callback=progress_callback)
+        if progress_callback is not None
+        else active_fetcher.fetch()
+    )
     base_rows = list(fetched.get("base_rows") or [])
     change_rows = list(fetched.get("change_rows") or [])
     cls_cnt = int(fetched.get("class_base_count", len(base_rows)) or 0)
@@ -214,6 +226,7 @@ def sync_comcigan_from_web(
 
     # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 보완 (entry_type == "class" 우선)
     if change_rows:
+        _report(78, "기존 기본 시간표 조회 및 변동 과목 매칭 중...")
         class_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
         fallback_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
         teacher_lookup: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
@@ -271,9 +284,39 @@ def sync_comcigan_from_web(
                 if not chg.get("original_teacher"):
                     chg["original_teacher"] = matched[1]
 
-    base_ok = svc.upsert_timetable_base(base_rows) if base_rows else True
-    chg_ok = svc.push_timetable_changes(change_rows) if change_rows else True
+    if base_rows:
+        _report(82, f"Google Sheets 기본 시간표 반영 중 ({len(base_rows)}건)...")
+        if progress_callback is not None:
+            base_ok = svc.upsert_timetable_base(
+                base_rows,
+                progress_callback=lambda b_idx, b_tot: _report(
+                    82 + int(10 * b_idx / max(1, b_tot)),
+                    f"Google Sheets 기본 시간표 반영 중 ({b_idx}/{b_tot} 배치)",
+                ),
+            )
+        else:
+            base_ok = svc.upsert_timetable_base(base_rows)
+    else:
+        base_ok = True
+
+    if change_rows:
+        _report(93, f"Google Sheets 시간표 변동 반영 중 ({len(change_rows)}건)...")
+        if progress_callback is not None:
+            chg_ok = svc.push_timetable_changes(
+                change_rows,
+                progress_callback=lambda b_idx, b_tot: _report(
+                    93 + int(6 * b_idx / max(1, b_tot)),
+                    f"Google Sheets 시간표 변동 반영 중 ({b_idx}/{b_tot} 배치)",
+                ),
+            )
+        else:
+            chg_ok = svc.push_timetable_changes(change_rows)
+    else:
+        chg_ok = True
+
     ok = base_ok and chg_ok
+    if ok:
+        _report(100, f"동기화 완료 (기본 {len(base_rows)}건, 변동 {len(change_rows)}건)")
 
     failed_steps: List[str] = []
     if not base_ok:

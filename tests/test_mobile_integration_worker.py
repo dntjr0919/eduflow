@@ -193,23 +193,37 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         self.assertEqual(len(t_base), 1)
         self.assertEqual(t_base[0]["remote_id"], "tb_t_홍길동_화_1")
 
-        self.assertEqual(len(t_chg), 3)
-        # 1) 빈 <td class="변경"></td> in teacher mode -> no homeroom grade/class leak
-        empty_chg = [c for c in t_chg if c["period"] == "1"][0]
-        self.assertEqual(empty_chg["grade"], "")
-        self.assertEqual(empty_chg["class_no"], "")
-        self.assertEqual(empty_chg["changed_subject"], "수업없음(휴업/공강)")
-        self.assertEqual(empty_chg["remote_id"], "tc_t_20261116_홍길동_1")
-        # 2) <del>2-4 수학</del> 자습 -> preserves grade/class from deleted_txt
+        self.assertEqual(len(t_chg), 2)
+        # 1) <del>2-4 수학</del> 자습 -> preserves grade/class from deleted_txt
         del_chg = [c for c in t_chg if c["period"] == "2" and c["changed_subject"] == "자습"][0]
         self.assertEqual(del_chg["grade"], "2")
         self.assertEqual(del_chg["class_no"], "4")
         self.assertEqual(del_chg["original_subject"], "수학")
-        # 3) arrow_match without grade/class in teacher mode -> no homeroom leak
+        # 2) arrow_match without grade/class in teacher mode -> no homeroom leak
         arrow_chg = [c for c in t_chg if c["period"] == "2" and c["changed_subject"] == "보강"][0]
         self.assertEqual(arrow_chg["grade"], "")
         self.assertEqual(arrow_chg["class_no"], "")
         self.assertEqual(arrow_chg["remote_id"], "tc_t_20261117_홍길동_2")
+
+        # 3) mode="class"에서 빈 <td class="변경"></td>는 "수업없음(휴업/공강)"으로 추출
+        class_html = """
+        <html><body>
+          <table>
+            <caption>1학년 5반 시간표</caption>
+            <tr><th>교시</th><th>월</th><th>화</th></tr>
+            <tr><td>1</td><td class="변경"></td><td>국어</td></tr>
+          </table>
+        </body></html>
+        """
+        c_base, c_chg = ComciganPlaywrightFetcher.parse_html(
+            class_html, target_date="2026-11-16", mode="class"
+        )
+        self.assertEqual(len(c_base), 1)
+        self.assertEqual(c_base[0]["subject"], "국어")
+        self.assertEqual(len(c_chg), 1)
+        self.assertEqual(c_chg[0]["grade"], "1")
+        self.assertEqual(c_chg[0]["class_no"], "5")
+        self.assertEqual(c_chg[0]["changed_subject"], "수업없음(휴업/공강)")
 
     def test_sync_comcigan_from_web_prefers_class_entry_and_reports_step_errors(self) -> None:
         from services.mobile_integration_worker import sync_comcigan_from_web
@@ -273,6 +287,80 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         pushed_changes = fake_sync.push_timetable_changes.call_args.args[0]
         self.assertEqual(pushed_changes[0]["original_subject"], "학급기본수학")
         self.assertEqual(pushed_changes[0]["original_teacher"], "이담임")
+
+    def test_extract_grade_class_variants_and_chunked_sync_with_progress(self) -> None:
+        import inspect
+        from services.comcigan_playwright_fetcher import _extract_grade_class
+        from services.google_sheets_sync_service import GoogleSheetsSyncService
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        self.assertEqual(_extract_grade_class("1-05", "", ""), ("1", "5"))
+        self.assertEqual(_extract_grade_class("1학년 05반", "", ""), ("1", "5"))
+        self.assertEqual(_extract_grade_class("105", "", ""), ("1", "5"))
+        self.assertEqual(_extract_grade_class("105반", "", ""), ("1", "5"))
+
+        sig_base = inspect.signature(GoogleSheetsSyncService.upsert_timetable_base)
+        sig_chg = inspect.signature(GoogleSheetsSyncService.push_timetable_changes)
+        self.assertGreaterEqual(sig_base.parameters["timeout"].default, 60.0)
+        self.assertGreaterEqual(sig_chg.parameters["timeout"].default, 60.0)
+
+        svc = GoogleSheetsSyncService(db=MagicMock())
+        rows = [{"remote_id": f"tb_c_1_5_월_{i}"} for i in range(250)]
+        batch_events = []
+        with patch.object(
+            svc,
+            "_resolve_urls",
+            return_value=("https://script.google.com/macros/s/demo/exec", "sheet123"),
+        ), patch(
+            "services.google_sheets_sync_service._http_post_json",
+            return_value={"ok": True},
+        ) as mock_post:
+            ok = svc.upsert_timetable_base(
+                rows,
+                chunk_size=100,
+                progress_callback=lambda b, tot: batch_events.append((b, tot)),
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(mock_post.call_count, 3)
+        self.assertEqual(batch_events, [(1, 3), (2, 3), (3, 3)])
+
+        progress_msgs = []
+        fake_fetcher = MagicMock()
+        fake_fetcher.fetch.return_value = {
+            "ok": True,
+            "base_rows": [{"remote_id": "tb_c_1_5_월_1"}],
+            "change_rows": [{"remote_id": "tc_20261116_1_5_1"}],
+        }
+        fake_sync = MagicMock()
+        fake_sync.fetch_sheet_rows.return_value = []
+        fake_sync.upsert_timetable_base.side_effect = (
+            lambda r, progress_callback=None: (progress_callback(1, 2), progress_callback(2, 2), True)[-1]
+        )
+        fake_sync.push_timetable_changes.side_effect = (
+            lambda r, progress_callback=None: (progress_callback(1, 1), True)[-1]
+        )
+
+        res = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            target_grade="1",
+            target_class="5",
+            sync_service=fake_sync,
+            fetcher=fake_fetcher,
+            progress_callback=lambda pct, msg: progress_msgs.append((pct, msg)),
+        )
+        self.assertTrue(res["ok"])
+        fake_fetcher.fetch.assert_called_once()
+        self.assertTrue(any("1/2 배치" in m for _, m in progress_msgs))
+        self.assertTrue(any("동기화 완료" in m for _, m in progress_msgs))
+
+    def test_gas_template_uses_bulk_upsert_for_timetable(self) -> None:
+        gs_path = Path("docs/apps_script_template.gs")
+        text = gs_path.read_text(encoding="utf-8")
+        self.assertIn("function _bulkUpsertRowsByRemoteId", text)
+        self.assertIn("_bulkUpsertRowsByRemoteId(tbSheet", text)
+        self.assertIn("_bulkUpsertRowsByRemoteId(tcSheet", text)
 
 
 if __name__ == "__main__":

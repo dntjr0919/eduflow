@@ -508,75 +508,103 @@ class GoogleSheetsSyncService:
             self.db.add_log("WARN", "GoogleSheetsSync", f"시트 조회 실패 ({sheet_name}): {exc}")
             return []
 
+    def _post_timetable_chunks(
+        self,
+        action: str,
+        label: str,
+        rows: List[Dict[str, Any]],
+        apps_script_url: str = "",
+        sheet_url: str = "",
+        timeout: float = 60.0,
+        api_secret: str = "",
+        chunk_size: int = 100,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
+        if not gas_url or not rows:
+            return False
+        size = max(1, int(chunk_size or 100))
+        total_batches = (len(rows) + size - 1) // size
+        try:
+            for batch_idx, start in enumerate(range(0, len(rows), size), start=1):
+                if progress_callback is not None:
+                    try:
+                        progress_callback(batch_idx, total_batches)
+                    except Exception:
+                        pass
+                chunk = rows[start : start + size]
+                payload = self._with_api_secret(
+                    {
+                        "action": action,
+                        "sheetId": sheet_id,
+                        "rows": chunk,
+                    },
+                    api_secret=api_secret,
+                )
+                res = _http_post_json(
+                    gas_url,
+                    payload,
+                    timeout=timeout,
+                )
+                ok = bool(res.get("ok", True))
+                if not ok:
+                    err_msg = res.get("error") or res.get("message") or str(res)
+                    self.db.add_log(
+                        "WARN",
+                        "GoogleSheetsSync",
+                        f"{label} GAS 오류 ({batch_idx}/{total_batches} 배치): {err_msg}",
+                    )
+                    return False
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "GoogleSheetsSync", f"{label} 실패: {exc}")
+            return False
+
     def upsert_timetable_base(
         self,
         rows: List[Dict[str, Any]],
         apps_script_url: str = "",
         sheet_url: str = "",
-        timeout: float = 30.0,
+        timeout: float = 60.0,
         api_secret: str = "",
+        chunk_size: int = 100,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 기본 시간표를 시간표_기본 시트로 Upsert합니다."""
-        gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
-        if not gas_url or not rows:
-            return False
-        try:
-            payload = self._with_api_secret(
-                {
-                    "action": "upsert_timetable_base",
-                    "sheetId": sheet_id,
-                    "rows": rows,
-                },
-                api_secret=api_secret,
-            )
-            res = _http_post_json(
-                gas_url,
-                payload,
-                timeout=timeout,
-            )
-            ok = bool(res.get("ok", True))
-            if not ok:
-                err_msg = res.get("error") or res.get("message") or str(res)
-                self.db.add_log("WARN", "GoogleSheetsSync", f"기본 시간표 Upsert GAS 오류: {err_msg}")
-            return ok
-        except Exception as exc:
-            self.db.add_log("WARN", "GoogleSheetsSync", f"기본 시간표 Upsert 실패: {exc}")
-            return False
+        return self._post_timetable_chunks(
+            action="upsert_timetable_base",
+            label="기본 시간표 Upsert",
+            rows=rows,
+            apps_script_url=apps_script_url,
+            sheet_url=sheet_url,
+            timeout=timeout,
+            api_secret=api_secret,
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+        )
 
     def push_timetable_changes(
         self,
         rows: List[Dict[str, Any]],
         apps_script_url: str = "",
         sheet_url: str = "",
-        timeout: float = 30.0,
+        timeout: float = 60.0,
         api_secret: str = "",
+        chunk_size: int = 100,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 시간표 변동 내역을 시간표_변동 시트로 Push합니다."""
-        gas_url, sheet_id = self._resolve_urls(apps_script_url, sheet_url)
-        if not gas_url or not rows:
-            return False
-        try:
-            payload = self._with_api_secret(
-                {
-                    "action": "push_timetable_changes",
-                    "sheetId": sheet_id,
-                    "rows": rows,
-                },
-                api_secret=api_secret,
-            )
-            res = _http_post_json(
-                gas_url,
-                payload,
-                timeout=timeout,
-            )
-            ok = bool(res.get("ok", True))
-            if not ok:
-                err_msg = res.get("error") or res.get("message") or str(res)
-                self.db.add_log("WARN", "GoogleSheetsSync", f"시간표 변동 Push GAS 오류: {err_msg}")
-            return ok
-        except Exception as exc:
-            self.db.add_log("WARN", "GoogleSheetsSync", f"시간표 변동 Push 실패: {exc}")
-            return False
+        return self._post_timetable_chunks(
+            action="push_timetable_changes",
+            label="시간표 변동 Push",
+            rows=rows,
+            apps_script_url=apps_script_url,
+            sheet_url=sheet_url,
+            timeout=timeout,
+            api_secret=api_secret,
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+        )
 
     def push_local_item(
         self,
