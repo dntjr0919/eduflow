@@ -141,6 +141,115 @@ def compute_comcigan_snapshot_hash(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _compute_row_hash(row: Dict[str, Any]) -> str:
+    """개별 시간표 행(remote_id 기준)의 결정적 SHA-256 해시를 계산합니다."""
+    cleaned = {k: v for k, v in (row or {}).items() if k != "updated_at"}
+    payload = json.dumps(cleaned, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _row_remote_id(collection_name: str, row: Dict[str, Any], idx: int) -> str:
+    rid = str((row or {}).get("remote_id") or "").strip()
+    if rid:
+        return rid.replace("/", "_")
+    h = _compute_row_hash(row)[:16]
+    return f"{collection_name}_{idx}_{h}"
+
+
+def _default_comcigan_cache_path() -> Path:
+    from utils.path_helper import get_data_path
+
+    return Path(get_data_path("comcigan_sync_cache.json", ensure_parent=True))
+
+
+def _load_comcigan_cache(cache_path: Path, cache_key: str) -> Dict[str, Any]:
+    if not cache_path.is_file():
+        return {}
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            entry = raw.get(cache_key)
+            return dict(entry) if isinstance(entry, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_comcigan_cache(cache_path: Path, cache_key: str, entry: Dict[str, Any]) -> None:
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        raw: Dict[str, Any] = {}
+        if cache_path.is_file():
+            try:
+                loaded = json.loads(cache_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    raw = loaded
+            except Exception:
+                raw = {}
+        raw[cache_key] = entry
+        cache_path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        _LOGGER.debug("컴시간 로컬 캐시 저장 실패: %s", exc)
+
+
+def compute_timetable_delta(
+    prev_cache: Dict[str, Any],
+    base_rows: List[Dict[str, Any]],
+    change_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    직전 로컬 스냅샷(remote_id별 해시)과 비교해 추가·수정·삭제된 Delta만 추출합니다.
+    """
+    prev_base_hashes: Dict[str, str] = dict(prev_cache.get("base_hashes") or {})
+    prev_chg_hashes: Dict[str, str] = dict(prev_cache.get("change_hashes") or {})
+
+    curr_base_hashes: Dict[str, str] = {}
+    curr_base_map: Dict[str, Dict[str, Any]] = {}
+    base_delta: List[Dict[str, Any]] = []
+    for idx, row in enumerate(base_rows):
+        if not isinstance(row, dict):
+            continue
+        rid = _row_remote_id("tb", row, idx)
+        r_hash = _compute_row_hash(row)
+        curr_base_hashes[rid] = r_hash
+        curr_base_map[rid] = row
+        if prev_base_hashes.get(rid) != r_hash:
+            base_delta.append(row)
+
+    deleted_base_ids = (
+        [rid for rid in prev_base_hashes if rid not in curr_base_hashes]
+        if base_rows and prev_base_hashes
+        else []
+    )
+
+    curr_chg_hashes: Dict[str, str] = {}
+    change_delta: List[Dict[str, Any]] = []
+    for idx, row in enumerate(change_rows):
+        if not isinstance(row, dict):
+            continue
+        rid = _row_remote_id("tc", row, idx)
+        r_hash = _compute_row_hash(row)
+        curr_chg_hashes[rid] = r_hash
+        if prev_chg_hashes.get(rid) != r_hash:
+            change_delta.append(row)
+
+    deleted_change_ids = (
+        [rid for rid in prev_chg_hashes if rid not in curr_chg_hashes]
+        if prev_chg_hashes
+        else []
+    )
+
+    return {
+        "base_delta": base_delta,
+        "change_delta": change_delta,
+        "deleted_base_ids": deleted_base_ids,
+        "deleted_change_ids": deleted_change_ids,
+        "curr_base_hashes": curr_base_hashes,
+        "curr_chg_hashes": curr_chg_hashes,
+        "curr_base_map": curr_base_map,
+    }
+
+
 def sync_comcigan_from_web(
     url: str = "",
     school_code: str = "",
@@ -154,6 +263,9 @@ def sync_comcigan_from_web(
     fetcher: Optional[ComciganPlaywrightFetcher] = None,
     prev_snapshot_hash: str = "",
     skip_if_unchanged: bool = False,
+    force_full: bool = False,
+    cache_path: Optional[Path | str] = None,
+    use_local_cache: bool = True,
     progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
     """Playwright로 컴시간 웹 시간표를 파싱한 뒤 시간표_기본 및 시간표_변동 시트로 반영합니다."""
@@ -168,10 +280,15 @@ def sync_comcigan_from_web(
     cfg_sec = cfg_mgr.get_section("api_and_integrations") or {}
     tp_sec = cfg_mgr.get_section("teacher_profile") or {}
     eff_url = str(url or cfg_sec.get("comcigan_url", "") or "").strip()
-    eff_code = str(
+    eff_comcigan_code = str(
         school_code
-        or tp_sec.get("neis_school_code")
         or cfg_sec.get("comcigan_school_code", "")
+        or tp_sec.get("comcigan_school_code", "")
+        or ""
+    ).strip()
+    eff_neis_code = str(
+        tp_sec.get("school_code")
+        or tp_sec.get("neis_school_code")
         or ""
     ).strip()
     eff_school_name = str(tp_sec.get("school_name") or "").strip()
@@ -181,6 +298,7 @@ def sync_comcigan_from_web(
         or tp_sec.get("name")
         or ""
     ).strip()
+    eff_teacher_id = str(tp_sec.get("teacher_id") or eff_teacher or "").strip()
     eff_date = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()
 
     if not eff_url and fetcher is None:
@@ -198,7 +316,9 @@ def sync_comcigan_from_web(
 
     active_fetcher = fetcher or ComciganPlaywrightFetcher(
         url=eff_url,
-        school_code=eff_code,
+        school_code=eff_comcigan_code or eff_neis_code,
+        comcigan_school_code=eff_comcigan_code,
+        school_name=eff_school_name,
         target_date=eff_date,
         teacher_name=eff_teacher,
         target_grade=str(target_grade or "").strip(),
@@ -219,8 +339,10 @@ def sync_comcigan_from_web(
     for b_row in base_rows:
         if not isinstance(b_row, dict):
             continue
-        if eff_code and not b_row.get("school_code"):
-            b_row["school_code"] = eff_code
+        if eff_neis_code and not b_row.get("school_code"):
+            b_row["school_code"] = eff_neis_code
+        if eff_comcigan_code and not b_row.get("comcigan_school_code"):
+            b_row["comcigan_school_code"] = eff_comcigan_code
         if eff_school_name and not b_row.get("school_name"):
             b_row["school_name"] = eff_school_name
         if not b_row.get("source"):
@@ -233,8 +355,10 @@ def sync_comcigan_from_web(
     for c_row in change_rows:
         if not isinstance(c_row, dict):
             continue
-        if eff_code and not c_row.get("school_code"):
-            c_row["school_code"] = eff_code
+        if eff_neis_code and not c_row.get("school_code"):
+            c_row["school_code"] = eff_neis_code
+        if eff_comcigan_code and not c_row.get("comcigan_school_code"):
+            c_row["comcigan_school_code"] = eff_comcigan_code
         if eff_school_name and not c_row.get("school_name"):
             c_row["school_name"] = eff_school_name
         if not c_row.get("source") or c_row.get("source") == "comcigan_playwright":
@@ -248,37 +372,66 @@ def sync_comcigan_from_web(
     tch_cnt = int(fetched.get("teacher_base_count", 0) or 0)
     snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows)
 
-    if skip_if_unchanged and prev_snapshot_hash and snap_hash == prev_snapshot_hash:
-        return {
-            "ok": True,
-            "skipped": True,
-            "changed": False,
-            "snapshot_hash": snap_hash,
-            "url": eff_url,
-            "school_code": eff_code,
-            "target_date": eff_date,
-            "base_count": len(base_rows),
-            "class_base_count": cls_cnt,
-            "teacher_base_count": tch_cnt,
-            "change_count": len(change_rows),
-            "base_pushed": 0,
-            "changes_pushed": 0,
-            "error": "",
-        }
-
+    resolved_cache_path = Path(cache_path) if cache_path is not None else _default_comcigan_cache_path()
+    cache_key = f"{eff_neis_code or eff_comcigan_code or 'default'}|{eff_teacher}|{scope}|{target_grade}|{target_class}"
+    prev_cache = {} if force_full else (_load_comcigan_cache(resolved_cache_path, cache_key) if use_local_cache else {})
     svc = sync_service or FirestoreSyncService()
 
-    # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 보완 (entry_type == "class" 우선)
+    def _is_remote_empty() -> bool:
+        if not hasattr(svc, "has_timetable_base_docs"):
+            return False
+        exists = svc.has_timetable_base_docs(
+            school_code=eff_neis_code,
+            comcigan_school_code=eff_comcigan_code,
+            school_name=eff_school_name,
+        )
+        return exists is False
+
+    effective_prev_hash = "" if force_full else (prev_snapshot_hash or str(prev_cache.get("snapshot_hash") or ""))
+    if not force_full and (skip_if_unchanged or use_local_cache) and effective_prev_hash and snap_hash == effective_prev_hash:
+        if _is_remote_empty():
+            _LOGGER.info("Firestore 시간표_기본 문서가 0건으로 감지되어 로컬 캐시를 무효화하고 전체 재동기화합니다.")
+            prev_cache = {}
+            effective_prev_hash = ""
+        else:
+            _report(100, "변경된 시간표가 없어 동기화를 건너뛰었습니다 (0건 반영)")
+            return {
+                "ok": True,
+                "skipped": True,
+                "changed": False,
+                "snapshot_hash": snap_hash,
+                "url": eff_url,
+                "school_code": eff_neis_code,
+                "comcigan_school_code": eff_comcigan_code,
+                "target_date": eff_date,
+                "base_count": len(base_rows),
+                "class_base_count": cls_cnt,
+                "teacher_base_count": tch_cnt,
+                "change_count": len(change_rows),
+                "base_pushed": 0,
+                "changes_pushed": 0,
+                "base_deleted": 0,
+                "changes_deleted": 0,
+                "error": "",
+            }
+
+    # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 로컬 캐시 기준으로 보완 (Firestore 전체 읽기 제거)
     if change_rows:
-        _report(78, "기존 기본 시간표 조회 및 변동 과목 매칭 중...")
+        _report(78, "로컬 기본 시간표와 변동 과목 매칭 중...")
         class_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
         fallback_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
         teacher_lookup: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
-        try:
-            existing_base = svc.fetch_sheet_rows("시간표_기본") or []
-        except Exception:
-            existing_base = []
-        for b in list(existing_base) + list(base_rows):
+        cached_base_rows = list((prev_cache.get("base_rows") or {}).values())
+        needs_orig_lookup = any(
+            str(c.get("original_subject") or "").strip() == "(기존수업)"
+            for c in change_rows
+        )
+        if not cached_base_rows and needs_orig_lookup and sync_service is not None:
+            try:
+                cached_base_rows = sync_service.fetch_sheet_rows("시간표_기본") or []
+            except Exception:
+                cached_base_rows = []
+        for b in cached_base_rows + list(base_rows):
             if not isinstance(b, dict):
                 continue
             g_val = str(b.get("grade") or "").strip()
@@ -328,48 +481,117 @@ def sync_comcigan_from_web(
                 if not chg.get("original_teacher"):
                     chg["original_teacher"] = matched[1]
 
-    if base_rows:
-        _report(82, f"Google Sheets 기본 시간표 반영 중 ({len(base_rows)}건)...")
+    snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows)
+    delta = (
+        compute_timetable_delta(prev_cache, base_rows, change_rows)
+        if (use_local_cache and not force_full)
+        else {
+            "base_delta": base_rows,
+            "change_delta": change_rows,
+            "deleted_base_ids": [],
+            "deleted_change_ids": [],
+            "curr_base_hashes": {_row_remote_id("tb", r, i): _compute_row_hash(r) for i, r in enumerate(base_rows) if isinstance(r, dict)},
+            "curr_chg_hashes": {_row_remote_id("tc", r, i): _compute_row_hash(r) for i, r in enumerate(change_rows) if isinstance(r, dict)},
+            "curr_base_map": {_row_remote_id("tb", r, i): r for i, r in enumerate(base_rows) if isinstance(r, dict)},
+        }
+    )
+    base_delta: List[Dict[str, Any]] = delta["base_delta"]
+    change_delta: List[Dict[str, Any]] = delta["change_delta"]
+    deleted_base_ids: List[str] = delta["deleted_base_ids"]
+    deleted_change_ids: List[str] = delta["deleted_change_ids"]
+
+    if not force_full and use_local_cache and not base_delta and not change_delta and not deleted_base_ids and not deleted_change_ids:
+        if _is_remote_empty():
+            _LOGGER.info("Firestore 시간표_기본 문서가 0건으로 감지되어 전체 재동기화합니다.")
+            base_delta = list(base_rows)
+            change_delta = list(change_rows)
+            deleted_base_ids = []
+            deleted_change_ids = []
+        else:
+            _report(100, "변경된 항목이 없어 동기화를 건너뛰었습니다 (0건 반영)")
+            return {
+                "ok": True,
+                "skipped": True,
+                "changed": False,
+                "snapshot_hash": snap_hash,
+                "url": eff_url,
+                "school_code": eff_neis_code,
+                "comcigan_school_code": eff_comcigan_code,
+                "target_date": eff_date,
+                "base_count": len(base_rows),
+                "class_base_count": cls_cnt,
+                "teacher_base_count": tch_cnt,
+                "change_count": len(change_rows),
+                "base_pushed": 0,
+                "changes_pushed": 0,
+                "base_deleted": 0,
+                "changes_deleted": 0,
+                "error": "",
+            }
+
+    if eff_comcigan_code and eff_teacher_id and (force_full or str(prev_cache.get("comcigan_school_code") or "") != eff_comcigan_code):
+        svc.update_teacher_comcigan_code(eff_teacher_id, eff_comcigan_code)
+
+    if base_delta:
+        _report(82, f"Firestore 기본 시간표 변경분 반영 중 ({len(base_delta)}건)...")
         if progress_callback is not None:
             base_ok = svc.upsert_timetable_base(
-                base_rows,
+                base_delta,
                 progress_callback=lambda b_idx, b_tot: _report(
                     82 + int(10 * b_idx / max(1, b_tot)),
-                    f"Google Sheets 기본 시간표 반영 중 ({b_idx}/{b_tot} 배치)",
+                    f"Firestore 기본 시간표 변경분 반영 중 ({b_idx}/{b_tot} 배치)",
                 ),
             )
         else:
-            base_ok = svc.upsert_timetable_base(base_rows)
+            base_ok = svc.upsert_timetable_base(base_delta)
     else:
         base_ok = True
 
-    if change_rows:
-        _report(93, f"Google Sheets 시간표 변동 반영 중 ({len(change_rows)}건)...")
+    if base_ok and deleted_base_ids and hasattr(svc, "delete_timetable_docs"):
+        base_ok = svc.delete_timetable_docs("시간표_기본", deleted_base_ids)
+
+    if change_delta:
+        _report(93, f"Firestore 시간표 변동 변경분 반영 중 ({len(change_delta)}건)...")
         if progress_callback is not None:
             chg_ok = svc.push_timetable_changes(
-                change_rows,
+                change_delta,
                 progress_callback=lambda b_idx, b_tot: _report(
                     93 + int(6 * b_idx / max(1, b_tot)),
-                    f"Google Sheets 시간표 변동 반영 중 ({b_idx}/{b_tot} 배치)",
+                    f"Firestore 시간표 변동 변경분 반영 중 ({b_idx}/{b_tot} 배치)",
                 ),
             )
         else:
-            chg_ok = svc.push_timetable_changes(change_rows)
+            chg_ok = svc.push_timetable_changes(change_delta)
     else:
         chg_ok = True
 
+    if chg_ok and deleted_change_ids and hasattr(svc, "delete_timetable_docs"):
+        chg_ok = svc.delete_timetable_docs("시간표_변동", deleted_change_ids)
+
     ok = base_ok and chg_ok
     if ok:
-        _report(100, f"동기화 완료 (기본 {len(base_rows)}건, 변동 {len(change_rows)}건)")
+        if use_local_cache:
+            _save_comcigan_cache(
+                resolved_cache_path,
+                cache_key,
+                {
+                    "snapshot_hash": snap_hash,
+                    "comcigan_school_code": eff_comcigan_code,
+                    "base_hashes": delta["curr_base_hashes"],
+                    "change_hashes": delta["curr_chg_hashes"],
+                    "base_rows": delta["curr_base_map"],
+                },
+            )
+        _report(100, f"동기화 완료 (기본 +{len(base_delta)}건, 변동 +{len(change_delta)}건)")
 
     failed_steps: List[str] = []
     if not base_ok:
-        failed_steps.append(f"시간표_기본 Upsert 실패 ({len(base_rows)}건)")
+        failed_steps.append(f"시간표_기본 Upsert 실패 ({len(base_delta)}건)")
     if not chg_ok:
-        failed_steps.append(f"시간표_변동 Push 실패 ({len(change_rows)}건)")
+        failed_steps.append(f"시간표_변동 Push 실패 ({len(change_delta)}건)")
     error_msg = ", ".join(failed_steps)
     if error_msg:
-        _LOGGER.warning("컴시간 Google Sheets 동기화 실패: %s", error_msg)
+        _LOGGER.warning("컴시간 Firestore 동기화 실패: %s", error_msg)
 
     return {
         "ok": ok,
@@ -377,14 +599,17 @@ def sync_comcigan_from_web(
         "changed": True,
         "snapshot_hash": snap_hash,
         "url": eff_url,
-        "school_code": eff_code,
+        "school_code": eff_neis_code,
+        "comcigan_school_code": eff_comcigan_code,
         "target_date": eff_date,
         "base_count": len(base_rows),
         "class_base_count": cls_cnt,
         "teacher_base_count": tch_cnt,
         "change_count": len(change_rows),
-        "base_pushed": len(base_rows) if base_ok else 0,
-        "changes_pushed": len(change_rows) if chg_ok else 0,
+        "base_pushed": len(base_delta) if base_ok else 0,
+        "changes_pushed": len(change_delta) if chg_ok else 0,
+        "base_deleted": len(deleted_base_ids) if base_ok else 0,
+        "changes_deleted": len(deleted_change_ids) if chg_ok else 0,
         "error": error_msg,
     }
 

@@ -328,6 +328,7 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             target_class="5",
             sync_service=fake_sync,
             fetcher=fake_fetcher,
+            use_local_cache=False,
             progress_callback=lambda pct, msg: progress_msgs.append((pct, msg)),
         )
         self.assertTrue(res["ok"])

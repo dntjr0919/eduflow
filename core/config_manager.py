@@ -56,6 +56,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "google_credentials_path": "",
         "google_sheet_url": "",
         "google_apps_script_url": "",
+        "vercel_api_url": "https://26oshs1-5.eduflow.kro.kr/api/firestore",
         "google_sheet_poll_interval_sec": 30,
         "sync_on_startup": True,
         "comcigan_url": "",

@@ -7,6 +7,7 @@ Firebase Admin SDK 초기화 및 Firestore 클라이언트 제공 모듈.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -16,13 +17,17 @@ from firebase_admin import credentials, firestore
 DEFAULT_SERVICE_ACCOUNT_FILENAME = "eduflow-db-b44f3-5692e5dea8c3.json"
 
 
-def _resolve_local_cred_path(cred_path: Optional[str] = None) -> Optional[Path]:
+def resolve_local_cred_path(cred_path: Optional[str] = None) -> Optional[Path]:
     candidates = []
     if cred_path:
         candidates.append(Path(cred_path))
     env_path = os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH", "").strip()
     if env_path:
         candidates.append(Path(env_path))
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.append(exe_dir / DEFAULT_SERVICE_ACCOUNT_FILENAME)
 
     project_root = Path(__file__).resolve().parent.parent
     candidates.append(project_root / DEFAULT_SERVICE_ACCOUNT_FILENAME)
@@ -32,6 +37,20 @@ def _resolve_local_cred_path(cred_path: Optional[str] = None) -> Optional[Path]:
         if path.is_file():
             return path
     return None
+
+
+def _resolve_local_cred_path(cred_path: Optional[str] = None) -> Optional[Path]:
+    return resolve_local_cred_path(cred_path)
+
+
+def has_local_credentials(cred_path: Optional[str] = None) -> bool:
+    """로컬 서비스 계정 JSON 키 파일 또는 Firebase 환경변수가 존재하는지 확인합니다."""
+    if resolve_local_cred_path(cred_path) is not None:
+        return True
+    project_id = os.environ.get("FIREBASE_PROJECT_ID", "").strip()
+    client_email = os.environ.get("FIREBASE_CLIENT_EMAIL", "").strip()
+    private_key = os.environ.get("FIREBASE_PRIVATE_KEY", "").strip()
+    return bool(project_id and client_email and private_key)
 
 
 def _build_credential(cred_path: Optional[str] = None) -> credentials.Certificate:

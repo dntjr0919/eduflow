@@ -172,8 +172,12 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         self.cfg.save()
 
     def test_teacher_login_and_dynamic_roster_binding(self) -> None:
+        from PyQt6.QtWidgets import QGraphicsBlurEffect
+
         tab = ClassroomToolsTab(task_runner=self.task_runner)
-        self.assertTrue(tab.auth_lock_overlay.isVisibleTo(tab) or not tab.pill_bar.isVisible())
+        self.assertIsInstance(tab._main_scroll.graphicsEffect(), QGraphicsBlurEffect)
+        self.assertFalse(tab.auth_overlay_backdrop.isHidden())
+        self.assertTrue(tab.auth_status_widget.isHidden())
 
         ok, err = tab.login_teacher("유우석", "wrong_pw", sync_service=self.sync_svc)
         self.assertFalse(ok)
@@ -181,13 +185,15 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
 
         ok, err = tab.login_teacher("유우석", "pw1234", sync_service=self.sync_svc)
         self.assertTrue(ok, err)
+        self.assertIsNone(tab._main_scroll.graphicsEffect())
+        self.assertTrue(tab.auth_overlay_backdrop.isHidden())
+        self.assertFalse(tab.auth_status_widget.isHidden())
         self.assertEqual(tab._teacher_meta()["school_code"], "7010001")
         self.assertEqual(tab._teacher_meta()["grade"], 2)
         self.assertEqual(tab._teacher_meta()["class_no"], 4)
         self.assertEqual(tab._get_active_roster(), [("20401", "김철수"), ("20402", "이영희")])
         self.assertIn("유우석", tab.lbl_teacher_auth_status.text())
         self.assertIn("2학년 4반", tab.lbl_teacher_auth_status.text())
-        self.assertIn("2명", tab.lbl_teacher_auth_status.text())
 
         # 앱 재시작 시 저장된 세션 자동 복원 검증
         tab2 = ClassroomToolsTab(task_runner=self.task_runner)
@@ -287,6 +293,267 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         self.assertEqual(chg["period"], 7)
         self.assertTrue(self.sync_svc.push_timetable_changes([chg]))
         self.assertEqual(len(self.fake_fs.cols["시간표_변동"]), 1)
+
+        # NEIS 7자리 school_code vs 컴시간 5자리 comcigan_school_code 분리 저장 검증
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        self.cfg.update_section(
+            "teacher_profile",
+            {
+                "teacher_id": "유우석",
+                "name": "유우석",
+                "school_code": "7010001",
+                "neis_school_code": "7010001",
+                "school_name": "에듀플로우고",
+            },
+        )
+
+        class _StubFetcher:
+            def fetch(self):
+                return {
+                    "base_rows": [
+                        {
+                            "remote_id": "tb_t_유우석_화_3",
+                            "entry_type": "teacher",
+                            "grade": "2",
+                            "class_no": "4",
+                            "day_of_week": "화",
+                            "period": "3",
+                            "subject": "수학",
+                            "teacher_name": "유우석T",
+                        }
+                    ],
+                    "change_rows": [],
+                    "class_base_count": 0,
+                    "teacher_base_count": 1,
+                }
+
+        res = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            school_code="31234",
+            teacher_name="유우석",
+            target_date="2026-11-17",
+            sync_service=self.sync_svc,
+            fetcher=_StubFetcher(),
+            use_local_cache=False,
+        )
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["school_code"], "7010001")
+        self.assertEqual(res["comcigan_school_code"], "31234")
+        self.assertEqual(self.fake_fs.cols["계정_교사"]["유우석"]["comcigan_school_code"], "31234")
+        saved_tt = self.fake_fs.cols["시간표_기본"]["tb_t_유우석_화_3"]
+        self.assertEqual(saved_tt["school_code"], "7010001")
+        self.assertEqual(saved_tt["comcigan_school_code"], "31234")
+        self.assertEqual(saved_tt["teacher_name"], "유우석")
+
+    def test_hybrid_backend_vercel_api_fallback(self) -> None:
+        from unittest.mock import patch
+        from services.firestore_sync_service import DEFAULT_VERCEL_API_URL
+
+        self.cfg.update_section(
+            "api_and_integrations",
+            {"google_credentials_path": "", "vercel_api_url": DEFAULT_VERCEL_API_URL},
+        )
+        svc = FirestoreSyncService(config=self.cfg)
+        with patch("services.firestore_sync_service.has_local_credentials", return_value=False):
+            self.assertEqual(svc.get_backend_mode(), "vercel_api")
+            self.assertTrue(svc.is_vercel_api_mode())
+            self.assertEqual(svc.get_vercel_api_url(), "https://26oshs1-5.eduflow.kro.kr/api/firestore")
+
+            captured_calls: List[Dict[str, Any]] = []
+
+            class _FakeResp:
+                ok = True
+                status_code = 200
+
+                def __init__(self, payload: Dict[str, Any]) -> None:
+                    self._payload = payload
+
+                def json(self) -> Dict[str, Any]:
+                    return self._payload
+
+            def _fake_post(url: str, json: Dict[str, Any], timeout: int = 20):
+                captured_calls.append({"url": url, "json": json})
+                act = json.get("action")
+                if act == "login":
+                    return _FakeResp({"ok": True, "user": {"teacher_id": "유우석", "name": "유우석", "school_code": "7010001", "grade": 2, "class_no": 4, "status": "active"}})
+                if act == "fetch_homeroom_students":
+                    return _FakeResp({"ok": True, "students": [{"student_id": "20401", "name": "김철수"}]})
+                if act == "publish_mobile_notice":
+                    return _FakeResp({"ok": True, "remote_id": "noti_doc_1"})
+                return _FakeResp({"ok": True})
+
+            with patch("requests.post", side_effect=_fake_post):
+                ok, user, err = svc.authenticate_account("teacher", "유우석", "pw1234")
+                self.assertTrue(ok, err)
+                self.assertEqual(user["teacher_id"], "유우석")
+                self.cfg.update_section(
+                    "teacher_profile",
+                    {"teacher_id": "유우석", "auth_password_hash": hash_password_sha256("pw1234")},
+                )
+                students = svc.fetch_homeroom_students(school_code="7010001", grade=2, class_no=4)
+                self.assertEqual(len(students), 1)
+                self.assertTrue(svc.upsert_timetable_base([{"day_of_week": "화", "period": 7, "subject": "보강"}]))
+                pub_ok, rid = svc.publish_mobile_notice({"title": "안내", "content": "내용"})
+                self.assertTrue(pub_ok)
+                self.assertEqual(rid, "noti_doc_1")
+                sent_ok, _ = svc.send_class_notification("공지", "내용")
+                self.assertTrue(sent_ok)
+
+            actions = [c["json"]["action"] for c in captured_calls]
+            self.assertEqual(
+                actions,
+                ["login", "fetch_homeroom_students", "sync_timetables_batch", "publish_mobile_notice", "send_class_notification"],
+            )
+            self.assertEqual(captured_calls[1]["json"]["auth_teacher_id"], "유우석")
+            self.assertTrue(captured_calls[1]["json"]["auth_password_hash"])
+
+    def test_comcigan_local_cache_delta_sync(self) -> None:
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        self.cfg.update_section(
+            "teacher_profile",
+            {
+                "teacher_id": "유우석",
+                "name": "유우석",
+                "school_code": "7010001",
+                "neis_school_code": "7010001",
+                "school_name": "에듀플로우고",
+            },
+        )
+
+        state = {"rows": [
+            {"remote_id": "tb_1", "grade": "2", "class_no": "4", "day_of_week": "화", "period": "1", "subject": "국어", "teacher_name": "김교사"},
+            {"remote_id": "tb_2", "grade": "2", "class_no": "4", "day_of_week": "화", "period": "2", "subject": "영어", "teacher_name": "이교사"},
+            {"remote_id": "tb_3", "grade": "2", "class_no": "4", "day_of_week": "화", "period": "3", "subject": "수학", "teacher_name": "유우석"},
+        ], "changes": [
+            {"remote_id": "tc_7", "date": "2026-11-17", "grade": "2", "class_no": "4", "period": "7", "changed_subject": "보강", "changed_teacher": "유우석"},
+        ]}
+
+        class _DynamicFetcher:
+            def fetch(self):
+                return {
+                    "base_rows": [dict(r) for r in state["rows"]],
+                    "change_rows": [dict(c) for c in state["changes"]],
+                    "class_base_count": 3,
+                    "teacher_base_count": 0,
+                }
+
+        pushed_base_batches: List[List[Dict[str, Any]]] = []
+        pushed_chg_batches: List[List[Dict[str, Any]]] = []
+        read_calls = {"count": 0}
+
+        class _TrackingSyncService(FirestoreSyncService):
+            def fetch_sheet_rows(self, *args, **kwargs):
+                read_calls["count"] += 1
+                return []
+
+            def upsert_timetable_base(self, rows, *args, **kwargs):
+                pushed_base_batches.append(list(rows))
+                return super().upsert_timetable_base(rows, *args, **kwargs)
+
+            def push_timetable_changes(self, rows, *args, **kwargs):
+                pushed_chg_batches.append(list(rows))
+                return super().push_timetable_changes(rows, *args, **kwargs)
+
+        tracking_svc = _TrackingSyncService(firestore_client=self.fake_fs, config=self.cfg)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_file = Path(tmp) / "comcigan_cache.json"
+
+            # 1차 동기화: 전체 3 + 1건 전송, Firestore 전체 읽기 0회
+            res1 = sync_comcigan_from_web(
+                url="http://comci.net:4082/st",
+                school_code="31234",
+                teacher_name="유우석",
+                target_date="2026-11-17",
+                sync_service=tracking_svc,
+                fetcher=_DynamicFetcher(),
+                cache_path=cache_file,
+            )
+            self.assertTrue(res1["ok"])
+            self.assertFalse(res1["skipped"])
+            self.assertEqual(res1["base_pushed"], 3)
+            self.assertEqual(res1["changes_pushed"], 1)
+            self.assertEqual(read_calls["count"], 0)
+            self.assertEqual(len(pushed_base_batches), 1)
+            self.assertEqual(len(pushed_chg_batches), 1)
+
+            # 2차 동기화 (동일 데이터): 0건 반영, 전송 스킵
+            res2 = sync_comcigan_from_web(
+                url="http://comci.net:4082/st",
+                school_code="31234",
+                teacher_name="유우석",
+                target_date="2026-11-17",
+                sync_service=tracking_svc,
+                fetcher=_DynamicFetcher(),
+                cache_path=cache_file,
+            )
+            self.assertTrue(res2["ok"])
+            self.assertTrue(res2["skipped"])
+            self.assertFalse(res2["changed"])
+            self.assertEqual(res2["base_pushed"], 0)
+            self.assertEqual(res2["changes_pushed"], 0)
+            self.assertEqual(len(pushed_base_batches), 1)
+            self.assertEqual(len(pushed_chg_batches), 1)
+
+            # 3차 동기화 (1개 교시만 변경): 정확히 1건만 전송
+            state["rows"][1]["subject"] = "물리학Ⅰ"
+            res3 = sync_comcigan_from_web(
+                url="http://comci.net:4082/st",
+                school_code="31234",
+                teacher_name="유우석",
+                target_date="2026-11-17",
+                sync_service=tracking_svc,
+                fetcher=_DynamicFetcher(),
+                cache_path=cache_file,
+            )
+            self.assertTrue(res3["ok"])
+            self.assertFalse(res3["skipped"])
+            self.assertTrue(res3["changed"])
+            self.assertEqual(res3["base_pushed"], 1)
+            self.assertEqual(res3["changes_pushed"], 0)
+            self.assertEqual(len(pushed_base_batches), 2)
+            self.assertEqual(len(pushed_base_batches[1]), 1)
+            self.assertEqual(pushed_base_batches[1][0]["remote_id"], "tb_2")
+            self.assertEqual(pushed_base_batches[1][0]["subject"], "물리학Ⅰ")
+            self.assertEqual(len(pushed_chg_batches), 1)
+            self.assertEqual(read_calls["count"], 0)
+
+            # 4차 동기화 (로컬 캐시는 있지만 Firestore 시간표_기본이 0건으로 초기화된 상황): 자동 전체 재동기화
+            self.fake_fs.cols["시간표_기본"].clear()
+            self.fake_fs.cols["시간표_변동"].clear()
+            res4 = sync_comcigan_from_web(
+                url="http://comci.net:4082/st",
+                school_code="31234",
+                teacher_name="유우석",
+                target_date="2026-11-17",
+                sync_service=tracking_svc,
+                fetcher=_DynamicFetcher(),
+                cache_path=cache_file,
+            )
+            self.assertTrue(res4["ok"])
+            self.assertFalse(res4["skipped"])
+            self.assertEqual(res4["base_pushed"], 3)
+            self.assertEqual(res4["changes_pushed"], 1)
+            self.assertEqual(len(self.fake_fs.cols["시간표_기본"]), 3)
+            self.assertEqual(len(self.fake_fs.cols["시간표_변동"]), 1)
+
+            # 5차 동기화 (force_full=True 강제 재동기화): 캐시 무시하고 전체 3+1건 덮어쓰기
+            res5 = sync_comcigan_from_web(
+                url="http://comci.net:4082/st",
+                school_code="31234",
+                teacher_name="유우석",
+                target_date="2026-11-17",
+                sync_service=tracking_svc,
+                fetcher=_DynamicFetcher(),
+                cache_path=cache_file,
+                force_full=True,
+            )
+            self.assertTrue(res5["ok"])
+            self.assertFalse(res5["skipped"])
+            self.assertEqual(res5["base_pushed"], 3)
+            self.assertEqual(res5["changes_pushed"], 1)
 
 
 if __name__ == "__main__":

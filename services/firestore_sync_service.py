@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from core.base_worker import BaseWorker
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
-from core.firebase_client import get_firestore_client
+from core.firebase_client import get_firestore_client, has_local_credentials
 from services.schedule_parser_service import (
     infer_schedule_category,
     normalize_date_str,
@@ -26,6 +26,8 @@ from services.schedule_parser_service import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+DEFAULT_VERCEL_API_URL = "https://26oshs1-5.eduflow.kro.kr/api/firestore"
 
 INT_FIELDS = {
     "grade",
@@ -136,9 +138,53 @@ class FirestoreSyncService:
         self.config = config or ConfigManager()
         self._firestore_client = firestore_client
 
+    def _cred_path(self) -> Optional[str]:
+        p = str(self.config.get("api_and_integrations", "google_credentials_path", "") or "").strip()
+        return p or None
+
+    def get_backend_mode(self) -> str:
+        """로컬 서비스 계정 JSON 키(또는 환경변수) 유무에 따라 'direct_admin' 또는 'vercel_api'를 반환합니다."""
+        if self._firestore_client is not None:
+            return "direct_admin"
+        if has_local_credentials(self._cred_path()):
+            return "direct_admin"
+        return "vercel_api"
+
+    def is_vercel_api_mode(self) -> bool:
+        return self.get_backend_mode() == "vercel_api"
+
+    def get_vercel_api_url(self) -> str:
+        url = str(
+            self.config.get("api_and_integrations", "vercel_api_url", DEFAULT_VERCEL_API_URL) or ""
+        ).strip()
+        return url or DEFAULT_VERCEL_API_URL
+
+    def _post_vercel_api(self, action: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        import requests
+
+        url = self.get_vercel_api_url()
+        tp = self.config.get_section("teacher_profile") or {}
+        body: Dict[str, Any] = {"action": action}
+        if tp.get("teacher_id"):
+            body["auth_teacher_id"] = str(tp.get("teacher_id") or "").strip()
+        if tp.get("auth_password_hash"):
+            body["auth_password_hash"] = str(tp.get("auth_password_hash") or "").strip()
+        if payload:
+            body.update(payload)
+
+        resp = requests.post(url, json=body, timeout=20)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        if not resp.ok or (isinstance(data, dict) and data.get("ok") is False):
+            err_msg = (data.get("error") if isinstance(data, dict) else "") or f"HTTP {resp.status_code}"
+            raise RuntimeError(err_msg)
+        return data if isinstance(data, dict) else {"ok": True}
+
     def _get_client(self) -> Any:
         if self._firestore_client is None:
-            self._firestore_client = get_firestore_client()
+            self._firestore_client = get_firestore_client(self._cred_path())
         return self._firestore_client
 
     def _find_account_doc(self, role: str, user_id: str) -> Tuple[Any, Optional[str], Optional[Dict[str, Any]]]:
@@ -174,7 +220,26 @@ class FirestoreSyncService:
     ) -> Tuple[bool, Optional[Dict[str, Any]], str]:
         """
         계정 로그인 검증(평문/SHA-256 모두 호환) 및 평문 저장 계정의 SHA-256 자동 업그레이드.
+        Vercel API 모드에서는 서버 `/api/firestore`의 `login` 액션을 통해 검증합니다.
         """
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api(
+                    "login",
+                    {
+                        "role": role,
+                        "user_id": str(user_id or "").strip(),
+                        "password": str(input_password or ""),
+                        "password_hash": hash_password_sha256(input_password) if input_password else "",
+                    },
+                )
+                user = res.get("user")
+                if isinstance(user, dict):
+                    return True, user, ""
+                return False, None, str(res.get("error") or "로그인 응답이 올바르지 않습니다.")
+            except Exception as exc:
+                return False, None, str(exc)
+
         col_ref, doc_id, user_doc = self._find_account_doc(role, user_id)
         if not user_doc or not doc_id:
             return False, None, "등록되지 않은 계정입니다."
@@ -234,6 +299,14 @@ class FirestoreSyncService:
         tid = str(teacher_id or "").strip()
         if not tid:
             return None
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api("get_teacher_profile", {"teacher_id": tid})
+                prof = res.get("profile")
+                return prof if isinstance(prof, dict) else None
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 교사 프로필 조회 실패 ({tid}): {exc}")
+                return None
         try:
             fs = self._get_client()
             snap = fs.collection("계정_교사").document(tid).get()
@@ -251,29 +324,68 @@ class FirestoreSyncService:
             return None
 
     def upsert_teacher_profile(self, profile: Dict[str, Any]) -> bool:
-        """교사 소속 학교·학년·반 및 NEIS 코드를 Firestore `계정_교사`에 저장합니다."""
+        """교사 소속 학교·학년·반 및 NEIS/컴시간 코드를 Firestore `계정_교사`에 저장합니다."""
         if not isinstance(profile, dict):
             return False
         tid = str(profile.get("teacher_id") or profile.get("remote_id") or "").strip()
         if not tid:
             return False
-        doc_data = {
+        neis_sc = str(profile.get("school_code") or profile.get("neis_school_code") or "").strip()
+        doc_data: Dict[str, Any] = {
             "remote_id": tid,
             "teacher_id": tid,
             "name": str(profile.get("name") or tid).strip(),
             "school_name": str(profile.get("school_name") or "").strip(),
+            "school_code": neis_sc,
             "grade": _to_int_or_none(profile.get("grade")),
             "class_no": _to_int_or_none(profile.get("class_no")),
             "neis_office_code": str(profile.get("neis_office_code") or "").strip(),
-            "neis_school_code": str(profile.get("neis_school_code") or "").strip(),
+            "neis_school_code": neis_sc,
             "updated_at": _now_str(),
         }
+        comcigan_sc = str(profile.get("comcigan_school_code") or "").strip()
+        if comcigan_sc:
+            doc_data["comcigan_school_code"] = comcigan_sc
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api("upsert_teacher_profile", doc_data)
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 교사 프로필 저장 실패 ({tid}): {exc}")
+                return False
         try:
             fs = self._get_client()
             fs.collection("계정_교사").document(tid).set(doc_data, merge=True)
             return True
         except Exception as exc:
             self.db.add_log("WARN", "FirestoreSync", f"교사 프로필 저장 실패 ({tid}): {exc}")
+            return False
+
+    def update_teacher_comcigan_code(self, teacher_id: str, comcigan_school_code: str) -> bool:
+        """교사 문서(`계정_교사`)에 5자리 컴시간 학교코드를 저장합니다."""
+        tid = str(teacher_id or "").strip()
+        cc = str(comcigan_school_code or "").strip()
+        if not tid or not cc:
+            return False
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api(
+                    "upsert_teacher_profile",
+                    {"teacher_id": tid, "comcigan_school_code": cc},
+                )
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 컴시간 학교코드 저장 실패 ({tid}): {exc}")
+                return False
+        try:
+            fs = self._get_client()
+            fs.collection("계정_교사").document(tid).set(
+                {"comcigan_school_code": cc, "updated_at": _now_str()},
+                merge=True,
+            )
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"컴시간 학교코드 저장 실패 ({tid}): {exc}")
             return False
 
     @staticmethod
@@ -314,6 +426,22 @@ class FirestoreSyncService:
         나이스(NEIS) 담임학급 명렬표 학생 목록을 기반으로 Firestore에 학생·학부모 초기 계정을 일괄 생성합니다.
         이미 존재하는 계정(또는 커스텀 ID/비밀번호 변경 계정)은 덮어쓰지 않고 신규 계정만 Batch Upsert합니다.
         """
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "provision_homeroom_accounts",
+                {
+                    "students": list(students or []),
+                    "school_code": str(school_code or "").strip(),
+                    "school_name": str(school_name or "").strip(),
+                },
+            )
+            return {
+                "students_created": int(res.get("students_created") or 0),
+                "students_skipped": int(res.get("students_skipped") or 0),
+                "parents_created": int(res.get("parents_created") or 0),
+                "parents_skipped": int(res.get("parents_skipped") or 0),
+            }
+
         fs = self._get_client()
         col_stu = fs.collection("계정_학생")
         col_par = fs.collection("계정_학부모")
@@ -451,6 +579,19 @@ class FirestoreSyncService:
         담임 학급의 가입 승인 대기(status == 'pending') 학생·학부모 목록을 조회합니다.
         최고 관리자(dntjr0919)인 경우 계정_교사의 승인 대기 신청도 함께 반환합니다.
         """
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "get_pending_registrations",
+                {
+                    "grade": grade,
+                    "class_no": class_no,
+                    "school_code": str(school_code or "").strip(),
+                    "school_name": str(school_name or "").strip(),
+                    "requester_id": str(requester_id or "").strip(),
+                },
+            )
+            return list(res.get("registrations") or [])
+
         fs = self._get_client()
         sc = str(school_code or "").strip()
         sn = str(school_name or "").strip()
@@ -499,6 +640,17 @@ class FirestoreSyncService:
         rid = str(remote_id or "").strip()
         if not rid:
             return False
+        if self.is_vercel_api_mode():
+            self._post_vercel_api(
+                "review_registration",
+                {
+                    "role": role_key,
+                    "remote_id": rid,
+                    "approve": bool(approve),
+                    "requester_id": str(requester_id or "").strip(),
+                },
+            )
+            return True
         fs = self._get_client()
         fs.collection(col_name).document(rid).set(
             {
@@ -517,6 +669,18 @@ class FirestoreSyncService:
         class_no: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Firestore `계정_학생` 컬렉션에서 교사 소속 학교·학년·반 명렬표를 조회합니다."""
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "fetch_homeroom_students",
+                {
+                    "school_code": str(school_code or "").strip(),
+                    "school_name": str(school_name or "").strip(),
+                    "grade": grade,
+                    "class_no": class_no,
+                },
+            )
+            return list(res.get("students") or [])
+
         fs = self._get_client()
         ref: Any = fs.collection("계정_학생")
         if grade is not None and class_no is not None:
@@ -557,6 +721,18 @@ class FirestoreSyncService:
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `일일_출결` 컬렉션에서 해당 학급의 모바일 출결 내역을 조회합니다."""
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "fetch_homeroom_attendance",
+                {
+                    "grade": grade,
+                    "class_no": class_no,
+                    "school_code": str(school_code or "").strip(),
+                    "school_name": str(school_name or "").strip(),
+                },
+            )
+            return list(res.get("attendance") or [])
+
         fs = self._get_client()
         ref: Any = fs.collection("일일_출결")
         if grade is not None and class_no is not None:
@@ -597,6 +773,9 @@ class FirestoreSyncService:
             "is_published": True,
             "updated_at": _now_str(),
         }
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api("publish_mobile_notice", payload)
+            return True, str(res.get("remote_id") or rid)
         fs = self._get_client()
         fs.collection("가정통신문_목록").document(rid).set(payload, merge=True)
         return True, rid
@@ -606,6 +785,9 @@ class FirestoreSyncService:
         nid = str(notice_id or "").strip()
         if not nid:
             return []
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api("fetch_notice_replies", {"notice_id": nid})
+            return list(res.get("replies") or [])
         fs = self._get_client()
         rows: List[Dict[str, Any]] = []
         for doc in fs.collection("가정통신문_회신").where("notice_id", "==", nid).stream():
@@ -628,26 +810,27 @@ class FirestoreSyncService:
     ) -> Tuple[bool, str]:
         """Firestore `Notifications`에 학급 공지/긴급 알림을 등록합니다."""
         rid = f"noti_{int(datetime.now().timestamp() * 1000)}"
+        payload = {
+            "remote_id": rid,
+            "title": str(title or "").strip(),
+            "message": str(message or "").strip(),
+            "channel": "desktop_broadcast",
+            "target_role": str(target_role or "all").strip().lower(),
+            "sender": str(sender or "담임교사").strip(),
+            "grade": _to_int_or_none(grade),
+            "class_no": _to_int_or_none(class_no),
+            "school_code": str(school_code or "").strip(),
+            "school_name": str(school_name or "").strip(),
+            "student_id": str(student_id or "").strip(),
+            "is_read": False,
+            "created_at": _now_str(),
+            "updated_at": _now_str(),
+        }
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api("send_class_notification", payload)
+            return True, str(res.get("remote_id") or rid)
         fs = self._get_client()
-        fs.collection("Notifications").document(rid).set(
-            {
-                "remote_id": rid,
-                "title": str(title or "").strip(),
-                "message": str(message or "").strip(),
-                "channel": "desktop_broadcast",
-                "target_role": str(target_role or "all").strip().lower(),
-                "sender": str(sender or "담임교사").strip(),
-                "grade": _to_int_or_none(grade),
-                "class_no": _to_int_or_none(class_no),
-                "school_code": str(school_code or "").strip(),
-                "school_name": str(school_name or "").strip(),
-                "student_id": str(student_id or "").strip(),
-                "is_read": False,
-                "created_at": _now_str(),
-                "updated_at": _now_str(),
-            },
-            merge=True,
-        )
+        fs.collection("Notifications").document(rid).set(payload, merge=True)
         return True, rid
 
     def fetch_sent_notifications(
@@ -659,6 +842,18 @@ class FirestoreSyncService:
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `Notifications` 발송 이력을 조회합니다."""
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "fetch_sent_notifications",
+                {
+                    "grade": grade,
+                    "class_no": class_no,
+                    "limit": limit,
+                    "school_code": str(school_code or "").strip(),
+                    "school_name": str(school_name or "").strip(),
+                },
+            )
+            return list(res.get("notifications") or [])
         fs = self._get_client()
         sc = str(school_code or "").strip()
         sn = str(school_name or "").strip()
@@ -689,6 +884,18 @@ class FirestoreSyncService:
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `1:1_상담채팅` 대화 내역을 조회합니다."""
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "fetch_chat_history",
+                {
+                    "grade": grade,
+                    "class_no": class_no,
+                    "student_id": str(student_id or "").strip(),
+                    "school_code": str(school_code or "").strip(),
+                    "school_name": str(school_name or "").strip(),
+                },
+            )
+            return list(res.get("messages") or [])
         fs = self._get_client()
         ref: Any = fs.collection("1:1_상담채팅")
         sid = str(student_id or "").strip()
@@ -717,6 +924,13 @@ class FirestoreSyncService:
         *args: Any,
         **kwargs: Any,
     ) -> Tuple[bool, str, Dict[str, Any]]:
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api("health_check", {})
+                url = self.get_vercel_api_url()
+                return True, f"연결 성공: Vercel API 모드 ({url})", res
+            except Exception as exc:
+                return False, f"Vercel API 연결 테스트 실패: {exc}", {}
         try:
             fs = self._get_client()
             counts = {
@@ -1024,6 +1238,15 @@ class FirestoreSyncService:
         **kwargs: Any,
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 기본 시간표를 Firestore `시간표_기본` 컬렉션으로 Batch Upsert합니다."""
+        if self.is_vercel_api_mode():
+            if not rows:
+                return False
+            try:
+                self._post_vercel_api("sync_timetables_batch", {"base_rows": list(rows)})
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 기본 시간표 Upsert 실패: {exc}")
+                return False
         return self._batch_upsert(
             collection_name="시간표_기본",
             rows=rows,
@@ -1041,6 +1264,15 @@ class FirestoreSyncService:
         **kwargs: Any,
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 시간표 변동 내역을 Firestore `시간표_변동` 컬렉션으로 Batch Upsert합니다."""
+        if self.is_vercel_api_mode():
+            if not rows:
+                return False
+            try:
+                self._post_vercel_api("sync_timetables_batch", {"change_rows": list(rows)})
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 시간표 변동 Push 실패: {exc}")
+                return False
         return self._batch_upsert(
             collection_name="시간표_변동",
             rows=rows,
@@ -1049,6 +1281,73 @@ class FirestoreSyncService:
             progress_callback=progress_callback,
         )
 
+    def delete_timetable_docs(
+        self,
+        collection_name: str,
+        remote_ids: List[str],
+    ) -> bool:
+        """더 이상 존재하지 않는 시간표 문서(`remote_id` 목록)를 삭제합니다."""
+        ids = [str(r).strip().replace("/", "_") for r in (remote_ids or []) if str(r).strip()]
+        if not ids:
+            return True
+        if collection_name not in ("시간표_기본", "시간표_변동"):
+            return False
+        if self.is_vercel_api_mode():
+            key = "delete_base_ids" if collection_name == "시간표_기본" else "delete_change_ids"
+            try:
+                self._post_vercel_api("sync_timetables_batch", {key: ids})
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 시간표 삭제 실패 ({collection_name}): {exc}")
+                return False
+        try:
+            fs = self._get_client()
+            col_ref = fs.collection(collection_name)
+            for start in range(0, len(ids), FIRESTORE_BATCH_LIMIT):
+                batch = fs.batch()
+                for rid in ids[start : start + FIRESTORE_BATCH_LIMIT]:
+                    batch.delete(col_ref.document(rid))
+                batch.commit()
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"{collection_name} Batch 삭제 실패: {exc}")
+            return False
+
+    def has_timetable_base_docs(
+        self,
+        school_code: str = "",
+        comcigan_school_code: str = "",
+        school_name: str = "",
+    ) -> Optional[bool]:
+        """Firestore `시간표_기본`에 해당 학교 문서가 최소 1건 이상 존재하는지 1건 조회로 확인합니다."""
+        sc = str(school_code or "").strip()
+        cc = str(comcigan_school_code or "").strip()
+        sn = str(school_name or "").strip()
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api(
+                    "check_timetable_exists",
+                    {"school_code": sc, "comcigan_school_code": cc, "school_name": sn},
+                )
+                return bool(res.get("exists"))
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 시간표 존재 확인 실패: {exc}")
+                return None
+        try:
+            fs = self._get_client()
+            col_ref = fs.collection("시간표_기본")
+            for field, val in (("school_code", sc), ("comcigan_school_code", cc), ("school_name", sn)):
+                if val:
+                    for _ in col_ref.where(field, "==", val).limit(1).stream():
+                        return True
+            if not (sc or cc or sn):
+                for _ in col_ref.limit(1).stream():
+                    return True
+            return False
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"시간표 존재 확인 실패: {exc}")
+            return None
+
     def upsert_meal_plans(
         self,
         rows: List[Dict[str, Any]],
@@ -1056,6 +1355,15 @@ class FirestoreSyncService:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> bool:
         """NEIS 급식 식단표 데이터를 Firestore `급식_식단표` 컬렉션으로 Batch Upsert합니다."""
+        if self.is_vercel_api_mode():
+            if not rows:
+                return False
+            try:
+                self._post_vercel_api("sync_meals_batch", {"meal_rows": list(rows)})
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 급식 식단표 Upsert 실패: {exc}")
+                return False
         return self._batch_upsert(
             collection_name="급식_식단표",
             rows=rows,

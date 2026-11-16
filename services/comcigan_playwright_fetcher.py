@@ -273,6 +273,7 @@ class ComciganPlaywrightFetcher:
         self,
         url: str = "",
         school_code: str = "",
+        comcigan_school_code: str = "",
         school_name: str = "",
         target_date: str = "",
         teacher_name: str = "",
@@ -285,6 +286,7 @@ class ComciganPlaywrightFetcher:
     ) -> None:
         self.url = str(url or "").strip()
         self.school_code = str(school_code or "").strip()
+        self.comcigan_school_code = str(comcigan_school_code or "").strip()
         self.school_name = str(school_name or "").strip()
         self.target_date = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()
         self.teacher_name = normalize_teacher_name(teacher_name)

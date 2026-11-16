@@ -287,10 +287,10 @@ class NotificationCenterTab(QWidget):
         layout.addWidget(self.notify_group)
 
         # -----------------------------------------------------------------
-        # 3.2 컴시간 알리미 시간표 변동 반영 (Google Sheets Push) 카드
+        # 3.2 컴시간 알리미 시간표 변동 반영 (Firebase Firestore 실시간 반영) 카드
         # -----------------------------------------------------------------
         self.comcigan_group = HoverZoomCard(
-            title="컴시간 알리미 시간표 변동 반영 (Google Sheets Push)",
+            title="컴시간 알리미 시간표 변동 반영 (Firebase Firestore 실시간 반영)",
             parent=container,
             zoom_ratio=1.0,
             hover_delay_ms=0,
@@ -318,18 +318,26 @@ class NotificationCenterTab(QWidget):
             str(self.config.get("api_and_integrations", "comcigan_school_code", ""))
         )
         self.edit_comcigan_school_code.setMinimumHeight(34)
-        self.edit_comcigan_school_code.setPlaceholderText("학교코드 또는 학교명 (예: OO고등학교)")
+        self.edit_comcigan_school_code.setPlaceholderText("컴시간 5자리 학교코드 또는 학교명 (예: 31234)")
         self.edit_comcigan_school_code.textChanged.connect(self._on_comcigan_config_changed)
 
-        self.btn_auto_sync_comcigan = QPushButton("🔄 컴시간 웹에서 자동 파싱 & 시트 반영")
+        self.btn_auto_sync_comcigan = QPushButton("🔄 컴시간 웹 자동 파싱 & Firebase Firestore 실시간 반영")
         apply_qss_role(self.btn_auto_sync_comcigan, role="primary", obj_name="BtnAutoSyncComcigan")
         self.btn_auto_sync_comcigan.setMinimumHeight(34)
         self.btn_auto_sync_comcigan.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_auto_sync_comcigan.clicked.connect(self._on_auto_sync_comcigan_clicked)
+        self.btn_auto_sync_comcigan.clicked.connect(lambda: self._on_auto_sync_comcigan_clicked(force_full=False))
+
+        self.btn_force_sync_comcigan = QPushButton("전체 강제 재동기화")
+        apply_qss_role(self.btn_force_sync_comcigan, role="warningOutline", obj_name="BtnForceSyncComcigan")
+        self.btn_force_sync_comcigan.setMinimumHeight(34)
+        self.btn_force_sync_comcigan.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_force_sync_comcigan.setToolTip("로컬 캐시를 무시하고 전체 시간표를 Firestore에 강제로 덮어씁니다.")
+        self.btn_force_sync_comcigan.clicked.connect(lambda: self._on_auto_sync_comcigan_clicked(force_full=True))
 
         code_row.addWidget(self.edit_comcigan_school_code, stretch=1)
         code_row.addWidget(self.btn_auto_sync_comcigan)
-        auto_form.addRow("학교코드/학교명:", code_row)
+        code_row.addWidget(self.btn_force_sync_comcigan)
+        auto_form.addRow("컴시간 학교코드(5자리)/학교명:", code_row)
 
         teacher_scope_row = QHBoxLayout()
         teacher_scope_row.setSpacing(10)
@@ -447,7 +455,7 @@ class NotificationCenterTab(QWidget):
         self.btn_push_comcigan.clicked.connect(self._on_push_comcigan_clicked)
 
         lbl_comcigan_hint = QLabel(
-            "Google Sheets '시간표_변동' 시트에 즉시 반영하며, 결과를 로그와 알림으로 기록합니다."
+            "Firebase Firestore '시간표_변동' 컬렉션에 즉시 반영하며, 결과를 로그와 알림으로 기록합니다."
         )
         apply_qss_role(lbl_comcigan_hint, role="mutedText")
 
@@ -706,7 +714,7 @@ class NotificationCenterTab(QWidget):
             ok = bool((res or {}).get("ok"))
             pushed = int((res or {}).get("pushed", 0) or 0)
             if ok:
-                msg = f"{target_date} 시간표 변동 {pushed}건이 Google Sheets에 반영되었습니다."
+                msg = f"{target_date} 시간표 변동 {pushed}건이 Firebase Firestore에 실시간 반영되었습니다."
                 self._append_log(f"[컴시간 Push 완료] {msg}")
                 self.notifier.notify("컴시간 시간표 변동 반영 완료", msg)
                 self.db.add_notification(
@@ -718,7 +726,7 @@ class NotificationCenterTab(QWidget):
                 )
                 self.refresh_notifications_inbox()
             else:
-                err_txt = str((res or {}).get("error") or "Google Sheets 반영에 실패했습니다.")
+                err_txt = str((res or {}).get("error") or "Firebase Firestore 반영에 실패했습니다.")
                 self._append_log(f"[컴시간 Push 실패] {err_txt}")
                 self.notifier.notify("컴시간 시간표 변동 반영 실패", err_txt)
 
@@ -727,7 +735,7 @@ class NotificationCenterTab(QWidget):
             self._append_log(f"[컴시간 Push 오류] {first_line}")
             self.notifier.notify("컴시간 시간표 변동 반영 오류", first_line)
 
-        worker = FunctionWorker("컴시간 시간표 변동 시트 반영", _run_push)
+        worker = FunctionWorker("컴시간 시간표 변동 Firebase Firestore 실시간 반영", _run_push)
         self.task_runner.start_worker(
             worker=worker,
             task_key="comcigan_timetable_push",
@@ -781,6 +789,8 @@ class NotificationCenterTab(QWidget):
 
         self._comcigan_sync_running = True
         self.btn_auto_sync_comcigan.setEnabled(False)
+        if hasattr(self, "btn_force_sync_comcigan"):
+            self.btn_force_sync_comcigan.setEnabled(False)
 
         def _run_periodic(_worker: FunctionWorker) -> dict:
             return sync_comcigan_from_web(
@@ -844,6 +854,8 @@ class NotificationCenterTab(QWidget):
         def _on_finished() -> None:
             self._comcigan_sync_running = False
             self.btn_auto_sync_comcigan.setEnabled(True)
+            if hasattr(self, "btn_force_sync_comcigan"):
+                self.btn_force_sync_comcigan.setEnabled(True)
 
         worker = FunctionWorker("컴시간 주기 자동 동기화", _run_periodic)
         worker.signals.progress.connect(
@@ -857,7 +869,7 @@ class NotificationCenterTab(QWidget):
             on_finished=_on_finished,
         )
 
-    def _on_auto_sync_comcigan_clicked(self) -> None:
+    def _on_auto_sync_comcigan_clicked(self, checked: bool = False, force_full: bool = False) -> None:
         if self._comcigan_sync_running:
             return
         url = self.edit_comcigan_url.text().strip()
@@ -879,6 +891,8 @@ class NotificationCenterTab(QWidget):
         target_date = self.date_comcigan.date().toString("yyyy-MM-dd")
         self._comcigan_sync_running = True
         self.btn_auto_sync_comcigan.setEnabled(False)
+        if hasattr(self, "btn_force_sync_comcigan"):
+            self.btn_force_sync_comcigan.setEnabled(False)
         self._append_log(
             f"[컴시간 웹 자동 파싱 시작] URL={url}, 학교={school_code or '(미지정)'}, "
             f"학년={grade or '(미지정)'}, 반={class_no or '(미지정)'}, "
@@ -895,6 +909,7 @@ class NotificationCenterTab(QWidget):
                 target_class=class_no,
                 scope=scope,
                 headless=True,
+                force_full=force_full,
                 progress_callback=lambda pct, msg: _worker.emit_progress(pct, msg),
             )
 
@@ -911,7 +926,7 @@ class NotificationCenterTab(QWidget):
             if ok:
                 msg = (
                     f"{target_date} 기본 시간표 {b_cnt}건(학급 {cls_cnt}건 + 교사 {tch_cnt}건), "
-                    f"변동 {c_cnt}건이 Google Sheets에 반영되었습니다."
+                    f"변동 {c_cnt}건이 Firebase Firestore에 실시간 반영되었습니다."
                 )
                 self._append_log(f"[컴시간 웹 자동 파싱 완료] {msg}")
                 self.lbl_comcigan_auto_status.setText(f"마지막 확인: {now_str} (수동 반영 완료)")
@@ -940,12 +955,14 @@ class NotificationCenterTab(QWidget):
         def _on_finished() -> None:
             self._comcigan_sync_running = False
             self.btn_auto_sync_comcigan.setEnabled(True)
+            if hasattr(self, "btn_force_sync_comcigan"):
+                self.btn_force_sync_comcigan.setEnabled(True)
 
         def _on_progress(pct: int, msg: str) -> None:
             self.lbl_comcigan_auto_status.setText(f"진행 중 ({pct}%): {msg}")
             self._append_log(f"[진행 {pct}%] {msg}")
 
-        worker = FunctionWorker("컴시간 웹 자동 파싱 및 시트 반영", _run_auto)
+        worker = FunctionWorker("컴시간 웹 자동 파싱 및 Firebase Firestore 실시간 반영", _run_auto)
         worker.signals.progress.connect(_on_progress)
         self.task_runner.start_worker(
             worker=worker,

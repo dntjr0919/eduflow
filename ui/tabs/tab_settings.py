@@ -52,6 +52,7 @@ from core.config_manager import ConfigManager, DEFAULT_CONFIG
 from core.database import DatabaseManager
 from services.ai_agent_router import TOOL_REGISTRY
 from services.firestore_sync_service import (
+    DEFAULT_VERCEL_API_URL,
     FirestoreSyncService,
     FirestoreSyncWorker,
 )
@@ -914,6 +915,15 @@ class SettingsTab(QWidget):
         ext_form.addRow("NEIS 코드:", neis_container)
         ext_form.addRow("교사 프로필 동기화:", tp_btn_container)
 
+        self.lbl_firebase_backend_mode = QLabel("Vercel API 모드")
+        apply_qss_role(self.lbl_firebase_backend_mode, role="badgePrimary", obj_name="LblFirebaseBackendMode")
+        self.edit_vercel_api_url = QLineEdit()
+        configure_input_widget(self.edit_vercel_api_url)
+        self.edit_vercel_api_url.setPlaceholderText(DEFAULT_VERCEL_API_URL)
+        self.edit_google_cred.textChanged.connect(lambda _: self._refresh_backend_mode_badge())
+
+        ext_form.addRow("Firebase 연결 모드:", self.lbl_firebase_backend_mode)
+        ext_form.addRow("연동 서버 URL (Vercel):", self.edit_vercel_api_url)
         ext_form.addRow("credentials.json:", cred_container)
         ext_form.addRow("Google 시트 URL:", self.edit_sheet_url)
         ext_form.addRow("Apps Script 웹 앱 URL:", self.edit_apps_script_url)
@@ -1114,6 +1124,7 @@ class SettingsTab(QWidget):
             self._loading_ui = False
 
         self._update_provider_field_states()
+        self._refresh_backend_mode_badge()
         self.lbl_model_status.setVisible(False)
         self._on_ai_setting_changed()
 
@@ -1639,6 +1650,7 @@ class SettingsTab(QWidget):
             self.edit_neis_school_code.setText(str(tp_sec.get("neis_school_code") or ""))
 
             self.edit_google_cred.setText(api.get("google_credentials_path", ""))
+            self.edit_vercel_api_url.setText(api.get("vercel_api_url", DEFAULT_VERCEL_API_URL) or DEFAULT_VERCEL_API_URL)
             self.edit_sheet_url.setText(api.get("google_sheet_url", ""))
             self.edit_apps_script_url.setText(api.get("google_apps_script_url", ""))
             self.edit_gas_api_secret.setText(api.get("gas_api_secret", ""))
@@ -1678,6 +1690,7 @@ class SettingsTab(QWidget):
         finally:
             self._loading_ui = False
         self._update_provider_field_states()
+        self._refresh_backend_mode_badge()
         self._update_model_status_label(
             prov_code,
             self._current_model_name() or PROVIDER_DEFAULT_MODELS.get(prov_code, "gemini-1.5-flash"),
@@ -1703,6 +1716,7 @@ class SettingsTab(QWidget):
             "api_and_integrations",
             {
                 "google_credentials_path": self.edit_google_cred.text().strip(),
+                "vercel_api_url": self.edit_vercel_api_url.text().strip() or DEFAULT_VERCEL_API_URL,
                 "google_sheet_url": self.edit_sheet_url.text().strip(),
                 "google_apps_script_url": self.edit_apps_script_url.text().strip(),
                 "gas_api_secret": self.edit_gas_api_secret.text().strip(),
@@ -1841,6 +1855,18 @@ class SettingsTab(QWidget):
             lay.addWidget(row_w)
         lay.addStretch(1)
         dlg.exec()
+
+    def _refresh_backend_mode_badge(self) -> None:
+        if not hasattr(self, "lbl_firebase_backend_mode"):
+            return
+        svc = FirestoreSyncService(db=self.db, config=self.config)
+        mode = svc.get_backend_mode()
+        if mode == "direct_admin":
+            self.lbl_firebase_backend_mode.setText("Direct Admin 모드 (로컬 JSON 키 감지됨)")
+            apply_qss_role(self.lbl_firebase_backend_mode, role="badgeSuccess")
+        else:
+            self.lbl_firebase_backend_mode.setText("Vercel API 모드 (키리스 HTTP 연동)")
+            apply_qss_role(self.lbl_firebase_backend_mode, role="badgePrimary")
 
     def _on_load_teacher_profile(self) -> None:
         tid = self.edit_teacher_id.text().strip()

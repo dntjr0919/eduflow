@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGraphicsBlurEffect,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -64,7 +65,7 @@ from core.base_worker import TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
 from services.batch_prompt_service import extract_json_from_llm_response
-from services.firestore_sync_service import FirestoreSyncService
+from services.firestore_sync_service import FirestoreSyncService, hash_password_sha256
 from services.timetable_manual_service import (
     build_manual_timetable_change,
     parse_weekly_timetable_file,
@@ -1621,12 +1622,14 @@ class ClassroomToolsTab(QWidget):
         return box, lbl_val, lbl_badge
 
     def _init_ui(self) -> None:
-        outer_lay = QVBoxLayout(self)
-        outer_lay.setContentsMargins(0, 0, 0, 0)
+        root_grid = QGridLayout(self)
+        root_grid.setContentsMargins(0, 0, 0, 0)
+        root_grid.setSpacing(0)
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._main_scroll = scroll
 
         container = QWidget()
         container.setSizePolicy(
@@ -1635,92 +1638,6 @@ class ClassroomToolsTab(QWidget):
         layout = QVBoxLayout(container)
         layout.setContentsMargins(16, 16, 20, 20)
         layout.setSpacing(14)
-
-        # 최상단 EduFlow Mobile 교사 계정 로그인 바 / 게이트
-        self.teacher_auth_bar = QFrame()
-        apply_qss_role(self.teacher_auth_bar, role="instrumentCard", obj_name="ClassroomTeacherAuthBar")
-        auth_outer = QVBoxLayout(self.teacher_auth_bar)
-        auth_outer.setContentsMargins(16, 10, 16, 10)
-        auth_outer.setSpacing(6)
-
-        self.auth_login_widget = QWidget()
-        login_row = QHBoxLayout(self.auth_login_widget)
-        login_row.setContentsMargins(0, 0, 0, 0)
-        login_row.setSpacing(8)
-        lbl_auth_title = QLabel("EduFlow Mobile 교사 계정 로그인:")
-        apply_qss_role(lbl_auth_title, role="fieldLabel")
-        self.edit_teacher_login_id = QLineEdit()
-        self.edit_teacher_login_id.setMinimumHeight(32)
-        self.edit_teacher_login_id.setPlaceholderText("교사 로그인 ID (예: 유우석)")
-        self.edit_teacher_login_pw = QLineEdit()
-        self.edit_teacher_login_pw.setMinimumHeight(32)
-        self.edit_teacher_login_pw.setEchoMode(QLineEdit.EchoMode.Password)
-        self.edit_teacher_login_pw.setPlaceholderText("비밀번호")
-        self.edit_teacher_login_pw.returnPressed.connect(self._on_teacher_login_clicked)
-        self.btn_toggle_pw_vis = QPushButton("👁")
-        self.btn_toggle_pw_vis.setCheckable(True)
-        self.btn_toggle_pw_vis.setFixedSize(34, 32)
-        self.btn_toggle_pw_vis.setToolTip("비밀번호 표시/숨김")
-        self.btn_toggle_pw_vis.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_toggle_pw_vis.toggled.connect(
-            lambda checked: self.edit_teacher_login_pw.setEchoMode(
-                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
-            )
-        )
-        self.btn_teacher_login = QPushButton("로그인")
-        apply_qss_role(self.btn_teacher_login, role="primary", obj_name="BtnTeacherLogin")
-        self.btn_teacher_login.setMinimumHeight(32)
-        self.btn_teacher_login.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_teacher_login.clicked.connect(self._on_teacher_login_clicked)
-
-        login_row.addWidget(lbl_auth_title)
-        login_row.addWidget(self.edit_teacher_login_id, stretch=1)
-        login_row.addWidget(self.edit_teacher_login_pw, stretch=1)
-        login_row.addWidget(self.btn_toggle_pw_vis)
-        login_row.addWidget(self.btn_teacher_login)
-        auth_outer.addWidget(self.auth_login_widget)
-
-        self.auth_status_widget = QWidget()
-        status_row = QHBoxLayout(self.auth_status_widget)
-        status_row.setContentsMargins(0, 0, 0, 0)
-        status_row.setSpacing(8)
-        self.lbl_teacher_auth_status = QLabel("[교사] 미로그인")
-        self.lbl_teacher_auth_status.setStyleSheet("color: #0F172A; font-weight: 700; font-size: 13px;")
-        self.btn_teacher_refresh = QPushButton("새로고침")
-        apply_qss_role(self.btn_teacher_refresh, role="secondary", obj_name="BtnTeacherRefresh")
-        self.btn_teacher_refresh.setMinimumHeight(30)
-        self.btn_teacher_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_teacher_refresh.clicked.connect(lambda: self.refresh_firebase_roster(silent=False))
-        self.btn_teacher_logout = QPushButton("로그아웃")
-        apply_qss_role(self.btn_teacher_logout, role="secondary", obj_name="BtnTeacherLogout")
-        self.btn_teacher_logout.setMinimumHeight(30)
-        self.btn_teacher_logout.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_teacher_logout.clicked.connect(self.logout_teacher)
-
-        status_row.addWidget(self.lbl_teacher_auth_status, stretch=1)
-        status_row.addWidget(self.btn_teacher_refresh)
-        status_row.addWidget(self.btn_teacher_logout)
-        auth_outer.addWidget(self.auth_status_widget)
-        self.auth_status_widget.setVisible(False)
-        layout.addWidget(self.teacher_auth_bar)
-
-        self.auth_lock_overlay = QFrame()
-        apply_qss_role(self.auth_lock_overlay, role="subCard", obj_name="ClassroomAuthLockOverlay")
-        lock_lay = QVBoxLayout(self.auth_lock_overlay)
-        lock_lay.setContentsMargins(24, 36, 24, 36)
-        lock_lay.setSpacing(8)
-        lbl_lock_title = QLabel("학급 경영 도구함 잠금 상태")
-        lbl_lock_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_lock_title.setStyleSheet("font-size: 15px; font-weight: 700; color: #1E293B;")
-        lbl_lock_desc = QLabel(
-            "상단 로그인 바에서 EduFlow Mobile 교사 계정으로 로그인하면\n"
-            "소속 학교·학년·반 명렬표가 자동으로 연동되며 6개 학급 경영 도구가 활성화됩니다."
-        )
-        lbl_lock_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_lock_desc.setStyleSheet("font-size: 12.5px; color: #475569;")
-        lock_lay.addWidget(lbl_lock_title)
-        lock_lay.addWidget(lbl_lock_desc)
-        layout.addWidget(self.auth_lock_overlay)
 
         # 상단 학급 운영 스테이션 상태 스트립
         header_bar = QFrame()
@@ -1755,10 +1672,32 @@ class ClassroomToolsTab(QWidget):
                 context_label="학급담임 명렬표 (.xlsx)",
             )
 
+        self.auth_status_widget = QWidget()
+        status_row = QHBoxLayout(self.auth_status_widget)
+        status_row.setContentsMargins(0, 0, 0, 0)
+        status_row.setSpacing(6)
+        self.lbl_teacher_auth_status = QLabel("[교사] 미로그인")
+        apply_qss_role(self.lbl_teacher_auth_status, role="badgePrimary", obj_name="LblTeacherAuthBadge")
+        self.btn_teacher_refresh = QPushButton("새로고침")
+        apply_qss_role(self.btn_teacher_refresh, role="secondary", obj_name="BtnTeacherRefresh")
+        self.btn_teacher_refresh.setMinimumHeight(30)
+        self.btn_teacher_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_teacher_refresh.clicked.connect(lambda: self.refresh_firebase_roster(silent=False))
+        self.btn_teacher_logout = QPushButton("로그아웃")
+        apply_qss_role(self.btn_teacher_logout, role="secondary", obj_name="BtnTeacherLogout")
+        self.btn_teacher_logout.setMinimumHeight(30)
+        self.btn_teacher_logout.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_teacher_logout.clicked.connect(self.logout_teacher)
+        status_row.addWidget(self.lbl_teacher_auth_status)
+        status_row.addWidget(self.btn_teacher_refresh)
+        status_row.addWidget(self.btn_teacher_logout)
+        self.auth_status_widget.setVisible(False)
+
         hb_lay.addWidget(lbl_station_title)
         hb_lay.addWidget(lbl_mode_chip)
         hb_lay.addWidget(self.lbl_roster_status_badge)
         hb_lay.addStretch()
+        hb_lay.addWidget(self.auth_status_widget)
         hb_lay.addWidget(self.btn_sync_roster)
         layout.addWidget(header_bar)
 
@@ -2257,36 +2196,112 @@ class ClassroomToolsTab(QWidget):
 
         layout.addWidget(self.tool_stack, stretch=1)
         scroll.setWidget(container)
-        outer_lay.addWidget(scroll)
+        root_grid.addWidget(scroll, 0, 0)
+
+        # 미로그인 시 반투명 오버레이 + 정중앙 로그인 카드 (폭 420px)
+        self.auth_overlay_backdrop = QFrame(self)
+        self.auth_overlay_backdrop.setObjectName("ClassroomAuthBackdrop")
+        self.auth_overlay_backdrop.setStyleSheet(
+            "QFrame#ClassroomAuthBackdrop { background: rgba(15, 23, 42, 0.28); }"
+        )
+        backdrop_lay = QVBoxLayout(self.auth_overlay_backdrop)
+        backdrop_lay.setContentsMargins(24, 24, 24, 24)
+        backdrop_lay.addStretch(1)
+
+        self.auth_login_card = QFrame(self.auth_overlay_backdrop)
+        self.auth_login_card.setObjectName("ClassroomAuthLoginCard")
+        self.auth_login_card.setFixedWidth(420)
+        self.auth_login_card.setStyleSheet(
+            "QFrame#ClassroomAuthLoginCard { "
+            "background: #FFFFFF; border: 1px solid #CBD5E1; border-radius: 16px; "
+            "}"
+        )
+        card_lay = QVBoxLayout(self.auth_login_card)
+        card_lay.setContentsMargins(28, 28, 28, 28)
+        card_lay.setSpacing(14)
+
+        lbl_card_title = QLabel("EduFlow Mobile 교사 계정 로그인")
+        lbl_card_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_card_title.setStyleSheet("font-size: 17px; font-weight: 700; color: #0F172A; border: none;")
+
+        lbl_card_desc = QLabel(
+            "로그인하면 소속 학교·학년·반 명렬표가 연동되고\n"
+            "학급 경영 도구함(출결·청소·가정통신문·알림·상담·시간표)이 활성화됩니다."
+        )
+        lbl_card_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_card_desc.setWordWrap(True)
+        lbl_card_desc.setStyleSheet("font-size: 12px; color: #64748B; border: none;")
+
+        self.edit_teacher_login_id = QLineEdit()
+        self.edit_teacher_login_id.setMinimumHeight(38)
+        self.edit_teacher_login_id.setPlaceholderText("교사 로그인 ID (예: 유우석)")
+
+        pw_row = QHBoxLayout()
+        pw_row.setSpacing(6)
+        self.edit_teacher_login_pw = QLineEdit()
+        self.edit_teacher_login_pw.setMinimumHeight(38)
+        self.edit_teacher_login_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_teacher_login_pw.setPlaceholderText("비밀번호")
+        self.edit_teacher_login_pw.returnPressed.connect(self._on_teacher_login_clicked)
+
+        self.btn_toggle_pw_vis = QPushButton("👁")
+        self.btn_toggle_pw_vis.setCheckable(True)
+        self.btn_toggle_pw_vis.setFixedSize(38, 38)
+        self.btn_toggle_pw_vis.setToolTip("비밀번호 표시/숨김")
+        self.btn_toggle_pw_vis.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_pw_vis.toggled.connect(
+            lambda checked: self.edit_teacher_login_pw.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        pw_row.addWidget(self.edit_teacher_login_pw, stretch=1)
+        pw_row.addWidget(self.btn_toggle_pw_vis)
+
+        self.btn_teacher_login = QPushButton("로그인")
+        apply_qss_role(self.btn_teacher_login, role="primary", obj_name="BtnTeacherLogin")
+        self.btn_teacher_login.setMinimumHeight(40)
+        self.btn_teacher_login.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_teacher_login.clicked.connect(self._on_teacher_login_clicked)
+
+        card_lay.addWidget(lbl_card_title)
+        card_lay.addWidget(lbl_card_desc)
+        card_lay.addWidget(self.edit_teacher_login_id)
+        card_lay.addLayout(pw_row)
+        card_lay.addWidget(self.btn_teacher_login)
+
+        backdrop_lay.addWidget(self.auth_login_card, alignment=Qt.AlignmentFlag.AlignCenter)
+        backdrop_lay.addStretch(1)
+        root_grid.addWidget(self.auth_overlay_backdrop, 0, 0)
 
     # =========================================================================
     # 교사 계정 로그인 / 세션 복원 / Firebase 명렬표 동적 연동
     # =========================================================================
     def _apply_teacher_auth_state(self) -> None:
         logged_in = bool(self._logged_in_teacher)
-        self.auth_login_widget.setVisible(not logged_in)
         self.auth_status_widget.setVisible(logged_in)
-        self.auth_lock_overlay.setVisible(not logged_in)
-        self.pill_bar.setVisible(logged_in)
-        self.tool_stack.setVisible(logged_in)
+        self.auth_overlay_backdrop.setVisible(not logged_in)
+        self.pill_bar.setVisible(True)
+        self.tool_stack.setVisible(True)
 
-        if logged_in and self._logged_in_teacher:
+        if not logged_in:
+            blur = QGraphicsBlurEffect(self._main_scroll)
+            blur.setBlurRadius(9.0)
+            self._main_scroll.setGraphicsEffect(blur)
+            self.auth_overlay_backdrop.raise_()
+            self.lbl_teacher_auth_status.setText("[교사] 미로그인")
+        else:
+            self._main_scroll.setGraphicsEffect(None)
             meta = self._teacher_meta()
             name = meta["teacher_name"]
             school_name = meta["school_name"] or meta["school_code"] or "소속학교"
             g = meta["grade"]
             c = meta["class_no"]
             cls_part = f"{school_name} {g}학년 {c}반" if (g and c) else school_name
-            roster_cnt = len(self._firebase_roster) if self._firebase_roster else len(self.db.get_active_homeroom_students())
-            self.lbl_teacher_auth_status.setText(
-                f"[교사] {name} ({cls_part}) · 연동 명렬표 ({roster_cnt}명)"
-            )
+            self.lbl_teacher_auth_status.setText(f"[교사] {name} ({cls_part})")
             if hasattr(self, "spin_tt_chg_grade") and g:
                 self.spin_tt_chg_grade.setValue(int(g))
             if hasattr(self, "spin_tt_chg_class") and c:
                 self.spin_tt_chg_class.setValue(int(c))
-        else:
-            self.lbl_teacher_auth_status.setText("[교사] 미로그인")
 
     def _on_teacher_login_clicked(self) -> None:
         uid = self.edit_teacher_login_id.text().strip()
@@ -2339,6 +2354,7 @@ class ClassroomToolsTab(QWidget):
         tp_sec = dict(self.config.get_section("teacher_profile") or {})
         tp_sec.update(self._logged_in_teacher)
         tp_sec["session_logged_in"] = True
+        tp_sec["auth_password_hash"] = hash_password_sha256(password) if password else ""
         self.config.update_section("teacher_profile", tp_sec)
 
         self.refresh_firebase_roster(sync_service=svc, silent=True)
@@ -2348,7 +2364,10 @@ class ClassroomToolsTab(QWidget):
     def logout_teacher(self) -> None:
         self._logged_in_teacher = None
         self._firebase_roster = []
-        self.config.update_section("teacher_profile", {"session_logged_in": False})
+        self.config.update_section(
+            "teacher_profile",
+            {"session_logged_in": False, "auth_password_hash": ""},
+        )
         self._apply_teacher_auth_state()
         self._refresh_roster_dependent_views()
 
