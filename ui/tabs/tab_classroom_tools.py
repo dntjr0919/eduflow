@@ -43,11 +43,13 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -56,7 +58,9 @@ from PyQt6.QtWidgets import (
 )
 
 from core.base_worker import TaskRunner
+from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from services.firestore_sync_service import FirestoreSyncService
 from services.hwpx_agent_service import (
     HwpxDocument,
     apply_hwpx_operations,
@@ -1606,14 +1610,41 @@ class ClassroomToolsTab(QWidget):
         hb_lay.addWidget(self.btn_sync_roster)
         layout.addWidget(header_bar)
 
-        # 메인 2x2 Bento Grid
-        grid = QGridLayout()
-        grid.setVerticalSpacing(16)
-        grid.setHorizontalSpacing(16)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setRowStretch(0, 1)
-        grid.setRowStretch(1, 1)
+        # 확장 가능한 상단 필(Pill) 탭 바 + 하단 단일 전체 폭 QStackedWidget
+        pill_bar = QFrame()
+        pill_bar_lay = QHBoxLayout(pill_bar)
+        pill_bar_lay.setContentsMargins(0, 0, 0, 0)
+        pill_bar_lay.setSpacing(8)
+        self.pill_btn_group = QButtonGroup(self)
+        self.pill_btn_group.setExclusive(True)
+        self.tool_pills: List[QPushButton] = []
+        pill_titles = [
+            "1. 출결 및 결석계 관리",
+            "2. 청소 당번 순환 배정기",
+            "3. 모바일 가정통신문·서명 취합 센터",
+            "4. 학급 공지·긴급 알림 일괄 발송기",
+            "5. 1:1 상담 내역·누가기록 뷰어",
+        ]
+        for idx, p_title in enumerate(pill_titles):
+            pill = QPushButton(p_title)
+            pill.setCheckable(True)
+            pill.setChecked(idx == 0)
+            pill.setCursor(Qt.CursorShape.PointingHandCursor)
+            pill.setMinimumHeight(34)
+            pill.setStyleSheet(
+                "QPushButton { padding: 6px 14px; border-radius: 17px; border: 1px solid #CBD5E1; "
+                "background: #FFFFFF; color: #334155; font-weight: 600; font-size: 12px; } "
+                "QPushButton:checked { background: #4F46E5; color: #FFFFFF; border-color: #4F46E5; } "
+                "QPushButton:hover:!checked { background: #F1F5F9; }"
+            )
+            self.pill_btn_group.addButton(pill, idx)
+            pill_bar_lay.addWidget(pill)
+            self.tool_pills.append(pill)
+        pill_bar_lay.addStretch(1)
+        layout.addWidget(pill_bar)
+
+        self.tool_stack = QStackedWidget()
+        self.pill_btn_group.idClicked.connect(self.tool_stack.setCurrentIndex)
 
         # =====================================================================
         # CARD 1: 출결 및 결석계 관리 (Attendance Tracker)
@@ -1694,9 +1725,16 @@ class ClassroomToolsTab(QWidget):
         self.btn_create_absence.setToolTip("선택한 출결 행으로 한글(.hwpx) 결석계·출석인정서 또는 CSV 파일을 생성합니다.")
         self.btn_create_absence.clicked.connect(self._on_export_absence_document)
 
+        self.btn_sync_mobile_att = QPushButton("모바일 출결 동기화")
+        apply_qss_role(self.btn_sync_mobile_att, role="secondary", obj_name="BtnSyncMobileAttendance")
+        self.btn_sync_mobile_att.setMinimumHeight(32)
+        self.btn_sync_mobile_att.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_mobile_att.clicked.connect(self._on_sync_mobile_attendance)
+
         att_btn_row.addWidget(self.btn_add_attendance)
         att_btn_row.addWidget(self.btn_edit_attendance)
         att_btn_row.addWidget(self.btn_delete_attendance)
+        att_btn_row.addWidget(self.btn_sync_mobile_att)
         att_btn_row.addStretch()
         att_btn_row.addWidget(self.btn_create_absence)
         c1_lay.addLayout(att_btn_row)
@@ -1831,194 +1869,143 @@ class ClassroomToolsTab(QWidget):
         c2_lay.addWidget(self.txt_cleaning_result)
 
         # =====================================================================
-        # CARD 3: 학급 자리 배치 및 모둠 편성기 (Seating Chart & Group Builder)
+        # TOOL 3: 모바일 가정통신문·서명 취합 센터
         # =====================================================================
-        self.card_seating = HoverZoomCard(
-            title="3. 학급 자리 배치 및 모둠 편성기 (Seating Grid 6x5)",
+        self.card_mobile_notice = HoverZoomCard(
+            title="3. 모바일 가정통신문·서명 취합 센터",
             parent=container,
             zoom_ratio=1.0,
             hover_delay_ms=0,
         )
-        apply_qss_role(self.card_seating, role="hoverZoomCard", obj_name="CardSeating")
-        c3_lay = self.card_seating.body_layout()
+        c3_lay = self.card_mobile_notice.body_layout()
+        notice_top = QHBoxLayout()
+        self.edit_notice_title = QLineEdit()
+        self.edit_notice_title.setPlaceholderText("가정통신문 제목 (PDF 불러오기 시 자동 채움)")
+        self.edit_notice_due = QLineEdit()
+        self.edit_notice_due.setPlaceholderText("마감일 (예: 2026-11-25)")
+        self.edit_notice_due.setFixedWidth(150)
+        self.btn_load_notice_pdf = QPushButton("PDF 불러오기 (자동 추출)")
+        apply_qss_role(self.btn_load_notice_pdf, role="secondary")
+        self.btn_load_notice_pdf.clicked.connect(self._on_load_notice_pdf)
+        self.btn_publish_mobile_notice = QPushButton("모바일 배포")
+        apply_qss_role(self.btn_publish_mobile_notice, role="primary")
+        self.btn_publish_mobile_notice.clicked.connect(self._on_publish_mobile_notice)
+        notice_top.addWidget(self.edit_notice_title, stretch=1)
+        notice_top.addWidget(self.edit_notice_due)
+        notice_top.addWidget(self.btn_load_notice_pdf)
+        notice_top.addWidget(self.btn_publish_mobile_notice)
+        c3_lay.addLayout(notice_top)
 
-        # 칠판 / 교탁 전면 바 + 클릭 맞교환 안내
-        podium_frame = QFrame()
-        apply_qss_role(podium_frame, role="podiumBar")
-        podium_lay = QHBoxLayout(podium_frame)
-        podium_lay.setContentsMargins(12, 6, 12, 6)
-        podium_lay.setSpacing(8)
-        lbl_podium = QLabel("[ 칠판 / 교탁 (전면) ]")
-        apply_qss_role(lbl_podium, role="podiumLabel")
-        self.lbl_seat_hint = QLabel("좌석 두 칸을 차례로 클릭하면 자리를 맞바꿉니다")
-        apply_qss_role(self.lbl_seat_hint, role="mutedText")
-        podium_lay.addWidget(lbl_podium)
-        podium_lay.addStretch()
-        podium_lay.addWidget(self.lbl_seat_hint)
-        c3_lay.addWidget(podium_frame)
+        self.txt_notice_content = QPlainTextEdit()
+        self.txt_notice_content.setPlaceholderText("가정통신문 본문 내용이 여기에 표시됩니다.")
+        self.txt_notice_content.setMinimumHeight(110)
+        c3_lay.addWidget(self.txt_notice_content)
 
-        # 6x5(30명 초과 시 6x6 자동 확장) 클릭형 좌석 그리드
-        seat_container = QFrame()
-        apply_qss_role(seat_container, role="subCard")
-        self.seating_grid = QGridLayout(seat_container)
-        self.seating_grid.setContentsMargins(8, 8, 8, 8)
-        self.seating_grid.setHorizontalSpacing(6)
-        self.seating_grid.setVerticalSpacing(6)
+        self.edit_notice_fields = QLineEdit()
+        self.edit_notice_fields.setPlaceholderText("추출된 회신 입력 항목 (쉼표 구분, 예: 참가 동의 여부, 비상연락처)")
+        c3_lay.addWidget(self.edit_notice_fields)
 
-        self._seat_cells.clear()
-        self._seat_labels.clear()
-        for r in range(6):
-            for c in range(6):
-                idx = r * 6 + c
-                cell = ClickableSeatCell(idx, self._on_seat_cell_clicked, seat_container)
-                if r >= 5:
-                    cell.setVisible(False)
-                self.seating_grid.addWidget(cell, r, c)
-                self._seat_cells.append(cell)
-                self._seat_labels.append((cell.lbl_code, cell.lbl_stu))
+        reply_bar = QHBoxLayout()
+        self.edit_active_notice_id = QLineEdit()
+        self.edit_active_notice_id.setPlaceholderText("조회할 가정통신문 ID (배포 시 자동 입력)")
+        self.btn_refresh_replies = QPushButton("제출 현황 조회")
+        apply_qss_role(self.btn_refresh_replies, role="secondary")
+        self.btn_refresh_replies.clicked.connect(self._on_refresh_notice_replies)
+        self.btn_nudge_unsubmitted = QPushButton("미제출자 일괄 알림")
+        apply_qss_role(self.btn_nudge_unsubmitted, role="warningOutline")
+        self.btn_nudge_unsubmitted.clicked.connect(self._on_nudge_unsubmitted_notice)
+        reply_bar.addWidget(self.edit_active_notice_id, stretch=1)
+        reply_bar.addWidget(self.btn_refresh_replies)
+        reply_bar.addWidget(self.btn_nudge_unsubmitted)
+        c3_lay.addLayout(reply_bar)
 
-        c3_lay.addWidget(seat_container, stretch=1)
-
-        # 자리 배치 액션 바 (앞자리 배려 + 배려 지정 + 좌석표 출력 + 무작위 배치)
-        seat_btn_row = QHBoxLayout()
-        seat_btn_row.setSpacing(6)
-        self.chk_front_care = QCheckBox("앞자리 배려")
-        self.chk_front_care.setChecked(True)
-        self.chk_front_care.setToolTip("체크 시 지정한 배려 학생을 칠판 앞 1~2열(D-01 ~ D-12)에 우선 무작위 배치합니다.")
-        self.chk_front_care.toggled.connect(self._on_front_care_toggled)
-
-        self.btn_front_care_cfg = QPushButton("배려 지정")
-        apply_qss_role(self.btn_front_care_cfg, role="secondary", obj_name="BtnFrontCareConfig")
-        self.btn_front_care_cfg.setMinimumHeight(34)
-        self.btn_front_care_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_front_care_cfg.clicked.connect(self._on_open_front_care_dialog)
-
-        self.btn_export_seats = QPushButton("좌석표 출력")
-        apply_qss_role(self.btn_export_seats, role="secondary", obj_name="BtnExportSeats")
-        self.btn_export_seats.setMinimumHeight(34)
-        self.btn_export_seats.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_export_seats.setToolTip("현재 좌석 배치를 한글(.hwpx), 엑셀(.xlsx), CSV 파일로 저장합니다.")
-        self.btn_export_seats.clicked.connect(self._on_export_seating_chart)
-
-        self.btn_random_seats = QPushButton("무작위 배치")
-        apply_qss_role(self.btn_random_seats, role="primary", obj_name="BtnRandomizeSeats")
-        self.btn_random_seats.setMinimumHeight(34)
-        self.btn_random_seats.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_random_seats.clicked.connect(lambda: self._on_randomize_seats(initial=False))
-
-        seat_btn_row.addWidget(self.chk_front_care)
-        seat_btn_row.addWidget(self.btn_front_care_cfg)
-        seat_btn_row.addStretch()
-        seat_btn_row.addWidget(self.btn_export_seats)
-        seat_btn_row.addWidget(self.btn_random_seats)
-        c3_lay.addLayout(seat_btn_row)
+        self.table_notice_replies = QTableWidget(0, 5)
+        self.table_notice_replies.setHorizontalHeaderLabels(["학번", "이름", "제출 상태", "회신/동의", "서명 URL"])
+        self.table_notice_replies.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_notice_replies.setMinimumHeight(180)
+        c3_lay.addWidget(self.table_notice_replies, stretch=1)
 
         # =====================================================================
-        # CARD 4: 학생 관찰·상담 메모장 (Counseling & Observation Log)
+        # TOOL 4: 학급 공지·긴급 알림 일괄 발송기
         # =====================================================================
-        self.card_counsel = HoverZoomCard(
-            title="4. 학생 관찰 및 상담 메모장 (Observation Log)",
+        self.card_class_notify = HoverZoomCard(
+            title="4. 학급 공지·긴급 알림 일괄 발송기",
             parent=container,
             zoom_ratio=1.0,
             hover_delay_ms=0,
         )
-        apply_qss_role(self.card_counsel, role="hoverZoomCard", obj_name="CardCounsel")
-        c4_lay = self.card_counsel.body_layout()
+        c4_lay = self.card_class_notify.body_layout()
+        noti_top = QHBoxLayout()
+        self.edit_broadcast_title = QLineEdit()
+        self.edit_broadcast_title.setPlaceholderText("공지 / 긴급 알림 제목")
+        self.combo_broadcast_target = QComboBox()
+        self.combo_broadcast_target.addItem("학생 + 학부모 전체", "all")
+        self.combo_broadcast_target.addItem("학생만", "student")
+        self.combo_broadcast_target.addItem("학부모만", "parent")
+        self.btn_send_broadcast = QPushButton("알림 일괄 발송")
+        apply_qss_role(self.btn_send_broadcast, role="primary")
+        self.btn_send_broadcast.clicked.connect(self._on_send_class_broadcast)
+        self.btn_refresh_broadcast = QPushButton("이력 새로고침")
+        apply_qss_role(self.btn_refresh_broadcast, role="secondary")
+        self.btn_refresh_broadcast.clicked.connect(self._on_refresh_broadcast_history)
+        noti_top.addWidget(self.edit_broadcast_title, stretch=1)
+        noti_top.addWidget(self.combo_broadcast_target)
+        noti_top.addWidget(self.btn_send_broadcast)
+        noti_top.addWidget(self.btn_refresh_broadcast)
+        c4_lay.addLayout(noti_top)
 
-        # 학생 선택 콤보박스 + 선택 학생 필터 체크박스
-        stu_sel_row = QHBoxLayout()
-        stu_sel_row.setSpacing(8)
-        lbl_stu_sel = QLabel("대상 학생:")
-        apply_qss_role(lbl_stu_sel, role="fieldLabel")
+        self.txt_broadcast_msg = QPlainTextEdit()
+        self.txt_broadcast_msg.setPlaceholderText("전달할 학급 공지 또는 긴급 안내 내용을 입력하세요.")
+        self.txt_broadcast_msg.setMinimumHeight(90)
+        c4_lay.addWidget(self.txt_broadcast_msg)
 
-        self.combo_counsel_student = QComboBox()
-        self.combo_counsel_student.setMinimumHeight(34)
-        install_no_scroll_wheel_filter(self.combo_counsel_student)
-        self.combo_counsel_student.currentIndexChanged.connect(self._on_counsel_filter_changed)
+        self.table_broadcast_history = QTableWidget(0, 4)
+        self.table_broadcast_history.setHorizontalHeaderLabels(["발송 일시", "대상", "제목", "내용"])
+        self.table_broadcast_history.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table_broadcast_history.setMinimumHeight(200)
+        c4_lay.addWidget(self.table_broadcast_history, stretch=1)
 
-        self.chk_counsel_filter_student = QCheckBox("선택 학생만 보기")
-        self.chk_counsel_filter_student.setToolTip("체크하면 현재 선택한 학생의 누적 관찰·상담 기록만 모아 봅니다.")
-        self.chk_counsel_filter_student.toggled.connect(self._on_counsel_filter_changed)
-
-        stu_sel_row.addWidget(lbl_stu_sel)
-        stu_sel_row.addWidget(self.combo_counsel_student, stretch=1)
-        stu_sel_row.addWidget(self.chk_counsel_filter_student)
-        c4_lay.addLayout(stu_sel_row)
-
-        # 빠른 키워드 태그 바
-        tag_row = QHBoxLayout()
-        tag_row.setSpacing(6)
-        lbl_tag_guide = QLabel("NEIS 키워드:")
-        apply_qss_role(lbl_tag_guide, role="mutedText")
-        tag_row.addWidget(lbl_tag_guide)
-        for kw in ("+ 탐구능력", "+ 자기주도성", "+ 협업태도", "+ 나눔과 배려"):
-            btn_kw = QPushButton(kw)
-            apply_qss_role(btn_kw, role="tagChip")
-            btn_kw.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn_kw.clicked.connect(lambda _checked=False, k=kw: self._append_keyword_to_note(k))
-            tag_row.addWidget(btn_kw)
-        tag_row.addStretch()
-        c4_lay.addLayout(tag_row)
-
-        # 한줄 관찰 입력 필드 + 기록 추가 버튼
-        obs_input_row = QHBoxLayout()
-        obs_input_row.setSpacing(8)
-        self.edit_observation = QLineEdit()
-        self.edit_observation.setMinimumHeight(34)
-        self.edit_observation.setPlaceholderText(
-            "수업 태도, 교우 관계, 진로 상담 등 수시 관찰 내용을 입력하세요..."
+        # =====================================================================
+        # TOOL 5: 1:1 상담 내역·누가기록 뷰어
+        # =====================================================================
+        self.card_chat_viewer = HoverZoomCard(
+            title="5. 1:1 상담 내역·누가기록 뷰어",
+            parent=container,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
         )
-        self.edit_observation.returnPressed.connect(self._on_add_observation_log)
+        c5_lay = self.card_chat_viewer.body_layout()
+        chat_top = QHBoxLayout()
+        self.combo_chat_student = QComboBox()
+        self.btn_load_chat_history = QPushButton("Firestore 상담 내역 불러오기")
+        apply_qss_role(self.btn_load_chat_history, role="primary")
+        self.btn_load_chat_history.clicked.connect(self._on_load_chat_history)
+        self.btn_copy_chat_history = QPushButton("상담일지/생기부용 복사")
+        apply_qss_role(self.btn_copy_chat_history, role="secondary")
+        self.btn_copy_chat_history.clicked.connect(self._on_copy_chat_history)
+        self.btn_save_chat_history = QPushButton("텍스트 저장 (.txt)")
+        apply_qss_role(self.btn_save_chat_history, role="secondary")
+        self.btn_save_chat_history.clicked.connect(self._on_save_chat_history)
+        chat_top.addWidget(QLabel("학생 선택:"))
+        chat_top.addWidget(self.combo_chat_student, stretch=1)
+        chat_top.addWidget(self.btn_load_chat_history)
+        chat_top.addWidget(self.btn_copy_chat_history)
+        chat_top.addWidget(self.btn_save_chat_history)
+        c5_lay.addLayout(chat_top)
 
-        self.btn_save_observation = QPushButton("일지에 기록")
-        apply_qss_role(self.btn_save_observation, role="primary", obj_name="BtnSaveObservation")
-        self.btn_save_observation.setMinimumHeight(34)
-        self.btn_save_observation.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_save_observation.clicked.connect(self._on_add_observation_log)
+        self.txt_chat_history_viewer = QPlainTextEdit()
+        self.txt_chat_history_viewer.setReadOnly(True)
+        self.txt_chat_history_viewer.setPlaceholderText("학생을 선택한 뒤 [Firestore 상담 내역 불러오기]를 클릭하세요.")
+        self.txt_chat_history_viewer.setMinimumHeight(260)
+        c5_lay.addWidget(self.txt_chat_history_viewer, stretch=1)
 
-        obs_input_row.addWidget(self.edit_observation, stretch=1)
-        obs_input_row.addWidget(self.btn_save_observation)
-        c4_lay.addLayout(obs_input_row)
+        self.tool_stack.addWidget(self.card_attendance)
+        self.tool_stack.addWidget(self.card_cleaning)
+        self.tool_stack.addWidget(self.card_mobile_notice)
+        self.tool_stack.addWidget(self.card_class_notify)
+        self.tool_stack.addWidget(self.card_chat_viewer)
 
-        # 최근 관찰/상담 이력 리스트 (더블클릭 내용 수정 지원)
-        self.list_counsel_history = QListWidget()
-        self.list_counsel_history.setAlternatingRowColors(True)
-        self.list_counsel_history.setToolTip("기록을 더블클릭하면 내용을 수정할 수 있습니다.")
-        self.list_counsel_history.itemDoubleClicked.connect(self._on_edit_observation_item)
-        c4_lay.addWidget(self.list_counsel_history, stretch=1)
-
-        # 하단 검색 필터 + 삭제 + 일지 내보내기 바
-        obs_footer_row = QHBoxLayout()
-        obs_footer_row.setSpacing(6)
-        self.edit_counsel_search = QLineEdit()
-        self.edit_counsel_search.setMinimumHeight(32)
-        self.edit_counsel_search.setPlaceholderText("이름 · 학번 · 키워드 검색...")
-        self.edit_counsel_search.textChanged.connect(self._on_counsel_filter_changed)
-
-        self.btn_delete_counsel = QPushButton("선택 삭제")
-        apply_qss_role(self.btn_delete_counsel, role="secondary", obj_name="BtnDeleteObservation")
-        self.btn_delete_counsel.setMinimumHeight(32)
-        self.btn_delete_counsel.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_delete_counsel.clicked.connect(self._on_delete_observation_log)
-
-        self.btn_export_counsel = QPushButton("일지 내보내기")
-        apply_qss_role(self.btn_export_counsel, role="secondary", obj_name="BtnExportObservation")
-        self.btn_export_counsel.setMinimumHeight(32)
-        self.btn_export_counsel.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_export_counsel.setToolTip("누적 관찰·상담 일지를 엑셀(.xlsx), 한글(.hwpx), CSV로 저장합니다.")
-        self.btn_export_counsel.clicked.connect(self._on_export_observation_logs)
-
-        obs_footer_row.addWidget(self.edit_counsel_search, stretch=1)
-        obs_footer_row.addWidget(self.btn_delete_counsel)
-        obs_footer_row.addWidget(self.btn_export_counsel)
-        c4_lay.addLayout(obs_footer_row)
-
-        grid.addWidget(self.card_attendance, 0, 0)
-        grid.addWidget(self.card_cleaning, 0, 1)
-        grid.addWidget(self.card_seating, 1, 0)
-        grid.addWidget(self.card_counsel, 1, 1)
-
-        layout.addLayout(grid, stretch=1)
+        layout.addWidget(self.tool_stack, stretch=1)
         scroll.setWidget(container)
         outer_lay.addWidget(scroll)
 
@@ -2059,27 +2046,184 @@ class ClassroomToolsTab(QWidget):
             self.lbl_roster_status_badge.setToolTip("환경설정 탭에서 나이스 학급담임 명렬표를 먼저 등록해주세요")
 
         roster = self._get_active_roster()
-        prev_counsel_sid = ""
-        cur_data = self.combo_counsel_student.currentData()
-        if isinstance(cur_data, tuple) and len(cur_data) == 2:
-            prev_counsel_sid = str(cur_data[0])
-
-        self.combo_counsel_student.blockSignals(True)
-        self.combo_counsel_student.clear()
-        restore_idx = 0
-        for idx, (sid, name) in enumerate(roster):
-            self.combo_counsel_student.addItem(f"{sid} {name}", (sid, name))
-            if prev_counsel_sid and sid == prev_counsel_sid:
-                restore_idx = idx
-        if self.combo_counsel_student.count() > 0:
-            self.combo_counsel_student.setCurrentIndex(restore_idx)
-        self.combo_counsel_student.blockSignals(False)
+        self.combo_chat_student.blockSignals(True)
+        self.combo_chat_student.clear()
+        self.combo_chat_student.addItem("우리 반 전체", "")
+        for sid, name in roster:
+            self.combo_chat_student.addItem(f"{sid} {name}", sid)
+        self.combo_chat_student.blockSignals(False)
 
         self._refresh_attendance_view()
-        self._load_seating_into_ui()
         self._load_duty_state_into_ui()
         self._update_duty_preview()
-        self._refresh_observation_view()
+
+    def _teacher_meta(self) -> Dict[str, Any]:
+        cfg = ConfigManager()
+        tp = cfg.get_section("teacher_profile")
+        return {
+            "grade": tp.get("grade") or 1,
+            "class_no": tp.get("class_no") or 1,
+            "school_code": str(tp.get("neis_school_code") or "").strip(),
+            "school_name": str(tp.get("school_name") or "").strip(),
+            "teacher_name": str(tp.get("name") or "담임교사").strip(),
+        }
+
+    def _on_sync_mobile_attendance(self) -> None:
+        meta = self._teacher_meta()
+        svc = FirestoreSyncService(db=self.db)
+        try:
+            rows = svc.fetch_homeroom_attendance(grade=meta["grade"], class_no=meta["class_no"])
+            QMessageBox.information(self, "모바일 출결 동기화", f"Firestore에서 {len(rows)}건의 출결 기록을 조회했습니다.")
+        except Exception as exc:
+            QMessageBox.warning(self, "모바일 출결 동기화 오류", str(exc))
+
+    def _on_load_notice_pdf(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(self, "가정통신문 PDF 선택", "", "PDF Files (*.pdf)")
+        if not file_path:
+            return
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            text = "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            if lines and not self.edit_notice_title.text().strip():
+                self.edit_notice_title.setText(lines[0][:60])
+            self.txt_notice_content.setPlainText(text[:4000])
+            fields = ["참가/동의 여부"]
+            for kw in ("연락처", "전화", "사유", "희망", "신청"):
+                if kw in text:
+                    fields.append(kw)
+            self.edit_notice_fields.setText(", ".join(dict.fromkeys(fields)))
+        except Exception as exc:
+            QMessageBox.warning(self, "PDF 파싱 오류", f"PDF를 읽을 수 없습니다: {exc}")
+
+    def _on_publish_mobile_notice(self) -> None:
+        title = self.edit_notice_title.text().strip()
+        if not title:
+            QMessageBox.warning(self, "입력 확인", "가정통신문 제목을 입력해 주세요.")
+            return
+        meta = self._teacher_meta()
+        fields = [f.strip() for f in self.edit_notice_fields.text().split(",") if f.strip()]
+        svc = FirestoreSyncService(db=self.db)
+        ok, rid = svc.publish_mobile_notice({
+            "title": title,
+            "content": self.txt_notice_content.toPlainText().strip(),
+            "due_date": self.edit_notice_due.text().strip(),
+            "reply_fields": fields,
+            "target_grade": meta["grade"],
+            "target_class": meta["class_no"],
+            "school_code": meta["school_code"],
+            "school_name": meta["school_name"],
+            "author_name": meta["teacher_name"],
+        })
+        if ok:
+            self.edit_active_notice_id.setText(rid)
+            QMessageBox.information(self, "배포 완료", f"모바일 가정통신문이 배포되었습니다.\n(ID: {rid})")
+
+    def _on_refresh_notice_replies(self) -> None:
+        nid = self.edit_active_notice_id.text().strip()
+        if not nid:
+            QMessageBox.information(self, "조회 안내", "먼저 가정통신문 ID를 입력하거나 배포해 주세요.")
+            return
+        svc = FirestoreSyncService(db=self.db)
+        replies = svc.fetch_notice_replies(nid)
+        rep_map = {str(r.get("student_id") or ""): r for r in replies}
+        roster = self._get_active_roster()
+        self.table_notice_replies.setRowCount(0)
+        for sid, name in roster:
+            r = self.table_notice_replies.rowCount()
+            self.table_notice_replies.insertRow(r)
+            rep = rep_map.get(str(sid))
+            self.table_notice_replies.setItem(r, 0, QTableWidgetItem(str(sid)))
+            self.table_notice_replies.setItem(r, 1, QTableWidgetItem(str(name)))
+            self.table_notice_replies.setItem(r, 2, QTableWidgetItem("제출완료" if rep else "미제출"))
+            self.table_notice_replies.setItem(r, 3, QTableWidgetItem(str(rep.get("reply_choice", "")) if rep else "-"))
+            self.table_notice_replies.setItem(r, 4, QTableWidgetItem(str(rep.get("signature_drive_url") or rep.get("signature_url") or "") if rep else ""))
+
+    def _on_nudge_unsubmitted_notice(self) -> None:
+        nid = self.edit_active_notice_id.text().strip()
+        title = self.edit_notice_title.text().strip() or "가정통신문"
+        if not nid:
+            return
+        meta = self._teacher_meta()
+        svc = FirestoreSyncService(db=self.db)
+        svc.send_class_notification(
+            title=f"[미제출 안내] {title}",
+            message="가정통신문 전자서명 회신이 아직 완료되지 않았습니다. 확인 후 제출해 주세요.",
+            target_role="all",
+            grade=meta["grade"],
+            class_no=meta["class_no"],
+            school_code=meta["school_code"],
+            school_name=meta["school_name"],
+            sender=meta["teacher_name"],
+        )
+        QMessageBox.information(self, "알림 발송 완료", "미제출 안내 알림이 Firestore에 등록되었습니다.")
+
+    def _on_send_class_broadcast(self) -> None:
+        title = self.edit_broadcast_title.text().strip()
+        msg = self.txt_broadcast_msg.toPlainText().strip()
+        if not title or not msg:
+            QMessageBox.warning(self, "입력 확인", "알림 제목과 내용을 모두 입력해 주세요.")
+            return
+        meta = self._teacher_meta()
+        svc = FirestoreSyncService(db=self.db)
+        svc.send_class_notification(
+            title=title,
+            message=msg,
+            target_role=str(self.combo_broadcast_target.currentData() or "all"),
+            grade=meta["grade"],
+            class_no=meta["class_no"],
+            school_code=meta["school_code"],
+            school_name=meta["school_name"],
+            sender=meta["teacher_name"],
+        )
+        self.edit_broadcast_title.clear()
+        self.txt_broadcast_msg.clear()
+        self._on_refresh_broadcast_history()
+        QMessageBox.information(self, "발송 완료", "학급 공지·긴급 알림이 발송되었습니다.")
+
+    def _on_refresh_broadcast_history(self) -> None:
+        meta = self._teacher_meta()
+        svc = FirestoreSyncService(db=self.db)
+        rows = svc.fetch_sent_notifications(grade=meta["grade"], class_no=meta["class_no"])
+        self.table_broadcast_history.setRowCount(0)
+        for item in rows:
+            r = self.table_broadcast_history.rowCount()
+            self.table_broadcast_history.insertRow(r)
+            self.table_broadcast_history.setItem(r, 0, QTableWidgetItem(str(item.get("created_at") or "")))
+            self.table_broadcast_history.setItem(r, 1, QTableWidgetItem(str(item.get("target_role") or "all")))
+            self.table_broadcast_history.setItem(r, 2, QTableWidgetItem(str(item.get("title") or "")))
+            self.table_broadcast_history.setItem(r, 3, QTableWidgetItem(str(item.get("message") or "")))
+
+    def _on_load_chat_history(self) -> None:
+        sid = str(self.combo_chat_student.currentData() or "").strip()
+        meta = self._teacher_meta()
+        svc = FirestoreSyncService(db=self.db)
+        rows = svc.fetch_chat_history(grade=meta["grade"], class_no=meta["class_no"], student_id=sid)
+        if not rows:
+            self.txt_chat_history_viewer.setPlainText("조회된 1:1 상담 대화 내역이 없습니다.")
+            return
+        lines = []
+        for m in rows:
+            ts = str(m.get("created_at") or "")
+            sender = m.get("sender_name") or m.get("sender_role") or ""
+            lines.append(f"[{ts}] {sender}: {m.get('message', '')}")
+        self.txt_chat_history_viewer.setPlainText("\n".join(lines))
+
+    def _on_copy_chat_history(self) -> None:
+        txt = self.txt_chat_history_viewer.toPlainText().strip()
+        if txt:
+            QGuiApplication.clipboard().setText(txt)
+            QMessageBox.information(self, "복사 완료", "상담 내역이 클립보드에 복사되었습니다.")
+
+    def _on_save_chat_history(self) -> None:
+        txt = self.txt_chat_history_viewer.toPlainText().strip()
+        if not txt:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "상담 내역 저장", "1대1_상담내역.txt", "Text Files (*.txt)")
+        if path:
+            Path(path).write_text(txt, encoding="utf-8")
+            QMessageBox.information(self, "저장 완료", f"저장되었습니다:\n{path}")
 
     # -------------------------------------------------------------------------
     # CARD 1: 출결 및 결석계 대장 (SQLite 연동 + 한글 .hwpx 출력)

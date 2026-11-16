@@ -507,6 +507,139 @@ class FirestoreSyncService:
         )
         return True
 
+    def fetch_homeroom_attendance(
+        self,
+        grade: Optional[int] = None,
+        class_no: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Firestore `일일_출결` 컬렉션에서 해당 학급의 모바일 출결 내역을 조회합니다."""
+        fs = self._get_client()
+        ref: Any = fs.collection("일일_출결")
+        if grade is not None and class_no is not None:
+            ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
+        rows: List[Dict[str, Any]] = []
+        for doc in ref.stream():
+            d = doc.to_dict() or {}
+            d.setdefault("remote_id", doc.id)
+            rows.append(d)
+        rows.sort(key=lambda x: str(x.get("date") or x.get("updated_at") or ""), reverse=True)
+        return rows
+
+    def publish_mobile_notice(self, notice_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """가정통신문을 Firestore `가정통신문_목록`에 배포합니다."""
+        if not isinstance(notice_data, dict):
+            return False, ""
+        rid = str(notice_data.get("remote_id") or f"noti_doc_{int(datetime.now().timestamp() * 1000)}").strip()
+        payload = {
+            "remote_id": rid,
+            "title": str(notice_data.get("title") or "").strip(),
+            "category": str(notice_data.get("category") or "가정통신문").strip(),
+            "content": str(notice_data.get("content") or "").strip(),
+            "reply_fields": notice_data.get("reply_fields") or [],
+            "target_grade": _to_int_or_none(notice_data.get("target_grade")),
+            "target_class": _to_int_or_none(notice_data.get("target_class")),
+            "school_code": str(notice_data.get("school_code") or "").strip(),
+            "school_name": str(notice_data.get("school_name") or "").strip(),
+            "due_date": str(notice_data.get("due_date") or "").strip(),
+            "author_name": str(notice_data.get("author_name") or "담임교사").strip(),
+            "is_published": True,
+            "updated_at": _now_str(),
+        }
+        fs = self._get_client()
+        fs.collection("가정통신문_목록").document(rid).set(payload, merge=True)
+        return True, rid
+
+    def fetch_notice_replies(self, notice_id: str) -> List[Dict[str, Any]]:
+        """특정 가정통신문(`notice_id`)의 회신 및 서명 내역을 조회합니다."""
+        nid = str(notice_id or "").strip()
+        if not nid:
+            return []
+        fs = self._get_client()
+        rows: List[Dict[str, Any]] = []
+        for doc in fs.collection("가정통신문_회신").where("notice_id", "==", nid).stream():
+            d = doc.to_dict() or {}
+            d.setdefault("remote_id", doc.id)
+            rows.append(d)
+        return rows
+
+    def send_class_notification(
+        self,
+        title: str,
+        message: str,
+        target_role: str = "all",
+        grade: Optional[int] = None,
+        class_no: Optional[int] = None,
+        school_code: str = "",
+        school_name: str = "",
+        sender: str = "",
+        student_id: str = "",
+    ) -> Tuple[bool, str]:
+        """Firestore `Notifications`에 학급 공지/긴급 알림을 등록합니다."""
+        rid = f"noti_{int(datetime.now().timestamp() * 1000)}"
+        fs = self._get_client()
+        fs.collection("Notifications").document(rid).set(
+            {
+                "remote_id": rid,
+                "title": str(title or "").strip(),
+                "message": str(message or "").strip(),
+                "channel": "desktop_broadcast",
+                "target_role": str(target_role or "all").strip().lower(),
+                "sender": str(sender or "담임교사").strip(),
+                "grade": _to_int_or_none(grade),
+                "class_no": _to_int_or_none(class_no),
+                "school_code": str(school_code or "").strip(),
+                "school_name": str(school_name or "").strip(),
+                "student_id": str(student_id or "").strip(),
+                "is_read": False,
+                "created_at": _now_str(),
+                "updated_at": _now_str(),
+            },
+            merge=True,
+        )
+        return True, rid
+
+    def fetch_sent_notifications(
+        self,
+        grade: Optional[int] = None,
+        class_no: Optional[int] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Firestore `Notifications` 발송 이력을 조회합니다."""
+        fs = self._get_client()
+        rows: List[Dict[str, Any]] = []
+        for doc in fs.collection("Notifications").limit(limit).stream():
+            d = doc.to_dict() or {}
+            d.setdefault("remote_id", doc.id)
+            if grade is not None and d.get("grade") is not None and int(d["grade"]) != int(grade):
+                continue
+            if class_no is not None and d.get("class_no") is not None and int(d["class_no"]) != int(class_no):
+                continue
+            rows.append(d)
+        rows.sort(key=lambda x: str(x.get("created_at") or x.get("updated_at") or ""), reverse=True)
+        return rows
+
+    def fetch_chat_history(
+        self,
+        grade: Optional[int] = None,
+        class_no: Optional[int] = None,
+        student_id: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Firestore `1:1_상담채팅` 대화 내역을 조회합니다."""
+        fs = self._get_client()
+        ref: Any = fs.collection("1:1_상담채팅")
+        sid = str(student_id or "").strip()
+        if sid:
+            ref = ref.where("room_id", "==", f"ROOM-{sid}")
+        elif grade is not None and class_no is not None:
+            ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
+        rows: List[Dict[str, Any]] = []
+        for doc in ref.stream():
+            d = doc.to_dict() or {}
+            d.setdefault("remote_id", doc.id)
+            rows.append(d)
+        rows.sort(key=lambda x: str(x.get("created_at") or ""))
+        return rows
+
     def test_connection(
         self,
         *args: Any,
