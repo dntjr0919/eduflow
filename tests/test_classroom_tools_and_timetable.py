@@ -358,7 +358,7 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         with patch("services.firestore_sync_service.has_local_credentials", return_value=False):
             self.assertEqual(svc.get_backend_mode(), "vercel_api")
             self.assertTrue(svc.is_vercel_api_mode())
-            self.assertEqual(svc.get_vercel_api_url(), "https://26oshs1-5.eduflow.kro.kr/api/firestore")
+            self.assertEqual(svc.get_vercel_api_url(), "https://m.eduflow.kro.kr/api/firestore")
 
             captured_calls: List[Dict[str, Any]] = []
 

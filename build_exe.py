@@ -186,7 +186,7 @@ def generate_deployment_guide_html(dist_dir: Path) -> Path:
           <span class="num">1</span>
           <h2>빠른 시작 (JSON 키 없이 바로 쓰기 — 기본 Vercel API 모드)</h2>
         </div>
-        <p><code>EduFlow.exe</code>는 로컬에 Firebase 서비스 계정 JSON 키 파일이 없으면 자동으로 <strong>Vercel API 모드</strong>(<code>https://26oshs1-5.eduflow.kro.kr/api/firestore</code>)로 동작합니다.</p>
+        <p><code>EduFlow.exe</code>는 로컬에 Firebase 서비스 계정 JSON 키 파일이 없으면 자동으로 <strong>Vercel API 모드</strong>(<code>https://m.eduflow.kro.kr/api/firestore</code>)로 동작합니다.</p>
         <ol>
           <li>별도의 인증 키 파일 없이 <code>EduFlow.exe</code>를 바로 실행합니다.</li>
           <li>상단 메뉴에서 <strong>학급 경영 도구함</strong> 탭을 선택합니다.</li>
@@ -194,7 +194,7 @@ def generate_deployment_guide_html(dist_dir: Path) -> Path:
           <li>로그인 즉시 소속 학교·학년·반 명렬표가 모바일 DB와 자동 연동됩니다.</li>
         </ol>
         <div class="callout info">
-          <strong>신규 교사 가입 승인 절차:</strong> 모바일 PWA(<code>26oshs1-5.eduflow.kro.kr</code>)에서 교사 회원가입을 신청하면 초기 상태가 <code>pending</code>으로 등록됩니다. 최고 관리자 승인 후 <code>active</code> 상태가 되면 데스크톱과 모바일 모두 즉시 로그인할 수 있습니다.
+          <strong>신규 교사 가입 승인 절차:</strong> 모바일 PWA(<code>m.eduflow.kro.kr</code>)에서 교사 회원가입을 신청하면 초기 상태가 <code>pending</code>으로 등록됩니다. 최고 관리자 승인 후 <code>active</code> 상태가 되면 데스크톱과 모바일 모두 즉시 로그인할 수 있습니다.
         </div>
       </section>
 
@@ -251,7 +251,7 @@ def generate_deployment_guide_html(dist_dir: Path) -> Path:
         </div>
         <div class="callout warn">
           <strong>모바일 PWA 설치 및 알림 허용 안내:</strong><br />
-          스마트폰 브라우저에서 <code>https://26oshs1-5.eduflow.kro.kr</code> 에 접속한 뒤 브라우저 메뉴에서 <strong>[홈 화면에 추가]</strong>를 선택해 앱처럼 설치하고, 로그인 후 <strong>푸시 알림 허용</strong>을 활성화해 주세요.
+          스마트폰 브라우저에서 <code>https://m.eduflow.kro.kr</code> 에 접속한 뒤 브라우저 메뉴에서 <strong>[홈 화면에 추가]</strong>를 선택해 앱처럼 설치하고, 로그인 후 <strong>푸시 알림 허용</strong>을 활성화해 주세요.
         </div>
       </section>
     </div>

@@ -27,7 +27,7 @@ from services.schedule_parser_service import (
 
 _LOGGER = logging.getLogger(__name__)
 
-DEFAULT_VERCEL_API_URL = "https://26oshs1-5.eduflow.kro.kr/api/firestore"
+DEFAULT_VERCEL_API_URL = "https://m.eduflow.kro.kr/api/firestore"
 
 INT_FIELDS = {
     "grade",
