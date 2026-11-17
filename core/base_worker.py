@@ -204,7 +204,9 @@ class TaskRunner(QObject):
                 continue
             thread, _ = entry
             if thread.isRunning() and wait_ms > 0:
-                thread.wait(wait_ms)
+                if not thread.wait(wait_ms):
+                    thread.terminate()
+                    thread.wait(500)
 
     def _cleanup_task(self, task_key: str) -> None:
         self._active_tasks.pop(task_key, None)

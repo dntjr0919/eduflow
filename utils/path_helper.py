@@ -26,13 +26,30 @@ def get_bundle_dir() -> Path:
 
 def get_app_dir() -> Path:
     """
-    사용자 설정(config.json), 로컬 DB(SQLite), 로그 등 영구 보존되어야 하는
-    파일들의 기준 폴더를 반환합니다.
-    - PyInstaller(.exe) 실행 시: .exe 실행 파일이 위치한 폴더
+    실행 파일(.exe)이 위치한 기준 폴더를 반환합니다.
+    - PyInstaller(.exe) 실행 시: .exe 실행 파일이 위치한 폴더 (Firebase JSON 키 탐색 등)
     - 일반 Python 실행 시: 프로젝트 루트 폴더
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def get_user_data_dir() -> Path:
+    """
+    사용자 설정(config.json), 로컬 DB(SQLite), 로그, 캐시 등 쓰기 작업이 발생하는
+    영구 데이터 기준 폴더를 반환합니다.
+    - PyInstaller(.exe) 실행 시: OS 사용자 데이터 디렉터리 (%LOCALAPPDATA%\\EduFlow)
+    - 일반 Python 실행 시: 프로젝트 루트 폴더
+    """
+    if getattr(sys, "frozen", False):
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            base_dir = Path(local_app_data) / "EduFlow"
+        else:
+            base_dir = Path.home() / "AppData" / "Local" / "EduFlow"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir.resolve()
     return Path(__file__).resolve().parent.parent
 
 
@@ -46,10 +63,10 @@ def get_resource_path(relative_path: str) -> str:
 
 def get_data_path(relative_path: str, ensure_parent: bool = True) -> str:
     """
-    읽기/쓰기가 필요한 로컬 데이터 파일(config.json, SQLite DB 등)의 절대 경로를 반환합니다.
+    읽기/쓰기가 필요한 로컬 데이터 파일(config.json, SQLite DB, 로그, 캐시 등)의 절대 경로를 반환합니다.
     ensure_parent=True일 경우 상위 디렉토리가 없으면 자동 생성합니다.
     """
-    target = get_app_dir() / relative_path
+    target = get_user_data_dir() / relative_path
     if ensure_parent:
         target.parent.mkdir(parents=True, exist_ok=True)
     return str(target)

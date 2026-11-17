@@ -267,7 +267,7 @@ def generate_deployment_guide_html(dist_dir: Path) -> Path:
     return out_path
 
 
-def build_executable(onefile: bool = True) -> None:
+def build_executable(onefile: bool = False) -> None:
     root_dir = Path(__file__).resolve().parent
     entry_script = str(root_dir / "main.py")
     app_name = "EduFlow"
@@ -284,6 +284,7 @@ def build_executable(onefile: bool = True) -> None:
         "--add-data=ui/assets/icons;ui/assets/icons",
         "--add-data=assets/blank_template.hwpx;assets",
         "--add-data=docs;docs",
+        "--hidden-import=PyQt6.QtNetwork",
         "--hidden-import=PyQt6.QtSvg",
         "--hidden-import=lxml.etree",
         "--hidden-import=win32com.client",
@@ -322,11 +323,13 @@ def build_executable(onefile: bool = True) -> None:
     print("=" * 65)
     subprocess.run(cmd, cwd=str(root_dir), check=True)
 
-    guide_path = generate_deployment_guide_html(root_dir / "dist")
+    guide_dir = (root_dir / "dist") if onefile else (root_dir / "dist" / app_name)
+    guide_path = generate_deployment_guide_html(guide_dir)
     print(f"\n[배포 안내서 생성 완료] {guide_path}")
-    print("\n✅ 빌드가 완료되었습니다! dist/ 폴더에서 EduFlow.exe 와 안내서를 확인하세요.")
+    target_desc = "dist/EduFlow.exe" if onefile else f"dist/{app_name}/{app_name}.exe"
+    print(f"\n✅ 빌드가 완료되었습니다! {target_desc} 와 안내서를 확인하세요.")
 
 
 if __name__ == "__main__":
-    use_onefile = "--onedir" not in sys.argv
+    use_onefile = "--onefile" in sys.argv
     build_executable(onefile=use_onefile)

@@ -1246,14 +1246,34 @@ class MainWindow(QMainWindow):
             )
 
     def restore_from_tray(self) -> None:
-        self.showNormal()
-        self.activateWindow()
+        if self.isMinimized():
+            self.showNormal()
+        if not self.isVisible():
+            self.show()
+
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
         self.raise_()
+        self.activateWindow()
+
+    def cleanup_on_quit(self) -> None:
+        if getattr(self, "_cleaned_up_on_quit", False):
+            return
+        self._cleaned_up_on_quit = True
+        for timer in self.findChildren(QTimer):
+            try:
+                timer.stop()
+            except Exception:
+                pass
+        self.task_runner.stop_all(wait_ms=3000)
+        if hasattr(self, "tray_icon") and self.tray_icon is not None:
+            self.tray_icon.hide()
 
     def quit_application(self) -> None:
         self._force_quit = True
-        self.task_runner.stop_all(wait_ms=3000)
-        self.tray_icon.hide()
+        self.cleanup_on_quit()
         QApplication.quit()
 
     def closeEvent(self, event: QCloseEvent) -> None:

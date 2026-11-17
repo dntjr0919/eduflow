@@ -7,27 +7,51 @@
 
 import os
 import sys
+
+# PyInstaller --windowed 모드에서 sys.stdout / sys.stderr가 None이 되는 경우 크래시 방지
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 import traceback
+from datetime import datetime
 from pathlib import Path
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+from core.single_instance import SingleInstanceManager
 from ui.main_window import MainWindow
 from ui.utils import create_eduflow_app_icon, install_global_wheel_guard
-from utils.path_helper import get_resource_path
+from utils.path_helper import get_data_path, get_resource_path
 
 
 def install_exception_hook() -> None:
-    """예기치 않은 예외 발생 시 프로그램이 조용히 죽지 않도록 로그 및 알림창을 표시합니다."""
+    """예기치 않은 예외 발생 시 프로그램이 조용히 죽지 않도록 크래시 로그 및 알림창을 표시합니다."""
 
     def _excepthook(exc_type, exc_value, exc_tb):
         tb_str = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
+        crash_log_path = ""
+        try:
+            crash_log_path = get_data_path("logs/crash.log", ensure_parent=True)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(crash_log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n[{timestamp}] Unhandled Exception\n{tb_str}\n")
+        except Exception:
+            crash_log_path = ""
+
+        try:
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
         if QApplication.instance() is not None:
+            log_notice = f"\n\n로그 파일: {crash_log_path}" if crash_log_path else ""
             QMessageBox.critical(
                 None,
                 "예기치 않은 오류 발생",
-                f"오류가 발생했습니다:\n{exc_value}\n\n상세 내역:\n{tb_str[:800]}",
+                f"오류가 발생했습니다:\n{exc_value}{log_notice}\n\n상세 내역:\n{tb_str[:800]}",
             )
 
     sys.excepthook = _excepthook
@@ -104,7 +128,16 @@ def apply_light_palette(app: QApplication) -> None:
 def main() -> int:
     install_exception_hook()
 
+    QApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+    )
     app = QApplication(sys.argv)
+
+    single_instance = SingleInstanceManager()
+    if single_instance.is_already_running():
+        sys.exit(0)
+    single_instance.start_server()
+
     app.setStyle("Fusion")
     apply_light_palette(app)
     app_icon = create_eduflow_app_icon()
@@ -121,6 +154,11 @@ def main() -> int:
     window = MainWindow()
     if qss_text:
         window.setStyleSheet(qss_text)
+
+    single_instance.show_window_requested.connect(window.restore_from_tray)
+    app.aboutToQuit.connect(window.cleanup_on_quit)
+    app.aboutToQuit.connect(single_instance.close)
+
     window.show()
 
     return app.exec()

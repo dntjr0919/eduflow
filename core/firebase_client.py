@@ -28,6 +28,12 @@ def resolve_local_cred_path(cred_path: Optional[str] = None) -> Optional[Path]:
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
         candidates.append(exe_dir / DEFAULT_SERVICE_ACCOUNT_FILENAME)
+        try:
+            from utils.path_helper import get_user_data_dir
+
+            candidates.append(get_user_data_dir() / DEFAULT_SERVICE_ACCOUNT_FILENAME)
+        except Exception:
+            pass
 
     project_root = Path(__file__).resolve().parent.parent
     candidates.append(project_root / DEFAULT_SERVICE_ACCOUNT_FILENAME)
