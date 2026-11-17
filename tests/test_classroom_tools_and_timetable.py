@@ -887,6 +887,56 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
                 self.assertEqual(res_hwp["data"]["target_id"], "notice_ocr")
                 self.assertEqual(res_hwp["data"]["pdf_path"], str(hwp_path))
 
+    def test_notice_signature_mode_parsing_ui_and_publish(self) -> None:
+        import os
+
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        from core.base_worker import TaskRunner
+        from services.notice_parser_service import NOTICE_OCR_JSON_PROMPT, parse_notice_ai_json
+        from ui.tabs.tab_classroom_tools import ClassroomToolsTab
+
+        app = QApplication.instance() or QApplication([])
+        _ = app
+
+        self.assertIn("signature_mode", NOTICE_OCR_JSON_PROMPT)
+
+        # 1) parse_notice_ai_json: 기본값 single 및 both 인식 검증
+        p_default = parse_notice_ai_json({"title": "일반 안내", "content": "본문", "reply_schema": []})
+        self.assertEqual(p_default["signature_mode"], "single")
+
+        p_both = parse_notice_ai_json(
+            {"title": "서약서", "content": "학생 및 학부모 서명 필요", "signature_mode": "both", "reply_schema": []}
+        )
+        self.assertEqual(p_both["signature_mode"], "both")
+
+        # 2) UI apply_ai_dock_result -> 콤보박스 반영 & _build_notice_payload -> Firestore 저장 검증
+        tab = ClassroomToolsTab(TaskRunner())
+        self.assertEqual(tab.combo_notice_signature_mode.currentData(), "single")
+
+        tab.apply_ai_dock_result(
+            {
+                "parsed_json": {
+                    "title": "학교폭력 예방 서약서",
+                    "content": "학생 성명(서명) 및 학부모 성명(서명) 필요",
+                    "signature_mode": "both",
+                    "requires_reply": True,
+                    "reply_schema": [],
+                }
+            }
+        )
+        self.assertEqual(tab.combo_notice_signature_mode.currentData(), "both")
+
+        payload = tab._build_notice_payload(is_published=True)
+        self.assertEqual(payload["signature_mode"], "both")
+        payload["remote_id"] = "notice_sig_both_1"
+
+        ok, rid = self.sync_svc.publish_mobile_notice(payload)
+        self.assertTrue(ok)
+        self.assertEqual(rid, "notice_sig_both_1")
+        saved = self.fake_fs.cols["가정통신문_목록"]["notice_sig_both_1"]
+        self.assertEqual(saved["signature_mode"], "both")
+
 
 if __name__ == "__main__":
     unittest.main()

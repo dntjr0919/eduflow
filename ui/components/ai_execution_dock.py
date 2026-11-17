@@ -82,6 +82,18 @@ from services.hwpx_agent_service import (
     extract_hwpx_dom_map,
     extract_hwpx_reference_chunks,
 )
+from services.hwpx_ref_session_service import (
+    MAX_EXTRA_CHUNK_ROUNDS,
+    SCANNED_OCR_BATCH_PAGES,
+    build_hwpx_scanned_ocr_prompt,
+    build_hwpx_stage1_selection_prompt,
+    build_reference_index_summary,
+    fallback_select_chunks_by_keywords,
+    get_hwpx_ref_session_cache,
+    parse_stage1_selection_response,
+    parse_stage2_response_status,
+    resolve_selected_chunks,
+)
 from services.llm_client import (
     MultiLlmClient,
     build_structured_prompt,
@@ -536,20 +548,162 @@ class _DockApiHwpxAgentWorker(BaseWorker):
         *,
         is_create_mode: bool = False,
         ref_chunks: Optional[List[Dict[str, Any]]] = None,
+        reference_files: Optional[List[str]] = None,
+        preselected_chunk_ids: Optional[List[str]] = None,
     ):
         super().__init__(task_name="HWPX AI 문서 에이전트 (API)")
         self.dom_map = dom_map
         self.instruction = instruction
         self.is_create_mode = bool(is_create_mode)
         self.ref_chunks: List[Dict[str, Any]] = list(ref_chunks or [])
+        self.reference_files: List[str] = [str(p).strip() for p in (reference_files or []) if str(p).strip()]
+        self.preselected_chunk_ids: List[str] = list(preselected_chunk_ids or [])
+
+    def _ocr_scanned_pages_in_batches(
+        self,
+        client: MultiLlmClient,
+        file_path: str,
+        page_numbers: List[int],
+        *,
+        is_toc: bool = False,
+    ) -> None:
+        cache = get_hwpx_ref_session_cache()
+        p_obj = Path(file_path)
+        for i in range(0, len(page_numbers), SCANNED_OCR_BATCH_PAGES):
+            if self.is_stop_requested():
+                break
+            batch_pages = page_numbers[i : i + SCANNED_OCR_BATCH_PAGES]
+            label = "목차" if is_toc else "본문"
+            self.emit_progress(15, f"스캔 PDF {label} AI OCR 중 ({p_obj.name}: {batch_pages[0]}~{batch_pages[-1]}쪽)...")
+            rendered = cache.render_pdf_pages_for_ocr(p_obj, batch_pages)
+            sys_p, usr_p = build_hwpx_scanned_ocr_prompt(p_obj.name, batch_pages, is_toc=is_toc)
+            img_bytes: Optional[bytes] = None
+            mime_type = "image/png"
+            valid_imgs = [(pn, ip) for pn, ip in rendered if ip is not None and ip.exists()]
+            if len(valid_imgs) == 1:
+                img_bytes = valid_imgs[0][1].read_bytes()
+            elif not valid_imgs and p_obj.exists():
+                img_bytes = p_obj.read_bytes()
+                mime_type = "application/pdf"
+            elif len(valid_imgs) > 1:
+                # 여러 페이지는 페이지별로 순차 OCR하여 누락 방지
+                for pn, ip in valid_imgs:
+                    if self.is_stop_requested():
+                        break
+                    s1, u1 = build_hwpx_scanned_ocr_prompt(p_obj.name, [pn], is_toc=is_toc)
+                    raw = client.generate(prompt=u1, system_prompt=s1, image_bytes=ip.read_bytes(), mime_type="image/png")
+                    try:
+                        parsed = extract_json_from_llm_response(raw)
+                        pages_arr = parsed.get("pages") if isinstance(parsed, dict) else None
+                        if isinstance(pages_arr, list) and pages_arr:
+                            txt = str(pages_arr[0].get("text") or "").strip()
+                        else:
+                            txt = raw.strip()
+                    except Exception:
+                        txt = raw.strip()
+                    cache.store_ocr_page_result(p_obj, pn, txt)
+                continue
+
+            raw = client.generate(prompt=usr_p, system_prompt=sys_p, image_bytes=img_bytes, mime_type=mime_type)
+            try:
+                parsed = extract_json_from_llm_response(raw)
+                pages_arr = parsed.get("pages") if isinstance(parsed, dict) else None
+                if isinstance(pages_arr, list) and pages_arr:
+                    for item in pages_arr:
+                        if isinstance(item, dict):
+                            pn = int(item.get("page") or batch_pages[0])
+                            cache.store_ocr_page_result(p_obj, pn, str(item.get("text") or ""))
+                else:
+                    for pn in batch_pages:
+                        cache.store_ocr_page_result(p_obj, pn, raw.strip())
+            except Exception:
+                for pn in batch_pages:
+                    cache.store_ocr_page_result(p_obj, pn, raw.strip())
+
+    def _ensure_chunks_ocrd(self, client: MultiLlmClient, chunks: List[Dict[str, Any]]) -> None:
+        pending_by_file: Dict[str, List[int]] = {}
+        for ch in chunks:
+            if ch.get("status") == "needs_ocr" and ch.get("file_path") and ch.get("page_num"):
+                pending_by_file.setdefault(str(ch["file_path"]), []).append(int(ch["page_num"]))
+        for fp, pages in pending_by_file.items():
+            uniq_pages = sorted(set(pages))
+            self._ocr_scanned_pages_in_batches(client, fp, uniq_pages, is_toc=False)
 
     def execute(self) -> Dict[str, Any]:
         client = MultiLlmClient()
-        total_parts = len(self.ref_chunks) if self.ref_chunks else 1
+
+        active_chunks = list(self.ref_chunks)
+        if self.reference_files:
+            summary = build_reference_index_summary(self.reference_files)
+            for toc_item in summary.get("scanned_toc_targets") or []:
+                self._ocr_scanned_pages_in_batches(
+                    client,
+                    str(toc_item["file_path"]),
+                    list(toc_item["pages"]),
+                    is_toc=True,
+                )
+            if summary.get("scanned_toc_targets"):
+                summary = build_reference_index_summary(self.reference_files)
+
+            if self.preselected_chunk_ids:
+                active_chunks = resolve_selected_chunks(
+                    self.reference_files, chunk_ids=self.preselected_chunk_ids
+                )
+            else:
+                self.emit_progress(20, "참고 문서 인덱스 분석 및 범위 선별 중...")
+                s1_sys, s1_usr = build_hwpx_stage1_selection_prompt(
+                    self.instruction,
+                    summary.get("index_text", ""),
+                    self.dom_map,
+                )
+                s1_raw = client.generate(prompt=s1_usr, system_prompt=s1_sys)
+                try:
+                    s1 = parse_stage1_selection_response(s1_raw)
+                except Exception:
+                    s1 = {"status": "fallback"}
+
+                if s1["status"] == "needs_clarification":
+                    return {
+                        "target_id": "hwpx_agent",
+                        "mode": "api",
+                        "clarification": s1,
+                        "already_applied_parts": True,
+                        "completed_parts": 0,
+                        "total_parts": 1,
+                    }
+                if s1["status"] == "direct_operations":
+                    return {
+                        "target_id": "hwpx_agent",
+                        "mode": "api",
+                        "parsed_json": s1["parsed_json"],
+                        "raw_response": s1_raw,
+                        "immediate": True,
+                        "already_applied_parts": False,
+                        "completed_parts": 1,
+                        "total_parts": 1,
+                    }
+                if s1["status"] == "fallback":
+                    active_chunks = fallback_select_chunks_by_keywords(
+                        self.reference_files, self.instruction
+                    )
+                else:
+                    active_chunks = resolve_selected_chunks(
+                        self.reference_files,
+                        chunk_ids=s1.get("chunk_ids"),
+                        page_ranges=s1.get("page_ranges"),
+                    )
+
+            self._ensure_chunks_ocrd(client, active_chunks)
+            active_chunks = resolve_selected_chunks(
+                self.reference_files,
+                chunk_ids=[str(c.get("chunk_id")) for c in active_chunks if c.get("chunk_id")],
+            )
+
+        total_parts = len(active_chunks) if active_chunks else 1
 
         # 단일 파트 (기존 수정 모드 또는 지시사항/단일참고 생성 모드)
-        if total_parts <= 1:
-            ref_content = str(self.ref_chunks[0].get("content", "")) if self.ref_chunks else ""
+        if total_parts <= 1 and not self.reference_files:
+            ref_content = str(active_chunks[0].get("content", "")) if active_chunks else ""
             if self.is_create_mode or ref_content:
                 self.emit_progress(25, "새 HWPX 양식 생성 프롬프트 전송 중...")
                 sys_p, usr_p = build_hwpx_create_prompt(
@@ -577,51 +731,92 @@ class _DockApiHwpxAgentWorker(BaseWorker):
                 "total_parts": 1,
             }
 
-        # 다중 분할 파트(Part 1/N ~ Part N/N) 순차 생성
+        # 다중/참고 파트 순차 생성 + need_more_chunks 루프(최대 3회)
         running_doc = _build_running_hwpx_seed_from_dom(self.dom_map)
         last_parsed: Dict[str, Any] = {}
         last_raw: str = ""
         completed_parts = 0
+        seen_chunk_ids = {str(c.get("chunk_id", "")) for c in active_chunks if c.get("chunk_id")}
+        extra_rounds = 0
+        idx = 0
 
-        for idx, chunk in enumerate(self.ref_chunks, start=1):
+        while idx < len(active_chunks):
             if self.is_stop_requested():
                 break
-            pct_start = int(((idx - 1) / max(1, total_parts)) * 100)
+            chunk = active_chunks[idx]
+            cur_total = len(active_chunks)
+            pct_start = int((idx / max(1, cur_total)) * 100)
             self.emit_progress(
                 max(5, pct_start),
-                f"HWPX 양식 분할 생성 중... (Part {idx}/{total_parts})",
+                f"HWPX 양식 분할 생성 중... (Part {idx + 1}/{cur_total})",
             )
             cur_dom = extract_hwpx_dom_map(running_doc)
             sys_p, usr_p = build_hwpx_create_prompt(
                 user_instruction=self.instruction,
                 reference_chunk=str(chunk.get("content", "")),
-                part_index=idx,
-                total_parts=total_parts,
+                part_index=idx + 1,
+                total_parts=cur_total,
                 current_dom_map=cur_dom,
             )
             raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
             parsed = extract_json_from_llm_response(raw_reply)
+            s2 = parse_stage2_response_status(parsed)
+
+            if s2["status"] == "needs_clarification":
+                return {
+                    "target_id": "hwpx_agent",
+                    "mode": "api",
+                    "clarification": s2,
+                    "already_applied_parts": True,
+                    "completed_parts": completed_parts,
+                    "total_parts": cur_total,
+                }
+
+            if s2["status"] == "need_more_chunks" and extra_rounds < MAX_EXTRA_CHUNK_ROUNDS and self.reference_files:
+                extra_rounds += 1
+                more = resolve_selected_chunks(
+                    self.reference_files,
+                    chunk_ids=s2.get("chunk_ids"),
+                    page_ranges=s2.get("pages"),
+                )
+                self._ensure_chunks_ocrd(client, more)
+                more = resolve_selected_chunks(
+                    self.reference_files,
+                    chunk_ids=[str(c.get("chunk_id")) for c in more if c.get("chunk_id")],
+                )
+                added = False
+                for mc in more:
+                    mcid = str(mc.get("chunk_id", ""))
+                    if mcid and mcid not in seen_chunk_ids:
+                        seen_chunk_ids.add(mcid)
+                        active_chunks.append(mc)
+                        added = True
+                if added:
+                    idx += 1
+                    continue
+
             ops = parsed.get("operations") if isinstance(parsed, dict) else None
             if isinstance(ops, list) and ops:
                 apply_hwpx_operations(running_doc, [o for o in ops if isinstance(o, dict)])
             last_parsed = parsed if isinstance(parsed, dict) else {}
             last_raw = raw_reply
-            completed_parts = idx
+            completed_parts = idx + 1
             self.part_completed.emit(
                 {
                     "target_id": "hwpx_agent",
                     "mode": "api",
-                    "part_index": idx,
-                    "total_parts": total_parts,
+                    "part_index": completed_parts,
+                    "total_parts": len(active_chunks),
                     "parsed_json": last_parsed,
                     "raw_response": raw_reply,
                     "immediate": True,
                 }
             )
             self.emit_progress(
-                int((idx / max(1, total_parts)) * 100),
-                f"Part {idx}/{total_parts} 생성·반영 완료",
+                int((completed_parts / max(1, len(active_chunks))) * 100),
+                f"Part {completed_parts}/{len(active_chunks)} 생성·반영 완료",
             )
+            idx += 1
 
         return {
             "target_id": "hwpx_agent",
@@ -1250,6 +1445,12 @@ class AiExecutionDock(QFrame):
         self._hwpx_ref_chunks: List[Dict[str, Any]] = []
         self._hwpx_ref_signature: Tuple[str, ...] = ()
         self._hwpx_ref_error: str = ""
+        self._hwpx_ref_index_summary: Dict[str, Any] = {}
+        self._hwpx_selected_chunk_ids: List[str] = []
+        self._hwpx_pending_clarification: Optional[Dict[str, Any]] = None
+        self._hwpx_extra_chunk_round: int = 0
+        self._pw_hwpx_stage1_pending: bool = False
+        self._pw_next_stage_pending: bool = False
 
         # 미리보기 선택 인용 상태
         self._quoted_text: str = ""
@@ -2133,6 +2334,12 @@ class AiExecutionDock(QFrame):
         self._hwpx_ref_chunks = []
         self._hwpx_ref_signature = ()
         self._hwpx_ref_error = ""
+        self._hwpx_ref_index_summary = {}
+        self._hwpx_selected_chunk_ids = []
+        self._hwpx_pending_clarification = None
+        self._hwpx_extra_chunk_round = 0
+        self._pw_hwpx_stage1_pending = False
+        self._pw_next_stage_pending = False
         if hasattr(self, "txt_manual_response"):
             self.txt_manual_response.blockSignals(True)
             self.txt_manual_response.clear()
@@ -2640,11 +2847,14 @@ class AiExecutionDock(QFrame):
                 self.txt_hwpx_instruction.setFocus()
                 return
             effective_inst = inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
+            ref_files_list = [str(p).strip() for p in (ctx.get("reference_files") or []) if str(p).strip()]
             worker = _DockApiHwpxAgentWorker(
                 dom_map=dom_map if isinstance(dom_map, dict) else None,
                 instruction=self._append_quote_to_prompt(effective_inst),
                 is_create_mode=create_or_ref,
                 ref_chunks=chunks,
+                reference_files=ref_files_list,
+                preselected_chunk_ids=list(self._hwpx_selected_chunk_ids),
             )
             worker.part_completed.connect(
                 lambda p_payload, tid=str(ctx.get("target_id", self._active_target_id)): self._on_api_hwpx_part_completed(
@@ -2712,6 +2922,9 @@ class AiExecutionDock(QFrame):
         target_id = str(ctx.get("target_id", self._active_target_id))
 
         def _on_res(res: Dict[str, Any]) -> None:
+            if kind == "hwpx_agent" and isinstance(res.get("clarification"), dict):
+                self._handle_hwpx_clarification_or_more_chunks(target_id, res["clarification"], mode="api")
+                return
             if not res.get("already_applied_parts"):
                 self._dispatch_result(target_id, res)
             self.sync_from_context(self._fetch_fresh_context(target_id))
@@ -2902,7 +3115,7 @@ class AiExecutionDock(QFrame):
         return None
 
     def _ensure_hwpx_ref_chunks(self, ctx: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """참고 파일 목록이 변경된 경우에만 extract_hwpx_reference_chunks()를 재파싱해 캐시합니다."""
+        """참고 파일 목록이 변경된 경우에만 세션 캐시 인덱싱을 수행하고 선택된 청크(또는 전체 청크)를 반환합니다."""
         target_ctx = ctx if ctx is not None else self._last_context
         ref_files = tuple(
             str(p).strip() for p in (target_ctx.get("reference_files") or []) if str(p).strip()
@@ -2910,17 +3123,116 @@ class AiExecutionDock(QFrame):
         if ref_files != self._hwpx_ref_signature:
             self._hwpx_ref_signature = ref_files
             self._hwpx_ref_error = ""
+            self._hwpx_selected_chunk_ids = []
+            self._hwpx_pending_clarification = None
+            self._hwpx_extra_chunk_round = 0
             if not ref_files:
                 self._hwpx_ref_chunks = []
+                self._hwpx_ref_index_summary = {}
             else:
                 try:
+                    self._hwpx_ref_index_summary = build_reference_index_summary(
+                        list(ref_files), max_chars_per_chunk=8000
+                    )
                     self._hwpx_ref_chunks = extract_hwpx_reference_chunks(
                         list(ref_files), max_chars_per_chunk=8000
                     )
                 except Exception as exc:
                     self._hwpx_ref_chunks = []
+                    self._hwpx_ref_index_summary = {}
                     self._hwpx_ref_error = str(exc)
+
+        if self._hwpx_selected_chunk_ids and ref_files:
+            selected = resolve_selected_chunks(
+                list(ref_files), chunk_ids=self._hwpx_selected_chunk_ids
+            )
+            total = len(selected)
+            out: List[Dict[str, Any]] = []
+            for idx, ch in enumerate(selected, start=1):
+                item = dict(ch)
+                item["part_index"] = idx
+                item["total_parts"] = total
+                out.append(item)
+            return out
         return self._hwpx_ref_chunks
+
+    def _should_run_hwpx_stage1(self, ctx: Dict[str, Any], chunks: List[Dict[str, Any]]) -> bool:
+        if not ctx.get("reference_files") or self._hwpx_selected_chunk_ids:
+            return False
+        summary = self._hwpx_ref_index_summary or {}
+        if not summary.get("index_text"):
+            return False
+        if summary.get("has_scanned_pdf"):
+            return True
+        if any(c.get("status") == "needs_ocr" for c in chunks):
+            return True
+        sum_chunks = summary.get("chunks") or []
+        total_chars = sum(int(c.get("char_count") or 0) for c in sum_chunks)
+        return len(sum_chunks) >= 3 or total_chars > 12000
+
+    def _handle_hwpx_clarification_or_more_chunks(
+        self,
+        target_id: str,
+        parsed_or_status: Dict[str, Any],
+        *,
+        mode: str = "api",
+    ) -> bool:
+        """
+        needs_clarification / need_more_chunks 응답을 처리합니다.
+        처리된 경우 True를 반환해 HWPX 문서 적용을 보류합니다.
+        """
+        st = parse_stage2_response_status(parsed_or_status)
+        status = st.get("status")
+        if status == "needs_clarification":
+            question = str(st.get("question") or "작업 범위를 구체적으로 알려주세요.").strip()
+            options = st.get("options") or []
+            opt_lines = "\n".join(f"- {opt}" for opt in options) if options else ""
+            msg_text = f"[확인 필요] {question}" + (f"\n\n선택 예시:\n{opt_lines}" if opt_lines else "")
+            orig_inst = (
+                self.txt_hwpx_instruction.toPlainText().strip()
+                if hasattr(self, "txt_hwpx_instruction")
+                else ""
+            )
+            self._hwpx_pending_clarification = {
+                "original_instruction": orig_inst,
+                "question": question,
+                "options": options,
+            }
+            self._append_chat_message(
+                role="assistant",
+                content=msg_text,
+                exec_mode=mode,
+                model_name="EduFlow Agent",
+                tool_name=target_id or "hwpx_agent",
+            )
+            self.lbl_dock_progress_meta.setText("AI가 추가 조건을 질문했습니다. 답변을 입력해 주세요.")
+            return True
+
+        if status == "need_more_chunks":
+            if self._hwpx_extra_chunk_round >= MAX_EXTRA_CHUNK_ROUNDS:
+                self.lbl_dock_progress_meta.setText(
+                    f"추가 청크 요청 최대 횟수({MAX_EXTRA_CHUNK_ROUNDS}회)에 도달했습니다."
+                )
+                return True
+            self._hwpx_extra_chunk_round += 1
+            ref_files = list(self._hwpx_ref_signature)
+            more = resolve_selected_chunks(
+                ref_files,
+                chunk_ids=st.get("chunk_ids"),
+                page_ranges=st.get("pages"),
+            )
+            existing = set(self._hwpx_selected_chunk_ids)
+            for ch in more:
+                cid = str(ch.get("chunk_id", ""))
+                if cid and cid not in existing:
+                    existing.add(cid)
+                    self._hwpx_selected_chunk_ids.append(cid)
+            self.lbl_dock_progress_meta.setText(
+                f"추가 참고 구간({len(more)}개)을 불러왔습니다. (라운드 {self._hwpx_extra_chunk_round}/{MAX_EXTRA_CHUNK_ROUNDS})"
+            )
+            return True
+
+        return False
 
     def _is_hwpx_create_or_ref_mode(self, ctx: Optional[Dict[str, Any]] = None) -> bool:
         """새 양식 생성 모드이거나 참고 파일이 첨부되었거나 빈 문서 상태인지 판별합니다."""
@@ -3036,6 +3348,15 @@ class AiExecutionDock(QFrame):
             if not inst and not chunks:
                 return ""
             effective_inst = inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
+            if self._should_run_hwpx_stage1(ctx, chunks):
+                idx_text = str((self._hwpx_ref_index_summary or {}).get("index_text") or "").strip()
+                if idx_text:
+                    sys_p, usr_p = build_hwpx_stage1_selection_prompt(
+                        self._append_quote_to_prompt(effective_inst),
+                        idx_text,
+                        dom_map if isinstance(dom_map, dict) else None,
+                    )
+                    return f"{sys_p}\n\n{usr_p}"
             if chunks:
                 self._sync_hwpx_manual_part_combo(chunks)
                 total_parts = len(chunks)
@@ -3218,12 +3539,86 @@ class AiExecutionDock(QFrame):
 
         target_id = str(ctx.get("target_id", self._active_target_id))
         if ctx.get("kind") == "hwpx_agent":
+            chunks = self._ensure_hwpx_ref_chunks(ctx)
+            is_stage1 = self._should_run_hwpx_stage1(ctx, chunks)
             try:
                 parsed = extract_json_from_llm_response(raw_resp)
             except Exception as exc:
+                if is_stage1:
+                    inst_txt = self.txt_hwpx_instruction.toPlainText().strip()
+                    selected = fallback_select_chunks_by_keywords(
+                        list(self._hwpx_ref_signature), inst_txt
+                    )
+                    self._hwpx_selected_chunk_ids = [
+                        str(c.get("chunk_id")) for c in selected if c.get("chunk_id")
+                    ]
+                    self.txt_manual_response.blockSignals(True)
+                    self.txt_manual_response.clear()
+                    self.txt_manual_response.blockSignals(False)
+                    new_chunks = self._ensure_hwpx_ref_chunks(ctx)
+                    self._sync_hwpx_manual_part_combo(new_chunks)
+                    next_prompt = self._build_current_manual_prompt()
+                    if next_prompt:
+                        QApplication.clipboard().setText(next_prompt)
+                    self.lbl_manual_verify.setText(
+                        f"로컬 키워드 선별 완료 ({len(new_chunks)}개 구간) — 2단계 프롬프트가 클립보드에 복사되었습니다!"
+                    )
+                    return
                 QMessageBox.warning(self, "JSON 검증 오류", f"유효한 JSON Patch 응답을 추출하지 못했습니다:\n{exc}")
                 return
-            chunks = self._ensure_hwpx_ref_chunks(ctx)
+            if is_stage1:
+                try:
+                    s1 = parse_stage1_selection_response(parsed)
+                except Exception:
+                    s1 = {"status": "fallback"}
+                if s1["status"] == "needs_clarification":
+                    self.txt_manual_response.blockSignals(True)
+                    self.txt_manual_response.clear()
+                    self.txt_manual_response.blockSignals(False)
+                    self._handle_hwpx_clarification_or_more_chunks(target_id, s1, mode="manual")
+                    return
+                if s1["status"] in ("ready", "fallback"):
+                    if s1["status"] == "fallback":
+                        selected = fallback_select_chunks_by_keywords(
+                            list(self._hwpx_ref_signature),
+                            self.txt_hwpx_instruction.toPlainText().strip(),
+                        )
+                    else:
+                        selected = resolve_selected_chunks(
+                            list(self._hwpx_ref_signature),
+                            chunk_ids=s1.get("chunk_ids"),
+                            page_ranges=s1.get("page_ranges"),
+                        )
+                    self._hwpx_selected_chunk_ids = [
+                        str(c.get("chunk_id")) for c in selected if c.get("chunk_id")
+                    ]
+                    self.txt_manual_response.blockSignals(True)
+                    self.txt_manual_response.clear()
+                    self.txt_manual_response.blockSignals(False)
+                    new_chunks = self._ensure_hwpx_ref_chunks(ctx)
+                    self._sync_hwpx_manual_part_combo(new_chunks)
+                    next_prompt = self._build_current_manual_prompt()
+                    if next_prompt:
+                        QApplication.clipboard().setText(next_prompt)
+                    self.lbl_manual_verify.setText(
+                        f"1단계 선별 완료 ({len(new_chunks)}개 구간) — 2단계 프롬프트가 클립보드에 복사되었습니다!"
+                    )
+                    self.lbl_dock_progress_meta.setText(
+                        f"참고 구간 {len(new_chunks)}개 선별 완료 · 2단계 프롬프트 복사됨"
+                    )
+                    return
+
+            if self._handle_hwpx_clarification_or_more_chunks(target_id, parsed, mode="manual"):
+                self.txt_manual_response.blockSignals(True)
+                self.txt_manual_response.clear()
+                self.txt_manual_response.blockSignals(False)
+                new_chunks = self._ensure_hwpx_ref_chunks(ctx)
+                self._sync_hwpx_manual_part_combo(new_chunks)
+                next_prompt = self._build_current_manual_prompt()
+                if next_prompt:
+                    QApplication.clipboard().setText(next_prompt)
+                return
+
             total_parts = len(chunks)
             is_multi_parts = total_parts >= 2
             cur_idx = max(0, self.combo_manual_batch.currentIndex()) if is_multi_parts else 0
@@ -3521,7 +3916,38 @@ class AiExecutionDock(QFrame):
                 QMessageBox.warning(self, "입력 확인", msg)
                 return
 
-            if len(chunks) >= 2:
+            if self._should_run_hwpx_stage1(ctx, chunks):
+                idx_text = str((self._hwpx_ref_index_summary or {}).get("index_text") or "").strip()
+                if idx_text:
+                    self._pw_hwpx_stage1_pending = True
+                    s1_sys, s1_usr = build_hwpx_stage1_selection_prompt(
+                        self._append_quote_to_prompt(
+                            inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
+                        ),
+                        idx_text,
+                        ctx.get("dom_map") if isinstance(ctx.get("dom_map"), dict) else None,
+                    )
+                    worker = WebGeminiAutoWorker(
+                        excel_path=None,
+                        single_prompt=f"{s1_sys}\n\n{s1_usr}",
+                        attachment_paths=[],
+                        provider=self._pw_provider,
+                        custom_url=custom_url,
+                        execution_mode=exec_mode,
+                        require_login=False,
+                        keep_login_session=keep_login,
+                        use_temp_chat=use_temp_chat,
+                        headless=False,
+                        task_label=f"{task_label} (1단계 범위 선별)",
+                    )
+                else:
+                    self._pw_hwpx_stage1_pending = False
+            else:
+                self._pw_hwpx_stage1_pending = False
+
+            if self._pw_hwpx_stage1_pending:
+                pass
+            elif len(chunks) >= 2:
                 effective_inst = self._append_quote_to_prompt(
                     inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
                 )
@@ -3752,6 +4178,7 @@ class AiExecutionDock(QFrame):
         self.lbl_dock_progress_meta.setText("응답 회수 및 반영 중...")
 
     def _on_pw_stop_clicked(self) -> None:
+        self._pw_next_stage_pending = False
         if self._active_pw_worker is not None:
             self._active_pw_worker.request_stop()
         self.task_runner.stop_task(self.TASK_DOCK_PLAYWRIGHT)
@@ -3780,6 +4207,48 @@ class AiExecutionDock(QFrame):
                 "터미널에서 'pip install playwright && playwright install chromium'을 실행해 주세요.",
             )
             return
+        if target_id == "hwpx_agent" and self._pw_hwpx_stage1_pending:
+            self._pw_hwpx_stage1_pending = False
+            raw_s1 = res.get("parsed_json") or res.get("raw_response") or ""
+            try:
+                s1 = parse_stage1_selection_response(raw_s1)
+            except Exception:
+                s1 = {"status": "fallback"}
+
+            if s1["status"] == "needs_clarification":
+                self._handle_hwpx_clarification_or_more_chunks(target_id, s1, mode="playwright")
+                self.sync_from_context(self._fetch_fresh_context(target_id))
+                return
+
+            if s1["status"] != "direct_operations":
+                if s1["status"] == "fallback":
+                    inst_txt = self.txt_hwpx_instruction.toPlainText().strip()
+                    selected = fallback_select_chunks_by_keywords(
+                        list(self._hwpx_ref_signature), inst_txt
+                    )
+                else:
+                    selected = resolve_selected_chunks(
+                        list(self._hwpx_ref_signature),
+                        chunk_ids=s1.get("chunk_ids"),
+                        page_ranges=s1.get("page_ranges"),
+                    )
+                self._hwpx_selected_chunk_ids = [
+                    str(c.get("chunk_id")) for c in selected if c.get("chunk_id")
+                ]
+                self.sync_from_context(self._fetch_fresh_context(target_id))
+                self.lbl_dock_progress_meta.setText(
+                    f"1단계 범위 선별 완료({len(self._hwpx_selected_chunk_ids)}개 구간) — 2단계 자동 실행 대기 중..."
+                )
+                self._pw_next_stage_pending = True
+                return
+
+        if target_id == "hwpx_agent" and isinstance(res.get("parsed_json"), dict):
+            if self._handle_hwpx_clarification_or_more_chunks(target_id, res["parsed_json"], mode="playwright"):
+                self.sync_from_context(self._fetch_fresh_context(target_id))
+                if self._hwpx_pending_clarification is None and self._hwpx_extra_chunk_round <= MAX_EXTRA_CHUNK_ROUNDS:
+                    self._pw_next_stage_pending = True
+                return
+
         if not self._pw_single_batches_applied:
             self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **res})
         self._pw_single_batches_applied = False
@@ -3804,6 +4273,26 @@ class AiExecutionDock(QFrame):
         self._active_pw_worker = None
         self._set_pw_running_state(False)
         self.lbl_dock_progress_meta.setStyleSheet("")
+        if self._pw_next_stage_pending:
+            self._pw_next_stage_pending = False
+            QTimer.singleShot(0, self._launch_pending_pw_stage)
+
+    def _launch_pending_pw_stage(self) -> None:
+        if self.task_runner.is_running(self.TASK_DOCK_PLAYWRIGHT):
+            QTimer.singleShot(25, self._launch_pending_pw_stage)
+            return
+        self._on_pw_start_clicked()
+
+    def shutdown_workers(self) -> None:
+        """앱 종료 시 실행 중인 도크 워커를 안전하게 중단합니다."""
+        self._pw_next_stage_pending = False
+        if self._active_pw_worker is not None:
+            try:
+                self._active_pw_worker.request_stop()
+            except Exception:
+                pass
+        self.task_runner.stop_task(self.TASK_DOCK_PLAYWRIGHT, wait_ms=3000, wait=True)
+        self.task_runner.stop_task(self.TASK_DOCK_API, wait_ms=3000, wait=True)
 
     # =========================================================================
     # 공통 상태 / 결과 핸들러
@@ -4339,7 +4828,13 @@ class AiExecutionDock(QFrame):
 
         # 특수 타겟의 지시사항 입력창과 연동
         if tid == "hwpx_agent":
-            self.txt_hwpx_instruction.setPlainText(raw_text)
+            if self._hwpx_pending_clarification:
+                orig = str(self._hwpx_pending_clarification.get("original_instruction") or "").strip()
+                combined = f"{orig}\n[사용자 추가 조건]: {raw_text}".strip() if orig else raw_text
+                self.txt_hwpx_instruction.setPlainText(combined)
+                self._hwpx_pending_clarification = None
+            else:
+                self.txt_hwpx_instruction.setPlainText(raw_text)
         elif tid == "calendar_todo":
             self.txt_calendar_instruction.setPlainText(raw_text)
 

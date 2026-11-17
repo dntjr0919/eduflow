@@ -134,6 +134,7 @@ class TaskRunner(QObject):
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
         self._active_tasks: Dict[str, Tuple[QThread, BaseWorker]] = {}
+        self._retired_tasks: List[Tuple[QThread, BaseWorker]] = []
         self._task_counter = 0
         self.global_signals = WorkerSignals()
 
@@ -150,7 +151,7 @@ class TaskRunner(QObject):
             task_key = f"task_{self._task_counter}_{worker.task_name}"
 
         if task_key in self._active_tasks:
-            self.stop_task(task_key)
+            self._retire_task(task_key)
 
         thread = QThread()
         worker.moveToThread(thread)
@@ -165,18 +166,34 @@ class TaskRunner(QObject):
             worker.signals.result.connect(on_result)
         if on_error is not None:
             worker.signals.error.connect(on_error)
-        if on_finished is not None:
-            worker.signals.task_finished.connect(lambda _: on_finished())
 
         thread.started.connect(worker.run)
         worker.signals.task_finished.connect(thread.quit)
         worker.signals.task_finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda key=task_key: self._cleanup_task(key))
+        thread.finished.connect(lambda key=task_key, th=thread: self._cleanup_task(key, th))
+        if on_finished is not None:
+            thread.finished.connect(on_finished)
         thread.finished.connect(thread.deleteLater)
 
         self._active_tasks[task_key] = (thread, worker)
         thread.start()
         return task_key
+
+    def _retire_task(self, task_key: str) -> None:
+        entry = self._active_tasks.pop(task_key, None)
+        if entry is None:
+            return
+        old_thread, old_worker = entry
+        old_worker.request_stop()
+        if old_thread.isRunning():
+            old_thread.requestInterruption()
+            old_thread.quit()
+            self._retired_tasks.append(entry)
+            old_thread.finished.connect(lambda e=entry: self._cleanup_retired_task(e))
+
+    def _cleanup_retired_task(self, entry: Tuple[QThread, BaseWorker]) -> None:
+        if entry in self._retired_tasks:
+            self._retired_tasks.remove(entry)
 
     def is_running(self, task_key: str) -> bool:
         if task_key not in self._active_tasks:
@@ -190,6 +207,7 @@ class TaskRunner(QObject):
         thread, worker = self._active_tasks[task_key]
         worker.request_stop()
         if thread.isRunning():
+            thread.requestInterruption()
             thread.quit()
             if wait and wait_ms > 0:
                 thread.wait(wait_ms)
@@ -198,6 +216,12 @@ class TaskRunner(QObject):
         keys = list(self._active_tasks.keys())
         for key in keys:
             self.stop_task(key, wait_ms=wait_ms, wait=False)
+        for thread, worker in list(self._retired_tasks):
+            worker.request_stop()
+            if thread.isRunning():
+                thread.requestInterruption()
+                thread.quit()
+
         for key in keys:
             entry = self._active_tasks.get(key)
             if entry is None:
@@ -208,5 +232,16 @@ class TaskRunner(QObject):
                     thread.terminate()
                     thread.wait(500)
 
-    def _cleanup_task(self, task_key: str) -> None:
-        self._active_tasks.pop(task_key, None)
+        for thread, _ in list(self._retired_tasks):
+            if thread.isRunning() and wait_ms > 0:
+                if not thread.wait(wait_ms):
+                    thread.terminate()
+                    thread.wait(500)
+        self._retired_tasks.clear()
+
+    def _cleanup_task(self, task_key: str, expected_thread: Optional[QThread] = None) -> None:
+        entry = self._active_tasks.get(task_key)
+        if entry is None:
+            return
+        if expected_thread is None or entry[0] is expected_thread:
+            self._active_tasks.pop(task_key, None)

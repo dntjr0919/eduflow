@@ -1624,8 +1624,9 @@ def build_hwpx_create_prompt(
     part_index = max(1, min(int(part_index or 1), total_parts))
 
     system_prompt = (
+        "인사말·설명 문장 없이 반드시 유효한 ```json ... ``` 코드블록 1개만 출력하세요.\n"
         "당신은 대한민국 교직 실무용 새 HWPX 양식 생성 AI 에이전트입니다.\n"
-        "교사의 지시사항과 참고 자료를 바탕으로 깔끔하고 구조화된 새 HWPX 문서를 생성하세요.\n"
+        "매 호출은 독립된 새 세션이므로 이전 대화 맥락에 의존하지 말고 아래 지시사항·현재 문서 상태·참고 자료만으로 완결된 JSON을 생성하세요.\n"
         "반드시 아래 JSON 스키마에 맞는 ```json ... ``` 블록만 출력하세요.\n\n"
         "사용 가능한 op 목록:\n"
         "1. append_paragraph: {\"op\":\"append_paragraph\", \"text\":\"...\", \"bold\":true|false, \"font_size_pt\":14.0, \"align\":\"LEFT\"|\"CENTER\"|\"RIGHT\"}\n"
@@ -1673,10 +1674,15 @@ def build_hwpx_create_prompt(
     ref_text = (reference_chunk or "").strip()
     if ref_text:
         part_tag = f" (Part {part_index}/{total_parts})" if total_parts > 1 else ""
-        sections.append(f"### [참고 문서 내용{part_tag}]\n{ref_text}")
+        sections.append(
+            f"### [참고 문서 내용{part_tag}]\n{ref_text}\n\n"
+            "(참고: 만약 현재 전달된 참고 내용만으로 부족해 다른 청크나 페이지가 추가로 필요하면, "
+            "`{\"status\": \"need_more_chunks\", \"chunk_ids\": [\"...\"], \"pages\": [1, 2], \"reason\": \"필요 사유\"}` 형태로 요청할 수 있습니다.)"
+        )
 
     sections.append(
         "### [출력 형식 - 필수 준수]\n"
+        "인사말·설명 문장 없이 반드시 유효한 ```json ... ``` 코드블록 1개만 출력하세요.\n"
         "```json\n"
         "{\n"
         '  "summary": "생성/추가한 양식 내용 요약",\n'
@@ -3618,42 +3624,18 @@ def _extract_excel_reference_text(path: Path) -> str:
 
 
 def _extract_pdf_reference_text(path: Path) -> str:
-    """pypdf 등으로 PDF 텍스트 레이어를 추출합니다."""
-    reader_cls = None
-    try:
-        from pypdf import PdfReader as reader_cls  # type: ignore
-    except ImportError:
-        try:
-            from PyPDF2 import PdfReader as reader_cls  # type: ignore
-        except ImportError:
-            reader_cls = None
+    """통합 PDF 엔진(PyMuPDF/pypdfium2/pypdf)으로 텍스트 레이어를 추출합니다."""
+    from services.hwpx_ref_session_service import inspect_pdf_document
 
-    if reader_cls is not None:
-        reader = reader_cls(str(path))
-        pages: List[str] = []
-        for idx, page in enumerate(reader.pages, start=1):
-            txt = (page.extract_text() or "").strip()
-            if txt:
-                pages.append(f"[페이지 {idx}]\n{txt}")
-        return "\n\n".join(pages).strip()
-
-    try:
-        import fitz  # type: ignore
-
-        doc_pdf = fitz.open(str(path))
-        try:
-            pages = []
-            for idx, page in enumerate(doc_pdf, start=1):
-                txt = (page.get_text("text") or "").strip()
-                if txt:
-                    pages.append(f"[페이지 {idx}]\n{txt}")
-            return "\n\n".join(pages).strip()
-        finally:
-            doc_pdf.close()
-    except ImportError as exc:
-        raise RuntimeError(
-            "PDF 참고 문서 추출을 위해 pypdf 패키지가 필요합니다."
-        ) from exc
+    info = inspect_pdf_document(path)
+    if info.get("is_scanned"):
+        return ""
+    pages: List[str] = []
+    for idx, txt in enumerate(info.get("page_texts") or [], start=1):
+        clean = (txt or "").strip()
+        if clean:
+            pages.append(f"[페이지 {idx}]\n{clean}")
+    return "\n\n".join(pages).strip()
 
 
 def _extract_text_file_with_encoding(path: Path) -> str:
@@ -3804,34 +3786,45 @@ def extract_hwpx_reference_chunks(
     max_chars_per_chunk: int = 8000,
 ) -> List[Dict[str, Any]]:
     """
-    참고 문서(.hwpx, .hwp, .docx, .xlsx/.xls, .pdf, .txt/.md/.csv)를 파싱해
-    max_chars_per_chunk 기준의 파트 목록([{"part_index": 1, "total_parts": N, "content": "..."}])으로 분할합니다.
+    참고 문서(.hwpx, .hwp, .docx, .xlsx/.xls, .pdf, .txt/.md/.csv)를 세션 캐시에 인덱싱하고
+    파트 목록([{"part_index": 1, "total_parts": N, "chunk_id": ..., "content": "...", ...}])으로 반환합니다.
     """
     if not file_paths:
         return []
 
-    doc_sections: List[str] = []
-    for raw_path in file_paths:
-        if not raw_path:
-            continue
-        p = Path(raw_path)
-        if not p.exists() or not p.is_file():
-            raise FileNotFoundError(f"참고 문서를 찾을 수 없습니다: {p}")
-        extracted = _extract_reference_text_from_file(p)
-        if extracted.strip():
-            doc_sections.append(f"=== [참고 문서: {p.name}] ===\n{extracted.strip()}")
+    from services.hwpx_ref_session_service import build_reference_index_summary
 
-    combined = "\n\n".join(doc_sections).strip()
-    if not combined:
-        return []
+    summary = build_reference_index_summary(file_paths, max_chars_per_chunk=max_chars_per_chunk)
+    chunks = summary.get("chunks") or []
+    limit = max(100, int(max_chars_per_chunk or 8000))
 
-    raw_chunks = _split_text_into_chunks(combined, max_chars_per_chunk=max_chars_per_chunk)
-    total = len(raw_chunks)
-    return [
-        {
-            "part_index": idx + 1,
-            "total_parts": total,
-            "content": chunk_text,
-        }
-        for idx, chunk_text in enumerate(raw_chunks)
-    ]
+    # 인접한 cached 청크가 max_chars_per_chunk 이하이면 하나로 병합(소형 다중 파일 호환)
+    merged_items: List[Dict[str, Any]] = []
+    for ch in chunks:
+        item = dict(ch)
+        if item.get("status") == "cached" and item.get("content"):
+            fname = item.get("file_name") or ""
+            if fname and not str(item["content"]).startswith("=== [참고 문서:"):
+                item["content"] = f"=== [참고 문서: {fname}] ===\n{item['content']}"
+            if len(str(item["content"])) > limit:
+                for sub_txt in _split_text_into_chunks(str(item["content"]), max_chars_per_chunk=limit):
+                    sub_item = dict(item)
+                    sub_item["content"] = sub_txt
+                    sub_item["char_count"] = len(sub_txt)
+                    merged_items.append(sub_item)
+                continue
+            if (
+                merged_items
+                and merged_items[-1].get("status") == "cached"
+                and len(str(merged_items[-1].get("content", ""))) + 2 + len(str(item["content"])) <= limit
+            ):
+                merged_items[-1]["content"] = f"{merged_items[-1]['content']}\n\n{item['content']}"
+                merged_items[-1]["char_count"] = len(merged_items[-1]["content"])
+                continue
+        merged_items.append(item)
+
+    total = len(merged_items)
+    for idx, item in enumerate(merged_items, start=1):
+        item["part_index"] = idx
+        item["total_parts"] = total
+    return merged_items

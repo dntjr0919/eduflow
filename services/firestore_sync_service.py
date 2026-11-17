@@ -939,6 +939,9 @@ class FirestoreSyncService:
             else bool(raw_schema or reply_fields)
         )
 
+        raw_sig_mode = str(notice_data.get("signature_mode") or "single").strip().lower()
+        signature_mode = "both" if raw_sig_mode == "both" else "single"
+
         now_ts = _now_str()
         payload = {
             "remote_id": rid,
@@ -947,6 +950,7 @@ class FirestoreSyncService:
             "content": str(notice_data.get("content") or "").strip(),
             "due_date": str(notice_data.get("due_date") or "").strip(),
             "requires_reply": requires_reply,
+            "signature_mode": signature_mode,
             "reply_schema": raw_schema,
             "reply_schema_json": reply_schema_json,
             "reply_fields": reply_fields,

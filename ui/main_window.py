@@ -1271,12 +1271,29 @@ class MainWindow(QMainWindow):
         if getattr(self, "_cleaned_up_on_quit", False):
             return
         self._cleaned_up_on_quit = True
+        try:
+            from services.hwpx_ref_session_service import clear_hwpx_ref_session_cache
+
+            clear_hwpx_ref_session_cache()
+        except Exception:
+            pass
         for timer in self.findChildren(QTimer):
             try:
                 timer.stop()
             except Exception:
                 pass
+        if hasattr(self, "ai_dock") and self.ai_dock is not None:
+            try:
+                self.ai_dock.shutdown_workers()
+            except Exception:
+                pass
         self.task_runner.stop_all(wait_ms=3000)
+        for runner in self.findChildren(TaskRunner):
+            if runner is not self.task_runner:
+                try:
+                    runner.stop_all(wait_ms=3000)
+                except Exception:
+                    pass
         if hasattr(self, "tray_icon") and self.tray_icon is not None:
             self.tray_icon.hide()
 
@@ -1287,7 +1304,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._force_quit:
-            self.task_runner.stop_all(wait_ms=3000)
+            self.cleanup_on_quit()
             event.accept()
             return
 

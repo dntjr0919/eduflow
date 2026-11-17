@@ -175,18 +175,21 @@ def extract_json_from_llm_response(response_text: str) -> Dict[str, Any]:
     cleaned = response_text.strip()
     parsed: Any = None
 
-    # 1순위: ```json ... ``` 또는 ``` ... ``` 코드 블록 내부 추출
-    code_block_match = re.search(
-        r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE
-    )
-    if code_block_match:
+    # 1순위: ```json ... ``` 또는 ``` ... ``` 코드 블록 내부 추출 (여러 블록이면 마지막 유효 JSON 우선)
+    for code_block_match in reversed(
+        list(re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE))
+    ):
         candidate_str = code_block_match.group(1).strip()
+        if not candidate_str:
+            continue
         try:
             parsed = json.loads(candidate_str)
+            break
         except json.JSONDecodeError:
             fixed_str = re.sub(r",\s*([\}\]])", r"\1", candidate_str)
             try:
                 parsed = json.loads(fixed_str)
+                break
             except json.JSONDecodeError:
                 parsed = None
 

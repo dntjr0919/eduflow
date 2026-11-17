@@ -85,7 +85,9 @@ from services.notice_parser_service import (
     NOTICE_OCR_JSON_PROMPT,
     VALID_REPLY_FIELD_TYPES,
     extract_notice_from_pdf,
+    extract_notice_from_text,
     extract_notice_source_text,
+    inspect_notice_file_locally,
     normalize_reply_schema,
     parse_notice_ai_json,
 )
@@ -1993,18 +1995,21 @@ class ClassroomToolsTab(QWidget):
         drop_lay.setContentsMargins(10, 8, 10, 8)
         drop_lay.setSpacing(8)
         self.lbl_notice_pdf_status = QLabel(
-            "가정통신문 PDF / HWP / HWPX / 이미지를 여기에 드래그앤드롭하거나 [파일 선택]을 누르세요."
+            "가정통신문 PDF / HWP / HWPX / 이미지를 여기에 드래그앤드롭하거나 [파일 선택]을 누르세요. (필요 시 [AI OCR 추출]로 구조화)"
         )
         self.lbl_notice_pdf_status.setStyleSheet("color: #475569; font-size: 12px;")
         self.lbl_notice_pdf_status.setWordWrap(True)
-        self.btn_load_notice_pdf = QPushButton("파일 선택 → AI 추출")
+        self.btn_load_notice_pdf = QPushButton("파일 선택")
         apply_qss_role(self.btn_load_notice_pdf, role="secondary")
         self.btn_load_notice_pdf.setToolTip(
-            "PDF, HWP, HWPX 또는 이미지 파일을 선택/드롭하면 AI OCR·텍스트 추출로 구조화 JSON을 생성합니다."
+            "PDF, HWP, HWPX 또는 이미지 파일을 선택합니다. HWP/HWPX 및 텍스트 PDF는 로컬에서 1차 파싱되며, 스캔 PDF·이미지는 AI OCR을 실행합니다."
         )
         self.btn_load_notice_pdf.clicked.connect(self._on_load_notice_pdf)
-        self.btn_reextract_notice_pdf = QPushButton("AI OCR 다시 추출")
+        self.btn_reextract_notice_pdf = QPushButton("AI OCR 추출")
         apply_qss_role(self.btn_reextract_notice_pdf, role="secondary")
+        self.btn_reextract_notice_pdf.setToolTip(
+            "현재 파일 또는 본문 텍스트를 AI로 분석해 제목·마감일·요약 및 회신 입력칸(reply_schema)을 추출합니다."
+        )
         self.btn_reextract_notice_pdf.clicked.connect(self._on_reextract_notice_pdf)
         drop_lay.addWidget(self.lbl_notice_pdf_status, stretch=1)
         drop_lay.addWidget(self.btn_load_notice_pdf)
@@ -2036,10 +2041,19 @@ class ClassroomToolsTab(QWidget):
         self.edit_notice_due.setFixedWidth(135)
         self.chk_notice_requires_reply = QCheckBox("회신·서명 필요")
         self.chk_notice_requires_reply.setChecked(True)
+        self.combo_notice_signature_mode = QComboBox()
+        self.combo_notice_signature_mode.addItem("서명 1칸 (기본)", "single")
+        self.combo_notice_signature_mode.addItem("서명 2칸 (학생·학부모)", "both")
+        self.combo_notice_signature_mode.setFixedWidth(160)
+        self.combo_notice_signature_mode.setToolTip(
+            "서명 방식을 선택합니다. 학생·학부모 서명이 각각 필요하면 '서명 2칸 (학생·학부모)'을 선택하세요."
+        )
+        install_no_scroll_wheel_filter(self.combo_notice_signature_mode)
         notice_top.addWidget(self.edit_notice_title, stretch=1)
         notice_top.addWidget(self.combo_notice_category)
         notice_top.addWidget(self.edit_notice_due)
         notice_top.addWidget(self.chk_notice_requires_reply)
+        notice_top.addWidget(self.combo_notice_signature_mode)
         c3_lay.addWidget(self._notice_top_widget)
 
         # 3) 대상 학년/반(정수) · 첨부 URL · 후보 저장 / 바로 게시 버튼
@@ -2092,7 +2106,27 @@ class ClassroomToolsTab(QWidget):
         notice_meta_row.addWidget(self.btn_publish_mobile_notice)
         c3_lay.addWidget(self._notice_meta_widget)
 
-        # 4) 본문 요약
+        # 4) 본문 요약 · 편집 헤더 및 본문 입력창
+        self._notice_content_bar_widget = QWidget()
+        content_bar = QHBoxLayout(self._notice_content_bar_widget)
+        content_bar.setContentsMargins(0, 0, 0, 0)
+        content_bar.setSpacing(6)
+        lbl_notice_content = QLabel("본문 미리보기 · 편집")
+        lbl_notice_content.setStyleSheet("font-weight: 600; color: #334155;")
+        self.lbl_notice_content_state = QLabel("")
+        self.lbl_notice_content_state.setStyleSheet("color: #64748B; font-size: 12px;")
+        self.btn_notice_content_fullscreen = QPushButton("전체화면 보기")
+        apply_qss_role(self.btn_notice_content_fullscreen, role="secondary")
+        self.btn_notice_content_fullscreen.setToolTip(
+            "본문 미리보기·편집 영역을 넓은 전체화면 창에서 조회하고 편집합니다."
+        )
+        self.btn_notice_content_fullscreen.clicked.connect(self._on_open_notice_content_fullscreen)
+        content_bar.addWidget(lbl_notice_content)
+        content_bar.addWidget(self.lbl_notice_content_state)
+        content_bar.addStretch(1)
+        content_bar.addWidget(self.btn_notice_content_fullscreen)
+        c3_lay.addWidget(self._notice_content_bar_widget)
+
         self.txt_notice_content = QPlainTextEdit()
         self.txt_notice_content.setPlaceholderText("학생·학부모용 핵심 요약 본문 내용이 여기에 표시됩니다.")
         self.txt_notice_content.setMinimumHeight(95)
@@ -2923,8 +2957,14 @@ class ClassroomToolsTab(QWidget):
     # =========================================================================
     def get_ai_context(self) -> Dict[str, Any]:
         files = [self._selected_notice_pdf_path] if self._selected_notice_pdf_path else []
+        content_text = self.txt_notice_content.toPlainText().strip()
         prompt = NOTICE_OCR_JSON_PROMPT
-        if self._selected_notice_pdf_path and Path(self._selected_notice_pdf_path).suffix.lower() in (".hwp", ".hwpx"):
+        if content_text:
+            prompt = (
+                f"{NOTICE_OCR_JSON_PROMPT}\n\n"
+                f"[가정통신문 본문(사용자 확인·편집 텍스트)]\n{content_text[:12000]}"
+            )
+        elif self._selected_notice_pdf_path and Path(self._selected_notice_pdf_path).suffix.lower() in (".hwp", ".hwpx"):
             extracted = extract_notice_source_text(self._selected_notice_pdf_path)
             if extracted:
                 prompt = f"{NOTICE_OCR_JSON_PROMPT}\n\n[문서 본문(HWP/HWPX 추출 텍스트)]\n{extracted}"
@@ -2934,6 +2974,7 @@ class ClassroomToolsTab(QWidget):
             "task_label": "가정통신문(PDF/HWP/HWPX) 구조화 JSON 추출",
             "ocr_files": files,
             "attachment_paths": files,
+            "ocr_current_text": content_text,
             "ocr_prompt": prompt,
         }
 
@@ -2966,9 +3007,19 @@ class ClassroomToolsTab(QWidget):
         if parsed.get("category"):
             self.combo_notice_category.setCurrentText(parsed["category"])
         self.edit_notice_due.setText(parsed.get("due_date") or "")
-        if parsed.get("content"):
-            self.txt_notice_content.setPlainText(parsed["content"])
+        notice_text = (
+            str(parsed.get("corrected_text") or payload.get("corrected_text") or "").strip()
+            or str(parsed.get("content") or "").strip()
+        )
+        if notice_text:
+            self.txt_notice_content.setPlainText(notice_text)
+        if hasattr(self, "lbl_notice_content_state"):
+            self.lbl_notice_content_state.setText("AI 정리 완료")
         self.chk_notice_requires_reply.setChecked(bool(parsed.get("requires_reply")))
+        if hasattr(self, "combo_notice_signature_mode"):
+            sig_mode = str(parsed.get("signature_mode") or "single").strip().lower()
+            sig_idx = self.combo_notice_signature_mode.findData(sig_mode)
+            self.combo_notice_signature_mode.setCurrentIndex(sig_idx if sig_idx >= 0 else 0)
         self._populate_reply_schema_table(parsed.get("reply_schema") or [])
         if parsed.get("attachment_url"):
             self.edit_notice_attachment_url.setText(str(parsed["attachment_url"]))
@@ -3107,6 +3158,7 @@ class ClassroomToolsTab(QWidget):
             getattr(self, "notice_pdf_dropzone", None),
             getattr(self, "_notice_top_widget", None),
             getattr(self, "_notice_meta_widget", None),
+            getattr(self, "_notice_content_bar_widget", None),
             getattr(self, "txt_notice_content", None),
             getattr(self, "_notice_reply_bar_widget", None),
             getattr(self, "table_notice_replies", None),
@@ -3120,6 +3172,50 @@ class ClassroomToolsTab(QWidget):
             self.btn_toggle_reply_schema_fullscreen.setText("전체화면 보기")
             self.table_reply_schema.setMinimumHeight(140)
 
+    def _on_open_notice_content_fullscreen(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("가정통신문 본문 미리보기 · 편집 (전체화면)")
+        dlg.setWindowFlags(
+            dlg.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        dlg.resize(920, 660)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+
+        header = QHBoxLayout()
+        lbl_info = QLabel("본문 내용을 넓게 조회·편집한 뒤 [적용 후 닫기]를 누르면 편집 내용이 반영됩니다.")
+        lbl_info.setStyleSheet("color: #475569; font-size: 12px;")
+        header.addWidget(lbl_info)
+        header.addStretch(1)
+        lay.addLayout(header)
+
+        editor = QPlainTextEdit(dlg)
+        editor.setPlainText(self.txt_notice_content.toPlainText())
+        editor.setPlaceholderText("학생·학부모용 핵심 요약 또는 추출된 본문 내용이 여기에 표시됩니다.")
+        lay.addWidget(editor, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("취소", dlg)
+        apply_qss_role(btn_cancel, role="secondary")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_apply = QPushButton("적용 후 닫기", dlg)
+        apply_qss_role(btn_apply, role="primary")
+        btn_apply.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_apply)
+        lay.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            updated_text = editor.toPlainText()
+            if updated_text != self.txt_notice_content.toPlainText():
+                self.txt_notice_content.setPlainText(updated_text)
+                self.ai_context_changed.emit()
+
     def _on_del_reply_field(self) -> None:
         rows = sorted({idx.row() for idx in self.table_reply_schema.selectedIndexes()}, reverse=True)
         if not rows and self.table_reply_schema.rowCount() > 0:
@@ -3131,7 +3227,7 @@ class ClassroomToolsTab(QWidget):
     def _on_notice_pdf_dropped(self, paths: List[str]) -> None:
         if not paths:
             return
-        self._set_notice_pdf_file(paths[0], auto_extract=True)
+        self._set_notice_pdf_file(paths[0], force_ai=False)
 
     def _on_load_notice_pdf(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -3142,34 +3238,92 @@ class ClassroomToolsTab(QWidget):
         )
         if not file_path:
             return
-        self._set_notice_pdf_file(file_path, auto_extract=True)
+        self._set_notice_pdf_file(file_path, force_ai=False)
 
     def _on_reextract_notice_pdf(self) -> None:
-        if not self._selected_notice_pdf_path:
+        content_text = self.txt_notice_content.toPlainText().strip()
+        if not self._selected_notice_pdf_path and not content_text:
             QMessageBox.information(
-                self, "파일 선택 안내", "먼저 가정통신문 문서(PDF/HWP/HWPX/이미지)를 선택하거나 드롭해 주세요."
+                self,
+                "추출 안내",
+                "먼저 가정통신문 문서(PDF/HWP/HWPX/이미지)를 선택하거나 본문 내용을 입력해 주세요.",
             )
             return
-        self._set_notice_pdf_file(self._selected_notice_pdf_path, auto_extract=True)
+        self._run_notice_ai_extraction(
+            file_path=self._selected_notice_pdf_path,
+            override_text=content_text,
+        )
 
-    def _set_notice_pdf_file(self, file_path: str, *, auto_extract: bool = True) -> None:
+    def _set_notice_pdf_file(self, file_path: str, *, force_ai: bool = False) -> None:
         self._selected_notice_pdf_path = str(file_path).strip()
         self._selected_notice_attachment_file_id = ""
         fname = Path(self._selected_notice_pdf_path).name
+
+        if not force_ai:
+            try:
+                info = inspect_notice_file_locally(self._selected_notice_pdf_path)
+            except Exception as exc:
+                QMessageBox.warning(self, "파일 파싱 오류", str(exc))
+                return
+
+            if not info.get("needs_ai_ocr"):
+                local_text = str(info.get("text") or "").strip()
+                self.txt_notice_content.setPlainText(local_text)
+                if info.get("title"):
+                    self.edit_notice_title.setText(str(info["title"]))
+                if info.get("due_date"):
+                    self.edit_notice_due.setText(str(info["due_date"]))
+                if info.get("category"):
+                    self.combo_notice_category.setCurrentText(str(info["category"]))
+
+                if hasattr(self, "lbl_notice_content_state"):
+                    self.lbl_notice_content_state.setText("로컬 파싱 완료" if local_text else "로컬 텍스트 없음")
+                if local_text:
+                    self.lbl_notice_pdf_status.setText(
+                        f"로컬 파싱 완료: {fname} — 본문 확인·수정 후 필요 시 [AI OCR 추출]을 누르세요."
+                    )
+                else:
+                    self.lbl_notice_pdf_status.setText(
+                        f"파일 선택됨: {fname} — 로컬 텍스트를 추출하지 못했습니다. 본문을 입력하거나 [AI OCR 추출]을 누르세요."
+                    )
+                self.ai_context_changed.emit()
+                return
+
+            # 이미지 파일 또는 스캔/이미지 PDF -> 본문 비우고 즉시 AI OCR 흐름 진입
+            self.txt_notice_content.clear()
+            if hasattr(self, "lbl_notice_content_state"):
+                self.lbl_notice_content_state.setText("AI OCR 대기")
+            self._run_notice_ai_extraction(file_path=self._selected_notice_pdf_path, override_text="")
+            return
+
+        self._run_notice_ai_extraction(
+            file_path=self._selected_notice_pdf_path,
+            override_text=self.txt_notice_content.toPlainText().strip(),
+        )
+
+    def _run_notice_ai_extraction(self, *, file_path: str = "", override_text: str = "") -> None:
         self.ai_context_changed.emit()
         self.ai_target_requested.emit("notice_ocr")
 
+        fname = Path(file_path).name if file_path else "직접 입력 본문"
         client = MultiLlmClient()
-        if not auto_extract or client.is_manual_mode_active():
+        if client.is_manual_mode_active():
             self.lbl_notice_pdf_status.setText(
-                f"선택된 파일: {fname} → 우측 AI 실행 패널에서 API / 수동 복붙 / Playwright로 추출하세요."
+                f"선택된 대상: {fname} → 우측 AI 실행 패널에서 API / 수동 복붙 / Playwright로 추출하세요."
             )
             return
 
-        self.lbl_notice_pdf_status.setText(f"AI OCR 분석 중: {fname} ...")
-        pdf_snapshot = self._selected_notice_pdf_path
+        self.lbl_notice_pdf_status.setText(f"AI 분석 중: {fname} ...")
+        pdf_snapshot = file_path
+        text_snapshot = str(override_text or "").strip()
 
         def _work() -> Dict[str, Any]:
+            if text_snapshot:
+                if pdf_snapshot:
+                    return extract_notice_from_pdf(
+                        pdf_snapshot, llm_client=client, override_text=text_snapshot
+                    )
+                return extract_notice_from_text(text_snapshot, llm_client=client)
             return extract_notice_from_pdf(pdf_snapshot, llm_client=client)
 
         def _on_result(parsed: Any) -> None:
@@ -3178,14 +3332,14 @@ class ClassroomToolsTab(QWidget):
 
         self._run_async_button_task(
             button=getattr(self, "btn_reextract_notice_pdf", None),
-            loading_text="OCR 추출 중...",
-            task_name="가정통신문 PDF AI OCR 추출",
+            loading_text="AI 추출 중...",
+            task_name="가정통신문 AI OCR·구조화 추출",
             task_key="classroom_extract_notice_pdf",
             work_fn=_work,
             on_result=_on_result,
             on_error=lambda err: (
-                self.lbl_notice_pdf_status.setText(f"AI OCR 오류 ({fname}): {str(err or '').splitlines()[0]}"),
-                QMessageBox.warning(self, "가정통신문 OCR 오류", str(err or "").splitlines()[0]),
+                self.lbl_notice_pdf_status.setText(f"AI 추출 오류 ({fname}): {str(err or '').splitlines()[0]}"),
+                QMessageBox.warning(self, "가정통신문 AI 추출 오류", str(err or "").splitlines()[0]),
             ),
         )
 
@@ -3320,6 +3474,11 @@ class ClassroomToolsTab(QWidget):
             "content": self.txt_notice_content.toPlainText().strip(),
             "due_date": self.edit_notice_due.text().strip(),
             "requires_reply": bool(self.chk_notice_requires_reply.isChecked()),
+            "signature_mode": str(
+                self.combo_notice_signature_mode.currentData() or "single"
+                if hasattr(self, "combo_notice_signature_mode")
+                else "single"
+            ),
             "reply_schema": reply_schema,
             "reply_schema_json": json.dumps(reply_schema, ensure_ascii=False),
             "reply_fields": reply_fields,

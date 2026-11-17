@@ -8,13 +8,22 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from services.llm_client import MultiLlmClient, extract_json_from_llm_response
-from services.multi_doc_extractor_service import extract_raw_text_preview
+from services.multi_doc_extractor_service import (
+    PDF_MIN_CHARS_PER_PAGE,
+    _extract_pdf_text_layers,
+    extract_raw_text_preview,
+)
+
+IMAGE_NOTICE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 VALID_REPLY_FIELD_TYPES = ("radio", "checkbox", "text", "textarea")
+
+VALID_SIGNATURE_MODES = ("single", "both")
 
 NOTICE_CATEGORIES = ("가정통신문", "수요조사", "체험학습", "동의서", "기타")
 
@@ -27,6 +36,7 @@ NOTICE_OCR_JSON_PROMPT = (
     '  "content": "학생·학부모용 핵심 요약 본문",\n'
     '  "due_date": "YYYY-MM-DD (회신 마감일이 없으면 빈 문자열 \\"\\")",\n'
     '  "requires_reply": true,\n'
+    '  "signature_mode": "single | both (기본 single)",\n'
     '  "reply_schema": [\n'
     "    {\n"
     '      "key": "consent",\n'
@@ -38,6 +48,7 @@ NOTICE_OCR_JSON_PROMPT = (
     "  ]\n"
     "}\n"
     "- type은 radio, checkbox, text, textarea 중 하나만 사용하세요.\n"
+    "- signature_mode: 원문에 '학생 성명 (서명/인)'과 '학부모(보호자) 성명 (서명/인)'처럼 학생과 학부모 서명이 각각 별도로 요구되는 경우 \"both\", 일반 단일 서명만 있으면 \"single\"로 응답하세요.\n"
     "- 회신/서명이 필요 없는 단순 안내문이면 requires_reply는 false, reply_schema는 []로 응답하세요."
 )
 
@@ -211,7 +222,10 @@ def parse_notice_ai_json(raw_or_dict: Any) -> Dict[str, Any]:
     if due_date.lower() in ("none", "null", "n/a", "없음", "해당없음"):
         due_date = ""
 
+    corrected_text = str(data.get("corrected_text") or "").strip()
     content = str(data.get("content") or data.get("body") or "").strip()
+    if not content and corrected_text:
+        content = corrected_text
     category = str(data.get("category") or "가정통신문").strip() or "가정통신문"
 
     if "requires_reply" in data:
@@ -221,14 +235,23 @@ def parse_notice_ai_json(raw_or_dict: Any) -> Dict[str, Any]:
     else:
         requires_reply = bool(reply_schema)
 
+    raw_sig_mode = str(data.get("signature_mode") or "").strip().lower()
+    signature_mode = (
+        "both"
+        if raw_sig_mode in ("both", "dual", "double", "2", "학생·학부모", "학생학부모")
+        else "single"
+    )
+
     return {
         "title": str(data.get("title") or "").strip(),
         "category": category,
+        "corrected_text": corrected_text,
         "content": content,
         "body": content,
         "due_date": due_date,
         "deadline": due_date,
         "requires_reply": requires_reply,
+        "signature_mode": signature_mode,
         "reply_schema": reply_schema,
         "reply_fields": legacy_fields,
     }
@@ -266,10 +289,157 @@ def extract_notice_source_text(file_path: str | Path, max_chars: int = 12000) ->
     return text.strip()
 
 
+def _extract_local_notice_metadata(text: str, file_path: Path) -> Dict[str, str]:
+    """로컬 추출 텍스트와 파일명에서 제목·마감일·분류를 1차 추정합니다."""
+    clean_text = str(text or "").strip()
+    title = ""
+    for line in clean_text.splitlines()[:20]:
+        s = line.strip()
+        if not s:
+            continue
+        m_title = re.match(r"^(?:제목|건명)\s*[:：]\s*(.+)$", s)
+        if m_title and m_title.group(1).strip():
+            title = m_title.group(1).strip()[:120]
+            break
+    if not title:
+        title = re.sub(r"[_\-]+", " ", file_path.stem).strip()
+
+    due_date = ""
+    due_keywords = ("마감", "제출", "기한", "까지", "회신")
+    for line in clean_text.splitlines():
+        if not any(kw in line for kw in due_keywords):
+            continue
+        m_full = re.search(r"(20\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*일?", line)
+        if m_full:
+            y, mo, d = int(m_full.group(1)), int(m_full.group(2)), int(m_full.group(3))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                due_date = f"{y:04d}-{mo:02d}-{d:02d}"
+                break
+        m_short = re.search(r"(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*일?", line)
+        if m_short:
+            y = datetime.now().year
+            mo, d = int(m_short.group(1)), int(m_short.group(2))
+            if 1 <= mo <= 12 and 1 <= d <= 31:
+                due_date = f"{y:04d}-{mo:02d}-{d:02d}"
+                break
+
+    combined = f"{file_path.stem}\n{clean_text[:1500]}"
+    if "체험학습" in combined or "현장체험" in combined:
+        category = "체험학습"
+    elif "수요조사" in combined or "신청서" in combined:
+        category = "수요조사"
+    elif "동의서" in combined:
+        category = "동의서"
+    else:
+        category = "가정통신문"
+
+    return {
+        "title": title,
+        "due_date": due_date,
+        "category": category,
+    }
+
+
+def inspect_notice_file_locally(file_path: str | Path, max_chars: int = 12000) -> Dict[str, Any]:
+    """파일 형식별 로컬 파싱 가능 여부를 판별하고, 가능하면 본문 텍스트 및 메타데이터를 반환합니다."""
+    p = Path(str(file_path or "").strip())
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(f"가정통신문 파일을 찾을 수 없습니다: {p}")
+
+    ext = p.suffix.lower()
+    if ext in IMAGE_NOTICE_EXTS:
+        return {
+            "kind": "image",
+            "needs_ai_ocr": True,
+            "text": "",
+            "title": "",
+            "due_date": "",
+            "category": "",
+        }
+
+    if ext == ".pdf":
+        full_text = ""
+        avg_chars = 0.0
+        try:
+            page_texts, avg_chars = _extract_pdf_text_layers(p)
+            full_text = "\n\n".join(t for t in page_texts if t).strip()
+        except Exception:
+            full_text = ""
+            avg_chars = 0.0
+
+        if avg_chars < PDF_MIN_CHARS_PER_PAGE or not full_text:
+            return {
+                "kind": "scanned_pdf",
+                "needs_ai_ocr": True,
+                "text": "",
+                "avg_chars": avg_chars,
+                "title": "",
+                "due_date": "",
+                "category": "",
+            }
+
+        trimmed = full_text[:max_chars]
+        meta = _extract_local_notice_metadata(trimmed, p)
+        return {
+            "kind": "text_pdf",
+            "needs_ai_ocr": False,
+            "text": trimmed,
+            "avg_chars": avg_chars,
+            **meta,
+        }
+
+    # .hwp, .hwpx 등 문서 파일: AI 호출 없이 로컬 텍스트 추출 수행
+    raw_text = extract_notice_source_text(p, max_chars=max_chars)
+    if raw_text.startswith("(") and (
+        "미리보기 불가" in raw_text or "텍스트 없음" in raw_text or "읽기 실패" in raw_text
+    ):
+        raw_text = ""
+
+    meta = _extract_local_notice_metadata(raw_text, p)
+    return {
+        "kind": ext.lstrip(".") or "document",
+        "needs_ai_ocr": False,
+        "text": raw_text,
+        **meta,
+    }
+
+
+def extract_notice_from_text(
+    content_text: str,
+    instruction: str = "",
+    llm_client: Optional[MultiLlmClient] = None,
+    source_path: str = "",
+) -> Dict[str, Any]:
+    """사용자 확인·편집 본문 텍스트를 기반으로 가정통신문 요약 및 회신 입력칸(reply_schema) JSON을 추출합니다."""
+    clean_text = str(content_text or "").strip()
+    if not clean_text:
+        raise ValueError("분석할 가정통신문 본문 텍스트가 비어 있습니다.")
+
+    client = llm_client or MultiLlmClient()
+    prompt_parts = [NOTICE_OCR_JSON_PROMPT]
+    if instruction.strip():
+        prompt_parts.append(f"\n[추가 요청사항]\n{instruction.strip()}")
+    prompt_parts.append(f"\n[가정통신문 본문(사용자 확인·편집 텍스트)]\n{clean_text[:12000]}")
+
+    raw_reply = client.generate(
+        prompt="\n".join(prompt_parts),
+        system_prompt=(
+            "당신은 한국 초·중·고등학교 가정통신문 구조화 및 학부모 회신서 설계 전문 AI입니다. "
+            "요청된 JSON 스키마만 정확하게 출력하세요."
+        ),
+        image_bytes=None,
+    )
+    parsed = parse_notice_ai_json(raw_reply)
+    if source_path:
+        parsed["source_path"] = source_path
+    return parsed
+
+
 def extract_notice_from_pdf(
     pdf_path: str | Path,
     instruction: str = "",
     llm_client: Optional[MultiLlmClient] = None,
+    override_text: str = "",
 ) -> Dict[str, Any]:
     """PDF/HWP/HWPX/이미지에서 기존 텍스트 추출 및 MultiLlmClient OCR을 호출해 구조화 JSON을 추출합니다."""
     p = Path(str(pdf_path or "").strip())
@@ -277,13 +447,22 @@ def extract_notice_from_pdf(
         raise FileNotFoundError(f"가정통신문 파일을 찾을 수 없습니다: {p}")
 
     client = llm_client or MultiLlmClient()
+    edited_text = str(override_text or "").strip()
+    if edited_text:
+        return extract_notice_from_text(
+            edited_text,
+            instruction=instruction,
+            llm_client=client,
+            source_path=str(p),
+        )
+
     ext = p.suffix.lower()
 
     local_text = extract_notice_source_text(p, max_chars=12000)
 
     image_bytes: Optional[bytes] = None
     mime_type = "application/pdf"
-    if ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+    if ext in IMAGE_NOTICE_EXTS:
         image_bytes = p.read_bytes()
         guessed, _ = mimetypes.guess_type(str(p))
         mime_type = guessed or "image/png"
