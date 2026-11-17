@@ -122,6 +122,7 @@ class MainWindow(QMainWindow):
         self.config = config or ConfigManager()
         self.db = db or DatabaseManager()
         self.task_runner = TaskRunner(self)
+        self._active_worker_count: int = 0
         self.notifier = NotificationService()
         self._force_quit = False
         self._sidebar_collapsed = False
@@ -1130,12 +1131,16 @@ class MainWindow(QMainWindow):
         sig.task_finished.connect(self._on_worker_finished)
 
     def _on_worker_started(self, task_name: str) -> None:
+        self._active_worker_count += 1
         self.lbl_current_task.setText(f"실행 중: {task_name}")
-        self.progress_bar.setValue(0)
+        self.progress_bar.setRange(0, 0)
         self.append_log("INFO", f"작업 시작: {task_name}")
 
     def _on_worker_progress(self, percent: int, status_msg: str) -> None:
-        self.progress_bar.setValue(percent)
+        if 0 < int(percent) <= 100:
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(int(percent))
         if status_msg:
             self.lbl_single_line_log.setText(status_msg)
             self.lbl_single_line_log.setToolTip(status_msg)
@@ -1144,7 +1149,11 @@ class MainWindow(QMainWindow):
         self.append_log("ERROR", err_msg)
 
     def _on_worker_finished(self, task_name: str) -> None:
+        self._active_worker_count = max(0, self._active_worker_count - 1)
         self.lbl_current_task.setText(f"완료: {task_name}")
+        if self._active_worker_count == 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
 
     def _on_toggle_log_console(self, checked: bool) -> None:
         self._drawer_anim.stop()

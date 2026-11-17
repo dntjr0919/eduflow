@@ -555,6 +555,98 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             self.assertEqual(res5["base_pushed"], 3)
             self.assertEqual(res5["changes_pushed"], 1)
 
+    def test_vercel_api_headers_and_timeout_and_async_roster_button_restore(self) -> None:
+        import time
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QApplication, QMessageBox
+        from services.firestore_sync_service import DEFAULT_VERCEL_TIMEOUT
+
+        # 1) _post_vercel_api가 (5, 45) 타임아웃 및 브라우저 User-Agent 헤더를 전달하는지 검증
+        self.cfg.update_section("api_and_integrations", {"google_credentials_path": ""})
+        svc = FirestoreSyncService(config=self.cfg)
+        captured_kwargs: List[Dict[str, Any]] = []
+
+        class _FakeOkResp:
+            ok = True
+            status_code = 200
+
+            def json(self) -> Dict[str, Any]:
+                return {"ok": True, "students": [{"student_id": "20401", "name": "김철수"}]}
+
+        def _fake_post_with_headers(url: str, json: Dict[str, Any], headers: Dict[str, str] = None, timeout: Any = None):
+            captured_kwargs.append({"url": url, "headers": headers or {}, "timeout": timeout})
+            return _FakeOkResp()
+
+        with patch("services.firestore_sync_service.has_local_credentials", return_value=False):
+            with patch("requests.post", side_effect=_fake_post_with_headers):
+                rows = svc.fetch_homeroom_students(school_code="7010001", grade=2, class_no=4)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(captured_kwargs[0]["timeout"], DEFAULT_VERCEL_TIMEOUT)
+                self.assertIn("Mozilla/5.0", captured_kwargs[0]["headers"].get("User-Agent", ""))
+                self.assertEqual(captured_kwargs[0]["headers"].get("Accept"), "application/json")
+
+        # 2) ClassroomToolsTab.refresh_firebase_roster 비동기 호출 시 버튼 비활성화 및 성공/실패 후 복구 검증
+        tab = ClassroomToolsTab(task_runner=self.task_runner)
+        tab.login_teacher("유우석", "pw1234", sync_service=self.sync_svc)
+        orig_refresh_text = tab.btn_teacher_refresh.text()
+        orig_sync_text = tab.btn_sync_roster.text()
+
+        def _wait_idle(timeout_sec: float = 3.0) -> None:
+            qapp = QApplication.instance()
+            deadline = time.time() + timeout_sec
+            while tab._roster_sync_running and time.time() < deadline:
+                if qapp is not None:
+                    qapp.processEvents()
+                time.sleep(0.01)
+            if qapp is not None:
+                qapp.processEvents()
+
+        # 2-a) 성공 케이스
+        with patch.object(
+            FirestoreSyncService,
+            "fetch_homeroom_students",
+            return_value=[{"student_id": "20401", "name": "김철수"}],
+        ):
+            tab.refresh_firebase_roster(silent=False)
+            self.assertFalse(tab.btn_teacher_refresh.isEnabled())
+            self.assertFalse(tab.btn_sync_roster.isEnabled())
+            _wait_idle()
+            self.assertTrue(tab.btn_teacher_refresh.isEnabled())
+            self.assertTrue(tab.btn_sync_roster.isEnabled())
+            self.assertEqual(tab.btn_teacher_refresh.text(), orig_refresh_text)
+            self.assertEqual(tab.btn_sync_roster.text(), orig_sync_text)
+
+        # 2-b) 실패(ReadTimeout) 케이스에서도 버튼 활성화 및 원래 텍스트 복구 보장
+        with patch.object(
+            FirestoreSyncService,
+            "fetch_homeroom_students",
+            side_effect=RuntimeError("Read timed out. (read timeout=45)"),
+        ):
+            with patch.object(QMessageBox, "warning") as mock_warn:
+                tab.refresh_firebase_roster(silent=False)
+                self.assertFalse(tab.btn_teacher_refresh.isEnabled())
+                self.assertFalse(tab.btn_sync_roster.isEnabled())
+                _wait_idle()
+                self.assertTrue(tab.btn_teacher_refresh.isEnabled())
+                self.assertTrue(tab.btn_sync_roster.isEnabled())
+                self.assertEqual(tab.btn_teacher_refresh.text(), orig_refresh_text)
+                self.assertEqual(tab.btn_sync_roster.text(), orig_sync_text)
+                mock_warn.assert_called_once()
+
+        # 3) 슬림 헤더 및 공용 Session Retry 설정 검증
+        self.assertEqual(tab.btn_teacher_refresh.text(), "")
+        self.assertEqual(tab.btn_teacher_refresh.width(), 34)
+        self.assertEqual(tab.btn_teacher_refresh.height(), 34)
+        self.assertFalse(tab.btn_teacher_refresh.icon().isNull())
+
+        session = svc._get_http_session()
+        adapter = session.get_adapter("https://m.eduflow.kro.kr/api/firestore")
+        self.assertEqual(adapter.max_retries.total, 2)
+        self.assertEqual(adapter.max_retries.backoff_factor, 0.5)
+        self.assertIn(502, adapter.max_retries.status_forcelist)
+        self.assertIn(503, adapter.max_retries.status_forcelist)
+        self.assertIn(504, adapter.max_retries.status_forcelist)
+
 
 if __name__ == "__main__":
     unittest.main()

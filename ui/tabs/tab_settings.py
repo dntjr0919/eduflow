@@ -1026,10 +1026,10 @@ class SettingsTab(QWidget):
         btn_save_cfg.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save_cfg.clicked.connect(self.save_ui_to_settings)
 
-        btn_test_notify = QPushButton("알림 테스트 발송")
-        apply_qss_role(btn_test_notify, role="secondary", obj_name="BtnTestNotify")
-        btn_test_notify.setMinimumHeight(40)
-        btn_test_notify.clicked.connect(self._on_test_notification)
+        self.btn_test_notify = QPushButton("알림 테스트 발송")
+        apply_qss_role(self.btn_test_notify, role="secondary", obj_name="BtnTestNotify")
+        self.btn_test_notify.setMinimumHeight(40)
+        self.btn_test_notify.clicked.connect(self._on_test_notification)
 
         btn_reset_cfg = QPushButton("초기값 복원")
         apply_qss_role(btn_reset_cfg, role="secondary", obj_name="BtnResetSettings")
@@ -1037,7 +1037,7 @@ class SettingsTab(QWidget):
         btn_reset_cfg.clicked.connect(self._on_reset_config)
 
         save_bar.addWidget(btn_save_cfg)
-        save_bar.addWidget(btn_test_notify)
+        save_bar.addWidget(self.btn_test_notify)
         save_bar.addStretch()
         save_bar.addWidget(btn_reset_cfg)
         scroll_layout.addLayout(save_bar)
@@ -1374,6 +1374,42 @@ class SettingsTab(QWidget):
         self.config.update_section("api_and_integrations", updates, auto_save=True)
         self._update_model_status_label(prov_code, model_name)
 
+    def _run_async_button_task(
+        self,
+        button: Optional[QPushButton],
+        loading_text: str,
+        task_name: str,
+        task_key: str,
+        work_fn: Any,
+        on_result: Any = None,
+        on_error: Any = None,
+    ) -> None:
+        """버튼 비활성화·로딩 텍스트 표시와 완료 시 복구를 보장하는 TaskRunner 헬퍼."""
+        if button is not None and not button.isEnabled():
+            return
+        orig_text = button.text() if button is not None else ""
+        if button is not None:
+            button.setEnabled(False)
+            if loading_text:
+                button.setText(loading_text)
+
+        def _restore() -> None:
+            if button is not None:
+                try:
+                    button.setText(orig_text)
+                    button.setEnabled(True)
+                except RuntimeError:
+                    pass
+
+        worker = FunctionWorker(task_name, lambda _w: work_fn())
+        self.task_runner.start_worker(
+            worker,
+            task_key=task_key,
+            on_result=on_result,
+            on_error=on_error,
+            on_finished=_restore,
+        )
+
     def _on_test_llm_connection(self) -> None:
         """[🔌 연결 테스트] 버튼 클릭 시 현재 입력된 AI 설정으로 즉시 연결을 테스트합니다."""
         self._on_ai_setting_changed()
@@ -1387,8 +1423,7 @@ class SettingsTab(QWidget):
         )
         model_name = self._current_model_name() or PROVIDER_DEFAULT_MODELS.get(prov_code, "gemini-1.5-flash")
 
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
+        def _work() -> tuple:
             client = MultiLlmClient(
                 provider=prov_code,
                 api_key=api_key,
@@ -1396,35 +1431,49 @@ class SettingsTab(QWidget):
                 base_url=custom_url,
             )
             ok, msg = client.test_connection()
-        finally:
-            QApplication.restoreOverrideCursor()
+            return ok, msg, (client.last_responded_model or model_name).strip()
 
-        if ok:
-            responded_model = (client.last_responded_model or model_name).strip()
-            self.config.update_section(
-                "api_and_integrations",
-                {
-                    "last_tested_provider": prov_code,
-                    "last_tested_requested_model": model_name,
-                    "last_tested_responded_model": responded_model,
-                    "last_tested_ok": True,
-                },
-                auto_save=True,
-            )
-            self._update_model_status_label(prov_code, model_name)
-            QMessageBox.information(self, "AI API 연결 테스트 성공", msg)
-        else:
-            self.config.update_section(
-                "api_and_integrations",
-                {
-                    "last_tested_provider": prov_code,
-                    "last_tested_requested_model": model_name,
-                    "last_tested_responded_model": "",
-                    "last_tested_ok": False,
-                },
-                auto_save=True,
-            )
-            QMessageBox.warning(self, "AI API 연결 테스트 실패", msg)
+        def _on_result(res: Any) -> None:
+            ok, msg, responded_model = res if isinstance(res, tuple) and len(res) >= 3 else (False, str(res), "")
+            if ok:
+                self.config.update_section(
+                    "api_and_integrations",
+                    {
+                        "last_tested_provider": prov_code,
+                        "last_tested_requested_model": model_name,
+                        "last_tested_responded_model": responded_model or model_name,
+                        "last_tested_ok": True,
+                    },
+                    auto_save=True,
+                )
+                self._update_model_status_label(prov_code, model_name)
+                QMessageBox.information(self, "AI API 연결 테스트 성공", msg)
+            else:
+                self.config.update_section(
+                    "api_and_integrations",
+                    {
+                        "last_tested_provider": prov_code,
+                        "last_tested_requested_model": model_name,
+                        "last_tested_responded_model": "",
+                        "last_tested_ok": False,
+                    },
+                    auto_save=True,
+                )
+                QMessageBox.warning(self, "AI API 연결 테스트 실패", msg)
+
+        def _on_error(err: str) -> None:
+            first_line = str(err or "").splitlines()[0] if err else "알 수 없는 오류"
+            QMessageBox.warning(self, "AI API 연결 테스트 오류", first_line)
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_test_connection", None),
+            loading_text="연결 테스트 중...",
+            task_name="AI API 연결 테스트",
+            task_key="settings_test_llm_connection",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=_on_error,
+        )
 
     def _on_open_manual_dialog_preview(self) -> None:
         dlg = ManualLlmDialog(
@@ -1770,91 +1819,156 @@ class SettingsTab(QWidget):
             return
         school_code = self.edit_neis_school_code.text().strip()
         school_name = self.edit_school_name.text().strip()
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        try:
-            res = svc.provision_homeroom_accounts(
+
+        def _work() -> Dict[str, Any]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.provision_homeroom_accounts(
                 students=students,
                 school_code=school_code,
                 school_name=school_name,
             )
+
+        def _on_result(res: Any) -> None:
+            data = res if isinstance(res, dict) else {}
             QMessageBox.information(
                 self,
                 "모바일 계정 일괄 발급 완료",
-                f"학생 신규 생성: {res['students_created']}명 (기존 보호 {res['students_skipped']}명)\n"
-                f"학부모 신규 생성: {res['parents_created']}명 (기존 보호 {res['parents_skipped']}명)",
+                f"학생 신규 생성: {data.get('students_created', 0)}명 (기존 보호 {data.get('students_skipped', 0)}명)\n"
+                f"학부모 신규 생성: {data.get('parents_created', 0)}명 (기존 보호 {data.get('parents_skipped', 0)}명)",
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "모바일 계정 발급 오류", str(exc))
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_sync_mobile_accounts", None),
+            loading_text="계정 발급 중...",
+            task_name="모바일 계정 일괄 발급",
+            task_key="settings_provision_mobile_accounts",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.critical(self, "모바일 계정 발급 오류", str(err or "").splitlines()[0]),
+        )
 
     def _on_open_pending_approvals(self) -> None:
-        svc = FirestoreSyncService(db=self.db, config=self.config)
         requester_id = self.edit_teacher_id.text().strip()
         grade_val = self.spin_teacher_grade.value()
         class_val = self.spin_teacher_class.value()
         school_code = self.edit_neis_school_code.text().strip()
         school_name = self.edit_school_name.text().strip()
-        try:
-            pending = svc.get_pending_registrations(
+
+        def _work_fetch() -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.get_pending_registrations(
                 grade=grade_val,
                 class_no=class_val,
                 school_code=school_code,
                 school_name=school_name,
                 requester_id=requester_id,
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "가입 승인 대기 목록 오류", str(exc))
-            return
 
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"가입 승인 대기 목록 ({grade_val}학년 {class_val}반)")
-        dlg.resize(620, 420)
-        lay = QVBoxLayout(dlg)
-        if not pending:
-            lay.addWidget(QLabel("현재 승인 대기 중인 가입 신청이 없습니다."))
-            btn_ok = QPushButton("닫기")
-            btn_ok.clicked.connect(dlg.accept)
-            lay.addWidget(btn_ok)
+        def _on_fetched(pending: Any) -> None:
+            pending_list = list(pending or [])
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"가입 승인 대기 목록 ({grade_val}학년 {class_val}반)")
+            dlg.resize(620, 420)
+            lay = QVBoxLayout(dlg)
+            if not pending_list:
+                lay.addWidget(QLabel("현재 승인 대기 중인 가입 신청이 없습니다."))
+                btn_ok = QPushButton("닫기")
+                btn_ok.clicked.connect(dlg.accept)
+                lay.addWidget(btn_ok)
+                dlg.exec()
+                return
+
+            for item in pending_list:
+                row_w = QWidget()
+                row_l = QHBoxLayout(row_w)
+                if item.get("role") == "teacher":
+                    code_info = "/".join(
+                        x for x in (str(item.get("neis_office_code") or "").strip(), str(item.get("neis_school_code") or "").strip()) if x
+                    )
+                    info_txt = (
+                        f"[교사 가입 신청] {item.get('name', '')} | ID: {item.get('teacher_id') or item.get('remote_id')} | "
+                        f"{item.get('school_name', '')}{f' ({code_info})' if code_info else ''} "
+                        f"{item.get('grade', '-')}학년 {item.get('class_no', '-')}반 · {item.get('subject', '')}"
+                    )
+                else:
+                    role_lbl = "학생" if item.get("role") == "student" else "학부모"
+                    info_txt = (
+                        f"[{role_lbl}] {item.get('name', '')} | ID: {item.get('login_id') or item.get('remote_id')} "
+                        f"({item.get('grade', '')}학년 {item.get('class_no', '')}반)"
+                    )
+                row_l.addWidget(QLabel(info_txt), stretch=1)
+                btn_app = QPushButton("승인")
+                btn_rej = QPushButton("반려")
+
+                def _handle_review(
+                    approve: bool,
+                    it: Dict[str, Any] = item,
+                    rw: QWidget = row_w,
+                    b_app: QPushButton = btn_app,
+                    b_rej: QPushButton = btn_rej,
+                ) -> None:
+                    orig_app, orig_rej = b_app.text(), b_rej.text()
+                    b_app.setEnabled(False)
+                    b_rej.setEnabled(False)
+                    (b_app if approve else b_rej).setText("처리 중...")
+                    done_state = {"ok": False}
+
+                    def _do_review(_w: Any) -> Any:
+                        svc = FirestoreSyncService(db=self.db, config=self.config)
+                        return svc.review_registration(
+                            it["role"],
+                            it["remote_id"],
+                            approve=approve,
+                            requester_id=requester_id,
+                        )
+
+                    def _on_rev_ok(_res: Any) -> None:
+                        done_state["ok"] = True
+                        try:
+                            (b_app if approve else b_rej).setText("승인 완료" if approve else "반려 완료")
+                            rw.setEnabled(False)
+                        except RuntimeError:
+                            pass
+
+                    def _on_rev_err(err: str) -> None:
+                        QMessageBox.warning(dlg, "가입 심사 오류", str(err or "").splitlines()[0])
+
+                    def _on_rev_fin() -> None:
+                        if not done_state["ok"]:
+                            try:
+                                b_app.setText(orig_app)
+                                b_rej.setText(orig_rej)
+                                b_app.setEnabled(True)
+                                b_rej.setEnabled(True)
+                            except RuntimeError:
+                                pass
+
+                    rev_worker = FunctionWorker("가입 신청 심사", _do_review)
+                    self.task_runner.start_worker(
+                        rev_worker,
+                        task_key=f"settings_review_reg_{it.get('remote_id', '')}",
+                        on_result=_on_rev_ok,
+                        on_error=_on_rev_err,
+                        on_finished=_on_rev_fin,
+                    )
+
+                btn_app.clicked.connect(lambda _c=False, fn=_handle_review: fn(True))
+                btn_rej.clicked.connect(lambda _c=False, fn=_handle_review: fn(False))
+                row_l.addWidget(btn_app)
+                row_l.addWidget(btn_rej)
+                lay.addWidget(row_w)
+            lay.addStretch(1)
             dlg.exec()
-            return
 
-        for item in pending:
-            row_w = QWidget()
-            row_l = QHBoxLayout(row_w)
-            if item.get("role") == "teacher":
-                code_info = "/".join(
-                    x for x in (str(item.get("neis_office_code") or "").strip(), str(item.get("neis_school_code") or "").strip()) if x
-                )
-                info_txt = (
-                    f"[교사 가입 신청] {item.get('name', '')} | ID: {item.get('teacher_id') or item.get('remote_id')} | "
-                    f"{item.get('school_name', '')}{f' ({code_info})' if code_info else ''} "
-                    f"{item.get('grade', '-')}학년 {item.get('class_no', '-')}반 · {item.get('subject', '')}"
-                )
-            else:
-                role_lbl = "학생" if item.get("role") == "student" else "학부모"
-                info_txt = (
-                    f"[{role_lbl}] {item.get('name', '')} | ID: {item.get('login_id') or item.get('remote_id')} "
-                    f"({item.get('grade', '')}학년 {item.get('class_no', '')}반)"
-                )
-            row_l.addWidget(QLabel(info_txt), stretch=1)
-            btn_app = QPushButton("승인")
-            btn_rej = QPushButton("반려")
-            btn_app.clicked.connect(
-                lambda _c=False, it=item, w=row_w: (
-                    svc.review_registration(it["role"], it["remote_id"], approve=True, requester_id=requester_id),
-                    w.setEnabled(False),
-                )
-            )
-            btn_rej.clicked.connect(
-                lambda _c=False, it=item, w=row_w: (
-                    svc.review_registration(it["role"], it["remote_id"], approve=False, requester_id=requester_id),
-                    w.setEnabled(False),
-                )
-            )
-            row_l.addWidget(btn_app)
-            row_l.addWidget(btn_rej)
-            lay.addWidget(row_w)
-        lay.addStretch(1)
-        dlg.exec()
+        self._run_async_button_task(
+            button=getattr(self, "btn_pending_approvals", None),
+            loading_text="목록 조회 중...",
+            task_name="가입 승인 대기 목록 조회",
+            task_key="settings_pending_approvals",
+            work_fn=_work_fetch,
+            on_result=_on_fetched,
+            on_error=lambda err: QMessageBox.critical(self, "가입 승인 대기 목록 오류", str(err or "").splitlines()[0]),
+        )
 
     def _refresh_backend_mode_badge(self) -> None:
         if not hasattr(self, "lbl_firebase_backend_mode"):
@@ -1873,21 +1987,35 @@ class SettingsTab(QWidget):
         if not tid:
             QMessageBox.warning(self, "교사 프로필 불러오기", "교사 계정 ID를 먼저 입력하세요.")
             return
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        profile = svc.get_teacher_profile(tid)
-        if not profile:
-            QMessageBox.information(self, "교사 프로필 불러오기", f"Firestore에서 '{tid}' 계정을 찾지 못했습니다.")
-            return
-        self.edit_teacher_name.setText(str(profile.get("name") or tid))
-        self.edit_school_name.setText(str(profile.get("school_name") or ""))
-        if profile.get("grade"):
-            self.spin_teacher_grade.setValue(int(profile["grade"]))
-        if profile.get("class_no"):
-            self.spin_teacher_class.setValue(int(profile["class_no"]))
-        self.edit_neis_office_code.setText(str(profile.get("neis_office_code") or ""))
-        self.edit_neis_school_code.setText(str(profile.get("neis_school_code") or ""))
-        self._persist_settings_silently()
-        QMessageBox.information(self, "교사 프로필 불러오기", f"'{tid}' 교사 프로필을 불러왔습니다.")
+
+        def _work() -> Optional[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.get_teacher_profile(tid)
+
+        def _on_result(profile: Any) -> None:
+            if not profile:
+                QMessageBox.information(self, "교사 프로필 불러오기", f"Firestore에서 '{tid}' 계정을 찾지 못했습니다.")
+                return
+            self.edit_teacher_name.setText(str(profile.get("name") or tid))
+            self.edit_school_name.setText(str(profile.get("school_name") or ""))
+            if profile.get("grade"):
+                self.spin_teacher_grade.setValue(int(profile["grade"]))
+            if profile.get("class_no"):
+                self.spin_teacher_class.setValue(int(profile["class_no"]))
+            self.edit_neis_office_code.setText(str(profile.get("neis_office_code") or ""))
+            self.edit_neis_school_code.setText(str(profile.get("neis_school_code") or ""))
+            self._persist_settings_silently()
+            QMessageBox.information(self, "교사 프로필 불러오기", f"'{tid}' 교사 프로필을 불러왔습니다.")
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_load_teacher_profile", None),
+            loading_text="불러오는 중...",
+            task_name="교사 프로필 불러오기",
+            task_key="settings_load_teacher_profile",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "교사 프로필 불러오기 오류", str(err or "").splitlines()[0]),
+        )
 
     def _on_save_teacher_profile(self) -> None:
         self._persist_settings_silently()
@@ -1904,11 +2032,26 @@ class SettingsTab(QWidget):
             "neis_office_code": self.edit_neis_office_code.text().strip(),
             "neis_school_code": self.edit_neis_school_code.text().strip(),
         }
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        if svc.upsert_teacher_profile(payload):
-            QMessageBox.information(self, "교사 프로필 저장", "Firestore 계정_교사 컬렉션에 저장되었습니다.")
-        else:
-            QMessageBox.warning(self, "교사 프로필 저장", "Firestore 저장에 실패했습니다. 로그를 확인하세요.")
+
+        def _work() -> bool:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return bool(svc.upsert_teacher_profile(payload))
+
+        def _on_result(ok: Any) -> None:
+            if ok:
+                QMessageBox.information(self, "교사 프로필 저장", "Firestore 계정_교사 컬렉션에 저장되었습니다.")
+            else:
+                QMessageBox.warning(self, "교사 프로필 저장", "Firestore 저장에 실패했습니다. 로그를 확인하세요.")
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_save_teacher_profile", None),
+            loading_text="저장 중...",
+            task_name="교사 프로필 저장",
+            task_key="settings_save_teacher_profile",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "교사 프로필 저장 오류", str(err or "").splitlines()[0]),
+        )
 
     def _set_default_target_dir(self, folder: str) -> None:
         if not folder:
@@ -2101,15 +2244,30 @@ class SettingsTab(QWidget):
 
     def _on_test_notification(self) -> None:
         self._persist_settings_silently()
-        results = self.notifier.notify(
-            "환경설정 알림 테스트",
-            "교무/업무 자동화 워크스테이션 알림 연동이 정상적으로 작동합니다.",
-            force_external=True,
-        )
-        QMessageBox.information(
-            self,
-            "알림 테스트 결과",
-            "발송 결과:\n- " + "\n- ".join(results if results else ["알림 채널 처리 완료"]),
+
+        def _work() -> List[str]:
+            return self.notifier.notify(
+                "환경설정 알림 테스트",
+                "교무/업무 자동화 워크스테이션 알림 연동이 정상적으로 작동합니다.",
+                force_external=True,
+            )
+
+        def _on_result(results: Any) -> None:
+            res_list = list(results or [])
+            QMessageBox.information(
+                self,
+                "알림 테스트 결과",
+                "발송 결과:\n- " + "\n- ".join(res_list if res_list else ["알림 채널 처리 완료"]),
+            )
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_test_notify", None),
+            loading_text="발송 중...",
+            task_name="알림 테스트 발송",
+            task_key="settings_test_notification",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "알림 테스트 오류", str(err or "").splitlines()[0]),
         )
 
     def _on_reset_config(self) -> None:

@@ -17,15 +17,18 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from PyQt6.QtCore import QDate, QRect, Qt, pyqtSignal
+from PyQt6.QtCore import QDate, QPointF, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QClipboard,
     QColor,
     QFont,
     QGuiApplication,
+    QIcon,
     QMouseEvent,
     QPainter,
     QPen,
+    QPixmap,
+    QPolygonF,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -61,7 +64,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.base_worker import TaskRunner
+from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
 from services.batch_prompt_service import extract_json_from_llm_response
@@ -81,6 +84,51 @@ from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.utils import install_no_scroll_wheel_filter
 from utils.path_helper import get_data_path, get_resource_path
+
+
+def _build_refresh_icon(size: int = 18, color: str = "#334155") -> QIcon:
+    """QPainter로 선명한 원형 새로고침 화살표 아이콘을 생성합니다."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    margin = 3.2
+    rect = QRectF(margin, margin, size - margin * 2, size - margin * 2)
+    # 45도 위치에서 시작해 285도 원호를 그림
+    p.drawArc(rect, 45 * 16, 285 * 16)
+    # 우상단 끝점에 작은 삼각형 화살촉 그리기
+    p.setBrush(QColor(color))
+    p.setPen(Qt.PenStyle.NoPen)
+    cx = size - margin - 1.2
+    cy = margin + (size - margin * 2) * 0.28
+    arrow = QPolygonF([
+        QPointF(cx + 2.0, cy - 3.0),
+        QPointF(cx + 2.4, cy + 2.6),
+        QPointF(cx - 3.2, cy + 1.4),
+    ])
+    p.drawPolygon(arrow)
+    p.end()
+    return QIcon(pix)
+
+
+def _build_spinner_icon(angle_deg: int, size: int = 18, color: str = "#2563EB") -> QIcon:
+    """QTimer 회전에 맞춰 각도가 변하는 로딩 링 QIcon을 생성합니다."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    margin = 3.0
+    rect = QRectF(margin, margin, size - margin * 2, size - margin * 2)
+    track_pen = QPen(QColor("#CBD5E1"), 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    p.setPen(track_pen)
+    p.drawEllipse(rect)
+    arc_pen = QPen(QColor(color), 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+    p.setPen(arc_pen)
+    p.drawArc(rect, -int(angle_deg) * 16, 110 * 16)
+    p.end()
+    return QIcon(pix)
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -1582,6 +1630,7 @@ class ClassroomToolsTab(QWidget):
         self._last_duty_plan: Dict[str, Any] = {}
         self._loading_duty_ui: bool = False
         self._custom_duty_template_path: Optional[Path] = None
+        self._roster_sync_running: bool = False
 
         self._init_ui()
         self.restore_saved_teacher_session()
@@ -1643,13 +1692,11 @@ class ClassroomToolsTab(QWidget):
         header_bar = QFrame()
         apply_qss_role(header_bar, role="instrumentCard", obj_name="ClassroomHeaderBar")
         hb_lay = QHBoxLayout(header_bar)
-        hb_lay.setContentsMargins(16, 10, 16, 10)
-        hb_lay.setSpacing(10)
+        hb_lay.setContentsMargins(12, 8, 12, 8)
+        hb_lay.setSpacing(8)
 
         lbl_station_title = QLabel("학급 경영 미니 툴 스테이션 (Classroom Operations Station)")
         apply_qss_role(lbl_station_title, role="cardTitle")
-        lbl_mode_chip = QLabel("HOMEROOM INSTRUMENT GRID")
-        apply_qss_role(lbl_mode_chip, role="badgePrimary")
 
         self.lbl_roster_status_badge = QLabel("연동 명렬표: [담임 학급] 등록된 담임 학급 없음")
         apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
@@ -1659,7 +1706,7 @@ class ClassroomToolsTab(QWidget):
         apply_qss_role(self.btn_sync_roster, role="secondary", obj_name="BtnSyncClassroomRoster")
         self.btn_sync_roster.setMinimumHeight(30)
         self.btn_sync_roster.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_sync_roster.clicked.connect(self._refresh_roster_dependent_views)
+        self.btn_sync_roster.clicked.connect(self._on_sync_roster_clicked)
 
         for drop_w in (self.lbl_roster_status_badge, self.btn_sync_roster):
             enable_file_drop(
@@ -1678,9 +1725,12 @@ class ClassroomToolsTab(QWidget):
         status_row.setSpacing(6)
         self.lbl_teacher_auth_status = QLabel("[교사] 미로그인")
         apply_qss_role(self.lbl_teacher_auth_status, role="badgePrimary", obj_name="LblTeacherAuthBadge")
-        self.btn_teacher_refresh = QPushButton("새로고침")
+        self.btn_teacher_refresh = QPushButton()
         apply_qss_role(self.btn_teacher_refresh, role="secondary", obj_name="BtnTeacherRefresh")
-        self.btn_teacher_refresh.setMinimumHeight(30)
+        self.btn_teacher_refresh.setFixedSize(34, 34)
+        self.btn_teacher_refresh.setIcon(_build_refresh_icon())
+        self.btn_teacher_refresh.setIconSize(QSize(18, 18))
+        self.btn_teacher_refresh.setToolTip("교사 계정 및 명렬표 새로고침")
         self.btn_teacher_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_teacher_refresh.clicked.connect(lambda: self.refresh_firebase_roster(silent=False))
         self.btn_teacher_logout = QPushButton("로그아웃")
@@ -1694,7 +1744,6 @@ class ClassroomToolsTab(QWidget):
         self.auth_status_widget.setVisible(False)
 
         hb_lay.addWidget(lbl_station_title)
-        hb_lay.addWidget(lbl_mode_chip)
         hb_lay.addWidget(self.lbl_roster_status_badge)
         hb_lay.addStretch()
         hb_lay.addWidget(self.auth_status_widget)
@@ -2303,6 +2352,94 @@ class ClassroomToolsTab(QWidget):
             if hasattr(self, "spin_tt_chg_class") and c:
                 self.spin_tt_chg_class.setValue(int(c))
 
+    def _start_spinner_for_buttons(
+        self,
+        items: List[Tuple[QPushButton, str]],
+    ) -> Callable[[], None]:
+        """버튼 목록에 QTimer 회전 스피너 QIcon을 적용하고, 호출 시 원래 아이콘·텍스트·활성 상태를 복구하는 콜백을 반환합니다."""
+        tracked: List[Tuple[QPushButton, str, QIcon]] = []
+        for btn, loading_text in items:
+            if btn is None:
+                continue
+            tracked.append((btn, btn.text(), QIcon(btn.icon())))
+            btn.setEnabled(False)
+            if loading_text is not None and btn.text():
+                btn.setText(loading_text)
+            if btn.iconSize().width() <= 0:
+                btn.setIconSize(QSize(16, 16))
+            btn.setIcon(_build_spinner_icon(0))
+
+        angle_state = {"deg": 0}
+        timer = QTimer(self)
+        timer.setInterval(50)
+
+        def _tick() -> None:
+            angle_state["deg"] = (angle_state["deg"] + 30) % 360
+            icon = _build_spinner_icon(angle_state["deg"])
+            for btn, _orig_txt, _orig_icon in tracked:
+                try:
+                    btn.setIcon(icon)
+                except RuntimeError:
+                    pass
+
+        timer.timeout.connect(_tick)
+        timer.start()
+
+        def _restore() -> None:
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except RuntimeError:
+                pass
+            for btn, orig_text, orig_icon in tracked:
+                try:
+                    btn.setIcon(orig_icon)
+                    btn.setText(orig_text)
+                    btn.setEnabled(True)
+                except RuntimeError:
+                    pass
+
+        return _restore
+
+    def _run_async_button_task(
+        self,
+        button: Optional[QPushButton],
+        loading_text: str,
+        task_name: str,
+        task_key: str,
+        work_fn: Callable[[], Any],
+        on_result: Optional[Callable[[Any], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+        extra_buttons: Optional[List[Tuple[QPushButton, str]]] = None,
+    ) -> None:
+        """버튼 비활성화·회전 스피너·로딩 텍스트 표시와 완료 시 복구를 보장하는 TaskRunner 헬퍼."""
+        if button is not None and not button.isEnabled():
+            return
+
+        items: List[Tuple[QPushButton, str]] = []
+        if button is not None:
+            items.append((button, loading_text))
+        for extra_btn, extra_loading in (extra_buttons or []):
+            if extra_btn is not None:
+                items.append((extra_btn, extra_loading))
+
+        _restore_buttons = self._start_spinner_for_buttons(items)
+
+        worker = FunctionWorker(task_name, lambda _w: work_fn())
+        self.task_runner.start_worker(
+            worker,
+            task_key=task_key,
+            on_result=on_result,
+            on_error=on_error,
+            on_finished=_restore_buttons,
+        )
+
+    def _on_sync_roster_clicked(self) -> None:
+        if self._logged_in_teacher:
+            self.refresh_firebase_roster(silent=False)
+        else:
+            self._refresh_roster_dependent_views()
+
     def _on_teacher_login_clicked(self) -> None:
         uid = self.edit_teacher_login_id.text().strip()
         pw = self.edit_teacher_login_pw.text()
@@ -2310,11 +2447,84 @@ class ClassroomToolsTab(QWidget):
             QMessageBox.warning(self, "로그인 확인", "교사 로그인 ID를 입력해 주세요.")
             self.edit_teacher_login_id.setFocus()
             return
-        ok, err = self.login_teacher(uid, pw)
-        if not ok:
-            QMessageBox.warning(self, "로그인 실패", err or "로그인에 실패했습니다.")
-            return
-        self.edit_teacher_login_pw.clear()
+
+        def _do_login() -> Dict[str, Any]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            ok, user_doc, err = svc.authenticate_account("teacher", uid, pw)
+            if not ok or not user_doc:
+                return {"ok": False, "error": err or "교사 계정을 확인할 수 없습니다."}
+            school_code = str(user_doc.get("school_code") or user_doc.get("neis_school_code") or "").strip()
+            school_name = str(user_doc.get("school_name") or "").strip()
+            grade_val = user_doc.get("grade")
+            class_val = user_doc.get("class_no")
+            g_int = int(grade_val) if str(grade_val or "").isdigit() else None
+            c_int = int(class_val) if str(class_val or "").isdigit() else None
+            roster_rows: List[Tuple[str, str]] = []
+            try:
+                students = svc.fetch_homeroom_students(
+                    school_code=school_code,
+                    school_name=school_name,
+                    grade=g_int,
+                    class_no=c_int,
+                )
+                roster_rows = [
+                    (str(s.get("student_id") or s.get("remote_id") or "").strip(), str(s.get("name") or "").strip())
+                    for s in students
+                    if str(s.get("student_id") or s.get("remote_id") or "").strip()
+                ]
+            except Exception:
+                roster_rows = []
+            return {"ok": True, "user_doc": user_doc, "roster": roster_rows}
+
+        def _on_login_result(res: Dict[str, Any]) -> None:
+            if not isinstance(res, dict) or not res.get("ok"):
+                QMessageBox.warning(self, "로그인 실패", str((res or {}).get("error") or "로그인에 실패했습니다."))
+                return
+            user_doc = res["user_doc"]
+            school_code = str(user_doc.get("school_code") or user_doc.get("neis_school_code") or "").strip()
+            school_name = str(user_doc.get("school_name") or "").strip()
+            grade_val = user_doc.get("grade")
+            class_val = user_doc.get("class_no")
+            teacher_name = str(user_doc.get("name") or user_doc.get("teacher_id") or uid).strip()
+            teacher_id = str(user_doc.get("teacher_id") or user_doc.get("remote_id") or uid).strip()
+            login_id = str(user_doc.get("login_id") or uid).strip()
+            is_admin = bool(user_doc.get("is_admin") is True)
+
+            self._logged_in_teacher = {
+                "teacher_id": teacher_id,
+                "login_id": login_id,
+                "name": teacher_name,
+                "school_code": school_code,
+                "neis_school_code": school_code,
+                "school_name": school_name,
+                "grade": int(grade_val) if str(grade_val or "").isdigit() else None,
+                "class_no": int(class_val) if str(class_val or "").isdigit() else None,
+                "is_admin": is_admin,
+            }
+            tp_sec = dict(self.config.get_section("teacher_profile") or {})
+            tp_sec.update(self._logged_in_teacher)
+            tp_sec["session_logged_in"] = True
+            tp_sec["auth_password_hash"] = hash_password_sha256(pw) if pw else ""
+            self.config.update_section("teacher_profile", tp_sec)
+
+            self._firebase_roster = list(res.get("roster") or [])
+            self._apply_teacher_auth_state()
+            self._refresh_roster_dependent_views()
+            self.edit_teacher_login_pw.clear()
+
+        def _on_login_error(err_msg: str) -> None:
+            first_line = str(err_msg or "").splitlines()[0] if err_msg else "알 수 없는 오류"
+            QMessageBox.warning(self, "로그인 실패", f"Firestore 인증 오류: {first_line}")
+
+        self._run_async_button_task(
+            button=self.btn_teacher_login,
+            loading_text="로그인 중...",
+            task_name="교사 계정 로그인",
+            task_key="classroom_teacher_login",
+            work_fn=_do_login,
+            on_result=_on_login_result,
+            on_error=_on_login_error,
+        )
 
     def login_teacher(
         self,
@@ -2410,26 +2620,81 @@ class ClassroomToolsTab(QWidget):
         if not self._logged_in_teacher:
             return 0
         meta = self._teacher_meta()
-        svc = sync_service or FirestoreSyncService(db=self.db, config=self.config)
-        try:
+
+        # 테스트 등에서 sync_service를 직접 주입한 경우 동기 실행 유지
+        if sync_service is not None:
+            try:
+                students = sync_service.fetch_homeroom_students(
+                    school_code=meta["school_code"],
+                    school_name=meta["school_name"],
+                    grade=meta["grade"],
+                    class_no=meta["class_no"],
+                )
+                self._firebase_roster = [
+                    (str(s.get("student_id") or s.get("remote_id") or "").strip(), str(s.get("name") or "").strip())
+                    for s in students
+                    if str(s.get("student_id") or s.get("remote_id") or "").strip()
+                ]
+            except Exception as exc:
+                if not silent:
+                    QMessageBox.warning(self, "명렬표 동기화 오류", f"Firestore 명렬표 조회 실패:\n{exc}")
+                return 0
+
+            self._apply_teacher_auth_state()
+            self._refresh_roster_dependent_views()
+            return len(self._firebase_roster)
+
+        if self._roster_sync_running:
+            return 0
+        self._roster_sync_running = True
+
+        self.lbl_roster_status_badge.setText("연동 명렬표: [Firebase] 동기화 중...")
+        apply_qss_role(self.lbl_roster_status_badge, role="badgePrimary")
+
+        spinner_items: List[Tuple[QPushButton, str]] = []
+        if getattr(self, "btn_teacher_refresh", None) is not None:
+            spinner_items.append((self.btn_teacher_refresh, ""))
+        if getattr(self, "btn_sync_roster", None) is not None:
+            spinner_items.append((self.btn_sync_roster, "명렬표 동기화 중..."))
+        _restore_spinner = self._start_spinner_for_buttons(spinner_items)
+
+        def _fetch_roster(_worker: Any) -> List[Tuple[str, str]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
             students = svc.fetch_homeroom_students(
                 school_code=meta["school_code"],
                 school_name=meta["school_name"],
                 grade=meta["grade"],
                 class_no=meta["class_no"],
             )
-            self._firebase_roster = [
+            return [
                 (str(s.get("student_id") or s.get("remote_id") or "").strip(), str(s.get("name") or "").strip())
                 for s in students
                 if str(s.get("student_id") or s.get("remote_id") or "").strip()
             ]
-        except Exception as exc:
-            if not silent:
-                QMessageBox.warning(self, "명렬표 동기화 오류", f"Firestore 명렬표 조회 실패:\n{exc}")
-            return 0
 
-        self._apply_teacher_auth_state()
-        self._refresh_roster_dependent_views()
+        def _on_result(rows: Any) -> None:
+            self._firebase_roster = list(rows or [])
+            self._apply_teacher_auth_state()
+            self._refresh_roster_dependent_views()
+
+        def _on_error(err_msg: str) -> None:
+            self._refresh_roster_dependent_views()
+            if not silent:
+                first_line = str(err_msg or "").splitlines()[0] if err_msg else "알 수 없는 오류"
+                QMessageBox.warning(self, "명렬표 동기화 오류", f"Firestore 명렬표 조회 실패:\n{first_line}")
+
+        def _on_finished() -> None:
+            self._roster_sync_running = False
+            _restore_spinner()
+
+        worker = FunctionWorker("Firestore 명렬표 새로고침", _fetch_roster)
+        self.task_runner.start_worker(
+            worker,
+            task_key="classroom_roster_refresh",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
+        )
         return len(self._firebase_roster)
 
     # =========================================================================
@@ -2528,17 +2793,29 @@ class ClassroomToolsTab(QWidget):
 
     def _on_sync_mobile_attendance(self) -> None:
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        try:
-            rows = svc.fetch_homeroom_attendance(
+
+        def _work() -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.fetch_homeroom_attendance(
                 grade=meta["grade"],
                 class_no=meta["class_no"],
                 school_code=meta["school_code"],
                 school_name=meta["school_name"],
             )
-            QMessageBox.information(self, "모바일 출결 동기화", f"Firestore에서 {len(rows)}건의 출결 기록을 조회했습니다.")
-        except Exception as exc:
-            QMessageBox.warning(self, "모바일 출결 동기화 오류", str(exc))
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_sync_mobile_att", None),
+            loading_text="동기화 중...",
+            task_name="모바일 출결 동기화",
+            task_key="classroom_sync_mobile_attendance",
+            work_fn=_work,
+            on_result=lambda rows: QMessageBox.information(
+                self, "모바일 출결 동기화", f"Firestore에서 {len(rows or [])}건의 출결 기록을 조회했습니다."
+            ),
+            on_error=lambda err: QMessageBox.warning(
+                self, "모바일 출결 동기화 오류", str(err or "").splitlines()[0]
+            ),
+        )
 
     # =========================================================================
     # 가정통신문 PDF -> AiExecutionDock 구조화 JSON OCR 연동 (pypdf 미사용)
@@ -2641,16 +2918,31 @@ class ClassroomToolsTab(QWidget):
         if not self._parsed_excel_timetable_rows:
             QMessageBox.information(self, "업로드 안내", "먼저 엑셀/CSV 시간표 파일을 선택해 주세요.")
             return
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        ok = svc.upsert_timetable_base(self._parsed_excel_timetable_rows)
-        if ok:
-            QMessageBox.information(
-                self,
-                "업로드 완료",
-                f"Firestore `시간표_기본`에 {len(self._parsed_excel_timetable_rows)}건(source=excel)이 반영되었습니다.",
-            )
-        else:
-            QMessageBox.warning(self, "업로드 실패", "Firestore 시간표_기본 반영에 실패했습니다.")
+        rows_snapshot = list(self._parsed_excel_timetable_rows)
+
+        def _work() -> bool:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return bool(svc.upsert_timetable_base(rows_snapshot))
+
+        def _on_result(ok: Any) -> None:
+            if ok:
+                QMessageBox.information(
+                    self,
+                    "업로드 완료",
+                    f"Firestore `시간표_기본`에 {len(rows_snapshot)}건(source=excel)이 반영되었습니다.",
+                )
+            else:
+                QMessageBox.warning(self, "업로드 실패", "Firestore 시간표_기본 반영에 실패했습니다.")
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_tt_upload_excel", None),
+            loading_text="업로드 중...",
+            task_name="시간표_기본 업로드",
+            task_key="classroom_upload_timetable_excel",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "업로드 실패", str(err or "").splitlines()[0]),
+        )
 
     def _on_save_manual_timetable_change(self) -> None:
         new_subj = self.edit_tt_chg_new_subj.text().strip()
@@ -2673,16 +2965,30 @@ class ClassroomToolsTab(QWidget):
             school_name=meta["school_name"],
             source="manual",
         )
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        ok = svc.push_timetable_changes([row])
-        if ok:
-            QMessageBox.information(
-                self,
-                "저장 완료",
-                f"{row['date']} {row['period']}교시 변동/보강({row['changed_subject']})이 Firestore에 저장되었습니다.",
-            )
-        else:
-            QMessageBox.warning(self, "저장 실패", "Firestore 시간표_변동 저장에 실패했습니다.")
+
+        def _work() -> bool:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return bool(svc.push_timetable_changes([row]))
+
+        def _on_result(ok: Any) -> None:
+            if ok:
+                QMessageBox.information(
+                    self,
+                    "저장 완료",
+                    f"{row['date']} {row['period']}교시 변동/보강({row['changed_subject']})이 Firestore에 저장되었습니다.",
+                )
+            else:
+                QMessageBox.warning(self, "저장 실패", "Firestore 시간표_변동 저장에 실패했습니다.")
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_tt_save_change", None),
+            loading_text="저장 중...",
+            task_name="시간표_변동 저장",
+            task_key="classroom_save_timetable_change",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "저장 실패", str(err or "").splitlines()[0]),
+        )
 
     def _on_publish_mobile_notice(self) -> None:
         title = self.edit_notice_title.text().strip()
@@ -2691,8 +2997,7 @@ class ClassroomToolsTab(QWidget):
             return
         meta = self._teacher_meta()
         fields = [f.strip() for f in self.edit_notice_fields.text().split(",") if f.strip()]
-        svc = FirestoreSyncService(db=self.db)
-        ok, rid = svc.publish_mobile_notice({
+        payload = {
             "title": title,
             "content": self.txt_notice_content.toPlainText().strip(),
             "due_date": self.edit_notice_due.text().strip(),
@@ -2702,30 +3007,63 @@ class ClassroomToolsTab(QWidget):
             "school_code": meta["school_code"],
             "school_name": meta["school_name"],
             "author_name": meta["teacher_name"],
-        })
-        if ok:
-            self.edit_active_notice_id.setText(rid)
-            QMessageBox.information(self, "배포 완료", f"모바일 가정통신문이 배포되었습니다.\n(ID: {rid})")
+        }
+
+        def _work() -> Tuple[bool, str]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.publish_mobile_notice(payload)
+
+        def _on_result(res: Any) -> None:
+            ok, rid = res if isinstance(res, tuple) and len(res) >= 2 else (False, "")
+            if ok:
+                self.edit_active_notice_id.setText(str(rid or ""))
+                QMessageBox.information(self, "배포 완료", f"모바일 가정통신문이 배포되었습니다.\n(ID: {rid})")
+            else:
+                QMessageBox.warning(self, "배포 실패", "모바일 가정통신문 배포에 실패했습니다.")
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_publish_mobile_notice", None),
+            loading_text="배포 중...",
+            task_name="모바일 가정통신문 배포",
+            task_key="classroom_publish_mobile_notice",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "배포 오류", str(err or "").splitlines()[0]),
+        )
 
     def _on_refresh_notice_replies(self) -> None:
         nid = self.edit_active_notice_id.text().strip()
         if not nid:
             QMessageBox.information(self, "조회 안내", "먼저 가정통신문 ID를 입력하거나 배포해 주세요.")
             return
-        svc = FirestoreSyncService(db=self.db)
-        replies = svc.fetch_notice_replies(nid)
-        rep_map = {str(r.get("student_id") or ""): r for r in replies}
-        roster = self._get_active_roster()
-        self.table_notice_replies.setRowCount(0)
-        for sid, name in roster:
-            r = self.table_notice_replies.rowCount()
-            self.table_notice_replies.insertRow(r)
-            rep = rep_map.get(str(sid))
-            self.table_notice_replies.setItem(r, 0, QTableWidgetItem(str(sid)))
-            self.table_notice_replies.setItem(r, 1, QTableWidgetItem(str(name)))
-            self.table_notice_replies.setItem(r, 2, QTableWidgetItem("제출완료" if rep else "미제출"))
-            self.table_notice_replies.setItem(r, 3, QTableWidgetItem(str(rep.get("reply_choice", "")) if rep else "-"))
-            self.table_notice_replies.setItem(r, 4, QTableWidgetItem(str(rep.get("signature_drive_url") or rep.get("signature_url") or "") if rep else ""))
+
+        def _work() -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.fetch_notice_replies(nid)
+
+        def _on_result(replies: Any) -> None:
+            rep_map = {str(r.get("student_id") or ""): r for r in (replies or [])}
+            roster = self._get_active_roster()
+            self.table_notice_replies.setRowCount(0)
+            for sid, name in roster:
+                r = self.table_notice_replies.rowCount()
+                self.table_notice_replies.insertRow(r)
+                rep = rep_map.get(str(sid))
+                self.table_notice_replies.setItem(r, 0, QTableWidgetItem(str(sid)))
+                self.table_notice_replies.setItem(r, 1, QTableWidgetItem(str(name)))
+                self.table_notice_replies.setItem(r, 2, QTableWidgetItem("제출완료" if rep else "미제출"))
+                self.table_notice_replies.setItem(r, 3, QTableWidgetItem(str(rep.get("reply_choice", "")) if rep else "-"))
+                self.table_notice_replies.setItem(r, 4, QTableWidgetItem(str(rep.get("signature_drive_url") or rep.get("signature_url") or "") if rep else ""))
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_refresh_replies", None),
+            loading_text="조회 중...",
+            task_name="가정통신문 회신 조회",
+            task_key="classroom_refresh_notice_replies",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "회신 조회 오류", str(err or "").splitlines()[0]),
+        )
 
     def _on_nudge_unsubmitted_notice(self) -> None:
         nid = self.edit_active_notice_id.text().strip()
@@ -2733,18 +3071,31 @@ class ClassroomToolsTab(QWidget):
         if not nid:
             return
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db)
-        svc.send_class_notification(
-            title=f"[미제출 안내] {title}",
-            message="가정통신문 전자서명 회신이 아직 완료되지 않았습니다. 확인 후 제출해 주세요.",
-            target_role="all",
-            grade=meta["grade"],
-            class_no=meta["class_no"],
-            school_code=meta["school_code"],
-            school_name=meta["school_name"],
-            sender=meta["teacher_name"],
+
+        def _work() -> Any:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.send_class_notification(
+                title=f"[미제출 안내] {title}",
+                message="가정통신문 전자서명 회신이 아직 완료되지 않았습니다. 확인 후 제출해 주세요.",
+                target_role="all",
+                grade=meta["grade"],
+                class_no=meta["class_no"],
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+                sender=meta["teacher_name"],
+            )
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_nudge_unsubmitted", None),
+            loading_text="발송 중...",
+            task_name="미제출 안내 알림 발송",
+            task_key="classroom_nudge_unsubmitted_notice",
+            work_fn=_work,
+            on_result=lambda _res: QMessageBox.information(
+                self, "알림 발송 완료", "미제출 안내 알림이 Firestore에 등록되었습니다."
+            ),
+            on_error=lambda err: QMessageBox.warning(self, "알림 발송 오류", str(err or "").splitlines()[0]),
         )
-        QMessageBox.information(self, "알림 발송 완료", "미제출 안내 알림이 Firestore에 등록되었습니다.")
 
     def _on_send_class_broadcast(self) -> None:
         title = self.edit_broadcast_title.text().strip()
@@ -2753,60 +3104,103 @@ class ClassroomToolsTab(QWidget):
             QMessageBox.warning(self, "입력 확인", "알림 제목과 내용을 모두 입력해 주세요.")
             return
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db)
-        svc.send_class_notification(
-            title=title,
-            message=msg,
-            target_role=str(self.combo_broadcast_target.currentData() or "all"),
-            grade=meta["grade"],
-            class_no=meta["class_no"],
-            school_code=meta["school_code"],
-            school_name=meta["school_name"],
-            sender=meta["teacher_name"],
+        target_role = str(self.combo_broadcast_target.currentData() or "all")
+
+        def _work() -> Any:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.send_class_notification(
+                title=title,
+                message=msg,
+                target_role=target_role,
+                grade=meta["grade"],
+                class_no=meta["class_no"],
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+                sender=meta["teacher_name"],
+            )
+
+        def _on_result(_res: Any) -> None:
+            self.edit_broadcast_title.clear()
+            self.txt_broadcast_msg.clear()
+            self._on_refresh_broadcast_history()
+            QMessageBox.information(self, "발송 완료", "학급 공지·긴급 알림이 발송되었습니다.")
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_send_broadcast", None),
+            loading_text="발송 중...",
+            task_name="학급 공지·긴급 알림 발송",
+            task_key="classroom_send_class_broadcast",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "발송 오류", str(err or "").splitlines()[0]),
         )
-        self.edit_broadcast_title.clear()
-        self.txt_broadcast_msg.clear()
-        self._on_refresh_broadcast_history()
-        QMessageBox.information(self, "발송 완료", "학급 공지·긴급 알림이 발송되었습니다.")
 
     def _on_refresh_broadcast_history(self) -> None:
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        rows = svc.fetch_sent_notifications(
-            grade=meta["grade"],
-            class_no=meta["class_no"],
-            school_code=meta["school_code"],
-            school_name=meta["school_name"],
+
+        def _work() -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.fetch_sent_notifications(
+                grade=meta["grade"],
+                class_no=meta["class_no"],
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+            )
+
+        def _on_result(rows: Any) -> None:
+            self.table_broadcast_history.setRowCount(0)
+            for item in (rows or []):
+                r = self.table_broadcast_history.rowCount()
+                self.table_broadcast_history.insertRow(r)
+                self.table_broadcast_history.setItem(r, 0, QTableWidgetItem(str(item.get("created_at") or "")))
+                self.table_broadcast_history.setItem(r, 1, QTableWidgetItem(str(item.get("target_role") or "all")))
+                self.table_broadcast_history.setItem(r, 2, QTableWidgetItem(str(item.get("title") or "")))
+                self.table_broadcast_history.setItem(r, 3, QTableWidgetItem(str(item.get("message") or "")))
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_refresh_broadcast", None),
+            loading_text="새로고침 중...",
+            task_name="발송 이력 조회",
+            task_key="classroom_refresh_broadcast_history",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "이력 조회 오류", str(err or "").splitlines()[0]),
         )
-        self.table_broadcast_history.setRowCount(0)
-        for item in rows:
-            r = self.table_broadcast_history.rowCount()
-            self.table_broadcast_history.insertRow(r)
-            self.table_broadcast_history.setItem(r, 0, QTableWidgetItem(str(item.get("created_at") or "")))
-            self.table_broadcast_history.setItem(r, 1, QTableWidgetItem(str(item.get("target_role") or "all")))
-            self.table_broadcast_history.setItem(r, 2, QTableWidgetItem(str(item.get("title") or "")))
-            self.table_broadcast_history.setItem(r, 3, QTableWidgetItem(str(item.get("message") or "")))
 
     def _on_load_chat_history(self) -> None:
         sid = str(self.combo_chat_student.currentData() or "").strip()
         meta = self._teacher_meta()
-        svc = FirestoreSyncService(db=self.db, config=self.config)
-        rows = svc.fetch_chat_history(
-            grade=meta["grade"],
-            class_no=meta["class_no"],
-            student_id=sid,
-            school_code=meta["school_code"],
-            school_name=meta["school_name"],
+
+        def _work() -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.fetch_chat_history(
+                grade=meta["grade"],
+                class_no=meta["class_no"],
+                student_id=sid,
+                school_code=meta["school_code"],
+                school_name=meta["school_name"],
+            )
+
+        def _on_result(rows: Any) -> None:
+            if not rows:
+                self.txt_chat_history_viewer.setPlainText("조회된 1:1 상담 대화 내역이 없습니다.")
+                return
+            lines = []
+            for m in rows:
+                ts = str(m.get("created_at") or "")
+                sender = m.get("sender_name") or m.get("sender_role") or ""
+                lines.append(f"[{ts}] {sender}: {m.get('message', '')}")
+            self.txt_chat_history_viewer.setPlainText("\n".join(lines))
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_load_chat_history", None),
+            loading_text="불러오는 중...",
+            task_name="1:1 상담 내역 조회",
+            task_key="classroom_load_chat_history",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "상담 내역 조회 오류", str(err or "").splitlines()[0]),
         )
-        if not rows:
-            self.txt_chat_history_viewer.setPlainText("조회된 1:1 상담 대화 내역이 없습니다.")
-            return
-        lines = []
-        for m in rows:
-            ts = str(m.get("created_at") or "")
-            sender = m.get("sender_name") or m.get("sender_role") or ""
-            lines.append(f"[{ts}] {sender}: {m.get('message', '')}")
-        self.txt_chat_history_viewer.setPlainText("\n".join(lines))
 
     def _on_copy_chat_history(self) -> None:
         txt = self.txt_chat_history_viewer.toPlainText().strip()

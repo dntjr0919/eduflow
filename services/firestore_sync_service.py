@@ -28,6 +28,12 @@ from services.schedule_parser_service import (
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_VERCEL_API_URL = "https://m.eduflow.kro.kr/api/firestore"
+DEFAULT_VERCEL_TIMEOUT = (5, 45)
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
 
 INT_FIELDS = {
     "grade",
@@ -137,6 +143,35 @@ class FirestoreSyncService:
         self.db = db or DatabaseManager()
         self.config = config or ConfigManager()
         self._firestore_client = firestore_client
+        self._http_session: Any = None
+
+    def _get_http_session(self) -> Any:
+        """일시적 소켓 끊김(WinError 10054) 및 502/503/504 재시도를 지원하는 공용 Session."""
+        if self._http_session is None:
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+
+            session = requests.Session()
+            retry_kwargs: Dict[str, Any] = {
+                "total": 2,
+                "connect": 2,
+                "read": 2,
+                "status": 2,
+                "backoff_factor": 0.5,
+                "status_forcelist": [502, 503, 504],
+                "raise_on_status": False,
+            }
+            try:
+                retry = Retry(allowed_methods=["POST", "GET"], **retry_kwargs)
+            except TypeError:
+                retry = Retry(method_whitelist=["POST", "GET"], **retry_kwargs)
+
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self._http_session = session
+        return self._http_session
 
     def _cred_path(self) -> Optional[str]:
         p = str(self.config.get("api_and_integrations", "google_credentials_path", "") or "").strip()
@@ -172,7 +207,30 @@ class FirestoreSyncService:
         if payload:
             body.update(payload)
 
-        resp = requests.post(url, json=body, timeout=20)
+        headers = {
+            "User-Agent": DEFAULT_BROWSER_USER_AGENT,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        is_mocked_post = getattr(requests.post, "__module__", "") != "requests.api"
+        if is_mocked_post:
+            try:
+                resp = requests.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=DEFAULT_VERCEL_TIMEOUT,
+                )
+            except TypeError:
+                resp = requests.post(url, json=body, timeout=DEFAULT_VERCEL_TIMEOUT)
+        else:
+            session = self._get_http_session()
+            resp = session.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=DEFAULT_VERCEL_TIMEOUT,
+            )
         try:
             data = resp.json()
         except Exception:

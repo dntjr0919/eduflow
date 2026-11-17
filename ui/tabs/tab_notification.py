@@ -658,6 +658,8 @@ class NotificationCenterTab(QWidget):
         self.unread_changed.emit()
 
     def _on_send_manual_notification(self) -> None:
+        if not self.btn_send_now.isEnabled():
+            return
         title = self.edit_notify_title.text().strip() or "알림"
         body = self.edit_notify_msg.text().strip()
         selected_channels = []
@@ -668,19 +670,47 @@ class NotificationCenterTab(QWidget):
         if self.chk_target_webhook.isChecked():
             selected_channels.append("Webhook")
 
-        results = self.notifier.notify(title, body, force_external=True)
         ch_summary = ", ".join(selected_channels) if selected_channels else "기본채널"
-        self.db.add_notification(
-            title=title,
-            message=body,
-            channel=ch_summary,
-            sender="manual",
-            is_read=1,
+        orig_text = self.btn_send_now.text()
+        self.btn_send_now.setEnabled(False)
+        self.btn_send_now.setText("발송 중...")
+
+        def _work(_worker: Any) -> List[str]:
+            return self.notifier.notify(title, body, force_external=True)
+
+        def _on_result(results: Any) -> None:
+            res_list = list(results or [])
+            self.db.add_notification(
+                title=title,
+                message=body,
+                channel=ch_summary,
+                sender="manual",
+                is_read=1,
+            )
+            self._append_log(
+                f"[즉시 발송 | 채널: {ch_summary}] {title}: {body} -> {', '.join(res_list)}"
+            )
+            self.refresh_notifications_inbox()
+
+        def _on_error(err: str) -> None:
+            first_line = str(err or "").splitlines()[0] if err else "알 수 없는 오류"
+            self._append_log(f"[즉시 발송 오류 | 채널: {ch_summary}] {title}: {first_line}")
+
+        def _on_finished() -> None:
+            try:
+                self.btn_send_now.setText(orig_text)
+                self.btn_send_now.setEnabled(True)
+            except RuntimeError:
+                pass
+
+        worker = FunctionWorker("즉시 알림 발송", _work)
+        self.task_runner.start_worker(
+            worker,
+            task_key="notify_send_manual",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
         )
-        self._append_log(
-            f"[즉시 발송 | 채널: {ch_summary}] {title}: {body} -> {', '.join(results)}"
-        )
-        self.refresh_notifications_inbox()
 
     def _on_push_comcigan_clicked(self) -> None:
         raw_data = self.txt_comcigan_payload.toPlainText().strip()
