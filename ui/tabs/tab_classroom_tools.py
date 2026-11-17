@@ -1,4 +1,4 @@
-"""
+﻿"""
 [탭 4] 학급 경영 도구함 (ui/tabs/tab_classroom_tools.py)
 - EduFlow Slate Workstation 2x2 Bento Instrument Card 레이아웃 적용 (Zero-Emoji, 1px #E2E8F0 정적 카드)
 - Card 1: 출결 및 결석계 관리 (Attendance Tracker) — 출석/질병결석/체험학습 배지, 증빙 대장, 결석계 생성 / 출석인정서 출력
@@ -2125,8 +2125,8 @@ class ClassroomToolsTab(QWidget):
 
         self.table_reply_schema = QTableWidget(0, 5)
         self.table_reply_schema.setHorizontalHeaderLabels(["키 (key)", "항목명 (label)", "유형 (type)", "선택지 (쉼표 구분)", "필수"])
-        self.table_reply_schema.verticalHeader().setDefaultSectionSize(40)
-        self.table_reply_schema.verticalHeader().setMinimumSectionSize(40)
+        self.table_reply_schema.verticalHeader().setDefaultSectionSize(46)
+        self.table_reply_schema.verticalHeader().setMinimumSectionSize(46)
         self.table_reply_schema.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.table_reply_schema.setColumnWidth(0, 115)
         self.table_reply_schema.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -2996,15 +2996,18 @@ class ClassroomToolsTab(QWidget):
 
         type_container = QWidget()
         type_lay = QHBoxLayout(type_container)
-        type_lay.setContentsMargins(4, 3, 4, 3)
+        type_lay.setContentsMargins(6, 5, 6, 5)
         type_lay.setSpacing(0)
         type_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         type_combo = QComboBox(type_container)
         type_combo.addItems(list(VALID_REPLY_FIELD_TYPES))
-        type_combo.setFixedHeight(30)
+        type_combo.setFixedHeight(32)
         type_combo.setStyleSheet(
             "QComboBox {"
-            " padding: 0px 24px 0px 8px;"
+            " border: 1px solid #cbd5e1;"
+            " border-radius: 6px;"
+            " background: #ffffff;"
+            " padding: 0px 22px 2px 8px;"
             " min-height: 0px;"
             " font-size: 12px;"
             "}"
@@ -3036,7 +3039,7 @@ class ClassroomToolsTab(QWidget):
             Qt.CheckState.Checked if item.get("required", True) else Qt.CheckState.Unchecked
         )
 
-        self.table_reply_schema.setRowHeight(row, 40)
+        self.table_reply_schema.setRowHeight(row, 46)
         self.table_reply_schema.setItem(row, 0, key_item)
         self.table_reply_schema.setItem(row, 1, label_item)
         self.table_reply_schema.setCellWidget(row, 2, type_container)

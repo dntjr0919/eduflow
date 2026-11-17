@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import inspect
 import os
 import tempfile
@@ -788,10 +788,10 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         self.assertIn(".pdf", drop_filter.allowed_exts)
 
         # 2) reply_schema 테이블 정렬(행 높이 40px, 유형 열 >= 110px) 및 전체화면 토글 검증
-        self.assertEqual(tab.table_reply_schema.verticalHeader().defaultSectionSize(), 40)
+        self.assertEqual(tab.table_reply_schema.verticalHeader().defaultSectionSize(), 46)
         self.assertGreaterEqual(tab.table_reply_schema.columnWidth(2), 110)
         tab._on_add_reply_field()
-        self.assertEqual(tab.table_reply_schema.rowHeight(0), 40)
+        self.assertEqual(tab.table_reply_schema.rowHeight(0), 46)
 
         tab.show()
         self.assertFalse(tab.notice_pdf_dropzone.isHidden())
