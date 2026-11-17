@@ -50,6 +50,7 @@ BOOL_FIELDS = {
     "is_read",
     "is_active",
     "is_published",
+    "is_pinned",
     "requires_reply",
     "teacher_confirmed",
     "consultation_enabled",
@@ -1033,6 +1034,42 @@ class FirestoreSyncService:
             return True, str(res.get("remote_id") or rid)
         fs = self._get_client()
         fs.collection("Notifications").document(rid).set(payload, merge=True)
+        return True, rid
+
+    def upsert_board_notice(self, notice: Dict[str, Any]) -> Tuple[bool, str]:
+        """Firestore `학급_공지게시판` 컬렉션에 학급 공지 게시물을 등록·수정합니다."""
+        row = dict(notice or {})
+        raw_id = str(row.get("remote_id") or "").strip().replace("/", "_")
+        rid = raw_id or f"board_{int(datetime.now().timestamp() * 1000)}"
+        src_type = str(row.get("source_type") or "teacher").strip().lower()
+        if src_type not in ("schoolbell", "kakao", "teacher"):
+            src_type = "teacher"
+        now_str = _now_str()
+        title = str(row.get("title") or "").strip()
+        content = str(row.get("content") or "").strip()
+        summary = str(row.get("summary") or "").strip() or content[:180].replace("\n", " ").strip()
+        payload: Dict[str, Any] = {
+            "remote_id": rid,
+            "title": title,
+            "summary": summary,
+            "content": content or summary,
+            "source_type": src_type,
+            "source_label": str(row.get("source_label") or "").strip(),
+            "source_url": str(row.get("source_url") or "").strip(),
+            "target_grade": _to_int_or_none(row.get("target_grade") if "target_grade" in row else row.get("grade")),
+            "target_class": _to_int_or_none(row.get("target_class") if "target_class" in row else row.get("class_no")),
+            "school_code": str(row.get("school_code") or "").strip(),
+            "school_name": str(row.get("school_name") or "").strip(),
+            "author_name": str(row.get("author_name") or "담임교사").strip(),
+            "is_pinned": _is_truthy(row.get("is_pinned")),
+            "published_at": str(row.get("published_at") or "").strip() or now_str,
+            "updated_at": str(row.get("updated_at") or "").strip() or now_str,
+        }
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api("upsert_board_notice", payload)
+            return True, str(res.get("remote_id") or rid)
+        fs = self._get_client()
+        fs.collection("학급_공지게시판").document(rid).set(payload, merge=True)
         return True, rid
 
     def fetch_sent_notifications(

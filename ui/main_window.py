@@ -892,6 +892,12 @@ class MainWindow(QMainWindow):
             context_getter=self.tab_classroom.get_ai_context,
             on_result=self.tab_classroom.apply_ai_dock_result,
         )
+        self.ai_dock.register_target(
+            target_id="class_notice_digest",
+            label="학급 도구함 > 카톡·학교종이 AI 공지 요약",
+            context_getter=self.tab_classroom.get_class_notice_ai_context,
+            on_result=self.tab_classroom.apply_class_notice_ai_result,
+        )
         self.ai_dock.target_changed.connect(self.tab_doc_ocr.set_active_ai_target)
         self.ai_dock.target_changed.connect(self._on_ai_dock_target_changed_nav)
         self.ai_dock.go_to_settings_requested.connect(self.switch_to_settings_tab)
@@ -900,6 +906,12 @@ class MainWindow(QMainWindow):
         self.tab_doc_ocr.ai_quote_selected.connect(self.ai_dock.set_quoted_selection)
         self.tab_classroom.ai_target_requested.connect(self._on_central_ai_target_requested)
         self.tab_classroom.ai_context_changed.connect(self.ai_dock.sync_from_context)
+        self.tab_classroom.schoolbell_login_required.connect(
+            lambda worker, msg: self.ai_dock.show_external_login_waiting(
+                worker, msg, provider_name="학교종이"
+            )
+        )
+        self.tab_classroom.schoolbell_login_cleared.connect(self.ai_dock.clear_external_login_waiting)
         self.tab_grade.ai_reference_requested.connect(self._on_grade_material_send_to_ai)
         self.ai_dock.set_target("general_chat", force=True)
 
@@ -1034,6 +1046,14 @@ class MainWindow(QMainWindow):
                 self.tab_classroom.tool_stack.setCurrentIndex(2)
             if hasattr(self.tab_classroom, "tool_pills") and len(self.tab_classroom.tool_pills) > 2:
                 self.tab_classroom.tool_pills[2].setChecked(True)
+        elif tid == "class_notice_digest":
+            cls_idx = self.stacked_widget.indexOf(self.tab_classroom)
+            if cls_idx >= 0 and self.sidebar_nav.currentRow() != cls_idx:
+                self.sidebar_nav.setCurrentRow(cls_idx)
+            if hasattr(self.tab_classroom, "tool_stack"):
+                self.tab_classroom.tool_stack.setCurrentIndex(3)
+            if hasattr(self.tab_classroom, "tool_pills") and len(self.tab_classroom.tool_pills) > 3:
+                self.tab_classroom.tool_pills[3].setChecked(True)
 
     def _on_sidebar_nav_changed(self, row: int) -> None:
         if 0 <= row < self.stacked_widget.count():

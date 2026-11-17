@@ -68,7 +68,17 @@ from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
 from services.batch_prompt_service import extract_json_from_llm_response
+from services.class_notice_digest_service import (
+    build_kakao_notice_digest_prompt,
+    build_schoolbell_summary_prompt,
+    digest_kakao_text_with_ai,
+    parse_kakao_chat_text,
+    parse_notice_digest_ai_response,
+    read_kakao_export_file,
+    summarize_schoolbell_notice_with_ai,
+)
 from services.firestore_sync_service import FirestoreSyncService, hash_password_sha256
+from services.schoolbell_crawler_service import SchoolbellCrawlWorker
 from services.timetable_manual_service import (
     build_manual_timetable_change,
     parse_weekly_timetable_file,
@@ -1571,6 +1581,8 @@ class ClassroomToolsTab(QWidget):
 
     ai_target_requested = pyqtSignal(str)
     ai_context_changed = pyqtSignal()
+    schoolbell_login_required = pyqtSignal(object, str)
+    schoolbell_login_cleared = pyqtSignal(str)
 
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1596,6 +1608,10 @@ class ClassroomToolsTab(QWidget):
         self._loading_duty_ui: bool = False
         self._custom_duty_template_path: Optional[Path] = None
         self._roster_sync_running: bool = False
+        self._notice_review_cards: List[Dict[str, Any]] = []
+        self._notice_review_seq: int = 0
+        self._active_notice_digest_ctx: Dict[str, Any] = {}
+        self._active_schoolbell_worker: Optional[SchoolbellCrawlWorker] = None
 
         self._init_ui()
         self.restore_saved_teacher_session()
@@ -2212,6 +2228,10 @@ class ClassroomToolsTab(QWidget):
             hover_delay_ms=0,
         )
         c4_lay = self.card_class_notify.body_layout()
+        self._c4_broadcast_top_widget = QWidget()
+        c4_top_lay = QVBoxLayout(self._c4_broadcast_top_widget)
+        c4_top_lay.setContentsMargins(0, 0, 0, 0)
+        c4_top_lay.setSpacing(6)
         noti_top = QHBoxLayout()
         self.edit_broadcast_title = QLineEdit()
         self.edit_broadcast_title.setPlaceholderText("공지 / 긴급 알림 제목")
@@ -2229,17 +2249,142 @@ class ClassroomToolsTab(QWidget):
         noti_top.addWidget(self.combo_broadcast_target)
         noti_top.addWidget(self.btn_send_broadcast)
         noti_top.addWidget(self.btn_refresh_broadcast)
-        c4_lay.addLayout(noti_top)
+        c4_top_lay.addLayout(noti_top)
 
         self.txt_broadcast_msg = QPlainTextEdit()
         self.txt_broadcast_msg.setPlaceholderText("전달할 학급 공지 또는 긴급 안내 내용을 입력하세요.")
-        self.txt_broadcast_msg.setMinimumHeight(90)
-        c4_lay.addWidget(self.txt_broadcast_msg)
+        self.txt_broadcast_msg.setMinimumHeight(80)
+        self.txt_broadcast_msg.setMaximumHeight(110)
+        c4_top_lay.addWidget(self.txt_broadcast_msg)
+        c4_lay.addWidget(self._c4_broadcast_top_widget)
+
+        # --- 4-1. 학교종이 공지 수집 & 카톡 대화 AI 공지 요약 패널 ---
+        ingest_frame = QFrame()
+        self._c4_ingest_frame = ingest_frame
+        ingest_frame.setStyleSheet(
+            "QFrame { background: #F8FAFC; border: 1px solid #E2E8F0; border-radius: 8px; }"
+        )
+        ingest_lay = QVBoxLayout(ingest_frame)
+        ingest_lay.setContentsMargins(10, 10, 10, 10)
+        ingest_lay.setSpacing(8)
+
+        sb_row = QHBoxLayout()
+        sb_row.setSpacing(8)
+        self.btn_fetch_schoolbell = QPushButton("학교종이 최근 공지 가져오기")
+        apply_qss_role(self.btn_fetch_schoolbell, role="secondary")
+        self.btn_fetch_schoolbell.clicked.connect(self._on_fetch_schoolbell_notices)
+        self.btn_schoolbell_confirm_login = QPushButton("로그인 완료 · 계속")
+        apply_qss_role(self.btn_schoolbell_confirm_login, role="primary")
+        self.btn_schoolbell_confirm_login.setVisible(False)
+        self.btn_schoolbell_confirm_login.clicked.connect(self._on_schoolbell_confirm_login)
+        self.lbl_schoolbell_status = QLabel("학교종이(schoolbell-e.com) 연동 대기 (최초 1회 브라우저 로그인 필요)")
+        self.lbl_schoolbell_status.setStyleSheet("color: #64748B; font-size: 12px; border: none;")
+        sb_row.addWidget(self.btn_fetch_schoolbell)
+        sb_row.addWidget(self.btn_schoolbell_confirm_login)
+        sb_row.addWidget(self.lbl_schoolbell_status, stretch=1)
+        ingest_lay.addLayout(sb_row)
+
+        kk_bar = QHBoxLayout()
+        kk_bar.setSpacing(6)
+        self.btn_load_kakao_txt = QPushButton("카톡 .txt 불러오기")
+        apply_qss_role(self.btn_load_kakao_txt, role="secondary")
+        self.btn_load_kakao_txt.clicked.connect(self._on_load_kakao_txt_file)
+        self.edit_kakao_source_label = QLineEdit("카카오톡 대화")
+        self.edit_kakao_source_label.setPlaceholderText("출처명 (예: 학부모 단톡방)")
+        self.edit_kakao_source_label.setMaximumWidth(170)
+        self.btn_digest_kakao = QPushButton("AI 공지 추출·요약")
+        apply_qss_role(self.btn_digest_kakao, role="primary")
+        self.btn_digest_kakao.clicked.connect(self._on_digest_kakao_notices)
+        self.btn_kakao_input_fullscreen = QPushButton("전체화면 보기")
+        apply_qss_role(self.btn_kakao_input_fullscreen, role="secondary")
+        self.btn_kakao_input_fullscreen.setToolTip("카톡·메신저 입력 원문을 넓은 전체화면 창에서 조회·편집합니다.")
+        self.btn_kakao_input_fullscreen.clicked.connect(self._on_open_kakao_input_fullscreen)
+        self.lbl_kakao_status = QLabel("카톡 내보내기(.txt)를 드롭하거나 대화·공지 텍스트를 붙여넣으세요.")
+        self.lbl_kakao_status.setStyleSheet("color: #64748B; font-size: 12px; border: none;")
+        kk_bar.addWidget(self.btn_load_kakao_txt)
+        kk_bar.addWidget(QLabel("출처:"))
+        kk_bar.addWidget(self.edit_kakao_source_label)
+        kk_bar.addWidget(self.btn_digest_kakao)
+        kk_bar.addWidget(self.btn_kakao_input_fullscreen)
+        kk_bar.addWidget(self.lbl_kakao_status, stretch=1)
+        ingest_lay.addLayout(kk_bar)
+
+        self.txt_kakao_input = QPlainTextEdit()
+        self.txt_kakao_input.setPlaceholderText(
+            "PC 카카오톡 대화 내보내기(.txt) 파일을 여기에 드래그·드롭하거나 대화/안내문을 붙여넣으세요."
+        )
+        self.txt_kakao_input.setMinimumHeight(80)
+        self.txt_kakao_input.setMaximumHeight(120)
+        enable_file_drop(
+            self.txt_kakao_input,
+            allowed_exts=[".txt"],
+            allow_dirs=False,
+            allow_files=True,
+            on_files_dropped=self._on_kakao_file_dropped,
+        )
+        ingest_lay.addWidget(self.txt_kakao_input)
+        c4_lay.addWidget(ingest_frame)
+
+        # --- 4-2. 발송 전 검수 목록 & 학급_공지게시판 게시 ---
+        review_bar = QHBoxLayout()
+        review_bar.setSpacing(6)
+        lbl_rev_title = QLabel("발송 전 검수 목록 (선택 항목만 게시·발송)")
+        lbl_rev_title.setStyleSheet("font-weight: 700; color: #1E293B; font-size: 13px;")
+        self.lbl_review_count = QLabel("0건")
+        self.lbl_review_count.setStyleSheet("color: #64748B; font-size: 12px;")
+        self.btn_toggle_review_select = QPushButton("전체 선택/해제")
+        apply_qss_role(self.btn_toggle_review_select, role="secondary")
+        self.btn_toggle_review_select.clicked.connect(self._on_toggle_all_review_cards)
+        self.btn_delete_selected_review = QPushButton("선택 삭제")
+        apply_qss_role(self.btn_delete_selected_review, role="secondary")
+        self.btn_delete_selected_review.setToolTip("체크된 항목만 발송 전 검수 목록에서 일괄 제거합니다.")
+        self.btn_delete_selected_review.clicked.connect(self._on_delete_selected_review_cards)
+        self.btn_toggle_review_fullscreen = QPushButton("전체화면 보기")
+        apply_qss_role(self.btn_toggle_review_fullscreen, role="secondary")
+        self.btn_toggle_review_fullscreen.setCheckable(True)
+        self.btn_toggle_review_fullscreen.setToolTip("상단 입력 영역을 숨기고 검수 목록을 전체 높이로 확장합니다.")
+        self.btn_toggle_review_fullscreen.clicked.connect(self._on_toggle_review_fullscreen)
+        self.btn_publish_board_only = QPushButton("공지 게시판 게시")
+        apply_qss_role(self.btn_publish_board_only, role="secondary")
+        self.btn_publish_board_only.clicked.connect(lambda: self._publish_selected_review_cards(False))
+        self.btn_publish_board_and_notify = QPushButton("게시 + 모바일 알림 동시 발송")
+        apply_qss_role(self.btn_publish_board_and_notify, role="primary")
+        self.btn_publish_board_and_notify.clicked.connect(lambda: self._publish_selected_review_cards(True))
+        review_bar.addWidget(lbl_rev_title)
+        review_bar.addWidget(self.lbl_review_count)
+        review_bar.addStretch()
+        review_bar.addWidget(self.btn_toggle_review_select)
+        review_bar.addWidget(self.btn_delete_selected_review)
+        review_bar.addWidget(self.btn_toggle_review_fullscreen)
+        review_bar.addWidget(self.btn_publish_board_only)
+        review_bar.addWidget(self.btn_publish_board_and_notify)
+        c4_lay.addLayout(review_bar)
+
+        self.scroll_review_cards = QScrollArea()
+        self.scroll_review_cards.setWidgetResizable(True)
+        self.scroll_review_cards.setMinimumHeight(180)
+        self.scroll_review_cards.setMaximumHeight(320)
+        self.scroll_review_cards.setStyleSheet(
+            "QScrollArea { background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 8px; }"
+        )
+        review_container = QWidget()
+        self.review_cards_layout = QVBoxLayout(review_container)
+        self.review_cards_layout.setContentsMargins(8, 8, 8, 8)
+        self.review_cards_layout.setSpacing(8)
+        self.lbl_review_empty = QLabel(
+            "수집·요약된 공지가 없습니다. 위에서 학교종이 공지를 가져오거나 카톡 대화를 요약해 주세요."
+        )
+        self.lbl_review_empty.setStyleSheet("color: #94A3B8; font-size: 12px; padding: 16px;")
+        self.lbl_review_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.review_cards_layout.addWidget(self.lbl_review_empty)
+        self.review_cards_layout.addStretch()
+        self.scroll_review_cards.setWidget(review_container)
+        c4_lay.addWidget(self.scroll_review_cards)
 
         self.table_broadcast_history = QTableWidget(0, 4)
         self.table_broadcast_history.setHorizontalHeaderLabels(["발송 일시", "대상", "제목", "내용"])
         self.table_broadcast_history.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table_broadcast_history.setMinimumHeight(200)
+        self.table_broadcast_history.setMinimumHeight(150)
         c4_lay.addWidget(self.table_broadcast_history, stretch=1)
 
         # =====================================================================
@@ -3714,6 +3859,616 @@ class ClassroomToolsTab(QWidget):
             work_fn=_work,
             on_result=_on_result,
             on_error=lambda err: QMessageBox.warning(self, "이력 조회 오류", str(err or "").splitlines()[0]),
+        )
+
+    # =========================================================================
+    # 학교종이 수집 · 카톡 AI 공지 요약 · 검수 목록 · 학급_공지게시판 게시
+    # =========================================================================
+    def _on_fetch_schoolbell_notices(self) -> None:
+        if self._active_schoolbell_worker is not None:
+            return
+        self.btn_fetch_schoolbell.setEnabled(False)
+        self.btn_fetch_schoolbell.setText("수집 중...")
+        self.btn_schoolbell_confirm_login.setVisible(False)
+        self.lbl_schoolbell_status.setText("학교종이(schoolbell-e.com) 브라우저를 여는 중...")
+
+        meta = self._teacher_meta()
+        worker = SchoolbellCrawlWorker(
+            max_items=15,
+            login_timeout_sec=180,
+            school_name=str(meta.get("school_name") or ""),
+        )
+        self._active_schoolbell_worker = worker
+
+        def _on_login_req(msg: str) -> None:
+            self.lbl_schoolbell_status.setText(msg)
+            self.btn_schoolbell_confirm_login.setVisible(True)
+            self.btn_schoolbell_confirm_login.setEnabled(True)
+            self.schoolbell_login_required.emit(worker, msg)
+
+        def _on_progress(_pct: int, msg: str) -> None:
+            if msg:
+                self.lbl_schoolbell_status.setText(msg)
+
+        def _on_result(res: Any) -> None:
+            data = res if isinstance(res, dict) else {}
+            if data.get("missing_playwright"):
+                self.lbl_schoolbell_status.setText("Playwright가 설치되지 않았습니다.")
+                QMessageBox.warning(self, "Playwright 필요", str(data.get("error") or ""))
+                return
+            if not data.get("ok"):
+                err = str(data.get("error") or "학교종이 공지를 가져오지 못했습니다.")
+                self.lbl_schoolbell_status.setText(err)
+                QMessageBox.warning(self, "학교종이 수집 실패", err)
+                return
+            notices = list(data.get("notices") or [])
+            for n in notices:
+                self._add_review_notice_card(
+                    {
+                        "title": n.get("title") or "",
+                        "summary": n.get("summary") or "",
+                        "content": n.get("content") or "",
+                        "source_type": "schoolbell",
+                        "source_label": n.get("source_label") or "학교종이",
+                        "source_url": n.get("source_url") or "",
+                        "published_at": n.get("published_at") or "",
+                        "is_pinned": False,
+                    }
+                )
+            self.lbl_schoolbell_status.setText(
+                f"학교종이 공지 {len(notices)}건을 검수 목록에 추가했습니다 (자동 발송 안 됨)."
+            )
+
+        def _on_error(err: str) -> None:
+            first = str(err or "").splitlines()[0]
+            self.lbl_schoolbell_status.setText(f"학교종이 수집 오류: {first}")
+            QMessageBox.warning(self, "학교종이 수집 오류", first)
+
+        def _on_finished() -> None:
+            self._active_schoolbell_worker = None
+            self.btn_fetch_schoolbell.setEnabled(True)
+            self.btn_fetch_schoolbell.setText("학교종이 최근 공지 가져오기")
+            self.btn_schoolbell_confirm_login.setVisible(False)
+            self.schoolbell_login_cleared.emit(self.lbl_schoolbell_status.text())
+
+        worker.login_required.connect(_on_login_req)
+        worker.signals.progress.connect(_on_progress)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="classroom_fetch_schoolbell",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
+        )
+
+    def _on_schoolbell_confirm_login(self) -> None:
+        if self._active_schoolbell_worker is not None:
+            self._active_schoolbell_worker.confirm_login()
+            self.btn_schoolbell_confirm_login.setEnabled(False)
+            self.lbl_schoolbell_status.setText("로그인 확인 완료 — 공지 목록 추출 진행 중...")
+
+    def _on_open_kakao_input_fullscreen(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("카톡 대화 · 공지 원문 전체화면 보기 / 편집")
+        dlg.setWindowFlags(
+            dlg.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        dlg.resize(920, 660)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+
+        header = QHBoxLayout()
+        lbl_info = QLabel("카톡·메신저 대화 원문을 넓게 조회·편집한 뒤 [적용 후 닫기]를 누르면 반영됩니다.")
+        lbl_info.setStyleSheet("color: #475569; font-size: 12px;")
+        header.addWidget(lbl_info)
+        header.addStretch(1)
+        lay.addLayout(header)
+
+        editor = QPlainTextEdit(dlg)
+        editor.setPlainText(self.txt_kakao_input.toPlainText())
+        editor.setPlaceholderText("PC 카카오톡 대화 내보내기(.txt) 내용이나 공지 원문을 여기에 입력·편집하세요.")
+        lay.addWidget(editor, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_cancel = QPushButton("취소", dlg)
+        apply_qss_role(btn_cancel, role="secondary")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_apply = QPushButton("적용 후 닫기", dlg)
+        apply_qss_role(btn_apply, role="primary")
+        btn_apply.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_apply)
+        lay.addLayout(btn_row)
+
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            updated_text = editor.toPlainText()
+            if updated_text != self.txt_kakao_input.toPlainText():
+                self.txt_kakao_input.setPlainText(updated_text)
+                self.lbl_kakao_status.setText(f"원문 편집 반영됨 ({len(updated_text):,}자)")
+                self.ai_context_changed.emit()
+
+    def _on_toggle_review_fullscreen(self, checked: Optional[bool] = None) -> None:
+        is_full = bool(checked) if checked is not None else self.btn_toggle_review_fullscreen.isChecked()
+        for w in (
+            getattr(self, "_c4_broadcast_top_widget", None),
+            getattr(self, "_c4_ingest_frame", None),
+            getattr(self, "table_broadcast_history", None),
+        ):
+            if w is not None:
+                w.setVisible(not is_full)
+        if is_full:
+            self.btn_toggle_review_fullscreen.setText("원래 크기로")
+            self.scroll_review_cards.setMinimumHeight(460)
+            self.scroll_review_cards.setMaximumHeight(16777215)
+        else:
+            self.btn_toggle_review_fullscreen.setText("전체화면 보기")
+            self.scroll_review_cards.setMinimumHeight(180)
+            self.scroll_review_cards.setMaximumHeight(320)
+
+    def _load_kakao_file_path(self, file_path: str) -> None:
+        try:
+            text = read_kakao_export_file(file_path)
+            self.txt_kakao_input.setPlainText(text)
+            self.lbl_kakao_status.setText(f"불러옴: {Path(file_path).name} ({len(text):,}자)")
+        except Exception as exc:
+            QMessageBox.warning(self, "파일 읽기 오류", f"카톡 .txt 파일을 읽지 못했습니다:\n{exc}")
+
+    def _on_load_kakao_txt_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "카카오톡 대화 내보내기(.txt) 선택", "", "텍스트 파일 (*.txt);;모든 파일 (*.*)"
+        )
+        if path:
+            self._load_kakao_file_path(path)
+
+    def _on_kakao_file_dropped(self, paths: List[str]) -> None:
+        for p in paths or []:
+            if str(p).lower().endswith(".txt"):
+                self._load_kakao_file_path(p)
+                break
+
+    def _on_digest_kakao_notices(self) -> None:
+        raw_text = self.txt_kakao_input.toPlainText().strip()
+        if not raw_text:
+            QMessageBox.warning(self, "입력 확인", "카톡 .txt 파일을 불러오거나 대화·공지 텍스트를 입력해 주세요.")
+            return
+        cleaned = parse_kakao_chat_text(raw_text)
+        if not cleaned:
+            QMessageBox.warning(self, "추출 불가", "시스템 메시지·감탄사를 제외하면 추출할 대화 내용이 없습니다.")
+            return
+        source_label = self.edit_kakao_source_label.text().strip() or "카카오톡 대화"
+        sys_p, usr_p = build_kakao_notice_digest_prompt(cleaned, source_label=source_label)
+        self._active_notice_digest_ctx = {
+            "target_id": "class_notice_digest",
+            "kind": "class_notice_digest",
+            "task_label": "카톡 대화 AI 공지 추출·요약",
+            "system_prompt": sys_p,
+            "user_prompt": usr_p,
+            "source_label": source_label,
+            "source_type": "kakao",
+            "digest_action": "kakao_digest",
+            "review_card_id": "",
+        }
+        self.ai_context_changed.emit()
+        self.ai_target_requested.emit("class_notice_digest")
+
+        client = MultiLlmClient()
+        if client.is_manual_mode_active():
+            self.lbl_kakao_status.setText(
+                "프롬프트 준비 완료 → 우측 AI 실행 패널(수동 복붙/Playwright)에서 실행해 주세요."
+            )
+            return
+
+        self.lbl_kakao_status.setText("AI 공지 추출·요약 중...")
+
+        def _work() -> List[Dict[str, Any]]:
+            return digest_kakao_text_with_ai(raw_text, source_label=source_label, llm_client=client)
+
+        def _on_result(items: Any) -> None:
+            item_list = list(items or [])
+            for it in item_list:
+                self._add_review_notice_card(
+                    {
+                        "title": it.get("title") or "",
+                        "summary": it.get("summary") or "",
+                        "content": it.get("content") or "",
+                        "source_type": "kakao",
+                        "source_label": it.get("source_label") or source_label,
+                        "source_url": "",
+                        "published_at": it.get("event_date") or "",
+                        "is_pinned": False,
+                    }
+                )
+            self.lbl_kakao_status.setText(
+                f"AI 공지 {len(item_list)}건 추출 완료 — 아래 검수 목록에서 확인 후 게시하세요."
+            )
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_digest_kakao", None),
+            loading_text="AI 요약 중...",
+            task_name="카톡 대화 AI 공지 요약",
+            task_key="classroom_digest_kakao_notices",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: (
+                self.lbl_kakao_status.setText(f"AI 요약 오류: {str(err or '').splitlines()[0]}"),
+                QMessageBox.warning(self, "AI 공지 요약 오류", str(err or "").splitlines()[0]),
+            ),
+        )
+
+    def _on_summarize_review_card(self, card_id: str) -> None:
+        entry = next((c for c in self._notice_review_cards if c["id"] == card_id), None)
+        if not entry:
+            return
+        title = entry["edit_title"].text().strip()
+        content = entry["txt_content"].toPlainText().strip()
+        source_label = entry["edit_source_label"].text().strip() or "학교종이"
+        published_at = str(entry.get("published_at") or "")
+        if not content:
+            QMessageBox.warning(self, "내용 확인", "요약할 공지 본문이 비어 있습니다.")
+            return
+
+        sys_p, usr_p = build_schoolbell_summary_prompt(
+            title=title, content=content, source_label=source_label, published_at=published_at
+        )
+        self._active_notice_digest_ctx = {
+            "target_id": "class_notice_digest",
+            "kind": "class_notice_digest",
+            "task_label": f"공지 3줄 요약 ({title[:20]})",
+            "system_prompt": sys_p,
+            "user_prompt": usr_p,
+            "source_label": source_label,
+            "source_type": entry.get("source_type") or "schoolbell",
+            "digest_action": "schoolbell_summary",
+            "review_card_id": card_id,
+        }
+        self.ai_context_changed.emit()
+        self.ai_target_requested.emit("class_notice_digest")
+
+        client = MultiLlmClient()
+        if client.is_manual_mode_active():
+            self.lbl_schoolbell_status.setText(
+                "3줄 요약 프롬프트 준비됨 → 우측 AI 실행 패널(수동 복붙/Playwright)에서 실행하세요."
+            )
+            return
+
+        btn = entry.get("btn_summarize")
+
+        def _work() -> Dict[str, Any]:
+            return summarize_schoolbell_notice_with_ai(
+                {
+                    "title": title,
+                    "content": content,
+                    "source_label": source_label,
+                    "published_at": published_at,
+                },
+                llm_client=client,
+            )
+
+        def _on_result(res: Any) -> None:
+            if isinstance(res, dict):
+                self._apply_summary_to_card(card_id, res)
+
+        self._run_async_button_task(
+            button=btn,
+            loading_text="요약 중...",
+            task_name="공지 3줄 요약",
+            task_key=f"classroom_summarize_card_{card_id}",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "3줄 요약 오류", str(err or "").splitlines()[0]),
+        )
+
+    def get_class_notice_ai_context(self) -> Dict[str, Any]:
+        if self._active_notice_digest_ctx:
+            return dict(self._active_notice_digest_ctx)
+        raw_text = self.txt_kakao_input.toPlainText().strip() if hasattr(self, "txt_kakao_input") else ""
+        cleaned = parse_kakao_chat_text(raw_text) if raw_text else ""
+        source_label = (
+            self.edit_kakao_source_label.text().strip()
+            if hasattr(self, "edit_kakao_source_label")
+            else "카카오톡 대화"
+        ) or "카카오톡 대화"
+        sys_p, usr_p = (
+            build_kakao_notice_digest_prompt(cleaned, source_label=source_label)
+            if cleaned
+            else ("", "")
+        )
+        return {
+            "target_id": "class_notice_digest",
+            "kind": "class_notice_digest",
+            "task_label": "카톡·학교종이 AI 공지 요약",
+            "system_prompt": sys_p,
+            "user_prompt": usr_p,
+            "source_label": source_label,
+            "source_type": "kakao",
+            "digest_action": "kakao_digest",
+            "review_card_id": "",
+        }
+
+    def apply_class_notice_ai_result(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        src_label = str(payload.get("source_label") or "카카오톡 대화").strip() or "카카오톡 대화"
+        src_type = str(payload.get("source_type") or "kakao").strip().lower()
+        action = str(payload.get("digest_action") or self._active_notice_digest_ctx.get("digest_action") or "kakao_digest")
+        card_id = str(payload.get("review_card_id") or self._active_notice_digest_ctx.get("review_card_id") or "")
+
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raw = payload.get("raw_response") or payload.get("parsed_json") or ""
+            if not raw:
+                return
+            try:
+                items = parse_notice_digest_ai_response(raw, default_source_label=src_label)
+            except Exception as exc:
+                QMessageBox.warning(self, "공지 JSON 파싱 오류", f"AI 응답에서 공지 JSON을 해석하지 못했습니다:\n{exc}")
+                return
+
+        if action == "schoolbell_summary" and card_id and items:
+            self._apply_summary_to_card(card_id, items[0])
+            self.lbl_schoolbell_status.setText("선택한 공지 카드에 3줄 요약이 반영되었습니다.")
+            return
+
+        for it in items:
+            self._add_review_notice_card(
+                {
+                    "title": it.get("title") or "",
+                    "summary": it.get("summary") or "",
+                    "content": it.get("content") or "",
+                    "source_type": src_type if src_type in ("schoolbell", "kakao", "teacher") else "kakao",
+                    "source_label": it.get("source_label") or src_label,
+                    "source_url": "",
+                    "published_at": it.get("event_date") or "",
+                    "is_pinned": False,
+                }
+            )
+        self.lbl_kakao_status.setText(
+            f"AI 공지 {len(items)}건이 검수 목록에 추가되었습니다 (자동 발송 안 됨)."
+        )
+
+    def _apply_summary_to_card(self, card_id: str, data: Dict[str, Any]) -> None:
+        entry = next((c for c in self._notice_review_cards if c["id"] == card_id), None)
+        if not entry:
+            return
+        if data.get("title"):
+            entry["edit_title"].setText(str(data["title"]))
+        if data.get("summary"):
+            entry["txt_summary"].setPlainText(str(data["summary"]))
+        if data.get("content"):
+            entry["txt_content"].setPlainText(str(data["content"]))
+
+    def _update_review_count_label(self) -> None:
+        total = len(self._notice_review_cards)
+        checked = sum(1 for c in self._notice_review_cards if c["chk_select"].isChecked())
+        self.lbl_review_count.setText(f"{checked}/{total}건 선택")
+        self.lbl_review_empty.setVisible(total == 0)
+
+    def _add_review_notice_card(self, item: Dict[str, Any]) -> str:
+        self._notice_review_seq += 1
+        card_id = f"rev_{self._notice_review_seq}"
+        src_type = str(item.get("source_type") or "teacher").strip().lower()
+        if src_type not in ("schoolbell", "kakao", "teacher"):
+            src_type = "teacher"
+        badge_map = {
+            "schoolbell": ("학교종이", "#DBEAFE", "#1D4ED8"),
+            "kakao": ("카카오톡", "#FEF3C7", "#92400E"),
+            "teacher": ("교사작성", "#E2E8F0", "#334155"),
+        }
+        badge_text, bg_col, fg_col = badge_map[src_type]
+
+        card = QFrame()
+        card.setStyleSheet(
+            "QFrame { background: #F8FAFC; border: 1px solid #CBD5E1; border-radius: 8px; }"
+        )
+        vlay = QVBoxLayout(card)
+        vlay.setContentsMargins(10, 8, 10, 8)
+        vlay.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        chk_select = QCheckBox("게시 선택")
+        chk_select.setChecked(True)
+        chk_select.toggled.connect(lambda _v: self._update_review_count_label())
+
+        lbl_badge = QLabel(badge_text)
+        lbl_badge.setStyleSheet(
+            f"background: {bg_col}; color: {fg_col}; padding: 2px 8px; border-radius: 4px; "
+            "font-size: 11px; font-weight: 700; border: none;"
+        )
+        published_at = str(item.get("published_at") or "").strip()
+        lbl_date = QLabel(published_at or "날짜 미상")
+        lbl_date.setStyleSheet("color: #64748B; font-size: 11px; border: none;")
+
+        chk_pinned = QCheckBox("상단 고정")
+        chk_pinned.setChecked(bool(item.get("is_pinned")))
+
+        btn_summarize = QPushButton("3줄 요약")
+        apply_qss_role(btn_summarize, role="secondary")
+        btn_summarize.clicked.connect(lambda _c=False, cid=card_id: self._on_summarize_review_card(cid))
+
+        btn_remove = QPushButton("삭제")
+        apply_qss_role(btn_remove, role="secondary")
+        btn_remove.clicked.connect(lambda _c=False, cid=card_id: self._remove_review_notice_card(cid))
+
+        top.addWidget(chk_select)
+        top.addWidget(lbl_badge)
+        top.addWidget(lbl_date)
+        top.addStretch()
+        top.addWidget(chk_pinned)
+        top.addWidget(btn_summarize)
+        top.addWidget(btn_remove)
+        vlay.addLayout(top)
+
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(6)
+        edit_title = QLineEdit(str(item.get("title") or ""))
+        edit_title.setPlaceholderText("공지 제목")
+        edit_source_label = QLineEdit(str(item.get("source_label") or badge_text))
+        edit_source_label.setPlaceholderText("출처명")
+        edit_source_label.setMaximumWidth(160)
+        meta_row.addWidget(QLabel("제목:"))
+        meta_row.addWidget(edit_title, stretch=1)
+        meta_row.addWidget(QLabel("출처명:"))
+        meta_row.addWidget(edit_source_label)
+        vlay.addLayout(meta_row)
+
+        txt_summary = QPlainTextEdit(str(item.get("summary") or ""))
+        txt_summary.setPlaceholderText("모바일 공지 요약 (2~3줄)")
+        txt_summary.setMaximumHeight(56)
+        vlay.addWidget(txt_summary)
+
+        txt_content = QPlainTextEdit(str(item.get("content") or ""))
+        txt_content.setPlaceholderText("상세 본문")
+        txt_content.setMaximumHeight(78)
+        vlay.addWidget(txt_content)
+
+        insert_pos = max(0, self.review_cards_layout.count() - 1)
+        self.review_cards_layout.insertWidget(insert_pos, card)
+        self._notice_review_cards.append(
+            {
+                "id": card_id,
+                "widget": card,
+                "chk_select": chk_select,
+                "chk_pinned": chk_pinned,
+                "edit_title": edit_title,
+                "edit_source_label": edit_source_label,
+                "txt_summary": txt_summary,
+                "txt_content": txt_content,
+                "btn_summarize": btn_summarize,
+                "source_type": src_type,
+                "source_url": str(item.get("source_url") or ""),
+                "published_at": published_at,
+            }
+        )
+        self._update_review_count_label()
+        return card_id
+
+    def _remove_review_notice_card(self, card_id: str) -> None:
+        idx = next((i for i, c in enumerate(self._notice_review_cards) if c["id"] == card_id), None)
+        if idx is None:
+            return
+        entry = self._notice_review_cards.pop(idx)
+        widget = entry.get("widget")
+        if widget is not None:
+            self.review_cards_layout.removeWidget(widget)
+            widget.deleteLater()
+        self._update_review_count_label()
+
+    def _on_toggle_all_review_cards(self) -> None:
+        if not self._notice_review_cards:
+            return
+        all_checked = all(c["chk_select"].isChecked() for c in self._notice_review_cards)
+        for c in self._notice_review_cards:
+            c["chk_select"].setChecked(not all_checked)
+        self._update_review_count_label()
+
+    def _on_delete_selected_review_cards(self) -> None:
+        selected_ids = [c["id"] for c in self._notice_review_cards if c["chk_select"].isChecked()]
+        for cid in selected_ids:
+            self._remove_review_notice_card(cid)
+        self._update_review_count_label()
+
+    def _collect_selected_review_payloads(self) -> List[Tuple[str, Dict[str, Any]]]:
+        meta = self._teacher_meta()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        selected: List[Tuple[str, Dict[str, Any]]] = []
+        for idx, c in enumerate(self._notice_review_cards):
+            if not c["chk_select"].isChecked():
+                continue
+            title = c["edit_title"].text().strip()
+            summary = c["txt_summary"].toPlainText().strip()
+            content = c["txt_content"].toPlainText().strip() or summary
+            if not title or not (summary or content):
+                continue
+            rid = f"board_{int(datetime.now().timestamp() * 1000)}_{idx}"
+            doc = {
+                "remote_id": rid,
+                "title": title,
+                "summary": summary or content[:180].replace("\n", " ").strip(),
+                "content": content,
+                "source_type": c.get("source_type") or "teacher",
+                "source_label": c["edit_source_label"].text().strip(),
+                "source_url": str(c.get("source_url") or ""),
+                "target_grade": meta["grade"],
+                "target_class": meta["class_no"],
+                "school_code": meta["school_code"],
+                "school_name": meta["school_name"],
+                "author_name": meta["teacher_name"],
+                "is_pinned": bool(c["chk_pinned"].isChecked()),
+                "published_at": str(c.get("published_at") or "") or now_str,
+                "updated_at": now_str,
+            }
+            selected.append((c["id"], doc))
+        return selected
+
+    def _publish_selected_review_cards(self, also_send_notification: bool) -> None:
+        selected = self._collect_selected_review_payloads()
+        if not selected:
+            QMessageBox.warning(self, "선택 확인", "게시할 공지 카드를 1건 이상 선택하고 제목·내용을 입력해 주세요.")
+            return
+        meta = self._teacher_meta()
+        target_role = str(self.combo_broadcast_target.currentData() or "all")
+        btn = (
+            getattr(self, "btn_publish_board_and_notify", None)
+            if also_send_notification
+            else getattr(self, "btn_publish_board_only", None)
+        )
+
+        def _work() -> Dict[str, Any]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            published_ids: List[str] = []
+            notified = 0
+            for card_id, doc in selected:
+                ok, rid = svc.upsert_board_notice(doc)
+                if ok:
+                    published_ids.append(card_id)
+                    if also_send_notification:
+                        svc.send_class_notification(
+                            title=doc["title"],
+                            message=doc["summary"] or doc["content"],
+                            target_role=target_role,
+                            grade=meta["grade"],
+                            class_no=meta["class_no"],
+                            school_code=meta["school_code"],
+                            school_name=meta["school_name"],
+                            sender=meta["teacher_name"],
+                            notice_id=rid,
+                        )
+                        notified += 1
+            return {"published_ids": published_ids, "notified": notified}
+
+        def _on_result(res: Any) -> None:
+            data = res if isinstance(res, dict) else {}
+            pub_ids = list(data.get("published_ids") or [])
+            for cid in pub_ids:
+                self._remove_review_notice_card(cid)
+            if also_send_notification:
+                self._on_refresh_broadcast_history()
+                QMessageBox.information(
+                    self,
+                    "게시 및 알림 발송 완료",
+                    f"학급 공지 게시판에 {len(pub_ids)}건 게시하고 모바일 알림 {data.get('notified', 0)}건을 발송했습니다.",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "공지 게시판 게시 완료",
+                    f"학급 공지 게시판(학급_공지게시판)에 {len(pub_ids)}건을 게시했습니다.",
+                )
+
+        self._run_async_button_task(
+            button=btn,
+            loading_text="게시 중...",
+            task_name="학급 공지 게시판 게시",
+            task_key="classroom_publish_board_notices",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "게시 오류", str(err or "").splitlines()[0]),
         )
 
     def _on_load_chat_history(self) -> None:

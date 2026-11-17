@@ -111,6 +111,7 @@ from services.schedule_parser_service import (
     build_calendar_ai_prompt,
     parse_calendar_ai_response,
 )
+from services.class_notice_digest_service import parse_notice_digest_ai_response
 from services.web_gemini_auto_worker import (
     PROVIDER_CONFIGS,
     WebGeminiAutoWorker,
@@ -852,6 +853,45 @@ class _DockApiCalendarTodoWorker(BaseWorker):
         }
 
 
+class _DockApiClassNoticeDigestWorker(BaseWorker):
+    """카톡 대화/학교종이 공지에서 학급 공지 요약 JSON 배열을 추출하는 API 워커."""
+
+    def __init__(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        source_label: str = "카카오톡 대화",
+        source_type: str = "kakao",
+        digest_action: str = "kakao_digest",
+        review_card_id: str = "",
+    ):
+        super().__init__(task_name="학급 공지 AI 추출·요약 (API)")
+        self.system_prompt = system_prompt
+        self.user_prompt = user_prompt
+        self.source_label = source_label
+        self.source_type = source_type
+        self.digest_action = digest_action
+        self.review_card_id = review_card_id
+
+    def execute(self) -> Dict[str, Any]:
+        self.emit_progress(25, "공지 요약 프롬프트 전송 중...")
+        client = MultiLlmClient()
+        raw_reply = client.generate(prompt=self.user_prompt, system_prompt=self.system_prompt)
+        self.emit_progress(80, "추출된 공지 JSON 정규화 중...")
+        items = parse_notice_digest_ai_response(raw_reply, default_source_label=self.source_label)
+        self.emit_progress(100, f"공지 {len(items)}건 추출 완료")
+        return {
+            "target_id": "class_notice_digest",
+            "mode": "api",
+            "raw_response": raw_reply,
+            "items": items,
+            "source_label": self.source_label,
+            "source_type": self.source_type,
+            "digest_action": self.digest_action,
+            "review_card_id": self.review_card_id,
+        }
+
+
 class _DockApiGeneralChatWorker(BaseWorker):
     """범용 챗 (에이전트) API 모드 워커."""
 
@@ -1438,6 +1478,8 @@ class AiExecutionDock(QFrame):
         # Playwright 상태
         self._pw_provider: str = "gemini"
         self._active_pw_worker: Optional[WebGeminiAutoWorker] = None
+        self._external_login_worker: Any = None
+        self._external_login_provider: str = ""
         self._is_api_running: bool = False
         self._pw_single_batches_applied: bool = False
 
@@ -2607,6 +2649,13 @@ class AiExecutionDock(QFrame):
             self.btn_manual_apply_next.setText("JSON 검증 후 일정·할일 확인")
             self.lbl_pw_exec_mode.setText("Playwright 실행 방식 (단일)")
             self.btn_pw_collect_next.setText("응답 회수")
+        elif kind == "class_notice_digest":
+            self.api_summary_card.setVisible(True)
+            self.combo_pw_exec_mode.setVisible(True)
+            self.btn_api_start.setText("AI 공지 추출·요약 실행")
+            self.btn_manual_apply_next.setText("JSON 검증 후 검수 목록에 추가")
+            self.lbl_pw_exec_mode.setText("Playwright 실행 방식 (단일)")
+            self.btn_pw_collect_next.setText("응답 회수")
         elif kind == "hwpx_agent":
             self.api_summary_card.setVisible(True)
             self.combo_pw_exec_mode.setVisible(True)
@@ -2652,7 +2701,7 @@ class AiExecutionDock(QFrame):
         if not ctx and self._active_target_id:
             fallback_kind = (
                 self._active_target_id
-                if self._active_target_id in ("general_chat", "ocr", "hwpx_agent", "calendar_todo")
+                if self._active_target_id in ("general_chat", "ocr", "hwpx_agent", "calendar_todo", "class_notice_digest")
                 else "excel_batch"
             )
             ctx = {"target_id": self._active_target_id, "kind": fallback_kind}
@@ -2668,7 +2717,7 @@ class AiExecutionDock(QFrame):
         if not kind:
             kind = (
                 tid
-                if tid in ("general_chat", "ocr", "hwpx_agent", "calendar_todo")
+                if tid in ("general_chat", "ocr", "hwpx_agent", "calendar_todo", "class_notice_digest")
                 else "excel_batch"
             )
         if prev_tid and tid and prev_tid != tid:
@@ -2874,6 +2923,24 @@ class AiExecutionDock(QFrame):
             worker = _DockApiCalendarTodoWorker(
                 instruction=self._append_quote_to_prompt(inst),
             )
+        elif kind == "class_notice_digest":
+            sys_p = str(ctx.get("system_prompt") or "").strip()
+            usr_p = str(ctx.get("user_prompt") or "").strip()
+            if not usr_p:
+                QMessageBox.information(
+                    self,
+                    "입력 확인",
+                    "중앙 '4. 학급 공지·긴급 알림' 탭에서 카톡 대화 또는 요약할 공지를 먼저 입력·선택해 주세요.",
+                )
+                return
+            worker = _DockApiClassNoticeDigestWorker(
+                system_prompt=sys_p,
+                user_prompt=self._append_quote_to_prompt(usr_p),
+                source_label=str(ctx.get("source_label") or "카카오톡 대화"),
+                source_type=str(ctx.get("source_type") or "kakao"),
+                digest_action=str(ctx.get("digest_action") or "kakao_digest"),
+                review_card_id=str(ctx.get("review_card_id") or ""),
+            )
         elif kind == "ocr":
             files = ctx.get("ocr_files") or []
             if not files:
@@ -2937,6 +3004,9 @@ class AiExecutionDock(QFrame):
                 self.lbl_dock_progress_meta.setText(
                     f"API 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건"
                 )
+            elif kind == "class_notice_digest":
+                n_cnt = len(res.get("items") or [])
+                self.lbl_dock_progress_meta.setText(f"API 공지 요약 완료 · {n_cnt}건")
             elif kind == "hwpx_agent":
                 c_p = res.get("completed_parts", 1)
                 t_p = res.get("total_parts", 1)
@@ -3383,6 +3453,13 @@ class AiExecutionDock(QFrame):
                 return ""
             sys_p, user_p = build_calendar_ai_prompt(self._append_quote_to_prompt(inst))
             return f"[System 지시문]\n{sys_p}\n\n{user_p}"
+        if kind == "class_notice_digest" or self._active_target_id == "class_notice_digest":
+            sys_p = str(ctx.get("system_prompt") or "").strip()
+            user_p = str(ctx.get("user_prompt") or "").strip()
+            if not user_p:
+                return ""
+            user_p = self._append_quote_to_prompt(user_p)
+            return f"[System 지시문]\n{sys_p}\n\n{user_p}" if sys_p else user_p
         if kind == "ocr":
             from ui.tabs.tab_doc_ocr import extract_local_text_from_files
 
@@ -3481,6 +3558,17 @@ class AiExecutionDock(QFrame):
                 )
             except Exception as exc:
                 self._manual_single_parsed = {}
+                self.lbl_manual_verify.setText(f"JSON 추출 오류: {exc}")
+            return
+
+        if kind == "class_notice_digest":
+            try:
+                src_label = str(ctx.get("source_label") or "카카오톡 대화")
+                items = parse_notice_digest_ai_response(raw_resp, default_source_label=src_label)
+                self._manual_parsed_items = items
+                self.lbl_manual_verify.setText(f"유효한 공지 JSON 확인됨 ({len(items)}건)")
+            except Exception as exc:
+                self._manual_parsed_items = []
                 self.lbl_manual_verify.setText(f"JSON 추출 오류: {exc}")
             return
 
@@ -3690,6 +3778,36 @@ class AiExecutionDock(QFrame):
             )
             self.lbl_manual_verify.setText(f"일정 {s_cnt}건, 할일 {t_cnt}건 확인창으로 전달됨")
             self.lbl_dock_progress_meta.setText(f"수동 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건")
+            self.progress_dock.setValue(100)
+            return
+        if ctx.get("kind") == "class_notice_digest":
+            src_label = str(ctx.get("source_label") or "카카오톡 대화")
+            try:
+                items = parse_notice_digest_ai_response(raw_resp, default_source_label=src_label)
+            except Exception as exc:
+                QMessageBox.warning(self, "JSON 검증 오류", f"유효한 공지 JSON 응답을 추출하지 못했습니다:\n{exc}")
+                return
+            if not items:
+                QMessageBox.information(self, "추출 결과 없음", "추출된 공지사항이 없습니다.")
+                return
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.clear()
+            self.txt_manual_response.blockSignals(False)
+            self._dispatch_result(
+                target_id,
+                {
+                    "target_id": target_id,
+                    "mode": "manual",
+                    "raw_response": raw_resp,
+                    "items": items,
+                    "source_label": src_label,
+                    "source_type": str(ctx.get("source_type") or "kakao"),
+                    "digest_action": str(ctx.get("digest_action") or "kakao_digest"),
+                    "review_card_id": str(ctx.get("review_card_id") or ""),
+                },
+            )
+            self.lbl_manual_verify.setText(f"공지 {len(items)}건 검수 목록에 반영됨")
+            self.lbl_dock_progress_meta.setText(f"수동 추출 완료 · 공지 {len(items)}건")
             self.progress_dock.setValue(100)
             return
         if ctx.get("kind") == "ocr":
@@ -4058,6 +4176,26 @@ class AiExecutionDock(QFrame):
                 headless=False,
                 task_label=task_label,
             )
+        elif kind == "class_notice_digest":
+            prompt_text = self._build_current_manual_prompt()
+            if not prompt_text:
+                QMessageBox.warning(
+                    self, "입력 확인", "중앙 '4. 학급 공지·긴급 알림' 탭에서 카톡 대화 또는 요약할 공지를 먼저 입력해 주세요."
+                )
+                return
+            worker = WebGeminiAutoWorker(
+                excel_path=None,
+                single_prompt=prompt_text,
+                attachment_paths=attachment_paths,
+                provider=self._pw_provider,
+                custom_url=custom_url,
+                execution_mode=exec_mode,
+                require_login=False,
+                keep_login_session=keep_login,
+                use_temp_chat=use_temp_chat,
+                headless=False,
+                task_label=task_label,
+            )
         else:
             excel_str = str(ctx.get("excel_path", "") or "").strip()
             if not excel_str or not Path(excel_str).is_file():
@@ -4095,7 +4233,7 @@ class AiExecutionDock(QFrame):
         self.progress_dock.setValue(0)
         self.lbl_dock_progress_meta.setText(
             f"[{task_label}] Playwright 브라우저 실행 중..."
-            if kind in ("ocr", "hwpx_agent", "calendar_todo")
+            if kind in ("ocr", "hwpx_agent", "calendar_todo", "class_notice_digest")
             else "Playwright 브라우저 실행 중..."
         )
 
@@ -4158,7 +4296,48 @@ class AiExecutionDock(QFrame):
         self._ensure_pw_inline_card(msg, needs_login=False)
         self.lbl_dock_progress_meta.setText(msg)
 
+    def show_external_login_waiting(
+        self,
+        worker: Any,
+        message: str = "",
+        provider_name: str = "학교종이",
+    ) -> None:
+        """외부 Playwright 워커(예: 학교종이 수집기)의 로그인 대기를 채팅 인라인 카드 + 확인 버튼으로 연동합니다."""
+        self._external_login_worker = worker
+        self._external_login_provider = str(provider_name or "외부 서비스").strip()
+        self.btn_pw_confirm_login.setText("인증/로그인 완료 · 작업 재개")
+        self.btn_pw_confirm_login.setVisible(True)
+        self.btn_pw_confirm_login.setEnabled(True)
+        self._sync_body_scroll_visibility()
+        display_msg = str(message or "").strip() or (
+            f"[{self._external_login_provider}] 브라우저에서 학교종이 로그인 후, "
+            "수집할 우리 학교 또는 우리 반의 학교안내문/알림장 목록 화면까지 이동한 뒤 "
+            "[인증/로그인 완료 · 작업 재개]를 눌러주세요."
+        )
+        self._ensure_pw_inline_card(display_msg, needs_login=True)
+        self._set_progress_meta_alert(display_msg, alert=True)
+        self._notify_attention(f"EduFlow {self._external_login_provider} 로그인 대기", display_msg)
+
+    def clear_external_login_waiting(self, status_message: str = "") -> None:
+        """외부 Playwright 워커의 로그인 대기 UI를 정리합니다."""
+        self._external_login_worker = None
+        self._external_login_provider = ""
+        self.btn_pw_confirm_login.setEnabled(False)
+        self.btn_pw_confirm_login.setVisible(False)
+        self._remove_pw_inline_card()
+        self._set_progress_meta_alert(status_message or "대기 중", alert=False)
+
     def _on_pw_confirm_login_clicked(self) -> None:
+        if self._external_login_worker is not None:
+            if hasattr(self._external_login_worker, "confirm_login"):
+                self._external_login_worker.confirm_login()
+            self.btn_pw_confirm_login.setEnabled(False)
+            self.btn_pw_confirm_login.setVisible(False)
+            prov = self._external_login_provider or "외부 서비스"
+            msg = f"[{prov}] 로그인 확인 완료 — 공지 목록 수집 진행 중..."
+            self._ensure_pw_inline_card(msg, needs_login=False)
+            self._set_progress_meta_alert(msg, alert=False)
+            return
         if self._active_pw_worker is not None:
             self._active_pw_worker.confirm_login()
         self.btn_pw_confirm_login.setEnabled(False)
@@ -4179,6 +4358,11 @@ class AiExecutionDock(QFrame):
 
     def _on_pw_stop_clicked(self) -> None:
         self._pw_next_stage_pending = False
+        if self._external_login_worker is not None:
+            if hasattr(self._external_login_worker, "request_stop"):
+                self._external_login_worker.request_stop()
+            self.clear_external_login_waiting("학교종이 수집 중지 요청됨...")
+            return
         if self._active_pw_worker is not None:
             self._active_pw_worker.request_stop()
         self.task_runner.stop_task(self.TASK_DOCK_PLAYWRIGHT)
