@@ -60,3 +60,8 @@ eduflow-db-b44f3-5692e5dea8c3.json
 #firebaseconfig
 eduflow-mobile-firebaseconfig.json
 
+
+# One-off migration archive
+scripts_archive/
+eduflow-db-*.json
+serviceAccountKey.json
