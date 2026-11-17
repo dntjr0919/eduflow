@@ -38,6 +38,8 @@ DEFAULT_BROWSER_USER_AGENT = (
 INT_FIELDS = {
     "grade",
     "class_no",
+    "target_grade",
+    "target_class",
     "student_no",
     "period",
     "due_business_days",
@@ -48,6 +50,7 @@ BOOL_FIELDS = {
     "is_read",
     "is_active",
     "is_published",
+    "requires_reply",
     "teacher_confirmed",
     "consultation_enabled",
 }
@@ -811,25 +814,154 @@ class FirestoreSyncService:
         rows.sort(key=lambda x: str(x.get("date") or x.get("updated_at") or ""), reverse=True)
         return rows
 
+    def upload_notice_attachment(
+        self,
+        file_path: str,
+        *,
+        folder_name: str = "EduFlow_Notices",
+    ) -> Dict[str, Any]:
+        """가정통신문 원본 파일(PDF/HWP/HWPX/이미지)을 Google Drive(GAS 또는 연동 API)에 업로드하고 URL·파일 ID를 반환합니다."""
+        import base64
+        import mimetypes
+        from pathlib import Path
+
+        p = Path(str(file_path or "").strip())
+        if not p.exists() or not p.is_file():
+            return {"ok": False, "attachment_url": "", "attachment_file_id": "", "error": "파일을 찾을 수 없습니다."}
+
+        raw_bytes = p.read_bytes()
+        ext = p.suffix.lower()
+        guessed, _ = mimetypes.guess_type(str(p))
+        if ext == ".pdf":
+            mime_type = "application/pdf"
+        elif ext == ".hwp":
+            mime_type = "application/x-hwp"
+        elif ext == ".hwpx":
+            mime_type = "application/haansofthwpx"
+        else:
+            mime_type = guessed or "application/octet-stream"
+
+        req_payload = {
+            "action": "upload_notice_file",
+            "file_name": p.name,
+            "mime_type": mime_type,
+            "file_base64": base64.b64encode(raw_bytes).decode("ascii"),
+            "folder_name": str(folder_name or "EduFlow_Notices").strip(),
+        }
+
+        gas_url = str(
+            self.config.get("api_and_integrations", "google_apps_script_url", "") or ""
+        ).strip()
+        if gas_url:
+            try:
+                sess = self._get_http_session()
+                resp = sess.post(gas_url, json=req_payload, timeout=DEFAULT_VERCEL_TIMEOUT)
+                if resp.ok:
+                    data = resp.json()
+                    if isinstance(data, dict) and data.get("ok"):
+                        att_url = str(
+                            data.get("attachment_url") or data.get("url") or data.get("download_url") or ""
+                        ).strip()
+                        att_id = str(data.get("attachment_file_id") or data.get("file_id") or "").strip()
+                        if att_url:
+                            return {
+                                "ok": True,
+                                "attachment_url": att_url,
+                                "attachment_file_id": att_id,
+                            }
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"GAS Google Drive 업로드 실패 ({p.name}): {exc}")
+
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api("upload_notice_file", req_payload)
+                att_url = str(
+                    res.get("attachment_url") or res.get("url") or res.get("download_url") or ""
+                ).strip()
+                att_id = str(res.get("attachment_file_id") or res.get("file_id") or "").strip()
+                if att_url:
+                    return {
+                        "ok": True,
+                        "attachment_url": att_url,
+                        "attachment_file_id": att_id,
+                    }
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API Google Drive 업로드 실패 ({p.name}): {exc}")
+
+        return {
+            "ok": False,
+            "attachment_url": "",
+            "attachment_file_id": "",
+            "error": "Google Drive 업로드 엔드포인트(GAS URL 또는 연동 API)가 설정되지 않았거나 응답이 없습니다.",
+        }
+
     def publish_mobile_notice(self, notice_data: Dict[str, Any]) -> Tuple[bool, str]:
-        """가정통신문을 Firestore `가정통신문_목록`에 배포합니다."""
+        """가정통신문을 Firestore `가정통신문_목록`에 저장(후보 저장 또는 즉시 게시)합니다."""
         if not isinstance(notice_data, dict):
             return False, ""
         rid = str(notice_data.get("remote_id") or f"noti_doc_{int(datetime.now().timestamp() * 1000)}").strip()
+        target_grade = _to_int_or_none(
+            notice_data.get("target_grade")
+            if notice_data.get("target_grade") is not None
+            else notice_data.get("grade")
+        )
+        target_class = _to_int_or_none(
+            notice_data.get("target_class")
+            if notice_data.get("target_class") is not None
+            else notice_data.get("class_no")
+        )
+
+        raw_schema = notice_data.get("reply_schema")
+        if isinstance(raw_schema, str):
+            try:
+                raw_schema = json.loads(raw_schema)
+            except Exception:
+                raw_schema = []
+        if not isinstance(raw_schema, list):
+            raw_schema = []
+
+        reply_schema_json = str(notice_data.get("reply_schema_json") or "").strip()
+        if not reply_schema_json:
+            reply_schema_json = json.dumps(raw_schema, ensure_ascii=False)
+
+        reply_fields = notice_data.get("reply_fields")
+        if not isinstance(reply_fields, list):
+            reply_fields = [
+                str(item.get("label") or item.get("key") or "").strip()
+                for item in raw_schema
+                if isinstance(item, dict) and str(item.get("label") or item.get("key") or "").strip()
+            ]
+
+        is_published = _is_truthy(notice_data.get("is_published")) if "is_published" in notice_data else True
+        requires_reply = (
+            _is_truthy(notice_data.get("requires_reply"))
+            if "requires_reply" in notice_data
+            else bool(raw_schema or reply_fields)
+        )
+
+        now_ts = _now_str()
         payload = {
             "remote_id": rid,
             "title": str(notice_data.get("title") or "").strip(),
-            "category": str(notice_data.get("category") or "가정통신문").strip(),
+            "category": str(notice_data.get("category") or "가정통신문").strip() or "가정통신문",
             "content": str(notice_data.get("content") or "").strip(),
-            "reply_fields": notice_data.get("reply_fields") or [],
-            "target_grade": _to_int_or_none(notice_data.get("target_grade")),
-            "target_class": _to_int_or_none(notice_data.get("target_class")),
+            "due_date": str(notice_data.get("due_date") or "").strip(),
+            "requires_reply": requires_reply,
+            "reply_schema": raw_schema,
+            "reply_schema_json": reply_schema_json,
+            "reply_fields": reply_fields,
+            "attachment_url": str(notice_data.get("attachment_url") or "").strip(),
+            "attachment_file_id": str(notice_data.get("attachment_file_id") or "").strip(),
+            "target_grade": target_grade,
+            "target_class": target_class,
+            "grade": target_grade,
+            "class_no": target_class,
             "school_code": str(notice_data.get("school_code") or "").strip(),
             "school_name": str(notice_data.get("school_name") or "").strip(),
-            "due_date": str(notice_data.get("due_date") or "").strip(),
             "author_name": str(notice_data.get("author_name") or "담임교사").strip(),
-            "is_published": True,
-            "updated_at": _now_str(),
+            "is_published": is_published,
+            "created_at": str(notice_data.get("created_at") or now_ts).strip(),
+            "updated_at": now_ts,
         }
         if self.is_vercel_api_mode():
             res = self._post_vercel_api("publish_mobile_notice", payload)
@@ -865,18 +997,24 @@ class FirestoreSyncService:
         school_name: str = "",
         sender: str = "",
         student_id: str = "",
+        channel: str = "desktop_broadcast",
+        notice_id: str = "",
     ) -> Tuple[bool, str]:
         """Firestore `Notifications`에 학급 공지/긴급 알림을 등록합니다."""
         rid = f"noti_{int(datetime.now().timestamp() * 1000)}"
+        int_grade = _to_int_or_none(grade)
+        int_class = _to_int_or_none(class_no)
         payload = {
             "remote_id": rid,
             "title": str(title or "").strip(),
             "message": str(message or "").strip(),
-            "channel": "desktop_broadcast",
+            "channel": str(channel or "desktop_broadcast").strip(),
             "target_role": str(target_role or "all").strip().lower(),
             "sender": str(sender or "담임교사").strip(),
-            "grade": _to_int_or_none(grade),
-            "class_no": _to_int_or_none(class_no),
+            "grade": int_grade,
+            "class_no": int_class,
+            "target_grade": int_grade,
+            "target_class": int_class,
             "school_code": str(school_code or "").strip(),
             "school_name": str(school_name or "").strip(),
             "student_id": str(student_id or "").strip(),
@@ -884,6 +1022,8 @@ class FirestoreSyncService:
             "created_at": _now_str(),
             "updated_at": _now_str(),
         }
+        if str(notice_id or "").strip():
+            payload["notice_id"] = str(notice_id).strip()
         if self.is_vercel_api_mode():
             res = self._post_vercel_api("send_class_notification", payload)
             return True, str(res.get("remote_id") or rid)

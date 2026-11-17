@@ -79,6 +79,16 @@ from services.hwpx_agent_service import (
     convert_hwpx_to_hwp,
     create_minimal_hwpx_document,
 )
+from services.llm_client import MultiLlmClient
+from services.notice_parser_service import (
+    NOTICE_CATEGORIES,
+    NOTICE_OCR_JSON_PROMPT,
+    VALID_REPLY_FIELD_TYPES,
+    extract_notice_from_pdf,
+    extract_notice_source_text,
+    normalize_reply_schema,
+    parse_notice_ai_json,
+)
 from services.roster_parser_service import parse_homeroom_roster
 from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
@@ -142,53 +152,6 @@ def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
     if st is not None:
         st.unpolish(widget)
         st.polish(widget)
-
-
-NOTICE_OCR_JSON_PROMPT = (
-    "첨부된 가정통신문 PDF(또는 이미지)를 정확히 판독하여 아래 JSON 스키마로만 응답하세요.\n"
-    "코드블록(```json ... ```)을 포함해도 되며, 다른 설명 문장은 출력하지 마세요.\n"
-    "{\n"
-    '  "title": "가정통신문 제목",\n'
-    '  "deadline": "YYYY-MM-DD",\n'
-    '  "body": "핵심 안내 본문 요약 및 원문 정리",\n'
-    '  "reply_fields": ["참가 동의 여부 (동의/미동의)", "비상연락처"]\n'
-    "}"
-)
-
-
-def parse_notice_ai_json(raw_or_dict: Any) -> Dict[str, Any]:
-    """AiExecutionDock(API/수동복붙/Playwright) 가정통신문 OCR JSON 응답을 정규화합니다."""
-    if isinstance(raw_or_dict, dict):
-        data = dict(raw_or_dict)
-    else:
-        raw_text = str(raw_or_dict or "").strip()
-        if not raw_text:
-            raise ValueError("가정통신문 JSON 응답이 비어 있습니다.")
-        try:
-            data = extract_json_from_llm_response(raw_text)
-        except Exception:
-            m = re.search(r"\{[\s\S]*\}", raw_text)
-            if not m:
-                raise ValueError("응답에서 JSON 객체를 찾을 수 없습니다.")
-            data = json.loads(m.group(0))
-
-    if not isinstance(data, dict):
-        raise ValueError("가정통신문 JSON 응답은 객체(dict) 형태여야 합니다.")
-
-    raw_fields = data.get("reply_fields")
-    if isinstance(raw_fields, list):
-        reply_fields = [str(x).strip() for x in raw_fields if str(x).strip()]
-    elif isinstance(raw_fields, str):
-        reply_fields = [x.strip() for x in raw_fields.split(",") if x.strip()]
-    else:
-        reply_fields = []
-
-    return {
-        "title": str(data.get("title") or "").strip(),
-        "deadline": str(data.get("deadline") or data.get("due_date") or "").strip(),
-        "body": str(data.get("body") or data.get("content") or "").strip(),
-        "reply_fields": reply_fields,
-    }
 
 
 SAMPLE_ROSTER: List[Tuple[str, str]] = [
@@ -2019,39 +1982,173 @@ class ClassroomToolsTab(QWidget):
             hover_delay_ms=0,
         )
         c3_lay = self.card_mobile_notice.body_layout()
-        notice_top = QHBoxLayout()
-        self.edit_notice_title = QLineEdit()
-        self.edit_notice_title.setPlaceholderText("가정통신문 제목 (PDF 불러오기 시 자동 채움)")
-        self.edit_notice_due = QLineEdit()
-        self.edit_notice_due.setPlaceholderText("마감일 (예: 2026-11-25)")
-        self.edit_notice_due.setFixedWidth(150)
-        self.btn_load_notice_pdf = QPushButton("PDF 선택 → AI OCR 추출")
+
+        # 1) 문서(PDF/HWP/HWPX/이미지) 선택 및 드래그앤드롭 영역
+        self.notice_pdf_dropzone = QFrame()
+        self.notice_pdf_dropzone.setObjectName("noticePdfDropzone")
+        self.notice_pdf_dropzone.setStyleSheet(
+            "#noticePdfDropzone { border: 1.5px dashed #94A3B8; border-radius: 8px; background: #F8FAFC; padding: 6px; }"
+        )
+        drop_lay = QHBoxLayout(self.notice_pdf_dropzone)
+        drop_lay.setContentsMargins(10, 8, 10, 8)
+        drop_lay.setSpacing(8)
+        self.lbl_notice_pdf_status = QLabel(
+            "가정통신문 PDF / HWP / HWPX / 이미지를 여기에 드래그앤드롭하거나 [파일 선택]을 누르세요."
+        )
+        self.lbl_notice_pdf_status.setStyleSheet("color: #475569; font-size: 12px;")
+        self.lbl_notice_pdf_status.setWordWrap(True)
+        self.btn_load_notice_pdf = QPushButton("파일 선택 → AI 추출")
         apply_qss_role(self.btn_load_notice_pdf, role="secondary")
-        self.btn_load_notice_pdf.setToolTip("PDF 파일을 선택하면 우측 AI 실행 패널(API/수동복붙/Playwright)로 구조화 JSON을 추출합니다.")
+        self.btn_load_notice_pdf.setToolTip(
+            "PDF, HWP, HWPX 또는 이미지 파일을 선택/드롭하면 AI OCR·텍스트 추출로 구조화 JSON을 생성합니다."
+        )
         self.btn_load_notice_pdf.clicked.connect(self._on_load_notice_pdf)
-        self.btn_publish_mobile_notice = QPushButton("모바일 배포")
-        apply_qss_role(self.btn_publish_mobile_notice, role="primary")
-        self.btn_publish_mobile_notice.clicked.connect(self._on_publish_mobile_notice)
+        self.btn_reextract_notice_pdf = QPushButton("AI OCR 다시 추출")
+        apply_qss_role(self.btn_reextract_notice_pdf, role="secondary")
+        self.btn_reextract_notice_pdf.clicked.connect(self._on_reextract_notice_pdf)
+        drop_lay.addWidget(self.lbl_notice_pdf_status, stretch=1)
+        drop_lay.addWidget(self.btn_load_notice_pdf)
+        drop_lay.addWidget(self.btn_reextract_notice_pdf)
+        c3_lay.addWidget(self.notice_pdf_dropzone)
+        enable_file_drop(
+            self.notice_pdf_dropzone,
+            allowed_exts=[".pdf", ".hwp", ".hwpx", ".png", ".jpg", ".jpeg", ".webp"],
+            allow_dirs=False,
+            multiple=False,
+            on_files_dropped=self._on_notice_pdf_dropped,
+            context_label="가정통신문 문서(PDF/HWP/HWPX/이미지)",
+        )
+
+        # 2) 제목 · 분류 · 마감일 · 회신필요 여부
+        self._notice_top_widget = QWidget()
+        notice_top = QHBoxLayout(self._notice_top_widget)
+        notice_top.setContentsMargins(0, 0, 0, 0)
+        notice_top.setSpacing(8)
+        self.edit_notice_title = QLineEdit()
+        self.edit_notice_title.setPlaceholderText("가정통신문 제목 (문서 불러오기 시 자동 채움)")
+        self.combo_notice_category = QComboBox()
+        self.combo_notice_category.setEditable(True)
+        self.combo_notice_category.addItems(list(NOTICE_CATEGORIES))
+        self.combo_notice_category.setFixedWidth(120)
+        install_no_scroll_wheel_filter(self.combo_notice_category)
+        self.edit_notice_due = QLineEdit()
+        self.edit_notice_due.setPlaceholderText("마감일 (YYYY-MM-DD)")
+        self.edit_notice_due.setFixedWidth(135)
+        self.chk_notice_requires_reply = QCheckBox("회신·서명 필요")
+        self.chk_notice_requires_reply.setChecked(True)
         notice_top.addWidget(self.edit_notice_title, stretch=1)
+        notice_top.addWidget(self.combo_notice_category)
         notice_top.addWidget(self.edit_notice_due)
-        notice_top.addWidget(self.btn_load_notice_pdf)
-        notice_top.addWidget(self.btn_publish_mobile_notice)
-        c3_lay.addLayout(notice_top)
+        notice_top.addWidget(self.chk_notice_requires_reply)
+        c3_lay.addWidget(self._notice_top_widget)
 
-        self.lbl_notice_pdf_status = QLabel("선택된 PDF: 없음 (PDF를 선택하면 우측 AI 실행 패널이 열립니다)")
-        self.lbl_notice_pdf_status.setStyleSheet("color: #64748B; font-size: 11.5px;")
-        c3_lay.addWidget(self.lbl_notice_pdf_status)
+        # 3) 대상 학년/반(정수) · 첨부 URL · 후보 저장 / 바로 게시 버튼
+        self._notice_meta_widget = QWidget()
+        notice_meta_row = QHBoxLayout(self._notice_meta_widget)
+        notice_meta_row.setContentsMargins(0, 0, 0, 0)
+        notice_meta_row.setSpacing(8)
+        self.spin_notice_target_grade = QSpinBox()
+        self.spin_notice_target_grade.setRange(1, 6)
+        self.spin_notice_target_grade.setSuffix("학년")
+        self.spin_notice_target_grade.setMinimumWidth(84)
+        install_no_scroll_wheel_filter(self.spin_notice_target_grade)
+        self.spin_notice_target_class = QSpinBox()
+        self.spin_notice_target_class.setRange(0, 30)
+        self.spin_notice_target_class.setSuffix("반")
+        self.spin_notice_target_class.setSpecialValueText("전체 반")
+        self.spin_notice_target_class.setMinimumWidth(96)
+        install_no_scroll_wheel_filter(self.spin_notice_target_class)
+        init_meta = self._teacher_meta()
+        if init_meta.get("grade"):
+            self.spin_notice_target_grade.setValue(int(init_meta["grade"]))
+        if init_meta.get("class_no") is not None:
+            self.spin_notice_target_class.setValue(int(init_meta["class_no"]))
 
+        self.edit_notice_attachment_url = QLineEdit()
+        self.edit_notice_attachment_url.setMinimumWidth(180)
+        self.edit_notice_attachment_url.setPlaceholderText(
+            "원본 attachment_url (스토리지 URL이 없으면 빈칸 유지)"
+        )
+        self.btn_save_notice_candidate = QPushButton("모바일 후보로 저장")
+        apply_qss_role(self.btn_save_notice_candidate, role="secondary")
+        self.btn_save_notice_candidate.setToolTip(
+            "is_published=false로 저장하여 모바일 교사 화면에서 확인 후 게시할 수 있게 합니다."
+        )
+        self.btn_save_notice_candidate.clicked.connect(lambda: self._save_mobile_notice(is_published=False))
+        self.btn_publish_mobile_notice = QPushButton("바로 게시하기")
+        apply_qss_role(self.btn_publish_mobile_notice, role="primary")
+        self.btn_publish_mobile_notice.setToolTip(
+            "is_published=true로 저장하고 Notifications 컬렉션에 대상 학급 알림을 함께 등록합니다."
+        )
+        self.btn_publish_mobile_notice.clicked.connect(self._on_publish_mobile_notice)
+
+        lbl_target = QLabel("대상:")
+        lbl_target.setFixedWidth(36)
+        notice_meta_row.addWidget(lbl_target)
+        notice_meta_row.addWidget(self.spin_notice_target_grade)
+        notice_meta_row.addWidget(self.spin_notice_target_class)
+        notice_meta_row.addWidget(self.edit_notice_attachment_url, stretch=1)
+        notice_meta_row.addWidget(self.btn_save_notice_candidate)
+        notice_meta_row.addWidget(self.btn_publish_mobile_notice)
+        c3_lay.addWidget(self._notice_meta_widget)
+
+        # 4) 본문 요약
         self.txt_notice_content = QPlainTextEdit()
-        self.txt_notice_content.setPlaceholderText("가정통신문 본문 내용이 여기에 표시됩니다.")
-        self.txt_notice_content.setMinimumHeight(110)
+        self.txt_notice_content.setPlaceholderText("학생·학부모용 핵심 요약 본문 내용이 여기에 표시됩니다.")
+        self.txt_notice_content.setMinimumHeight(95)
         c3_lay.addWidget(self.txt_notice_content)
 
+        # 5) 회신 입력칸 (reply_schema) 편집 UI
+        schema_bar = QHBoxLayout()
+        schema_bar.setSpacing(6)
+        lbl_schema = QLabel("회신 입력칸 (reply_schema)")
+        lbl_schema.setStyleSheet("font-weight: 600; color: #334155;")
+        self.btn_toggle_reply_schema_fullscreen = QPushButton("전체화면 보기")
+        self.btn_toggle_reply_schema_fullscreen.setCheckable(True)
+        apply_qss_role(self.btn_toggle_reply_schema_fullscreen, role="secondary")
+        self.btn_toggle_reply_schema_fullscreen.setToolTip(
+            "다른 입력 영역을 잠시 접고 회신 입력칸 테이블을 넓게 펼쳐 편집합니다."
+        )
+        self.btn_toggle_reply_schema_fullscreen.toggled.connect(self._on_toggle_reply_schema_fullscreen)
+        self.btn_add_reply_field = QPushButton("+ 입력칸 추가")
+        apply_qss_role(self.btn_add_reply_field, role="secondary")
+        self.btn_add_reply_field.clicked.connect(self._on_add_reply_field)
+        self.btn_del_reply_field = QPushButton("- 선택 삭제")
+        apply_qss_role(self.btn_del_reply_field, role="secondary")
+        self.btn_del_reply_field.clicked.connect(self._on_del_reply_field)
+        schema_bar.addWidget(lbl_schema)
+        schema_bar.addStretch(1)
+        schema_bar.addWidget(self.btn_toggle_reply_schema_fullscreen)
+        schema_bar.addWidget(self.btn_add_reply_field)
+        schema_bar.addWidget(self.btn_del_reply_field)
+        c3_lay.addLayout(schema_bar)
+
+        self.table_reply_schema = QTableWidget(0, 5)
+        self.table_reply_schema.setHorizontalHeaderLabels(["키 (key)", "항목명 (label)", "유형 (type)", "선택지 (쉼표 구분)", "필수"])
+        self.table_reply_schema.verticalHeader().setDefaultSectionSize(40)
+        self.table_reply_schema.verticalHeader().setMinimumSectionSize(40)
+        self.table_reply_schema.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table_reply_schema.setColumnWidth(0, 115)
+        self.table_reply_schema.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table_reply_schema.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.table_reply_schema.setColumnWidth(2, 120)
+        self.table_reply_schema.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table_reply_schema.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.table_reply_schema.setColumnWidth(4, 56)
+        self.table_reply_schema.setMinimumHeight(140)
+        self.table_reply_schema.itemChanged.connect(self._sync_notice_fields_summary)
+        c3_lay.addWidget(self.table_reply_schema)
+
+        # 레거시 호환용 요약 필드 (reply_schema 변경 시 자동 동기화)
         self.edit_notice_fields = QLineEdit()
-        self.edit_notice_fields.setPlaceholderText("추출된 회신 입력 항목 (쉼표 구분, 예: 참가 동의 여부, 비상연락처)")
+        self.edit_notice_fields.setReadOnly(True)
+        self.edit_notice_fields.setVisible(False)
         c3_lay.addWidget(self.edit_notice_fields)
 
-        reply_bar = QHBoxLayout()
+        self._notice_reply_bar_widget = QWidget()
+        reply_bar = QHBoxLayout(self._notice_reply_bar_widget)
+        reply_bar.setContentsMargins(0, 0, 0, 0)
+        reply_bar.setSpacing(8)
         self.edit_active_notice_id = QLineEdit()
         self.edit_active_notice_id.setPlaceholderText("조회할 가정통신문 ID (배포 시 자동 입력)")
         self.btn_refresh_replies = QPushButton("제출 현황 조회")
@@ -2063,7 +2160,7 @@ class ClassroomToolsTab(QWidget):
         reply_bar.addWidget(self.edit_active_notice_id, stretch=1)
         reply_bar.addWidget(self.btn_refresh_replies)
         reply_bar.addWidget(self.btn_nudge_unsubmitted)
-        c3_lay.addLayout(reply_bar)
+        c3_lay.addWidget(self._notice_reply_bar_widget)
 
         self.table_notice_replies = QTableWidget(0, 5)
         self.table_notice_replies.setHorizontalHeaderLabels(["학번", "이름", "제출 상태", "회신/동의", "서명 URL"])
@@ -2351,6 +2448,10 @@ class ClassroomToolsTab(QWidget):
                 self.spin_tt_chg_grade.setValue(int(g))
             if hasattr(self, "spin_tt_chg_class") and c:
                 self.spin_tt_chg_class.setValue(int(c))
+            if hasattr(self, "spin_notice_target_grade") and g:
+                self.spin_notice_target_grade.setValue(int(g))
+            if hasattr(self, "spin_notice_target_class") and c is not None:
+                self.spin_notice_target_class.setValue(int(c))
 
     def _start_spinner_for_buttons(
         self,
@@ -2822,19 +2923,30 @@ class ClassroomToolsTab(QWidget):
     # =========================================================================
     def get_ai_context(self) -> Dict[str, Any]:
         files = [self._selected_notice_pdf_path] if self._selected_notice_pdf_path else []
+        prompt = NOTICE_OCR_JSON_PROMPT
+        if self._selected_notice_pdf_path and Path(self._selected_notice_pdf_path).suffix.lower() in (".hwp", ".hwpx"):
+            extracted = extract_notice_source_text(self._selected_notice_pdf_path)
+            if extracted:
+                prompt = f"{NOTICE_OCR_JSON_PROMPT}\n\n[문서 본문(HWP/HWPX 추출 텍스트)]\n{extracted}"
         return {
             "target_id": "notice_ocr",
             "kind": "ocr",
-            "task_label": "가정통신문 PDF 구조화 JSON 추출",
+            "task_label": "가정통신문(PDF/HWP/HWPX) 구조화 JSON 추출",
             "ocr_files": files,
             "attachment_paths": files,
-            "ocr_prompt": NOTICE_OCR_JSON_PROMPT,
+            "ocr_prompt": prompt,
         }
 
     def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
-        raw_source = payload.get("parsed_json")
+        if payload.get("pdf_path"):
+            self._selected_notice_pdf_path = str(payload.get("pdf_path") or "").strip()
+            if self._selected_notice_pdf_path:
+                self.lbl_notice_pdf_status.setText(
+                    f"선택된 파일: {Path(self._selected_notice_pdf_path).name}"
+                )
+        raw_source = payload.get("parsed_notice") or payload.get("parsed_json")
         if not isinstance(raw_source, dict):
             raw_source = payload.get("raw_response") or payload.get("formatted_text") or ""
         if not raw_source:
@@ -2849,31 +2961,230 @@ class ClassroomToolsTab(QWidget):
             )
             return
 
-        if parsed["title"]:
+        if parsed.get("title"):
             self.edit_notice_title.setText(parsed["title"])
-        if parsed["deadline"]:
-            self.edit_notice_due.setText(parsed["deadline"])
-        if parsed["body"]:
-            self.txt_notice_content.setPlainText(parsed["body"])
-        if parsed["reply_fields"]:
-            self.edit_notice_fields.setText(", ".join(parsed["reply_fields"]))
-        self.lbl_notice_pdf_status.setText("AI 구조화 JSON 반영 완료 — 내용 확인 후 [모바일 배포]를 클릭하세요.")
+        if parsed.get("category"):
+            self.combo_notice_category.setCurrentText(parsed["category"])
+        self.edit_notice_due.setText(parsed.get("due_date") or "")
+        if parsed.get("content"):
+            self.txt_notice_content.setPlainText(parsed["content"])
+        self.chk_notice_requires_reply.setChecked(bool(parsed.get("requires_reply")))
+        self._populate_reply_schema_table(parsed.get("reply_schema") or [])
+        if parsed.get("attachment_url"):
+            self.edit_notice_attachment_url.setText(str(parsed["attachment_url"]))
+        self.lbl_notice_pdf_status.setText(
+            "AI 구조화 JSON 반영 완료 — 검수 후 [모바일 후보로 저장] 또는 [바로 게시하기]를 클릭하세요."
+        )
+
+    def _populate_reply_schema_table(self, schema: List[Dict[str, Any]]) -> None:
+        normalized = normalize_reply_schema(schema)
+        self.table_reply_schema.blockSignals(True)
+        try:
+            self.table_reply_schema.setRowCount(0)
+            for item in normalized:
+                self._append_reply_schema_row(item)
+        finally:
+            self.table_reply_schema.blockSignals(False)
+        self._sync_notice_fields_summary()
+
+    def _append_reply_schema_row(self, item: Dict[str, Any]) -> None:
+        row = self.table_reply_schema.rowCount()
+        self.table_reply_schema.insertRow(row)
+
+        key_item = QTableWidgetItem(str(item.get("key") or f"field_{row + 1}").strip())
+        label_item = QTableWidgetItem(str(item.get("label") or "").strip())
+
+        type_container = QWidget()
+        type_lay = QHBoxLayout(type_container)
+        type_lay.setContentsMargins(4, 3, 4, 3)
+        type_lay.setSpacing(0)
+        type_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        type_combo = QComboBox(type_container)
+        type_combo.addItems(list(VALID_REPLY_FIELD_TYPES))
+        type_combo.setFixedHeight(30)
+        type_combo.setStyleSheet(
+            "QComboBox {"
+            " padding: 0px 24px 0px 8px;"
+            " min-height: 0px;"
+            " font-size: 12px;"
+            "}"
+            "QComboBox::drop-down {"
+            " subcontrol-origin: padding;"
+            " subcontrol-position: center right;"
+            " width: 20px;"
+            " border: none;"
+            "}"
+            "QComboBox::down-arrow {"
+            " subcontrol-position: center;"
+            "}"
+        )
+        ftype = str(item.get("type") or "text").strip().lower()
+        if ftype in VALID_REPLY_FIELD_TYPES:
+            type_combo.setCurrentText(ftype)
+        install_no_scroll_wheel_filter(type_combo)
+        type_lay.addWidget(type_combo)
+
+        opts = item.get("options") or []
+        opts_text = ", ".join(str(o).strip() for o in opts if str(o).strip())
+        opts_item = QTableWidgetItem(opts_text)
+
+        req_item = QTableWidgetItem("")
+        req_item.setFlags(
+            Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        )
+        req_item.setCheckState(
+            Qt.CheckState.Checked if item.get("required", True) else Qt.CheckState.Unchecked
+        )
+
+        self.table_reply_schema.setRowHeight(row, 40)
+        self.table_reply_schema.setItem(row, 0, key_item)
+        self.table_reply_schema.setItem(row, 1, label_item)
+        self.table_reply_schema.setCellWidget(row, 2, type_container)
+        self.table_reply_schema.setItem(row, 3, opts_item)
+        self.table_reply_schema.setItem(row, 4, req_item)
+
+    def _collect_reply_schema_from_table(self) -> List[Dict[str, Any]]:
+        raw_items: List[Dict[str, Any]] = []
+        for r in range(self.table_reply_schema.rowCount()):
+            key_item = self.table_reply_schema.item(r, 0)
+            label_item = self.table_reply_schema.item(r, 1)
+            type_widget = self.table_reply_schema.cellWidget(r, 2)
+            opts_item = self.table_reply_schema.item(r, 3)
+            req_item = self.table_reply_schema.item(r, 4)
+
+            key = key_item.text().strip() if key_item else f"field_{r + 1}"
+            label = label_item.text().strip() if label_item else ""
+            combo = (
+                type_widget
+                if isinstance(type_widget, QComboBox)
+                else (type_widget.findChild(QComboBox) if type_widget is not None else None)
+            )
+            ftype = combo.currentText().strip() if isinstance(combo, QComboBox) else "text"
+            opts_raw = opts_item.text().strip() if opts_item else ""
+            options = [o.strip() for o in re.split(r"[,/|]", opts_raw) if o.strip()]
+            required = req_item.checkState() == Qt.CheckState.Checked if req_item else True
+            if not label and not key:
+                continue
+            raw_items.append(
+                {
+                    "key": key or f"field_{r + 1}",
+                    "label": label or key,
+                    "type": ftype,
+                    "options": options,
+                    "required": required,
+                }
+            )
+        return normalize_reply_schema(raw_items)
+
+    def _sync_notice_fields_summary(self, *_args: Any) -> None:
+        schema = self._collect_reply_schema_from_table()
+        labels = [str(item.get("label") or item.get("key") or "").strip() for item in schema]
+        self.edit_notice_fields.setText(", ".join(x for x in labels if x))
+
+    def _on_add_reply_field(self) -> None:
+        idx = self.table_reply_schema.rowCount() + 1
+        self.table_reply_schema.blockSignals(True)
+        try:
+            self._append_reply_schema_row(
+                {
+                    "key": f"field_{idx}",
+                    "label": f"입력 항목 {idx}",
+                    "type": "text",
+                    "options": [],
+                    "required": True,
+                }
+            )
+        finally:
+            self.table_reply_schema.blockSignals(False)
+        self._sync_notice_fields_summary()
+
+    def _on_toggle_reply_schema_fullscreen(self, checked: bool) -> None:
+        is_full = bool(checked)
+        for w in (
+            getattr(self, "notice_pdf_dropzone", None),
+            getattr(self, "_notice_top_widget", None),
+            getattr(self, "_notice_meta_widget", None),
+            getattr(self, "txt_notice_content", None),
+            getattr(self, "_notice_reply_bar_widget", None),
+            getattr(self, "table_notice_replies", None),
+        ):
+            if w is not None:
+                w.setVisible(not is_full)
+        if is_full:
+            self.btn_toggle_reply_schema_fullscreen.setText("원래대로")
+            self.table_reply_schema.setMinimumHeight(460)
+        else:
+            self.btn_toggle_reply_schema_fullscreen.setText("전체화면 보기")
+            self.table_reply_schema.setMinimumHeight(140)
+
+    def _on_del_reply_field(self) -> None:
+        rows = sorted({idx.row() for idx in self.table_reply_schema.selectedIndexes()}, reverse=True)
+        if not rows and self.table_reply_schema.rowCount() > 0:
+            rows = [self.table_reply_schema.rowCount() - 1]
+        for r in rows:
+            self.table_reply_schema.removeRow(r)
+        self._sync_notice_fields_summary()
+
+    def _on_notice_pdf_dropped(self, paths: List[str]) -> None:
+        if not paths:
+            return
+        self._set_notice_pdf_file(paths[0], auto_extract=True)
 
     def _on_load_notice_pdf(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "가정통신문 PDF 선택",
+            "가정통신문 문서 선택",
             "",
-            "PDF & Image Files (*.pdf *.png *.jpg *.jpeg *.webp)",
+            "가정통신문 파일 (*.pdf *.hwp *.hwpx *.png *.jpg *.jpeg *.webp)",
         )
         if not file_path:
             return
+        self._set_notice_pdf_file(file_path, auto_extract=True)
+
+    def _on_reextract_notice_pdf(self) -> None:
+        if not self._selected_notice_pdf_path:
+            QMessageBox.information(
+                self, "파일 선택 안내", "먼저 가정통신문 문서(PDF/HWP/HWPX/이미지)를 선택하거나 드롭해 주세요."
+            )
+            return
+        self._set_notice_pdf_file(self._selected_notice_pdf_path, auto_extract=True)
+
+    def _set_notice_pdf_file(self, file_path: str, *, auto_extract: bool = True) -> None:
         self._selected_notice_pdf_path = str(file_path).strip()
-        self.lbl_notice_pdf_status.setText(
-            f"선택된 파일: {Path(file_path).name} → 우측 AI 실행 패널에서 API / 수동 복붙 / Playwright로 추출하세요."
-        )
+        self._selected_notice_attachment_file_id = ""
+        fname = Path(self._selected_notice_pdf_path).name
         self.ai_context_changed.emit()
         self.ai_target_requested.emit("notice_ocr")
+
+        client = MultiLlmClient()
+        if not auto_extract or client.is_manual_mode_active():
+            self.lbl_notice_pdf_status.setText(
+                f"선택된 파일: {fname} → 우측 AI 실행 패널에서 API / 수동 복붙 / Playwright로 추출하세요."
+            )
+            return
+
+        self.lbl_notice_pdf_status.setText(f"AI OCR 분석 중: {fname} ...")
+        pdf_snapshot = self._selected_notice_pdf_path
+
+        def _work() -> Dict[str, Any]:
+            return extract_notice_from_pdf(pdf_snapshot, llm_client=client)
+
+        def _on_result(parsed: Any) -> None:
+            if isinstance(parsed, dict):
+                self.apply_ai_dock_result({"target_id": "notice_ocr", "mode": "api", "parsed_notice": parsed})
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_reextract_notice_pdf", None),
+            loading_text="OCR 추출 중...",
+            task_name="가정통신문 PDF AI OCR 추출",
+            task_key="classroom_extract_notice_pdf",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: (
+                self.lbl_notice_pdf_status.setText(f"AI OCR 오류 ({fname}): {str(err or '').splitlines()[0]}"),
+                QMessageBox.warning(self, "가정통신문 OCR 오류", str(err or "").splitlines()[0]),
+            ),
+        )
 
     def _on_load_timetable_excel(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
@@ -2990,45 +3301,121 @@ class ClassroomToolsTab(QWidget):
             on_error=lambda err: QMessageBox.warning(self, "저장 실패", str(err or "").splitlines()[0]),
         )
 
+    def _build_notice_payload(self, *, is_published: bool) -> Dict[str, Any]:
+        meta = self._teacher_meta()
+        reply_schema = self._collect_reply_schema_from_table()
+        reply_fields = [
+            str(item.get("label") or item.get("key") or "").strip()
+            for item in reply_schema
+            if str(item.get("label") or item.get("key") or "").strip()
+        ]
+        target_grade = int(self.spin_notice_target_grade.value())
+        target_class = int(self.spin_notice_target_class.value())
+        return {
+            "title": self.edit_notice_title.text().strip(),
+            "category": self.combo_notice_category.currentText().strip() or "가정통신문",
+            "content": self.txt_notice_content.toPlainText().strip(),
+            "due_date": self.edit_notice_due.text().strip(),
+            "requires_reply": bool(self.chk_notice_requires_reply.isChecked()),
+            "reply_schema": reply_schema,
+            "reply_schema_json": json.dumps(reply_schema, ensure_ascii=False),
+            "reply_fields": reply_fields,
+            "attachment_url": self.edit_notice_attachment_url.text().strip(),
+            "attachment_file_id": getattr(self, "_selected_notice_attachment_file_id", ""),
+            "target_grade": target_grade,
+            "target_class": target_class,
+            "grade": target_grade,
+            "class_no": target_class,
+            "school_code": meta["school_code"],
+            "school_name": meta["school_name"],
+            "author_name": meta["teacher_name"],
+            "is_published": bool(is_published),
+        }
+
     def _on_publish_mobile_notice(self) -> None:
+        self._save_mobile_notice(is_published=True)
+
+    def _save_mobile_notice(self, *, is_published: bool) -> None:
         title = self.edit_notice_title.text().strip()
         if not title:
             QMessageBox.warning(self, "입력 확인", "가정통신문 제목을 입력해 주세요.")
             return
-        meta = self._teacher_meta()
-        fields = [f.strip() for f in self.edit_notice_fields.text().split(",") if f.strip()]
-        payload = {
-            "title": title,
-            "content": self.txt_notice_content.toPlainText().strip(),
-            "due_date": self.edit_notice_due.text().strip(),
-            "reply_fields": fields,
-            "target_grade": meta["grade"],
-            "target_class": meta["class_no"],
-            "school_code": meta["school_code"],
-            "school_name": meta["school_name"],
-            "author_name": meta["teacher_name"],
-        }
+        payload = self._build_notice_payload(is_published=is_published)
+        local_src_path = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
+        target_btn = (
+            getattr(self, "btn_publish_mobile_notice", None)
+            if is_published
+            else getattr(self, "btn_save_notice_candidate", None)
+        )
 
-        def _work() -> Tuple[bool, str]:
+        def _work() -> Tuple[bool, str, str, str]:
             svc = FirestoreSyncService(db=self.db, config=self.config)
-            return svc.publish_mobile_notice(payload)
+            uploaded_url = str(payload.get("attachment_url") or "").strip()
+            uploaded_id = str(payload.get("attachment_file_id") or "").strip()
+            if not uploaded_url and local_src_path and Path(local_src_path).is_file():
+                up_res = svc.upload_notice_attachment(local_src_path)
+                if up_res.get("ok") and up_res.get("attachment_url"):
+                    uploaded_url = str(up_res["attachment_url"]).strip()
+                    uploaded_id = str(up_res.get("attachment_file_id") or "").strip()
+                    payload["attachment_url"] = uploaded_url
+                    payload["attachment_file_id"] = uploaded_id
+
+            ok, rid = svc.publish_mobile_notice(payload)
+            if ok and is_published:
+                due_txt = f" (마감: {payload['due_date']})" if payload.get("due_date") else ""
+                svc.send_class_notification(
+                    title=f"[{payload['category']}] {title}",
+                    message=(payload.get("content") or title)[:120] + due_txt,
+                    target_role="all",
+                    grade=payload["target_grade"],
+                    class_no=payload["target_class"],
+                    school_code=payload["school_code"],
+                    school_name=payload["school_name"],
+                    sender=payload["author_name"],
+                    channel="notice_publish",
+                    notice_id=rid,
+                )
+            return ok, rid, uploaded_url, uploaded_id
 
         def _on_result(res: Any) -> None:
-            ok, rid = res if isinstance(res, tuple) and len(res) >= 2 else (False, "")
+            if isinstance(res, tuple) and len(res) >= 4:
+                ok, rid, uploaded_url, uploaded_id = res[:4]
+            elif isinstance(res, tuple) and len(res) >= 2:
+                ok, rid, uploaded_url, uploaded_id = res[0], res[1], "", ""
+            else:
+                ok, rid, uploaded_url, uploaded_id = False, "", "", ""
+
+            if uploaded_url:
+                self.edit_notice_attachment_url.setText(uploaded_url)
+                self._selected_notice_attachment_file_id = uploaded_id
+
             if ok:
                 self.edit_active_notice_id.setText(str(rid or ""))
-                QMessageBox.information(self, "배포 완료", f"모바일 가정통신문이 배포되었습니다.\n(ID: {rid})")
+                if is_published:
+                    self.lbl_notice_pdf_status.setText(f"바로 게시 완료 (ID: {rid}) — Notifications 알림 등록됨")
+                    QMessageBox.information(
+                        self,
+                        "게시 완료",
+                        f"모바일 가정통신문이 즉시 게시되고 대상 학급 알림이 등록되었습니다.\n(ID: {rid})",
+                    )
+                else:
+                    self.lbl_notice_pdf_status.setText(f"모바일 후보 저장 완료 (ID: {rid}, is_published=false)")
+                    QMessageBox.information(
+                        self,
+                        "후보 저장 완료",
+                        f"가정통신문이 모바일 후보(is_published=false)로 저장되었습니다.\n(ID: {rid})",
+                    )
             else:
-                QMessageBox.warning(self, "배포 실패", "모바일 가정통신문 배포에 실패했습니다.")
+                QMessageBox.warning(self, "저장 실패", "가정통신문 저장에 실패했습니다.")
 
         self._run_async_button_task(
-            button=getattr(self, "btn_publish_mobile_notice", None),
-            loading_text="배포 중...",
-            task_name="모바일 가정통신문 배포",
-            task_key="classroom_publish_mobile_notice",
+            button=target_btn,
+            loading_text="게시 중..." if is_published else "저장 중...",
+            task_name="가정통신문 바로 게시" if is_published else "가정통신문 후보 저장",
+            task_key="classroom_publish_mobile_notice" if is_published else "classroom_save_notice_candidate",
             work_fn=_work,
             on_result=_on_result,
-            on_error=lambda err: QMessageBox.warning(self, "배포 오류", str(err or "").splitlines()[0]),
+            on_error=lambda err: QMessageBox.warning(self, "저장 오류", str(err or "").splitlines()[0]),
         )
 
     def _on_refresh_notice_replies(self) -> None:

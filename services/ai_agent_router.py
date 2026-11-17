@@ -129,10 +129,19 @@ TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {
     "process_hwpx_or_ocr": {
         "kind": "action",
         "label": "HWPX/OCR 작업 전환",
-        "description": "HWPX AI 에이전트 또는 AI OCR 타겟으로 전환해 문서를 처리합니다.",
+        "description": "HWPX AI 에이전트, AI OCR 또는 가정통신문 PDF OCR 타겟으로 전환해 문서를 처리합니다.",
         "args": {
-            "target_id": "'hwpx_agent' 또는 'ocr'",
+            "target_id": "'hwpx_agent', 'ocr' 또는 'notice_ocr'",
             "instruction": "처리 지시사항 (선택)",
+        },
+    },
+    "parse_notice_pdf": {
+        "kind": "action",
+        "label": "가정통신문 문서(PDF/HWP/HWPX) AI 파싱",
+        "description": "가정통신문 PDF/HWP/HWPX/이미지를 AI OCR·텍스트 추출로 분석해 제목·분류·본문·마감일·회신 입력칸(reply_schema) JSON을 추출하고 가정통신문 등록 폼에 반영합니다.",
+        "args": {
+            "pdf_path": "가정통신문 PDF, HWP, HWPX 또는 이미지 파일 경로 (필수)",
+            "instruction": "추가 추출 지시사항 (선택)",
         },
     },
     "send_external_notification": {
@@ -626,6 +635,55 @@ def execute_action_tool(
             "tool_name": tool_name,
             "summary": f"대상 타겟 전환 준비 완료: {tid}",
             "data": {"target_id": tid, "instruction": instruction},
+        }
+
+    if tool_name == "parse_notice_pdf":
+        from services.llm_client import MultiLlmClient
+        from services.notice_parser_service import extract_notice_from_pdf
+
+        pdf_raw = str(args.get("pdf_path") or args.get("file_path") or "").strip()
+        instruction = str(args.get("instruction", "") or "").strip()
+        if not pdf_raw:
+            return {
+                "ok": False,
+                "tool_name": tool_name,
+                "summary": "가정통신문 PDF 경로(pdf_path)가 필요합니다.",
+                "data": {},
+            }
+        p = Path(pdf_raw)
+        if not p.exists() or not p.is_file():
+            return {
+                "ok": False,
+                "tool_name": tool_name,
+                "summary": f"파일을 찾을 수 없습니다: {pdf_raw}",
+                "data": {},
+            }
+        client = MultiLlmClient()
+        if client.is_manual_mode_active():
+            return {
+                "ok": True,
+                "tool_name": tool_name,
+                "summary": f"수동/웹 LLM 모드입니다. 가정통신문 OCR 패널로 전환했습니다: {p.name}",
+                "data": {
+                    "target_id": "notice_ocr",
+                    "pdf_path": str(p),
+                    "manual_required": True,
+                },
+            }
+        parsed = extract_notice_from_pdf(p, instruction=instruction, llm_client=client)
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "summary": (
+                f"가정통신문 AI OCR 파싱 완료: {parsed.get('title') or p.name} "
+                f"(입력칸 {len(parsed.get('reply_schema') or [])}개)"
+            ),
+            "data": {
+                "target_id": "notice_ocr",
+                "pdf_path": str(p),
+                "parsed_notice": parsed,
+                "parsed_json": parsed,
+            },
         }
 
     if tool_name == "send_external_notification":

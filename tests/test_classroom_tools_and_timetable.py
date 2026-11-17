@@ -647,6 +647,246 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         self.assertIn(503, adapter.max_retries.status_forcelist)
         self.assertIn(504, adapter.max_retries.status_forcelist)
 
+    def test_notice_pdf_schema_edit_candidate_and_publish(self) -> None:
+        import json
+
+        raw_v2 = (
+            "```json\n"
+            "{\n"
+            '  "title": "수련활동 참가 수요조사",\n'
+            '  "category": "수요조사",\n'
+            '  "content": "1학년 수련활동 참가 희망 여부를 회신해 주세요.",\n'
+            '  "due_date": "2026-11-30",\n'
+            '  "requires_reply": true,\n'
+            '  "reply_schema": [\n'
+            '    {"key": "consent", "label": "참가 희망 여부", "type": "radio", "options": ["참가", "불참"], "required": true},\n'
+            '    {"key": "allergy", "label": "식품 알레르기", "type": "textarea", "options": [], "required": false}\n'
+            "  ]\n"
+            "}\n"
+            "```"
+        )
+        parsed = parse_notice_ai_json(raw_v2)
+        self.assertEqual(parsed["category"], "수요조사")
+        self.assertEqual(parsed["due_date"], "2026-11-30")
+        self.assertTrue(parsed["requires_reply"])
+        self.assertEqual(len(parsed["reply_schema"]), 2)
+        self.assertEqual(parsed["reply_schema"][0]["type"], "radio")
+
+        tab = ClassroomToolsTab(task_runner=self.task_runner)
+        tab.login_teacher("유우석", "pw1234", sync_service=self.sync_svc)
+        self.assertEqual(tab.spin_notice_target_grade.value(), 2)
+        self.assertEqual(tab.spin_notice_target_class.value(), 4)
+
+        tab.apply_ai_dock_result({"target_id": "notice_ocr", "mode": "api", "raw_response": raw_v2})
+        self.assertEqual(tab.edit_notice_title.text(), "수련활동 참가 수요조사")
+        self.assertEqual(tab.combo_notice_category.currentText(), "수요조사")
+        self.assertEqual(tab.edit_notice_due.text(), "2026-11-30")
+        self.assertTrue(tab.chk_notice_requires_reply.isChecked())
+        self.assertEqual(tab.table_reply_schema.rowCount(), 2)
+
+        # 입력칸 추가 및 삭제 검증
+        tab._on_add_reply_field()
+        self.assertEqual(tab.table_reply_schema.rowCount(), 3)
+        tab.table_reply_schema.selectRow(2)
+        tab._on_del_reply_field()
+        self.assertEqual(tab.table_reply_schema.rowCount(), 2)
+
+        # 1) 모바일 후보로 저장 (is_published=False)
+        cand_payload = tab._build_notice_payload(is_published=False)
+        cand_payload["remote_id"] = "notice_cand_1"
+        ok, rid = self.sync_svc.publish_mobile_notice(cand_payload)
+        self.assertTrue(ok)
+        self.assertEqual(rid, "notice_cand_1")
+        saved_cand = self.fake_fs.cols["가정통신문_목록"]["notice_cand_1"]
+        self.assertFalse(saved_cand["is_published"])
+        self.assertIsInstance(saved_cand["target_grade"], int)
+        self.assertIsInstance(saved_cand["target_class"], int)
+        self.assertIsInstance(saved_cand["grade"], int)
+        self.assertIsInstance(saved_cand["class_no"], int)
+        self.assertEqual(saved_cand["target_grade"], 2)
+        self.assertEqual(saved_cand["target_class"], 4)
+        self.assertIsInstance(saved_cand["reply_schema_json"], str)
+        self.assertEqual(len(json.loads(saved_cand["reply_schema_json"])), 2)
+        self.assertEqual(saved_cand["attachment_url"], "")
+
+        # 2) 바로 게시하기 (is_published=True + Notifications 등록)
+        pub_payload = tab._build_notice_payload(is_published=True)
+        pub_payload["remote_id"] = "notice_pub_1"
+        ok2, rid2 = self.sync_svc.publish_mobile_notice(pub_payload)
+        self.assertTrue(ok2)
+        self.sync_svc.send_class_notification(
+            title=f"[{pub_payload['category']}] {pub_payload['title']}",
+            message=pub_payload["content"],
+            target_role="all",
+            grade=pub_payload["target_grade"],
+            class_no=pub_payload["target_class"],
+            school_code=pub_payload["school_code"],
+            school_name=pub_payload["school_name"],
+            sender=pub_payload["author_name"],
+            channel="notice_publish",
+            notice_id=rid2,
+        )
+        saved_pub = self.fake_fs.cols["가정통신문_목록"]["notice_pub_1"]
+        self.assertTrue(saved_pub["is_published"])
+        notifs = list(self.fake_fs.cols["Notifications"].values())
+        self.assertEqual(len(notifs), 1)
+        self.assertEqual(notifs[0]["notice_id"], "notice_pub_1")
+        self.assertEqual(notifs[0]["grade"], 2)
+        self.assertEqual(notifs[0]["class_no"], 4)
+        self.assertEqual(notifs[0]["target_grade"], 2)
+        self.assertEqual(notifs[0]["target_class"], 4)
+
+    def test_agent_router_parse_notice_pdf(self) -> None:
+        from unittest.mock import patch
+        from services.ai_agent_router import TOOL_REGISTRY, execute_action_tool
+
+        self.assertIn("parse_notice_pdf", TOOL_REGISTRY)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dummy_pdf = Path(tmpdir) / "notice.pdf"
+            dummy_pdf.write_bytes(b"%PDF-1.4 dummy")
+
+            with patch("services.llm_client.MultiLlmClient.is_manual_mode_active", return_value=True):
+                res_manual = execute_action_tool("parse_notice_pdf", {"pdf_path": str(dummy_pdf)})
+                self.assertTrue(res_manual["ok"])
+                self.assertEqual(res_manual["data"]["target_id"], "notice_ocr")
+                self.assertTrue(res_manual["data"]["manual_required"])
+
+            mock_parsed = {
+                "title": "가정통신문 테스트",
+                "category": "가정통신문",
+                "content": "안내 본문",
+                "due_date": "2026-12-01",
+                "requires_reply": True,
+                "reply_schema": [{"key": "consent", "label": "동의", "type": "radio", "options": ["동의", "미동의"], "required": True}],
+            }
+            with (
+                patch("services.llm_client.MultiLlmClient.is_manual_mode_active", return_value=False),
+                patch("services.notice_parser_service.extract_notice_from_pdf", return_value=mock_parsed),
+            ):
+                res_api = execute_action_tool("parse_notice_pdf", {"pdf_path": str(dummy_pdf)})
+                self.assertTrue(res_api["ok"])
+                self.assertEqual(res_api["data"]["parsed_notice"]["title"], "가정통신문 테스트")
+
+    def test_notice_hwp_hwpx_support_and_reply_schema_fullscreen_ui(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from services.ai_agent_router import execute_action_tool
+        from services.hwpx_agent_service import (
+            apply_hwpx_operations,
+            create_minimal_hwpx_document,
+        )
+        from services.notice_parser_service import extract_notice_from_pdf, extract_notice_source_text
+
+        tab = ClassroomToolsTab(task_runner=self.task_runner)
+        tab.login_teacher("유우석", "pw1234", sync_service=self.sync_svc)
+
+        # 1) 드롭존 허용 확장자에 .hwp, .hwpx 포함 검증
+        drop_filter = getattr(tab.notice_pdf_dropzone, "_eduflow_file_drop_filter", None)
+        self.assertIsNotNone(drop_filter)
+        self.assertIn(".hwp", drop_filter.allowed_exts)
+        self.assertIn(".hwpx", drop_filter.allowed_exts)
+        self.assertIn(".pdf", drop_filter.allowed_exts)
+
+        # 2) reply_schema 테이블 정렬(행 높이 40px, 유형 열 >= 110px) 및 전체화면 토글 검증
+        self.assertEqual(tab.table_reply_schema.verticalHeader().defaultSectionSize(), 40)
+        self.assertGreaterEqual(tab.table_reply_schema.columnWidth(2), 110)
+        tab._on_add_reply_field()
+        self.assertEqual(tab.table_reply_schema.rowHeight(0), 40)
+
+        tab.show()
+        self.assertFalse(tab.notice_pdf_dropzone.isHidden())
+        self.assertFalse(tab.txt_notice_content.isHidden())
+        tab.btn_toggle_reply_schema_fullscreen.setChecked(True)
+        self.assertEqual(tab.btn_toggle_reply_schema_fullscreen.text(), "원래대로")
+        self.assertTrue(tab.notice_pdf_dropzone.isHidden())
+        self.assertTrue(tab.txt_notice_content.isHidden())
+        self.assertTrue(tab.table_notice_replies.isHidden())
+        self.assertGreaterEqual(tab.table_reply_schema.minimumHeight(), 400)
+
+        tab.btn_toggle_reply_schema_fullscreen.setChecked(False)
+        self.assertEqual(tab.btn_toggle_reply_schema_fullscreen.text(), "전체화면 보기")
+        self.assertFalse(tab.notice_pdf_dropzone.isHidden())
+        self.assertFalse(tab.txt_notice_content.isHidden())
+        self.assertEqual(tab.table_reply_schema.minimumHeight(), 140)
+
+        # 3) 실제 .hwpx 문서 생성 후 기존 HWPX 파서로 텍스트 추출 및 구조화 JSON 파싱 검증
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hwpx_path = Path(tmpdir) / "notice_test.hwpx"
+            doc = create_minimal_hwpx_document(title="가정통신문", empty=True)
+            apply_hwpx_operations(
+                doc,
+                [
+                    {"op": "append_paragraph", "text": "2026학년도 2학기 현장체험학습 참가 안내"},
+                    {"op": "append_table", "headers": ["구분", "내용"], "rows": [["마감일", "2026-12-05"]]},
+                ],
+            )
+            doc.save(hwpx_path)
+
+            extracted_text = extract_notice_source_text(hwpx_path)
+            self.assertIn("현장체험학습", extracted_text)
+            self.assertIn("2026-12-05", extracted_text)
+
+            # 4) Google Drive 업로드 연계(GAS URL 모킹) 후 attachment_url / attachment_file_id 저장 검증
+            fake_resp = MagicMock()
+            fake_resp.ok = True
+            fake_resp.json.return_value = {
+                "ok": True,
+                "file_id": "drive_file_123",
+                "attachment_url": "https://drive.google.com/file/d/drive_file_123/view",
+            }
+            orig_gas = self.cfg.get("api_and_integrations", "google_apps_script_url", "")
+            try:
+                self.cfg._config.setdefault("api_and_integrations", {})["google_apps_script_url"] = (
+                    "https://script.google.com/macros/s/fake/exec"
+                )
+                svc_with_cfg = FirestoreSyncService(firestore_client=self.fake_fs, config=self.cfg)
+                with patch.object(svc_with_cfg, "_get_http_session") as mock_sess:
+                    mock_sess.return_value.post.return_value = fake_resp
+                    up = svc_with_cfg.upload_notice_attachment(str(hwpx_path))
+                self.assertTrue(up["ok"])
+                self.assertEqual(up["attachment_file_id"], "drive_file_123")
+                self.assertEqual(up["attachment_url"], "https://drive.google.com/file/d/drive_file_123/view")
+
+                tab.edit_notice_title.setText("드라이브 연동 가정통신문")
+                p_drive = tab._build_notice_payload(is_published=False)
+                p_drive["remote_id"] = "notice_drive_1"
+                p_drive["attachment_url"] = up["attachment_url"]
+                p_drive["attachment_file_id"] = up["attachment_file_id"]
+                ok_d, _ = svc_with_cfg.publish_mobile_notice(p_drive)
+                self.assertTrue(ok_d)
+                saved_d = self.fake_fs.cols["가정통신문_목록"]["notice_drive_1"]
+                self.assertEqual(saved_d["attachment_url"], "https://drive.google.com/file/d/drive_file_123/view")
+                self.assertEqual(saved_d["attachment_file_id"], "drive_file_123")
+            finally:
+                self.cfg._config.setdefault("api_and_integrations", {})["google_apps_script_url"] = orig_gas
+
+            # get_ai_context()가 수동/Playwright용 프롬프트에도 HWPX 추출 텍스트를 포함하는지 검증
+            tab._selected_notice_pdf_path = str(hwpx_path)
+            ctx = tab.get_ai_context()
+            self.assertIn("현장체험학습", ctx["ocr_prompt"])
+
+            fake_llm = MagicMock()
+            fake_llm.provider = "gemini"
+            fake_llm.generate.return_value = (
+                '{"title": "2학기 현장체험학습 안내", "category": "체험학습", '
+                '"content": "현장체험학습 참가 안내", "due_date": "2026-12-05", '
+                '"requires_reply": true, "reply_schema": ['
+                '{"key": "consent", "label": "참가 동의", "type": "radio", "options": ["동의", "미동의"], "required": true}]}'
+            )
+            parsed = extract_notice_from_pdf(hwpx_path, llm_client=fake_llm)
+            self.assertEqual(parsed["title"], "2학기 현장체험학습 안내")
+            self.assertEqual(parsed["category"], "체험학습")
+            self.assertIn("현장체험학습", fake_llm.generate.call_args.kwargs["prompt"])
+
+            # .hwp 확장자에 대한 범용 에이전트(parse_notice_pdf) 수동 모드 호환 검증
+            hwp_path = Path(tmpdir) / "notice_legacy.hwp"
+            hwp_path.write_bytes(b"dummy hwp")
+            with patch("services.llm_client.MultiLlmClient.is_manual_mode_active", return_value=True):
+                res_hwp = execute_action_tool("parse_notice_pdf", {"pdf_path": str(hwp_path)})
+                self.assertTrue(res_hwp["ok"])
+                self.assertEqual(res_hwp["data"]["target_id"], "notice_ocr")
+                self.assertEqual(res_hwp["data"]["pdf_path"], str(hwp_path))
+
 
 if __name__ == "__main__":
     unittest.main()

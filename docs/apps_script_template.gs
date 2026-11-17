@@ -1056,17 +1056,18 @@ function _addBusinessDays(baseDateStr, businessDays, tz) {
 }
 
 /**
- * Base64 PNG 전자서명을 Google Drive 폴더에 저장하고 URL 반환
+ * Base64 파일을 Google Drive 폴더에 저장하고 URL 및 file_id 반환
  */
-function _saveSignatureToDrive(base64Data, fileName, folderName) {
+function _saveFileToDrive(base64Data, fileName, mimeType, folderName) {
   var raw = (base64Data || '').toString().trim();
   if (!raw) {
     return null;
   }
-  var clean = raw.replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+  var clean = raw.replace(/^data:[^;]+;base64,/, '');
   var bytes = Utilities.base64Decode(clean);
-  var safeName = (fileName || ('signature_' + new Date().getTime() + '.png')).toString();
-  var blob = Utilities.newBlob(bytes, 'image/png', safeName);
+  var safeName = (fileName || ('file_' + new Date().getTime())).toString();
+  var safeMime = (mimeType || 'application/octet-stream').toString();
+  var blob = Utilities.newBlob(bytes, safeMime, safeName);
 
   var targetFolderName = folderName || SIGNATURE_DRIVE_FOLDER;
   var folders = DriveApp.getFoldersByName(targetFolderName);
@@ -1084,6 +1085,14 @@ function _saveSignatureToDrive(base64Data, fileName, folderName) {
     url: file.getUrl(),
     download_url: 'https://drive.google.com/uc?export=view&id=' + fileId
   };
+}
+
+/**
+ * Base64 PNG 전자서명을 Google Drive 폴더에 저장하고 URL 반환
+ */
+function _saveSignatureToDrive(base64Data, fileName, folderName) {
+  var safeName = (fileName || ('signature_' + new Date().getTime() + '.png')).toString();
+  return _saveFileToDrive(base64Data, safeName, 'image/png', folderName || SIGNATURE_DRIVE_FOLDER);
 }
 
 /**
@@ -1831,6 +1840,26 @@ function doPost(e) {
     }
 
     // ── 5. 가정통신문 & 전자서명 Google Drive 업로드 ─────────────────────────
+    if (action === 'upload_notice_file') {
+      var uData = body.data || body;
+      var uBase64 = (uData.file_base64 || '').toString();
+      var uName = (uData.file_name || ('notice_' + new Date().getTime() + '.pdf')).toString();
+      var uMime = (uData.mime_type || 'application/pdf').toString();
+      var uFolder = (uData.folder_name || 'EduFlow_Notices').toString();
+      var uInfo = _saveFileToDrive(uBase64, uName, uMime, uFolder);
+      if (!uInfo) {
+        return _jsonResponse({ ok: false, error: 'file_base64 is required' });
+      }
+      return _jsonResponse({
+        ok: true,
+        file_id: uInfo.file_id,
+        attachment_file_id: uInfo.file_id,
+        attachment_url: uInfo.url,
+        url: uInfo.url,
+        download_url: uInfo.download_url
+      });
+    }
+
     if (action === 'upsert_notice') {
       var noticeId = _upsertRowByRemoteId(ss.getSheetByName('가정통신문_목록'), SHEET_SCHEMAS['가정통신문_목록'], body.data || body, tz);
       return _jsonResponse({ ok: true, remote_id: noticeId });

@@ -4120,6 +4120,10 @@ class AiExecutionDock(QFrame):
                 tgt = str((res.get("data") or {}).get("target_id", "") or "").strip()
                 if tgt:
                     self.set_target(tgt, force=True)
+            elif tool_name == "parse_notice_pdf" and res.get("ok"):
+                data = res.get("data") or {}
+                self._dispatch_result("notice_ocr", data)
+                self.set_target("notice_ocr", force=True)
             card.setVisible(False)
             card.deleteLater()
             self._append_chat_message(
