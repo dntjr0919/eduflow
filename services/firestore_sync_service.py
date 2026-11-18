@@ -1683,6 +1683,307 @@ class FirestoreSyncService:
             self.db.add_log("WARN", "FirestoreSync", f"NEIS 급식 동기화 실패: {exc}")
             return False, 0
 
+    def _default_teacher_meta(self) -> Dict[str, str]:
+        tp = self.config.get_section("teacher_profile") or {}
+        return {
+            "school_code": str(tp.get("school_code") or tp.get("neis_school_code") or "").strip(),
+            "teacher_id": str(tp.get("teacher_id") or "").strip(),
+            "teacher_name": str(tp.get("name") or tp.get("teacher_id") or "").strip(),
+        }
+
+    @staticmethod
+    def _normalize_roster_student_entry(student: Dict[str, Any], index: int = 0) -> Dict[str, Any]:
+        serial_raw = student.get("serial_no")
+        if serial_raw is None:
+            serial_raw = student.get("seq_no")
+        if serial_raw is None:
+            serial_raw = index + 1
+        return {
+            "student_id": str(student.get("student_id") or "").strip(),
+            "name": str(student.get("name") or "").strip(),
+            "number": _to_int_or_none(student.get("number")),
+            "serial_no": _to_int_or_none(serial_raw),
+            "grade": _to_int_or_none(student.get("grade")),
+            "class_no": _to_int_or_none(student.get("class_no")),
+        }
+
+    @classmethod
+    def normalize_subject_roster_doc(
+        cls,
+        raw: Dict[str, Any],
+        default_meta: Optional[Dict[str, str]] = None,
+        index: int = 0,
+    ) -> Dict[str, Any]:
+        meta = default_meta or {}
+        school_code = str(raw.get("school_code") or meta.get("school_code") or "").strip()
+        teacher_id = str(raw.get("teacher_id") or meta.get("teacher_id") or "").strip()
+        teacher_name = str(raw.get("teacher_name") or meta.get("teacher_name") or teacher_id).strip()
+        roster_type = str(raw.get("roster_type") or raw.get("group_type") or "subject").strip().lower()
+        if roster_type not in ("subject", "club"):
+            roster_type = "subject"
+        subject = str(raw.get("subject") or raw.get("group_name") or "").strip()
+        class_label = str(raw.get("class_label") or raw.get("extra_info") or "").strip()
+
+        raw_students = raw.get("students") if isinstance(raw.get("students"), list) else []
+        students = [
+            cls._normalize_roster_student_entry(s, idx)
+            for idx, s in enumerate(raw_students)
+            if isinstance(s, dict) and (str(s.get("name") or "").strip() or str(s.get("student_id") or "").strip())
+        ]
+
+        grade = _to_int_or_none(raw.get("grade"))
+        class_no = _to_int_or_none(raw.get("class_no"))
+        if (grade is None or class_no is None) and class_label:
+            m = re.search(r"(\d+)\s*학년\s*(\d+)\s*반", class_label) or re.search(r"(\d+)\s*-\s*(\d+)", class_label)
+            if m:
+                if grade is None:
+                    grade = _to_int_or_none(m.group(1))
+                if class_no is None:
+                    class_no = _to_int_or_none(m.group(2))
+        if grade is None and students:
+            grades = {s["grade"] for s in students if s.get("grade") is not None}
+            if len(grades) == 1:
+                grade = next(iter(grades))
+        if class_no is None and students:
+            classes = {s["class_no"] for s in students if s.get("class_no") is not None}
+            if len(classes) == 1:
+                class_no = next(iter(classes))
+
+        remote_id = str(raw.get("remote_id") or "").strip().replace("/", "_")
+        if not remote_id:
+            key_src = f"{school_code}|{teacher_id}|{roster_type}|{subject}|{class_label}"
+            digest = hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:12]
+            remote_id = f"sr_{roster_type}_{digest}"
+
+        updated_at = str(raw.get("updated_at") or "").strip() or _now_str()
+        return {
+            "remote_id": remote_id,
+            "school_code": school_code,
+            "teacher_id": teacher_id,
+            "teacher_name": teacher_name,
+            "roster_type": roster_type,
+            "subject": subject,
+            "class_label": class_label,
+            "grade": grade,
+            "class_no": class_no,
+            "students": students,
+            "updated_at": updated_at,
+        }
+
+    @classmethod
+    def build_subject_roster_payload(
+        cls,
+        group: Dict[str, Any],
+        students: List[Dict[str, Any]],
+        school_code: str = "",
+        teacher_id: str = "",
+        teacher_name: str = "",
+    ) -> Dict[str, Any]:
+        """로컬 `roster_groups` + `roster_students` 레코드를 `교과_명렬표` 동기화 페이로드로 변환합니다."""
+        raw = {
+            "school_code": school_code,
+            "teacher_id": teacher_id,
+            "teacher_name": teacher_name,
+            "roster_type": str(group.get("group_type") or "subject").strip().lower(),
+            "subject": str(group.get("group_name") or "").strip(),
+            "class_label": str(group.get("extra_info") or "").strip(),
+            "students": list(students or []),
+        }
+        return cls.normalize_subject_roster_doc(raw)
+
+    def sync_subject_rosters_batch(
+        self,
+        rosters: List[Dict[str, Any]],
+        chunk_size: int = FIRESTORE_BATCH_LIMIT,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        """교과(`subject`) 및 동아리(`club`) 명렬표를 Firestore `교과_명렬표` 컬렉션으로 Batch Upsert합니다."""
+        if not rosters:
+            return False
+        meta = self._default_teacher_meta()
+        normalized = [
+            self.normalize_subject_roster_doc(r, default_meta=meta, index=idx)
+            for idx, r in enumerate(rosters)
+            if isinstance(r, dict)
+        ]
+        if not normalized:
+            return False
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api("sync_subject_rosters_batch", {"rosters": normalized})
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 교과·동아리 명렬표 동기화 실패: {exc}")
+                return False
+        return self._batch_upsert(
+            collection_name="교과_명렬표",
+            rows=normalized,
+            label="교과·동아리 명렬표 Batch Upsert",
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+        )
+
+    @staticmethod
+    def normalize_lesson_progress_doc(
+        raw: Dict[str, Any],
+        default_meta: Optional[Dict[str, str]] = None,
+        index: int = 0,
+    ) -> Dict[str, Any]:
+        meta = default_meta or {}
+        school_code = str(raw.get("school_code") or meta.get("school_code") or "").strip()
+        teacher_id = str(raw.get("teacher_id") or meta.get("teacher_id") or "").strip()
+
+        raw_date = str(raw.get("date") or "").strip()
+        if raw_date:
+            s_date, _ = normalize_date_str(raw_date)
+            date_str = s_date or raw_date
+        else:
+            date_str = ""
+
+        period = _to_int_or_none(raw.get("period"))
+        subject = str(raw.get("subject") or "").strip()
+        class_label = str(raw.get("class_label") or "").strip()
+        roster_key = str(raw.get("roster_key") or "").strip()
+        unit_title = str(raw.get("unit_title") or "").strip()
+        lesson_no = str(raw.get("lesson_no") if raw.get("lesson_no") is not None else "").strip()
+        content = str(raw.get("content") or "").strip()
+        next_plan = str(raw.get("next_plan") or "").strip()
+        memo = str(raw.get("memo") or "").strip()
+        updated_at = str(raw.get("updated_at") or "").strip() or _now_str()
+
+        remote_id = str(raw.get("remote_id") or "").strip().replace("/", "_")
+        if not remote_id:
+            key_src = f"{school_code}|{teacher_id}|{roster_key}|{subject}|{class_label}|{unit_title}|{date_str}|{period}|{lesson_no}|{index}"
+            digest = hashlib.sha1(key_src.encode("utf-8")).hexdigest()[:12]
+            remote_id = f"lp_{digest}"
+
+        doc: Dict[str, Any] = {
+            "remote_id": remote_id,
+            "school_code": school_code,
+            "teacher_id": teacher_id,
+            "date": date_str,
+            "period": period,
+            "subject": subject,
+            "class_label": class_label,
+            "roster_key": roster_key,
+            "unit_title": unit_title,
+            "lesson_no": lesson_no,
+            "content": content,
+            "next_plan": next_plan,
+            "memo": memo,
+            "updated_at": updated_at,
+        }
+        if raw.get("status") is not None:
+            doc["status"] = str(raw.get("status") or "").strip()
+        if raw.get("rel_path") is not None:
+            doc["rel_path"] = str(raw.get("rel_path") or "").strip()
+        return doc
+
+    def sync_lesson_progress_batch(
+        self,
+        items: List[Dict[str, Any]],
+        chunk_size: int = FIRESTORE_BATCH_LIMIT,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        """수업 진도 관리 기록을 Firestore `수업_진도` 컬렉션으로 Batch Upsert합니다."""
+        if not items:
+            return False
+        meta = self._default_teacher_meta()
+        normalized = [
+            self.normalize_lesson_progress_doc(item, default_meta=meta, index=idx)
+            for idx, item in enumerate(items)
+            if isinstance(item, dict)
+        ]
+        if not normalized:
+            return False
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api("sync_lesson_progress_batch", {"items": normalized})
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 수업 진도 동기화 실패: {exc}")
+                return False
+        return self._batch_upsert(
+            collection_name="수업_진도",
+            rows=normalized,
+            label="수업 진도 Batch Upsert",
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+        )
+
+    def fetch_lesson_progress(
+        self,
+        teacher_id: str = "",
+        school_code: str = "",
+        roster_key: str = "",
+        subject: str = "",
+        date_from: str = "",
+        date_to: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Firestore `수업_진도` 컬렉션에서 진도 기록을 조회합니다."""
+        meta = self._default_teacher_meta()
+        tid = str(teacher_id or meta.get("teacher_id") or "").strip()
+        sc = str(school_code or meta.get("school_code") or "").strip()
+        rk = str(roster_key or "").strip()
+        subj = str(subject or "").strip()
+        d_from = str(date_from or "").strip()
+        d_to = str(date_to or "").strip()
+
+        raw_rows: List[Dict[str, Any]] = []
+        if self.is_vercel_api_mode():
+            payload: Dict[str, Any] = {}
+            if tid:
+                payload["teacher_id"] = tid
+            if sc:
+                payload["school_code"] = sc
+            if rk:
+                payload["roster_key"] = rk
+            if subj:
+                payload["subject"] = subj
+            if d_from:
+                payload["date_from"] = d_from
+            if d_to:
+                payload["date_to"] = d_to
+            try:
+                res = self._post_vercel_api("fetch_lesson_progress", payload)
+                items = res.get("items") or res.get("rows") or res.get("progress") or []
+                if isinstance(items, list):
+                    raw_rows = [r for r in items if isinstance(r, dict)]
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 수업 진도 조회 실패: {exc}")
+                return []
+        else:
+            try:
+                fs = self._get_client()
+                col_ref = fs.collection("수업_진도")
+                query = col_ref.where("teacher_id", "==", tid) if tid else col_ref
+                for doc in query.stream():
+                    data = doc.to_dict() or {}
+                    if not data.get("remote_id"):
+                        data["remote_id"] = doc.id
+                    raw_rows.append(data)
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"수업 진도 조회 실패: {exc}")
+                return []
+
+        results: List[Dict[str, Any]] = []
+        for idx, row in enumerate(raw_rows):
+            norm = self.normalize_lesson_progress_doc(row, default_meta=meta, index=idx)
+            if sc and norm.get("school_code") and norm["school_code"] != sc:
+                continue
+            if rk and norm.get("roster_key") and norm["roster_key"] != rk:
+                continue
+            if subj and norm.get("subject") and norm["subject"] != subj:
+                continue
+            if d_from and norm.get("date") and norm["date"] < d_from:
+                continue
+            if d_to and norm.get("date") and norm["date"] > d_to:
+                continue
+            results.append(norm)
+
+        results.sort(key=lambda x: (str(x.get("date") or ""), str(x.get("updated_at") or "")), reverse=True)
+        return results
+
     def push_local_item(
         self,
         action: str,

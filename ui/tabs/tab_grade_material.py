@@ -45,8 +45,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from core.base_worker import TaskRunner
+from core.base_worker import FunctionWorker, TaskRunner
+from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from services.firestore_sync_service import FirestoreSyncService
 from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.utils import install_no_scroll_wheel_filter
@@ -786,9 +788,19 @@ class GradeMaterialTab(QWidget):
         self.btn_save_progress.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_save_progress.clicked.connect(self._on_save_material_progress)
 
+        self.btn_sync_mobile_progress = QPushButton("모바일 진도 동기화(업로드/불러오기)")
+        apply_qss_role(self.btn_sync_mobile_progress, role="secondary", obj_name="BtnSyncMobileProgress")
+        self.btn_sync_mobile_progress.setMinimumHeight(32)
+        self.btn_sync_mobile_progress.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_mobile_progress.setToolTip(
+            "현재 교과·학반의 진도 기록을 모바일(Firestore 수업_진도)과 양방향 동기화합니다."
+        )
+        self.btn_sync_mobile_progress.clicked.connect(self._on_sync_mobile_progress)
+
         p_ctrl_row.addWidget(self.combo_material_status)
         p_ctrl_row.addWidget(self.edit_material_memo, stretch=1)
         p_ctrl_row.addWidget(self.btn_save_progress)
+        p_ctrl_row.addWidget(self.btn_sync_mobile_progress)
         p_lay.addLayout(p_ctrl_row)
         r_lay.addWidget(progress_card)
 
@@ -1602,6 +1614,193 @@ class GradeMaterialTab(QWidget):
         self._populate_unit_tree(
             filter_title=self.combo_unit_filter.currentText(),
             preserve_rel_path=rel_key,
+        )
+
+    def _current_subject_meta(self) -> Dict[str, str]:
+        subject_key = self._current_subject_key()
+        subject_name = self.combo_subject_roster.currentText().strip()
+        class_label = ""
+        group_id = self.combo_subject_roster.currentData()
+        if group_id:
+            grp = self.db.get_roster_group(int(group_id))
+            if grp:
+                subject_name = str(grp.get("group_name") or subject_name).strip()
+                class_label = str(grp.get("extra_info") or "").strip()
+        return {
+            "roster_key": subject_key,
+            "subject": subject_name or subject_key,
+            "class_label": class_label,
+        }
+
+    def _build_lesson_progress_items_for_sync(
+        self,
+        config: Optional[ConfigManager] = None,
+    ) -> List[Dict[str, Any]]:
+        """현재 선택된 교과 강좌의 로컬 진도 기록을 `수업_진도` 업로드 페이로드로 변환합니다."""
+        cfg = config or ConfigManager()
+        tp = cfg.get_section("teacher_profile") or {}
+        school_code = str(tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+        teacher_id = str(tp.get("teacher_id") or "").strip()
+        meta = self._current_subject_meta()
+        subject_key = meta["roster_key"]
+        progress_map = self.db.get_subject_material_progress_map(subject_key)
+
+        items: List[Dict[str, Any]] = []
+        for rel_path, entry in progress_map.items():
+            updated_at = str(entry.get("updated_at") or "").strip()
+            date_str = updated_at[:10] if len(updated_at) >= 10 else datetime.now().strftime("%Y-%m-%d")
+            status = str(entry.get("status") or "예정").strip()
+            memo = str(entry.get("memo") or "").strip()
+            unit_title = rel_path.split("/")[0] if "/" in rel_path else rel_path
+            items.append(
+                {
+                    "school_code": school_code,
+                    "teacher_id": teacher_id,
+                    "date": date_str,
+                    "period": None,
+                    "subject": meta["subject"],
+                    "class_label": meta["class_label"],
+                    "roster_key": subject_key,
+                    "unit_title": unit_title,
+                    "lesson_no": "",
+                    "content": status,
+                    "next_plan": "",
+                    "memo": memo,
+                    "status": status,
+                    "rel_path": rel_path,
+                    "updated_at": updated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+        return items
+
+    def _apply_remote_lesson_progress(self, remote_items: List[Dict[str, Any]]) -> int:
+        """모바일(`수업_진도`)에서 불러온 진도 기록을 로컬 SQLite 진도 테이블에 반영합니다."""
+        meta = self._current_subject_meta()
+        subject_key = meta["roster_key"]
+        subject_name = meta["subject"]
+        local_map = self.db.get_subject_material_progress_map(subject_key)
+        applied = 0
+
+        for item in remote_items or []:
+            if not isinstance(item, dict):
+                continue
+            r_key = str(item.get("roster_key") or "").strip()
+            r_subj = str(item.get("subject") or "").strip()
+            if r_key and r_key != subject_key and r_subj and r_subj != subject_name:
+                continue
+            if not r_key and r_subj and r_subj != subject_name:
+                continue
+
+            rel_path = str(item.get("rel_path") or "").strip()
+            if not rel_path:
+                unit_title = str(item.get("unit_title") or "").strip()
+                lesson_no = str(item.get("lesson_no") or "").strip()
+                if unit_title and lesson_no:
+                    rel_path = f"{unit_title} ({lesson_no})"
+                elif unit_title:
+                    rel_path = unit_title
+                else:
+                    date_part = str(item.get("date") or "").strip()
+                    period_part = str(item.get("period") or "").strip()
+                    rel_path = f"모바일_{date_part}_{period_part}".strip("_") or "모바일_수업진도"
+
+            remote_updated = str(item.get("updated_at") or "").strip()
+            local_updated = str((local_map.get(rel_path) or {}).get("updated_at") or "").strip()
+            if local_updated and remote_updated and remote_updated < local_updated:
+                continue
+
+            raw_status = str(item.get("status") or "").strip()
+            if raw_status in MATERIAL_STATUS_OPTIONS:
+                status_val = raw_status
+            elif str(item.get("content") or "").strip() in MATERIAL_STATUS_OPTIONS:
+                status_val = str(item.get("content") or "").strip()
+            elif str(item.get("content") or "").strip() or str(item.get("memo") or "").strip():
+                status_val = "진도 완료"
+            else:
+                status_val = "예정"
+
+            memo_parts: List[str] = []
+            content_str = str(item.get("content") or "").strip()
+            if content_str and content_str not in MATERIAL_STATUS_OPTIONS:
+                memo_parts.append(content_str)
+            next_plan = str(item.get("next_plan") or "").strip()
+            if next_plan:
+                memo_parts.append(f"다음: {next_plan}")
+            raw_memo = str(item.get("memo") or "").strip()
+            if raw_memo and raw_memo not in memo_parts:
+                memo_parts.append(raw_memo)
+            memo_val = " / ".join(memo_parts)
+
+            self.db.upsert_subject_material_progress(subject_key, rel_path, status_val, memo_val)
+            applied += 1
+
+        return applied
+
+    def _on_sync_mobile_progress(self) -> None:
+        """[모바일 진도 동기화(업로드/불러오기)] 버튼 핸들러."""
+        cfg = ConfigManager()
+        upload_items = self._build_lesson_progress_items_for_sync(config=cfg)
+        meta = self._current_subject_meta()
+
+        self.btn_sync_mobile_progress.setEnabled(False)
+        self.btn_sync_mobile_progress.setText("진도 동기화 중...")
+
+        def _work(_worker: Any) -> Dict[str, Any]:
+            svc = FirestoreSyncService(db=self.db, config=cfg)
+            uploaded = 0
+            upload_ok = True
+            if upload_items:
+                upload_ok = svc.sync_lesson_progress_batch(upload_items)
+                if upload_ok:
+                    uploaded = len(upload_items)
+            remote_items = svc.fetch_lesson_progress(
+                roster_key=meta["roster_key"],
+                subject=meta["subject"],
+            )
+            return {
+                "upload_ok": upload_ok,
+                "uploaded": uploaded,
+                "remote_items": remote_items,
+            }
+
+        def _on_result(res: Any) -> None:
+            data = res if isinstance(res, dict) else {}
+            remote_items = data.get("remote_items") or []
+            pulled = self._apply_remote_lesson_progress(remote_items)
+            self._populate_unit_tree(filter_title=self.combo_unit_filter.currentText())
+            uploaded = int(data.get("uploaded") or 0)
+            if not data.get("upload_ok", True):
+                QMessageBox.warning(
+                    self,
+                    "모바일 진도 동기화 부분 실패",
+                    f"로컬 진도 업로드에 실패했습니다.\n모바일 진도 불러오기: {pulled}건 반영",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "모바일 진도 동기화 완료",
+                    f"업로드: {uploaded}건 · 모바일 진도 반영: {pulled}건\n"
+                    f"({meta['subject']} 진도가 모바일 수업_진도와 동기화되었습니다.)",
+                )
+
+        def _on_error(err: str) -> None:
+            QMessageBox.critical(
+                self,
+                "모바일 진도 동기화 오류",
+                f"진도 동기화 중 오류가 발생했습니다:\n{str(err or '').splitlines()[0]}",
+            )
+
+        def _on_finished() -> None:
+            self.btn_sync_mobile_progress.setEnabled(True)
+            self.btn_sync_mobile_progress.setText("모바일 진도 동기화(업로드/불러오기)")
+
+        worker = FunctionWorker("모바일 수업 진도 동기화", _work)
+        self.task_runner.start_worker(
+            worker,
+            task_key="grade_material_sync_mobile_progress",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
         )
 
     def link_subject_material_folder(self, chosen: str) -> None:

@@ -2413,10 +2413,20 @@ class SettingsTab(QWidget):
         apply_qss_role(btn_del_sub, role="secondary", obj_name="BtnDeleteSubject")
         btn_del_sub.clicked.connect(self._on_delete_subject)
 
+        self.btn_sync_subject_rosters = QPushButton("모바일·어드민 동기화")
+        apply_qss_role(self.btn_sync_subject_rosters, role="secondary", obj_name="BtnSyncSubjectRosters")
+        self.btn_sync_subject_rosters.setToolTip(
+            "등록된 교과·동아리 명렬표를 모바일/어드민(Firestore 교과_명렬표)에 동기화합니다."
+        )
+        self.btn_sync_subject_rosters.clicked.connect(
+            lambda: self._on_sync_rosters_to_mobile(button=self.btn_sync_subject_rosters)
+        )
+
         t2_top.addWidget(lbl_sub_sel)
         t2_top.addWidget(self.combo_subject_groups)
         t2_top.addWidget(self.lbl_subject_badge)
         t2_top.addStretch()
+        t2_top.addWidget(self.btn_sync_subject_rosters)
         t2_top.addWidget(self.btn_import_sub)
         t2_top.addWidget(btn_del_sub)
         tab2_lay.addLayout(t2_top)
@@ -2477,10 +2487,20 @@ class SettingsTab(QWidget):
         apply_qss_role(btn_del_club, role="secondary", obj_name="BtnDeleteClub")
         btn_del_club.clicked.connect(self._on_delete_club)
 
+        self.btn_sync_club_rosters = QPushButton("모바일·어드민 동기화")
+        apply_qss_role(self.btn_sync_club_rosters, role="secondary", obj_name="BtnSyncClubRosters")
+        self.btn_sync_club_rosters.setToolTip(
+            "등록된 교과·동아리 명렬표를 모바일/어드민(Firestore 교과_명렬표)에 동기화합니다."
+        )
+        self.btn_sync_club_rosters.clicked.connect(
+            lambda: self._on_sync_rosters_to_mobile(button=self.btn_sync_club_rosters)
+        )
+
         t3_top.addWidget(lbl_club_sel)
         t3_top.addWidget(self.combo_club_groups)
         t3_top.addWidget(self.lbl_club_badge)
         t3_top.addStretch()
+        t3_top.addWidget(self.btn_sync_club_rosters)
         t3_top.addWidget(self.btn_import_club)
         t3_top.addWidget(btn_del_club)
         tab3_lay.addLayout(t3_top)
@@ -2790,6 +2810,7 @@ class SettingsTab(QWidget):
             if idx >= 0:
                 self.combo_subject_groups.setCurrentIndex(idx)
 
+            self._sync_rosters_in_background(group_ids=[group_id])
             QMessageBox.information(
                 self,
                 "교과 출석부 등록 완료",
@@ -2829,6 +2850,7 @@ class SettingsTab(QWidget):
             if idx >= 0:
                 self.combo_club_groups.setCurrentIndex(idx)
 
+            self._sync_rosters_in_background(group_ids=[group_id])
             QMessageBox.information(
                 self,
                 "동아리 출석부 등록 완료",
@@ -2887,6 +2909,126 @@ class SettingsTab(QWidget):
         if ans == QMessageBox.StandardButton.Yes:
             self.db.delete_roster_group(group_id)
             self.refresh_all_rosters()
+
+    def _build_rosters_payload_for_sync(
+        self,
+        roster_types: Optional[List[str]] = None,
+        group_ids: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """로컬에 등록된 교과·동아리 명렬표를 `교과_명렬표` 동기화 페이로드 목록으로 변환합니다."""
+        tp = self.config.get_section("teacher_profile") or {}
+        school_code = (
+            self.edit_neis_school_code.text().strip()
+            if hasattr(self, "edit_neis_school_code")
+            else str(tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+        )
+        teacher_id = (
+            self.edit_teacher_id.text().strip()
+            if hasattr(self, "edit_teacher_id")
+            else str(tp.get("teacher_id") or "").strip()
+        )
+        teacher_name = (
+            self.edit_teacher_name.text().strip()
+            if hasattr(self, "edit_teacher_name")
+            else str(tp.get("name") or teacher_id).strip()
+        ) or teacher_id
+
+        target_types = roster_types or ["subject", "club"]
+        id_filter = set(int(gid) for gid in (group_ids or [])) if group_ids is not None else None
+
+        rosters: List[Dict[str, Any]] = []
+        for gtype in target_types:
+            for grp in self.db.get_roster_groups(group_type=gtype):
+                gid = int(grp["id"])
+                if id_filter is not None and gid not in id_filter:
+                    continue
+                students = self.db.get_roster_students(gid)
+                rosters.append(
+                    FirestoreSyncService.build_subject_roster_payload(
+                        group=grp,
+                        students=students,
+                        school_code=school_code,
+                        teacher_id=teacher_id,
+                        teacher_name=teacher_name,
+                    )
+                )
+        return rosters
+
+    def _sync_rosters_in_background(self, group_ids: Optional[List[int]] = None) -> None:
+        """교과·동아리 명렬표 등록 직후 조용히 백그라운드 동기화를 수행합니다."""
+        payloads = self._build_rosters_payload_for_sync(group_ids=group_ids)
+        if not payloads:
+            return
+        tp = self.config.get_section("teacher_profile") or {}
+        teacher_id = (
+            self.edit_teacher_id.text().strip()
+            if hasattr(self, "edit_teacher_id")
+            else str(tp.get("teacher_id") or "").strip()
+        )
+        if not teacher_id:
+            return
+
+        def _work() -> bool:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.sync_subject_rosters_batch(payloads)
+
+        self._run_async_button_task(
+            button=None,
+            loading_text="",
+            task_name="교과·동아리 명렬표 자동 동기화",
+            task_key="settings_auto_sync_subject_rosters",
+            work_fn=_work,
+            on_result=lambda _ok: None,
+            on_error=lambda err: self.db.add_log("WARN", "SettingsTab", f"명렬표 자동 동기화 실패: {err}"),
+        )
+
+    def _on_sync_rosters_to_mobile(self, button: Optional[QPushButton] = None) -> None:
+        """수동 [모바일·어드민 동기화] 버튼 핸들러."""
+        payloads = self._build_rosters_payload_for_sync()
+        if not payloads:
+            QMessageBox.warning(
+                self,
+                "모바일·어드민 동기화",
+                "동기화할 교과 또는 동아리 명렬표가 없습니다. 먼저 엑셀(.xlsx) 파일을 등록해 주세요.",
+            )
+            return
+
+        def _work() -> Dict[str, Any]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            ok = svc.sync_subject_rosters_batch(payloads)
+            subj_cnt = sum(1 for r in payloads if r.get("roster_type") == "subject")
+            club_cnt = sum(1 for r in payloads if r.get("roster_type") == "club")
+            return {"ok": ok, "subject_count": subj_cnt, "club_count": club_cnt}
+
+        def _on_result(res: Any) -> None:
+            data = res if isinstance(res, dict) else {}
+            if data.get("ok"):
+                QMessageBox.information(
+                    self,
+                    "모바일·어드민 동기화 완료",
+                    f"교과 명렬표 {data.get('subject_count', 0)}건, 동아리 명렬표 {data.get('club_count', 0)}건이 "
+                    "모바일/어드민(교과_명렬표)과 동기화되었습니다.\n이제 모바일에서 바로 출석부를 열 수 있습니다.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "모바일·어드민 동기화 실패",
+                    "동기화에 실패했습니다. 교사 계정 설정 및 네트워크/Firebase 연결을 확인해 주세요.",
+                )
+
+        self._run_async_button_task(
+            button=button,
+            loading_text="동기화 중...",
+            task_name="교과·동아리 명렬표 모바일 동기화",
+            task_key="settings_sync_subject_rosters",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.critical(
+                self,
+                "모바일·어드민 동기화 오류",
+                str(err or "").splitlines()[0],
+            ),
+        )
 
     # =========================================================================
     # 학생 수동 추가/수정/삭제/내보내기
