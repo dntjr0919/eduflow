@@ -21,6 +21,19 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.database import DatabaseManager
 from services.firestore_sync_service import FirestoreSyncService
 
+_APP_INSTANCE = None
+
+
+def _ensure_qapp():
+    global _APP_INSTANCE
+    from PyQt6.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    if app is None:
+        _APP_INSTANCE = QApplication(["eduflow-test"])
+        return _APP_INSTANCE
+    return app
+
 
 class _FakeConfig:
     def __init__(self, data: dict | None = None):
@@ -227,8 +240,7 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
         from core.base_worker import TaskRunner
         from ui.tabs.tab_grade_material import GradeMaterialTab
 
-        if QApplication.instance() is None:
-            self._qapp = QApplication(["eduflow-test"])
+        _ensure_qapp()
 
         gid = self.db.create_roster_group("subject", "정보", extra_info="1학년 3반")
         self.db.add_roster_students(
@@ -239,36 +251,175 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
         tab.db = self.db
         tab._populate_subject_combo()
 
-        subj_key = tab._current_subject_key()
-        self.db.upsert_subject_material_progress(subj_key, "1단원/수업안.pdf", "진도 완료", "p.15까지 완료")
+        # 1) 3개 Pill 메뉴 + QStackedWidget 전환 검증
+        self.assertEqual(len(tab.tool_pills), 3)
+        self.assertEqual(tab.tool_stack.count(), 3)
+        self.assertEqual(tab.tool_stack.currentIndex(), 0)
+        tab.tool_pills[2].click()
+        self.assertEqual(tab.tool_stack.currentIndex(), 2)
+        tab.tool_pills[1].click()
+        self.assertEqual(tab.tool_stack.currentIndex(), 1)
+
+        # 2) 컴시간 시간표 강좌·학반 연동 검증
+        tab._refresh_progress_course_combo(
+            comcigan_rows=[
+                {"day": "수", "period": 2, "subject": "통합과학2", "grade": 1, "class_no": 2},
+                {"day": "목", "period": 4, "subject": "통합과학2", "grade": 1, "class_no": 13},
+            ]
+        )
+        course_labels = [tab.combo_progress_course.itemText(i) for i in range(tab.combo_progress_course.count())]
+        self.assertIn("통합과학2 1-2", course_labels)
+        self.assertIn("통합과학2 1-13", course_labels)
+        self.assertEqual(tab.list_comcigan_slots.count(), 2)
+
+        # 3) 진도 기록 저장 -> 업로드 페이로드 직렬화 -> 모바일 진도 반영 검증
+        idx_2 = tab.combo_progress_course.findText("통합과학2 1-2")
+        tab.combo_progress_course.setCurrentIndex(idx_2)
+        tab.edit_prog_date.setText("2026-11-18")
+        tab.spin_prog_period.setValue(2)
+        tab.edit_prog_unit.setText("II. 물질과 규칙성")
+        tab.edit_prog_lesson_no.setText("3차시")
+        tab.edit_prog_content.setText("원소의 주기성 탐구")
+        tab.edit_prog_next_plan.setText("이온 결합 실습")
+        tab.combo_prog_status.setCurrentText("완료")
+        tab._on_save_lesson_progress()
 
         items = tab._build_lesson_progress_items_for_sync(config=self.cfg)
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["roster_key"], subj_key)
-        self.assertEqual(items[0]["subject"], "정보")
-        self.assertEqual(items[0]["class_label"], "1학년 3반")
-        self.assertEqual(items[0]["memo"], "p.15까지 완료")
+        self.assertEqual(items[0]["subject"], "통합과학2")
+        self.assertEqual(items[0]["class_label"], "1-2")
+        self.assertEqual(items[0]["period"], 2)
+        self.assertEqual(items[0]["status"], "완료")
 
         applied = tab._apply_remote_lesson_progress(
             [
                 {
-                    "roster_key": subj_key,
-                    "subject": "정보",
-                    "unit_title": "2단원_알고리즘",
-                    "lesson_no": "3차시",
-                    "content": "정렬 알고리즘 실습",
-                    "next_plan": "탐색 알고리즘",
+                    "remote_id": "mob_prog_1",
+                    "subject": "통합과학2",
+                    "class_label": "1-2",
+                    "date": "2026-11-19",
+                    "period": 3,
+                    "unit_title": "II. 물질과 규칙성",
+                    "lesson_no": "4차시",
+                    "content": "이온 결합 모형",
+                    "next_plan": "공유 결합",
+                    "status": "진행중",
                     "memo": "모바일 수업 중 입력",
                     "updated_at": "2099-01-01 10:00:00",
                 }
             ]
         )
         self.assertEqual(applied, 1)
-        pmap = self.db.get_subject_material_progress_map(subj_key)
-        self.assertIn("2단원_알고리즘 (3차시)", pmap)
-        self.assertEqual(pmap["2단원_알고리즘 (3차시)"]["status"], "진도 완료")
-        self.assertIn("모바일 수업 중 입력", pmap["2단원_알고리즘 (3차시)"]["memo"])
+        logs = self.db.get_lesson_progress_logs(subject="통합과학2", class_label="1-2")
+        self.assertEqual(len(logs), 2)
+        self.assertTrue(any(l["lesson_no"] == "4차시" and l["status"] == "진행중" for l in logs))
         tab.close()
+
+    def test_fetch_and_merge_homeroom_attendance_all_dates_and_unconfirmed(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        from core.base_worker import TaskRunner
+        from ui.tabs.tab_classroom_tools import ClassroomToolsTab
+
+        _ensure_qapp()
+
+        # Direct Admin 모드에서 문자열 grade/class_no, 미확인, 타 날짜 출결 보고 조회 검증
+        fake_fs = MagicMock()
+        fake_fs.collection.return_value.stream.return_value = [
+            _FakeDocSnap(
+                "att_1",
+                {
+                    "school_code": "8140246",
+                    "grade": "1",
+                    "class_no": "3",
+                    "student_id": "10301",
+                    "student_name": "홍길동",
+                    "category": "질병결석",
+                    "reason": "감기",
+                    "date": "2026-11-20",
+                    "teacher_confirmed": False,
+                },
+            ),
+            _FakeDocSnap(
+                "att_2",
+                {
+                    "school_code": "8140246",
+                    "grade": 1,
+                    "class_no": 3,
+                    "student_id": "10302",
+                    "student_name": "김철수",
+                    "category": "교외체험학습",
+                    "reason": "가족여행",
+                    "date": "2026-11-15",
+                    "teacher_confirmed": True,
+                },
+            ),
+            _FakeDocSnap(
+                "att_other_class",
+                {
+                    "school_code": "8140246",
+                    "grade": 1,
+                    "class_no": 4,
+                    "student_id": "10401",
+                    "student_name": "타반학생",
+                    "category": "질병결석",
+                    "date": "2026-11-18",
+                },
+            ),
+        ]
+        svc = FirestoreSyncService(db=self.db, config=self.cfg, firestore_client=fake_fs)
+        rows = svc.fetch_homeroom_attendance(grade=1, class_no=3, school_code="8140246")
+        self.assertEqual(len(rows), 2)
+
+        ctab = ClassroomToolsTab(task_runner=TaskRunner())
+        ctab.db = self.db
+        added, updated = ctab._merge_mobile_attendance_rows(rows)
+        self.assertEqual(added, 2)
+        self.assertEqual(updated, 0)
+        # 중복 병합 시 신규 추가 0건
+        added2, updated2 = ctab._merge_mobile_attendance_rows(rows)
+        self.assertEqual(added2, 0)
+        self.assertEqual(updated2, 2)
+
+        ctab._refresh_attendance_view()
+        self.assertEqual(ctab.table_attendance.rowCount(), 2)
+        self.assertIn("1건", ctab.lbl_mobile_att_pending.text())
+        ctab.close()
+
+    def test_settings_batch_roster_import_continues_on_error_and_syncs_once(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        import openpyxl
+        from ui.tabs.tab_settings import SettingsTab
+
+        _ensure_qapp()
+
+        # 유효한 나이스 교과출석부 xlsx 2개 + 잘못된 파일 1개 생성
+        valid1 = self.tmp_path / "subj1.xlsx"
+        valid2 = self.tmp_path / "subj2.xlsx"
+        invalid = self.tmp_path / "broken.xlsx"
+        invalid.write_text("not an xlsx", encoding="utf-8")
+
+        for fp, subj_name in ((valid1, "정보"), (valid2, "인공지능기초")):
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws["A3"] = f"과목명 : {subj_name}"
+            ws["A4"] = "1학년 3반"
+            ws.append([])
+            ws.append(["연번", "학년", "학과", "반", "번호", "성명"])
+            ws.append([1, 1, "일반", 3, 1, "홍길동"])
+            wb.save(fp)
+
+        stab = SettingsTab()
+        stab.db = self.db
+        with patch.object(stab, "_sync_rosters_in_background") as mock_sync:
+            res = stab.import_subject_rosters_batch(
+                [str(valid1), str(invalid), str(valid2)],
+                show_dialog=False,
+            )
+        self.assertEqual(res["ok_count"], 2)
+        self.assertEqual(res["fail_count"], 1)
+        self.assertEqual(len(res["group_ids"]), 2)
+        mock_sync.assert_called_once_with(group_ids=res["group_ids"])
+        stab.close()
 
 
 if __name__ == "__main__":

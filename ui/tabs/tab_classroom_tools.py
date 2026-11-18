@@ -1780,6 +1780,26 @@ class ClassroomToolsTab(QWidget):
         apply_qss_role(self.card_attendance, role="hoverZoomCard", obj_name="CardAttendance")
         c1_lay = self.card_attendance.body_layout()
 
+        # 상단 모바일 출결 보고 새로고침 + 미확인(대기중) 건수 바
+        att_mobile_bar = QHBoxLayout()
+        att_mobile_bar.setSpacing(8)
+        self.lbl_mobile_att_pending = QLabel("미확인(대기중) 출결 보고: 0건")
+        apply_qss_role(self.lbl_mobile_att_pending, role="badgeNeutral", obj_name="LblMobileAttPending")
+
+        self.btn_refresh_mobile_att = QPushButton("모바일 출결 보고 새로고침")
+        apply_qss_role(self.btn_refresh_mobile_att, role="primary", obj_name="BtnRefreshMobileAttendance")
+        self.btn_refresh_mobile_att.setMinimumHeight(32)
+        self.btn_refresh_mobile_att.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_refresh_mobile_att.setToolTip(
+            "학생·학부모가 모바일에서 보고한 출결 내역(미확인·전체 날짜 포함)을 불러와 대장에 병합합니다."
+        )
+        self.btn_refresh_mobile_att.clicked.connect(self._on_sync_mobile_attendance)
+
+        att_mobile_bar.addWidget(self.lbl_mobile_att_pending)
+        att_mobile_bar.addStretch(1)
+        att_mobile_bar.addWidget(self.btn_refresh_mobile_att)
+        c1_lay.addLayout(att_mobile_bar)
+
         # 출결 상태 배지 3종 (재적·대장 / 질병·기타 / 체험학습·인정)
         att_badge_row = QHBoxLayout()
         att_badge_row.setSpacing(8)
@@ -3071,6 +3091,68 @@ class ClassroomToolsTab(QWidget):
             "is_admin": bool(tp.get("is_admin") is True),
         }
 
+    def _merge_mobile_attendance_rows(self, rows: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """Firestore `일일_출결`에서 조회한 모바일 출결 보고를 로컬 출결 대장에 병합합니다."""
+        hk = self._current_homeroom_key()
+        added = 0
+        updated = 0
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("student_id") or "").strip()
+            sname = str(row.get("student_name") or row.get("name") or "").strip()
+            if not sid and not sname:
+                continue
+            rid = str(row.get("remote_id") or row.get("id") or "").strip()
+            cat = str(row.get("category") or row.get("type") or row.get("attendance_type") or "질병결석").strip()
+            reason = str(row.get("reason") or row.get("memo") or "").strip()
+            date_str = str(row.get("date") or row.get("start_date") or "").strip()
+            raw_dates = row.get("selected_dates")
+            if isinstance(raw_dates, list) and raw_dates:
+                sel_dates = [str(d).strip() for d in raw_dates if str(d).strip()]
+            elif date_str:
+                sel_dates = [date_str]
+            else:
+                sel_dates = []
+            period_text = str(row.get("period_text") or "").strip()
+            if not period_text:
+                period_val = str(row.get("period") or "").strip()
+                if date_str and period_val:
+                    period_text = f"{date_str} ({period_val}교시)"
+                elif date_str:
+                    period_text = date_str
+                elif sel_dates:
+                    period_text = ", ".join(sel_dates[:3])
+
+            confirmed = bool(row.get("teacher_confirmed")) or str(row.get("status") or "").strip() in (
+                "confirmed",
+                "확인 완료",
+                "서류 완비",
+            )
+            raw_proof = str(row.get("proof_status") or "").strip()
+            if confirmed:
+                proof_status = raw_proof if raw_proof and "대기" not in raw_proof and "미확인" not in raw_proof else "확인 완료"
+            else:
+                proof_status = raw_proof or "미확인(대기중)"
+
+            _, created = self.db.upsert_remote_attendance_log(
+                hk,
+                remote_id=rid,
+                student_id=sid,
+                student_name=sname or sid,
+                category=cat,
+                reason=reason,
+                period_text=period_text,
+                selected_dates=sel_dates,
+                proof_status=proof_status,
+                updated_at=str(row.get("updated_at") or "").strip(),
+            )
+            if created:
+                added += 1
+            else:
+                updated += 1
+        return added, updated
+
     def _on_sync_mobile_attendance(self) -> None:
         meta = self._teacher_meta()
 
@@ -3083,15 +3165,29 @@ class ClassroomToolsTab(QWidget):
                 school_name=meta["school_name"],
             )
 
+        def _on_result(rows: Any) -> None:
+            row_list = list(rows or [])
+            added, updated = self._merge_mobile_attendance_rows(row_list)
+            self._refresh_attendance_view()
+            pending_cnt = sum(
+                1
+                for r in self.db.get_attendance_logs(self._current_homeroom_key())
+                if "대기" in str(r.get("proof_status", "")) or "미확인" in str(r.get("proof_status", ""))
+            )
+            QMessageBox.information(
+                self,
+                "모바일 출결 동기화",
+                f"Firestore에서 {len(row_list)}건의 출결 보고를 조회하여 병합했습니다.\n"
+                f"신규 반영: {added}건 · 갱신: {updated}건 · 현재 미확인(대기중): {pending_cnt}건",
+            )
+
         self._run_async_button_task(
-            button=getattr(self, "btn_sync_mobile_att", None),
-            loading_text="동기화 중...",
+            button=getattr(self, "btn_refresh_mobile_att", None) or getattr(self, "btn_sync_mobile_att", None),
+            loading_text="새로고침 중...",
             task_name="모바일 출결 동기화",
             task_key="classroom_sync_mobile_attendance",
             work_fn=_work,
-            on_result=lambda rows: QMessageBox.information(
-                self, "모바일 출결 동기화", f"Firestore에서 {len(rows or [])}건의 출결 기록을 조회했습니다."
-            ),
+            on_result=_on_result,
             on_error=lambda err: QMessageBox.warning(
                 self, "모바일 출결 동기화 오류", str(err or "").splitlines()[0]
             ),
@@ -4529,7 +4625,17 @@ class ClassroomToolsTab(QWidget):
         total = len(roster)
         logs = self.db.get_attendance_logs(self._current_homeroom_key())
 
-        pending_cnt = sum(1 for r in logs if "대기" in str(r.get("proof_status", "")))
+        pending_cnt = sum(
+            1
+            for r in logs
+            if "대기" in str(r.get("proof_status", "")) or "미확인" in str(r.get("proof_status", ""))
+        )
+        if getattr(self, "lbl_mobile_att_pending", None) is not None:
+            self.lbl_mobile_att_pending.setText(f"미확인(대기중) 출결 보고: {pending_cnt}건")
+            apply_qss_role(
+                self.lbl_mobile_att_pending,
+                role="badgeWarning" if pending_cnt > 0 else "badgeSuccess",
+            )
         sick_cnt = sum(1 for r in logs if str(r.get("category", "")) in ("질병결석", "기타·미인정"))
         sick_pending = sum(
             1

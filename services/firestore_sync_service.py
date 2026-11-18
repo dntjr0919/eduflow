@@ -782,25 +782,28 @@ class FirestoreSyncService:
         school_code: str = "",
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
-        """Firestore `일일_출결` 컬렉션에서 해당 학급의 모바일 출결 내역을 조회합니다."""
+        """Firestore `일일_출결` 컬렉션에서 해당 학급의 모바일 출결 내역(미확인·전체 날짜 포함)을 조회합니다."""
+        g_int = _to_int_or_none(grade)
+        c_int = _to_int_or_none(class_no)
+        sc = str(school_code or "").strip()
+        sn = str(school_name or "").strip()
+
         if self.is_vercel_api_mode():
             res = self._post_vercel_api(
                 "fetch_homeroom_attendance",
                 {
-                    "grade": grade,
-                    "class_no": class_no,
-                    "school_code": str(school_code or "").strip(),
-                    "school_name": str(school_name or "").strip(),
+                    "grade": g_int,
+                    "class_no": c_int,
+                    "school_code": sc,
+                    "school_name": sn,
+                    "include_all_dates": True,
+                    "include_unconfirmed": True,
                 },
             )
             return list(res.get("attendance") or [])
 
         fs = self._get_client()
         ref: Any = fs.collection("일일_출결")
-        if grade is not None and class_no is not None:
-            ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
-        sc = str(school_code or "").strip()
-        sn = str(school_name or "").strip()
         rows: List[Dict[str, Any]] = []
         for doc in ref.stream():
             d = doc.to_dict() or {}
@@ -810,6 +813,12 @@ class FirestoreSyncService:
             if sc and doc_sc and doc_sc != sc:
                 continue
             if sn and doc_sn and doc_sn != sn:
+                continue
+            doc_g = _to_int_or_none(d.get("grade"))
+            doc_c = _to_int_or_none(d.get("class_no"))
+            if g_int is not None and doc_g is not None and doc_g != g_int:
+                continue
+            if c_int is not None and doc_c is not None and doc_c != c_int:
                 continue
             rows.append(d)
         rows.sort(key=lambda x: str(x.get("date") or x.get("updated_at") or ""), reverse=True)
@@ -1983,6 +1992,51 @@ class FirestoreSyncService:
 
         results.sort(key=lambda x: (str(x.get("date") or ""), str(x.get("updated_at") or "")), reverse=True)
         return results
+
+    def fetch_timetable_base(
+        self,
+        teacher_name: str = "",
+        school_code: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Firestore `시간표_기본` 컬렉션에서 교사/학교 기준 기본 시간표를 조회합니다."""
+        meta = self._default_teacher_meta()
+        t_name = str(teacher_name or meta.get("teacher_name") or "").strip()
+        sc = str(school_code or meta.get("school_code") or "").strip()
+
+        raw_rows: List[Dict[str, Any]] = []
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api(
+                    "fetch_timetable_base",
+                    {"teacher": t_name, "school_code": sc},
+                )
+                items = res.get("rows") or res.get("base_rows") or res.get("timetable") or []
+                if isinstance(items, list):
+                    raw_rows = [r for r in items if isinstance(r, dict)]
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 기본 시간표 조회 실패: {exc}")
+                return []
+        else:
+            try:
+                fs = self._get_client()
+                for doc in fs.collection("시간표_기본").stream():
+                    d = doc.to_dict() or {}
+                    d.setdefault("remote_id", doc.id)
+                    raw_rows.append(d)
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"기본 시간표 조회 실패: {exc}")
+                return []
+
+        filtered: List[Dict[str, Any]] = []
+        for row in raw_rows:
+            doc_sc = str(row.get("school_code") or row.get("neis_school_code") or "").strip()
+            if sc and doc_sc and doc_sc != sc:
+                continue
+            doc_teacher = str(row.get("teacher") or row.get("teacher_name") or "").strip()
+            if t_name and doc_teacher and t_name not in doc_teacher and doc_teacher not in t_name:
+                continue
+            filtered.append(row)
+        return filtered
 
     def push_local_item(
         self,

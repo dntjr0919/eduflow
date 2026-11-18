@@ -243,6 +243,7 @@ class DatabaseManager:
                     CREATE TABLE IF NOT EXISTS classroom_attendance_logs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         homeroom_key TEXT NOT NULL,
+                        remote_id TEXT NOT NULL DEFAULT '',
                         student_id TEXT NOT NULL,
                         student_name TEXT NOT NULL,
                         category TEXT NOT NULL DEFAULT '질병결석',
@@ -254,8 +255,37 @@ class DatabaseManager:
                     )
                     """
                 )
+                cur.execute("PRAGMA table_info(classroom_attendance_logs)")
+                att_cols = {str(r["name"]) for r in cur.fetchall()}
+                if "remote_id" not in att_cols:
+                    cur.execute(
+                        "ALTER TABLE classroom_attendance_logs ADD COLUMN remote_id TEXT NOT NULL DEFAULT ''"
+                    )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_classroom_attendance_hr ON classroom_attendance_logs(homeroom_key, id DESC)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lesson_progress_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_id TEXT NOT NULL DEFAULT '',
+                        roster_key TEXT NOT NULL DEFAULT '',
+                        subject TEXT NOT NULL DEFAULT '',
+                        class_label TEXT NOT NULL DEFAULT '',
+                        date TEXT NOT NULL DEFAULT '',
+                        period INTEGER,
+                        unit_title TEXT NOT NULL DEFAULT '',
+                        lesson_no TEXT NOT NULL DEFAULT '',
+                        content TEXT NOT NULL DEFAULT '',
+                        next_plan TEXT NOT NULL DEFAULT '',
+                        status TEXT NOT NULL DEFAULT '예정',
+                        memo TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_lesson_progress_key ON lesson_progress_logs(roster_key, date DESC, id DESC)"
                 )
                 cur.execute(
                     """
@@ -1330,7 +1360,7 @@ class DatabaseManager:
                 cur = conn.cursor()
                 cur.execute(
                     """
-                    SELECT id, homeroom_key, student_id, student_name, category,
+                    SELECT id, homeroom_key, remote_id, student_id, student_name, category,
                            reason, period_text, selected_dates_json, proof_status, updated_at
                     FROM classroom_attendance_logs
                     WHERE homeroom_key = ?
@@ -1350,6 +1380,7 @@ class DatabaseManager:
                         {
                             "id": int(r["id"]),
                             "homeroom_key": str(r["homeroom_key"]),
+                            "remote_id": str(r["remote_id"] or ""),
                             "student_id": str(r["student_id"] or ""),
                             "student_name": str(r["student_name"] or ""),
                             "category": str(r["category"] or "질병결석"),
@@ -1404,6 +1435,222 @@ class DatabaseManager:
                 new_id = int(cur.lastrowid or 0)
                 conn.commit()
                 return new_id
+            finally:
+                conn.close()
+
+    def upsert_remote_attendance_log(
+        self,
+        homeroom_key: str,
+        *,
+        remote_id: str,
+        student_id: str,
+        student_name: str,
+        category: str,
+        reason: str,
+        period_text: str,
+        selected_dates: Optional[List[str]] = None,
+        proof_status: str = "증빙 대기",
+        updated_at: str = "",
+    ) -> Tuple[int, bool]:
+        """모바일(`일일_출결`) 출결 보고를 로컬 출결 대장에 중복 없이 병합합니다."""
+        key = (homeroom_key or "").strip() or "__sample__"
+        rid = str(remote_id or "").strip()
+        sid = str(student_id or "").strip()
+        sname = str(student_name or "").strip()
+        cat = str(category or "질병결석").strip() or "질병결석"
+        rsn = str(reason or "").strip()
+        ptext = str(period_text or "").strip()
+        dates_clean = [str(x).strip() for x in (selected_dates or []) if str(x).strip()]
+        dates_json = json.dumps(dates_clean, ensure_ascii=False)
+        pstatus = str(proof_status or "증빙 대기").strip() or "증빙 대기"
+        ts = str(updated_at or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                existing = None
+                if rid:
+                    cur.execute(
+                        "SELECT id, proof_status FROM classroom_attendance_logs WHERE homeroom_key = ? AND remote_id = ? LIMIT 1",
+                        (key, rid),
+                    )
+                    existing = cur.fetchone()
+                if existing is None and sid:
+                    cur.execute(
+                        """
+                        SELECT id, proof_status FROM classroom_attendance_logs
+                        WHERE homeroom_key = ? AND student_id = ? AND category = ? AND period_text = ?
+                        LIMIT 1
+                        """,
+                        (key, sid, cat, ptext),
+                    )
+                    existing = cur.fetchone()
+
+                if existing is not None:
+                    row_id = int(existing["id"])
+                    cur_status = str(existing["proof_status"] or "")
+                    if cur_status and "대기" not in cur_status and "미확인" not in cur_status and ("대기" in pstatus or "미확인" in pstatus):
+                        pstatus = cur_status
+                    cur.execute(
+                        """
+                        UPDATE classroom_attendance_logs
+                        SET remote_id = CASE WHEN remote_id = '' THEN ? ELSE remote_id END,
+                            student_name = ?,
+                            category = ?,
+                            reason = ?,
+                            period_text = ?,
+                            selected_dates_json = ?,
+                            proof_status = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (rid, sname, cat, rsn, ptext, dates_json, pstatus, ts, row_id),
+                    )
+                    conn.commit()
+                    return row_id, False
+
+                cur.execute(
+                    """
+                    INSERT INTO classroom_attendance_logs
+                    (homeroom_key, remote_id, student_id, student_name, category, reason, period_text, selected_dates_json, proof_status, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, rid, sid, sname, cat, rsn, ptext, dates_json, pstatus, ts),
+                )
+                new_id = int(cur.lastrowid or 0)
+                conn.commit()
+                return new_id, True
+            finally:
+                conn.close()
+
+    def get_lesson_progress_logs(
+        self,
+        roster_key: str = "",
+        subject: str = "",
+        class_label: str = "",
+    ) -> List[Dict[str, Any]]:
+        rk = str(roster_key or "").strip()
+        subj = str(subject or "").strip()
+        clbl = str(class_label or "").strip()
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                clauses: List[str] = []
+                params: List[Any] = []
+                if rk:
+                    clauses.append("roster_key = ?")
+                    params.append(rk)
+                if subj:
+                    clauses.append("subject = ?")
+                    params.append(subj)
+                if clbl:
+                    clauses.append("class_label = ?")
+                    params.append(clbl)
+                where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                cur.execute(
+                    f"""
+                    SELECT id, remote_id, roster_key, subject, class_label, date, period,
+                           unit_title, lesson_no, content, next_plan, status, memo, updated_at
+                    FROM lesson_progress_logs
+                    {where_sql}
+                    ORDER BY date DESC, period DESC, id DESC
+                    """,
+                    tuple(params),
+                )
+                return [dict(r) for r in cur.fetchall()]
+            finally:
+                conn.close()
+
+    def upsert_lesson_progress_log(
+        self,
+        *,
+        log_id: Optional[int] = None,
+        remote_id: str = "",
+        roster_key: str = "",
+        subject: str = "",
+        class_label: str = "",
+        date: str = "",
+        period: Optional[int] = None,
+        unit_title: str = "",
+        lesson_no: str = "",
+        content: str = "",
+        next_plan: str = "",
+        status: str = "예정",
+        memo: str = "",
+        updated_at: str = "",
+    ) -> Tuple[int, bool]:
+        rid = str(remote_id or "").strip()
+        rk = str(roster_key or "").strip()
+        subj = str(subject or "").strip()
+        clbl = str(class_label or "").strip()
+        dt = str(date or "").strip()
+        per = int(period) if period is not None and str(period).strip() != "" else None
+        utitle = str(unit_title or "").strip()
+        lno = str(lesson_no or "").strip()
+        cnt = str(content or "").strip()
+        nplan = str(next_plan or "").strip()
+        st = str(status or "예정").strip() or "예정"
+        mm = str(memo or "").strip()
+        ts = str(updated_at or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                target_id = int(log_id) if log_id else 0
+                if not target_id and rid:
+                    cur.execute("SELECT id FROM lesson_progress_logs WHERE remote_id = ? LIMIT 1", (rid,))
+                    row = cur.fetchone()
+                    if row:
+                        target_id = int(row["id"])
+
+                if target_id > 0:
+                    cur.execute(
+                        """
+                        UPDATE lesson_progress_logs
+                        SET remote_id = CASE WHEN ? != '' THEN ? ELSE remote_id END,
+                            roster_key = ?,
+                            subject = ?,
+                            class_label = ?,
+                            date = ?,
+                            period = ?,
+                            unit_title = ?,
+                            lesson_no = ?,
+                            content = ?,
+                            next_plan = ?,
+                            status = ?,
+                            memo = ?,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (rid, rid, rk, subj, clbl, dt, per, utitle, lno, cnt, nplan, st, mm, ts, target_id),
+                    )
+                    conn.commit()
+                    return target_id, False
+
+                cur.execute(
+                    """
+                    INSERT INTO lesson_progress_logs
+                    (remote_id, roster_key, subject, class_label, date, period, unit_title, lesson_no, content, next_plan, status, memo, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (rid, rk, subj, clbl, dt, per, utitle, lno, cnt, nplan, st, mm, ts),
+                )
+                new_id = int(cur.lastrowid or 0)
+                conn.commit()
+                return new_id, True
+            finally:
+                conn.close()
+
+    def delete_lesson_progress_log(self, log_id: int) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM lesson_progress_logs WHERE id = ?", (int(log_id),))
+                conn.commit()
             finally:
                 conn.close()
 

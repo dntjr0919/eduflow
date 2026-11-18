@@ -2450,8 +2450,12 @@ class SettingsTab(QWidget):
                 allowed_exts=[".xlsx"],
                 allow_dirs=False,
                 allow_files=True,
-                multiple=False,
-                on_files_dropped=lambda paths: self.import_subject_roster_file(paths[0]),
+                multiple=True,
+                on_files_dropped=lambda paths: (
+                    self.import_subject_rosters_batch(paths)
+                    if len(paths) > 1
+                    else self.import_subject_roster_file(paths[0])
+                ),
                 context_label="교과 출석부 명렬표 (.xlsx)",
             )
         tab2_lay.addWidget(self.table_subject)
@@ -2524,8 +2528,12 @@ class SettingsTab(QWidget):
                 allowed_exts=[".xlsx"],
                 allow_dirs=False,
                 allow_files=True,
-                multiple=False,
-                on_files_dropped=lambda paths: self.import_club_roster_file(paths[0]),
+                multiple=True,
+                on_files_dropped=lambda paths: (
+                    self.import_club_rosters_batch(paths)
+                    if len(paths) > 1
+                    else self.import_club_roster_file(paths[0])
+                ),
                 context_label="동아리 출석부 명렬표 (.xlsx)",
             )
         tab3_lay.addWidget(self.table_club)
@@ -2791,6 +2799,83 @@ class SettingsTab(QWidget):
         if file_path:
             self.import_homeroom_roster_file(file_path)
 
+    def _import_rosters_batch(
+        self,
+        file_paths: List[str],
+        roster_type: str = "subject",
+        show_dialog: bool = True,
+    ) -> Dict[str, Any]:
+        """교과 또는 동아리 출석부 엑셀(.xlsx) 복수 파일을 순차 파싱·저장하고 1회 일괄 동기화합니다."""
+        paths = [str(p).strip() for p in (file_paths or []) if str(p).strip()]
+        if not paths:
+            return {"ok_count": 0, "fail_count": 0, "total_students": 0, "group_ids": [], "failures": []}
+
+        is_club = str(roster_type or "subject").strip().lower() == "club"
+        parser_fn = parse_club_roster if is_club else parse_subject_roster
+        label = "동아리 출석부" if is_club else "교과 출석부"
+
+        created_ids: List[int] = []
+        total_students = 0
+        failures: List[str] = []
+
+        for fp in paths:
+            try:
+                group_info, student_list = parser_fn(fp)
+                group_id = self.db.create_roster_group(
+                    group_type=group_info["group_type"],
+                    group_name=group_info["group_name"],
+                    extra_info=group_info.get("extra_info", ""),
+                    columns_json=group_info.get("columns_json", "[]"),
+                    is_active=1,
+                )
+                self.db.add_roster_students(group_id, student_list)
+                created_ids.append(group_id)
+                total_students += len(student_list)
+            except Exception as exc:
+                failures.append(f"{Path(fp).name}: {exc}")
+
+        if created_ids:
+            self.refresh_all_rosters()
+            target_combo = self.combo_club_groups if is_club else self.combo_subject_groups
+            idx = target_combo.findData(created_ids[-1])
+            if idx >= 0:
+                target_combo.setCurrentIndex(idx)
+            self._sync_rosters_in_background(group_ids=created_ids)
+
+        if show_dialog:
+            summary_msg = (
+                f"총 {len(created_ids)}개 강좌 등록 완료 (학생 {total_students}명) / 실패 {len(failures)}건"
+            )
+            if failures:
+                detail = "\n".join(failures[:8])
+                if len(failures) > 8:
+                    detail += f"\n... 외 {len(failures) - 8}건"
+                QMessageBox.warning(
+                    self,
+                    f"{label} 일괄 등록 결과",
+                    f"{summary_msg}\n\n[실패 목록]\n{detail}",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    f"{label} 일괄 등록 완료",
+                    summary_msg,
+                )
+
+        return {
+            "ok_count": len(created_ids),
+            "fail_count": len(failures),
+            "total_students": total_students,
+            "group_ids": created_ids,
+            "failures": failures,
+        }
+
+    def import_subject_rosters_batch(self, file_paths: List[str], show_dialog: bool = True) -> Dict[str, Any]:
+        return self._import_rosters_batch(file_paths, roster_type="subject", show_dialog=show_dialog)
+
+    def import_club_rosters_batch(self, file_paths: List[str], show_dialog: bool = True) -> Dict[str, Any]:
+        return self._import_rosters_batch(file_paths, roster_type="club", show_dialog=show_dialog)
+
     def import_subject_roster_file(self, file_path: str) -> int:
         if not file_path:
             return 0
@@ -2822,14 +2907,18 @@ class SettingsTab(QWidget):
             return 0
 
     def _on_import_subject_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "나이스 교과출석부 엑셀 파일(.xlsx) 선택",
+            "나이스 교과출석부 엑셀 파일(.xlsx) 선택 (복수 선택 가능)",
             "",
             "Excel Files (*.xlsx);;All Files (*.*)",
         )
-        if file_path:
-            self.import_subject_roster_file(file_path)
+        if not file_paths:
+            return
+        if len(file_paths) == 1:
+            self.import_subject_roster_file(file_paths[0])
+        else:
+            self.import_subject_rosters_batch(file_paths)
 
     def import_club_roster_file(self, file_path: str) -> int:
         if not file_path:
@@ -2862,14 +2951,18 @@ class SettingsTab(QWidget):
             return 0
 
     def _on_import_club_file(self) -> None:
-        file_path, _ = QFileDialog.getOpenFileName(
+        file_paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "나이스 동아리출석부 엑셀 파일(.xlsx) 선택",
+            "나이스 동아리출석부 엑셀 파일(.xlsx) 선택 (복수 선택 가능)",
             "",
             "Excel Files (*.xlsx);;All Files (*.*)",
         )
-        if file_path:
-            self.import_club_roster_file(file_path)
+        if not file_paths:
+            return
+        if len(file_paths) == 1:
+            self.import_club_roster_file(file_paths[0])
+        else:
+            self.import_club_rosters_batch(file_paths)
 
     def _on_reset_homeroom(self) -> None:
         ans = QMessageBox.question(

@@ -14,12 +14,13 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -36,7 +37,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSplitter,
+    QSpinBox,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTreeWidget,
@@ -68,6 +70,7 @@ def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
 
 
 MATERIAL_STATUS_OPTIONS: List[str] = ["예정", "수업 중", "진도 완료", "보강 필요"]
+PROGRESS_STATUS_OPTIONS: List[str] = ["예정", "진행중", "완료"]
 
 AI_REFERENCE_EXTENSIONS: set[str] = {
     ".hwpx",
@@ -402,6 +405,8 @@ class GradeMaterialTab(QWidget):
         self._focused_card: Optional[str] = None
         self._updating_table: bool = False
         self._loading_material_meta: bool = False
+        self._editing_progress_id: Optional[int] = None
+        self._comcigan_rows: List[Dict[str, Any]] = []
         self._eval_columns: List[Dict[str, str]] = []
         self.materials_base_dir = Path("workspace") / "course_materials"
         self._current_material_root: Path = self.materials_base_dir.resolve()
@@ -409,6 +414,8 @@ class GradeMaterialTab(QWidget):
         self._init_ui()
         self._populate_subject_combo()
         self.refresh_student_preview()
+        self._refresh_progress_course_combo()
+        self._refresh_progress_table()
 
     def _create_kpi_card(
         self,
@@ -541,25 +548,49 @@ class GradeMaterialTab(QWidget):
         layout.addLayout(kpi_row)
 
         # -----------------------------------------------------------------
-        # 2. 메인 좌우 분할 (QSplitter: 좌측 성적표 / 우측 단원별 수업자료)
+        # 2. 상단 Pill 버튼 바 + 하단 단일 전체 폭 QStackedWidget
         # -----------------------------------------------------------------
-        self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.setChildrenCollapsible(False)
+        self.pill_bar = QFrame()
+        pill_bar_lay = QHBoxLayout(self.pill_bar)
+        pill_bar_lay.setContentsMargins(0, 0, 0, 0)
+        pill_bar_lay.setSpacing(8)
+        self.pill_btn_group = QButtonGroup(self)
+        self.pill_btn_group.setExclusive(True)
+        self.tool_pills: List[QPushButton] = []
+        pill_titles = [
+            "1. 학생 명렬표 연동 성적·수행평가 관리",
+            "2. 교과 수업자료 폴더",
+            "3. 학반별 진도 관리 (컴시간 연동)",
+        ]
+        for idx, p_title in enumerate(pill_titles):
+            pill = QPushButton(p_title)
+            pill.setCheckable(True)
+            pill.setChecked(idx == 0)
+            pill.setCursor(Qt.CursorShape.PointingHandCursor)
+            pill.setMinimumHeight(34)
+            pill.setStyleSheet(
+                "QPushButton { padding: 6px 14px; border-radius: 17px; border: 1px solid #CBD5E1; "
+                "background: #FFFFFF; color: #334155; font-weight: 600; font-size: 12px; } "
+                "QPushButton:checked { background: #4F46E5; color: #FFFFFF; border-color: #4F46E5; } "
+                "QPushButton:hover:!checked { background: #F1F5F9; }"
+            )
+            self.pill_btn_group.addButton(pill, idx)
+            pill_bar_lay.addWidget(pill)
+            self.tool_pills.append(pill)
+        pill_bar_lay.addStretch(1)
+        layout.addWidget(self.pill_bar)
 
-        # === [좌측 패널] 학생 명렬표 연동 성적/수행평가 관리 ===
+        self.tool_stack = QStackedWidget()
+        self.pill_btn_group.idClicked.connect(self.tool_stack.setCurrentIndex)
+
+        # === [메뉴 1] 학생 명렬표 연동 성적/수행평가 관리 ===
         self.left_group = HoverZoomCard(
-            title="학생 명렬표 연동 성적 및 수행평가 관리",
+            title="1. 학생 명렬표 연동 성적 및 수행평가 관리",
+            parent=container,
             zoom_ratio=1.0,
             hover_delay_ms=0,
         )
         apply_qss_role(self.left_group, role="hoverZoomCard", obj_name="GradeRosterGroup")
-
-        self.btn_focus_left = QPushButton("전체화면")
-        apply_qss_role(self.btn_focus_left, role="cardMax", obj_name="CardMaxButton")
-        self.btn_focus_left.setCheckable(True)
-        self.btn_focus_left.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_focus_left.clicked.connect(lambda: self._toggle_card_focus("left"))
-        self.left_group.add_header_widget(self.btn_focus_left)
 
         l_lay = self.left_group.body_layout()
 
@@ -654,20 +685,14 @@ class GradeMaterialTab(QWidget):
         footer_bar.addStretch()
         l_lay.addLayout(footer_bar)
 
-        # === [우측 패널] 교과 수업 자료 로컬 폴더 연동 및 학반별 진도 관리 ===
+        # === [메뉴 2] 교과 수업자료 폴더 ===
         self.right_group = HoverZoomCard(
-            title="교과 수업 자료 폴더 연동 및 학반별 진도 관리",
+            title="2. 교과 수업자료 폴더 (단원·버전·백업·AI 전달)",
+            parent=container,
             zoom_ratio=1.0,
             hover_delay_ms=0,
         )
         apply_qss_role(self.right_group, role="hoverZoomCard", obj_name="CourseMaterialGroup")
-
-        self.btn_focus_right = QPushButton("전체화면")
-        apply_qss_role(self.btn_focus_right, role="cardMax", obj_name="CardMaxButton")
-        self.btn_focus_right.setCheckable(True)
-        self.btn_focus_right.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_focus_right.clicked.connect(lambda: self._toggle_card_focus("right"))
-        self.right_group.add_header_widget(self.btn_focus_right)
 
         r_lay = self.right_group.body_layout()
 
@@ -755,56 +780,7 @@ class GradeMaterialTab(QWidget):
         self.tree_materials.currentItemChanged.connect(self._on_material_selection_changed)
         r_lay.addWidget(self.tree_materials, stretch=1)
 
-        # 4) 선택한 단원/파일의 현재 강좌(학반) 진도 상태 및 수업 메모 기록 바
-        progress_card = QFrame()
-        apply_qss_role(progress_card, role="subCard")
-        p_lay = QVBoxLayout(progress_card)
-        p_lay.setContentsMargins(10, 8, 10, 8)
-        p_lay.setSpacing(6)
-
-        self.lbl_selected_material = QLabel("선택 항목: 트리에서 단원 폴더 또는 자료 파일을 선택하세요 (파일 더블클릭 시 바로 열기)")
-        apply_qss_role(self.lbl_selected_material, role="fieldLabel")
-        self.lbl_selected_material.setSizePolicy(
-            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
-        )
-        p_lay.addWidget(self.lbl_selected_material)
-
-        p_ctrl_row = QHBoxLayout()
-        p_ctrl_row.setSpacing(6)
-
-        self.combo_material_status = QComboBox()
-        self.combo_material_status.setMinimumHeight(32)
-        self.combo_material_status.addItems(MATERIAL_STATUS_OPTIONS)
-        install_no_scroll_wheel_filter(self.combo_material_status)
-
-        self.edit_material_memo = QLineEdit()
-        self.edit_material_memo.setMinimumHeight(32)
-        self.edit_material_memo.setPlaceholderText("이 강좌·학반 진도 메모 (예: p.28 탐구완료, 수행 안내지 배부)")
-        self.edit_material_memo.returnPressed.connect(self._on_save_material_progress)
-
-        self.btn_save_progress = QPushButton("진도 저장")
-        apply_qss_role(self.btn_save_progress, role="secondary", obj_name="BtnSaveMaterialProgress")
-        self.btn_save_progress.setMinimumHeight(32)
-        self.btn_save_progress.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_save_progress.clicked.connect(self._on_save_material_progress)
-
-        self.btn_sync_mobile_progress = QPushButton("모바일 진도 동기화(업로드/불러오기)")
-        apply_qss_role(self.btn_sync_mobile_progress, role="secondary", obj_name="BtnSyncMobileProgress")
-        self.btn_sync_mobile_progress.setMinimumHeight(32)
-        self.btn_sync_mobile_progress.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_sync_mobile_progress.setToolTip(
-            "현재 교과·학반의 진도 기록을 모바일(Firestore 수업_진도)과 양방향 동기화합니다."
-        )
-        self.btn_sync_mobile_progress.clicked.connect(self._on_sync_mobile_progress)
-
-        p_ctrl_row.addWidget(self.combo_material_status)
-        p_ctrl_row.addWidget(self.edit_material_memo, stretch=1)
-        p_ctrl_row.addWidget(self.btn_save_progress)
-        p_ctrl_row.addWidget(self.btn_sync_mobile_progress)
-        p_lay.addLayout(p_ctrl_row)
-        r_lay.addWidget(progress_card)
-
-        # 5) 하단 실용 액션 버튼 바 (2행 3열 배치로 좁은 폭에서도 글자 잘림 방지)
+        # 4) 하단 실용 액션 버튼 바 (2행 3열 배치로 좁은 폭에서도 글자 잘림 방지)
         action_row_top = QHBoxLayout()
         action_row_top.setSpacing(8)
 
@@ -880,47 +856,23 @@ class GradeMaterialTab(QWidget):
         action_row_bottom.addWidget(self.btn_send_to_ai, stretch=1)
         r_lay.addLayout(action_row_bottom)
 
-        self.splitter.addWidget(self.left_group)
-        self.splitter.addWidget(self.right_group)
-        self.splitter.setSizes([640, 440])
-        self.splitter.setStretchFactor(0, 6)
-        self.splitter.setStretchFactor(1, 4)
-        layout.addWidget(self.splitter, stretch=1)
+        # === [메뉴 3] 학반별 진도 관리 (컴시간 연동) ===
+        self.progress_group = self._build_lesson_progress_page(container)
+
+        self.tool_stack.addWidget(self.left_group)
+        self.tool_stack.addWidget(self.right_group)
+        self.tool_stack.addWidget(self.progress_group)
+        self.tool_stack.setCurrentIndex(0)
+        layout.addWidget(self.tool_stack, stretch=1)
 
         scroll.setWidget(container)
         outer_lay.addWidget(scroll)
 
     def _toggle_card_focus(self, target: str) -> None:
-        if self._focused_card == target:
-            self._focused_card = None
-            self.left_group.set_zoom_enabled(True)
-            self.right_group.set_zoom_enabled(True)
-            self.left_group.show()
-            self.right_group.show()
-            self.btn_focus_left.setChecked(False)
-            self.btn_focus_left.setText("전체화면")
-            self.btn_focus_right.setChecked(False)
-            self.btn_focus_right.setText("전체화면")
-            self.splitter.setSizes([640, 440])
-            return
-
-        self._focused_card = target
-        if target == "left":
-            self.left_group.set_zoom_enabled(False)
-            self.left_group.show()
-            self.right_group.hide()
-            self.btn_focus_left.setChecked(True)
-            self.btn_focus_left.setText("원래 크기로")
-            self.btn_focus_right.setChecked(False)
-            self.btn_focus_right.setText("전체화면")
-        else:
-            self.right_group.set_zoom_enabled(False)
-            self.left_group.hide()
-            self.right_group.show()
-            self.btn_focus_right.setChecked(True)
-            self.btn_focus_right.setText("원래 크기로")
-            self.btn_focus_left.setChecked(False)
-            self.btn_focus_left.setText("전체화면")
+        idx = 0 if target == "left" else 1
+        if 0 <= idx < len(self.tool_pills):
+            self.tool_pills[idx].setChecked(True)
+        self.tool_stack.setCurrentIndex(idx)
 
     def _populate_subject_combo(self) -> None:
         """등록된 교과 강좌 목록을 콤보박스에 바인딩합니다."""
@@ -1557,6 +1509,191 @@ class GradeMaterialTab(QWidget):
             if visible and any_child_match:
                 top_it.setExpanded(True)
 
+    def _build_lesson_progress_page(self, parent: QWidget) -> HoverZoomCard:
+        """[메뉴 3] 학반별 진도 관리 (컴시간 시간표 연동 + 수업_진도 양방향 동기화) 화면을 생성합니다."""
+        card = HoverZoomCard(
+            title="3. 학반별 진도 관리 (컴시간 시간표 연동)",
+            parent=parent,
+            zoom_ratio=1.0,
+            hover_delay_ms=0,
+        )
+        apply_qss_role(card, role="hoverZoomCard", obj_name="LessonProgressGroup")
+        p_lay = card.body_layout()
+
+        # 1) 컴시간 시간표 연동 및 강좌·학반 선택 바
+        top_bar = QFrame()
+        apply_qss_role(top_bar, role="subCard")
+        tb_lay = QHBoxLayout(top_bar)
+        tb_lay.setContentsMargins(10, 8, 10, 8)
+        tb_lay.setSpacing(8)
+
+        lbl_course = QLabel("강좌 · 학반:")
+        apply_qss_role(lbl_course, role="fieldLabel")
+
+        self.combo_progress_course = QComboBox()
+        self.combo_progress_course.setMinimumHeight(32)
+        self.combo_progress_course.setMinimumWidth(240)
+        install_no_scroll_wheel_filter(self.combo_progress_course)
+        self.combo_progress_course.currentIndexChanged.connect(self._on_progress_course_changed)
+
+        self.btn_load_comcigan_schedule = QPushButton("컴시간 시간표 불러오기")
+        apply_qss_role(self.btn_load_comcigan_schedule, role="secondary", obj_name="BtnLoadComciganSchedule")
+        self.btn_load_comcigan_schedule.setMinimumHeight(32)
+        self.btn_load_comcigan_schedule.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_load_comcigan_schedule.setToolTip(
+            "컴시간 시간표(오늘/이번 주 수업 및 담당 학반 목록)를 불러와 강좌·학반 선택 목록에 반영합니다."
+        )
+        self.btn_load_comcigan_schedule.clicked.connect(self.load_comcigan_timetable_courses)
+
+        self.lbl_comcigan_status = QLabel("등록된 교과 명렬표 기준 (컴시간 불러오기 가능)")
+        apply_qss_role(self.lbl_comcigan_status, role="mutedText")
+
+        self.btn_sync_mobile_progress = QPushButton("모바일·어드민 진도 동기화")
+        apply_qss_role(self.btn_sync_mobile_progress, role="primary", obj_name="BtnSyncMobileProgress")
+        self.btn_sync_mobile_progress.setMinimumHeight(32)
+        self.btn_sync_mobile_progress.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sync_mobile_progress.setToolTip(
+            "데스크톱 진도 기록과 모바일(Firestore 수업_진도)을 양방향 동기화(업로드/불러오기)합니다."
+        )
+        self.btn_sync_mobile_progress.clicked.connect(self._on_sync_mobile_progress)
+
+        tb_lay.addWidget(lbl_course)
+        tb_lay.addWidget(self.combo_progress_course)
+        tb_lay.addWidget(self.btn_load_comcigan_schedule)
+        tb_lay.addWidget(self.lbl_comcigan_status, stretch=1)
+        tb_lay.addWidget(self.btn_sync_mobile_progress)
+        p_lay.addWidget(top_bar)
+
+        # 2) 이번 주 / 오늘 컴시간 수업 슬롯 빠른 선택 리스트
+        self.list_comcigan_slots = QListWidget()
+        self.list_comcigan_slots.setMaximumHeight(74)
+        self.list_comcigan_slots.setFlow(QListWidget.Flow.LeftToRight)
+        self.list_comcigan_slots.setWrapping(True)
+        self.list_comcigan_slots.setSpacing(4)
+        self.list_comcigan_slots.setToolTip("컴시간 시간표의 수업 슬롯을 클릭하면 해당 과목·학반·교시가 자동 선택됩니다.")
+        self.list_comcigan_slots.itemClicked.connect(self._on_comcigan_slot_clicked)
+        p_lay.addWidget(self.list_comcigan_slots)
+
+        # 3) 진도 입력 / 수정 폼
+        form_card = QFrame()
+        apply_qss_role(form_card, role="subCard")
+        f_lay = QVBoxLayout(form_card)
+        f_lay.setContentsMargins(10, 8, 10, 8)
+        f_lay.setSpacing(6)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+
+        self.edit_prog_date = QLineEdit(datetime.now().strftime("%Y-%m-%d"))
+        self.edit_prog_date.setMinimumHeight(32)
+        self.edit_prog_date.setMaximumWidth(120)
+        self.edit_prog_date.setPlaceholderText("YYYY-MM-DD")
+
+        self.spin_prog_period = QSpinBox()
+        self.spin_prog_period.setMinimumHeight(32)
+        self.spin_prog_period.setRange(0, 10)
+        self.spin_prog_period.setSpecialValueText("교시 미지정")
+        self.spin_prog_period.setSuffix("교시")
+        self.spin_prog_period.setValue(1)
+
+        self.edit_prog_unit = QLineEdit()
+        self.edit_prog_unit.setMinimumHeight(32)
+        self.edit_prog_unit.setPlaceholderText("단원명 (예: II. 물질과 규칙성)")
+
+        self.edit_prog_lesson_no = QLineEdit()
+        self.edit_prog_lesson_no.setMinimumHeight(32)
+        self.edit_prog_lesson_no.setMaximumWidth(110)
+        self.edit_prog_lesson_no.setPlaceholderText("차시 (예: 3차시)")
+
+        self.combo_prog_status = QComboBox()
+        self.combo_prog_status.setMinimumHeight(32)
+        self.combo_prog_status.addItems(PROGRESS_STATUS_OPTIONS)
+        install_no_scroll_wheel_filter(self.combo_prog_status)
+
+        row1.addWidget(QLabel("수업일:"))
+        row1.addWidget(self.edit_prog_date)
+        row1.addWidget(QLabel("교시:"))
+        row1.addWidget(self.spin_prog_period)
+        row1.addWidget(QLabel("단원:"))
+        row1.addWidget(self.edit_prog_unit, stretch=1)
+        row1.addWidget(QLabel("차시:"))
+        row1.addWidget(self.edit_prog_lesson_no)
+        row1.addWidget(QLabel("상태:"))
+        row1.addWidget(self.combo_prog_status)
+        f_lay.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+
+        self.edit_prog_content = QLineEdit()
+        self.edit_prog_content.setMinimumHeight(32)
+        self.edit_prog_content.setPlaceholderText("수업 내용 (예: 원소의 주기성 탐구 활동 완료)")
+
+        self.edit_prog_next_plan = QLineEdit()
+        self.edit_prog_next_plan.setMinimumHeight(32)
+        self.edit_prog_next_plan.setPlaceholderText("다음 시간 계획 (예: 이온 결합 형성 모형 실습)")
+
+        self.edit_prog_memo = QLineEdit()
+        self.edit_prog_memo.setMinimumHeight(32)
+        self.edit_prog_memo.setPlaceholderText("비고 / 학반 특이사항 메모")
+
+        row2.addWidget(QLabel("수업 내용:"))
+        row2.addWidget(self.edit_prog_content, stretch=2)
+        row2.addWidget(QLabel("다음 계획:"))
+        row2.addWidget(self.edit_prog_next_plan, stretch=2)
+        row2.addWidget(QLabel("메모:"))
+        row2.addWidget(self.edit_prog_memo, stretch=1)
+        f_lay.addLayout(row2)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.btn_prog_new = QPushButton("새로 입력")
+        apply_qss_role(self.btn_prog_new, role="subtle", obj_name="BtnNewLessonProgress")
+        self.btn_prog_new.setMinimumHeight(32)
+        self.btn_prog_new.clicked.connect(self._on_new_lesson_progress)
+
+        self.btn_prog_save = QPushButton("진도 기록 저장")
+        apply_qss_role(self.btn_prog_save, role="primary", obj_name="BtnSaveLessonProgress")
+        self.btn_prog_save.setMinimumHeight(32)
+        self.btn_prog_save.clicked.connect(self._on_save_lesson_progress)
+
+        self.btn_prog_delete = QPushButton("선택 삭제")
+        apply_qss_role(self.btn_prog_delete, role="secondary", obj_name="BtnDeleteLessonProgress")
+        self.btn_prog_delete.setMinimumHeight(32)
+        self.btn_prog_delete.clicked.connect(self._on_delete_lesson_progress)
+
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_prog_new)
+        btn_row.addWidget(self.btn_prog_delete)
+        btn_row.addWidget(self.btn_prog_save)
+        f_lay.addLayout(btn_row)
+        p_lay.addWidget(form_card)
+
+        # 4) 학반별 진도 이력 테이블
+        self.table_progress = QTableWidget(0, 8)
+        self.table_progress.setAlternatingRowColors(True)
+        self.table_progress.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table_progress.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table_progress.verticalHeader().setDefaultSectionSize(30)
+        self.table_progress.verticalHeader().setVisible(False)
+        self.table_progress.setHorizontalHeaderLabels(
+            ["날짜", "교시", "강좌 · 학반", "단원", "차시", "수업 내용", "다음 계획", "상태"]
+        )
+        p_hdr = self.table_progress.horizontalHeader()
+        p_hdr.setMinimumHeight(32)
+        p_hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        p_hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        p_hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        p_hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        p_hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        p_hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        p_hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        p_hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
+        self.table_progress.cellClicked.connect(self._on_progress_row_clicked)
+        p_lay.addWidget(self.table_progress, stretch=1)
+
+        return card
+
     def _on_material_selection_changed(
         self,
         current: Optional[QTreeWidgetItem],
@@ -1565,56 +1702,281 @@ class GradeMaterialTab(QWidget):
         self._loading_material_meta = True
         try:
             if current is None:
-                self.lbl_selected_material.setText(
-                    "선택 항목: 트리에서 단원 폴더 또는 자료 파일을 선택하세요 (파일 더블클릭 시 바로 열기)"
-                )
-                self.combo_material_status.setCurrentIndex(0)
-                self.edit_material_memo.clear()
-                self.combo_material_status.setEnabled(False)
-                self.edit_material_memo.setEnabled(False)
-                self.btn_save_progress.setEnabled(False)
                 return
-
-            self.combo_material_status.setEnabled(True)
-            self.edit_material_memo.setEnabled(True)
-            self.btn_save_progress.setEnabled(True)
-
-            rel_key = str(current.data(0, self.ROLE_REL_PATH) or "")
-            kind = str(current.data(0, self.ROLE_NODE_KIND) or "")
-            kind_prefix = "파일" if kind == "file" else "단원"
-            self.lbl_selected_material.setText(f"선택 {kind_prefix}: {current.text(0)}")
-            self.lbl_selected_material.setToolTip(str(current.data(0, self.ROLE_ABS_PATH) or ""))
-
-            progress_map = self.db.get_subject_material_progress_map(self._current_subject_key())
-            saved = progress_map.get(rel_key, {})
-            st_val = saved.get("status", "예정")
-            idx = self.combo_material_status.findText(st_val)
-            self.combo_material_status.setCurrentIndex(idx if idx >= 0 else 0)
-            self.edit_material_memo.setText(saved.get("memo", ""))
         finally:
             self._loading_material_meta = False
 
     def _on_save_material_progress(self) -> None:
-        if self._loading_material_meta:
+        return
+
+    def _get_selected_progress_course_meta(self) -> Dict[str, str]:
+        if getattr(self, "combo_progress_course", None) is not None:
+            data = self.combo_progress_course.currentData()
+            if isinstance(data, dict) and (data.get("subject") or data.get("roster_key")):
+                return {
+                    "roster_key": str(data.get("roster_key") or "").strip(),
+                    "subject": str(data.get("subject") or "").strip(),
+                    "class_label": str(data.get("class_label") or "").strip(),
+                }
+        return self._current_subject_meta()
+
+    def _refresh_progress_course_combo(
+        self,
+        comcigan_rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """등록된 교과 명렬표와 컴시간 시간표에서 강좌·학반 목록을 구성합니다."""
+        if getattr(self, "combo_progress_course", None) is None:
             return
-        curr = self.tree_materials.currentItem()
-        if curr is None:
+        if comcigan_rows is not None:
+            self._comcigan_rows = list(comcigan_rows)
+
+        prev_data = self.combo_progress_course.currentData()
+        entries: List[Tuple[str, Dict[str, str]]] = []
+        seen_keys = set()
+
+        # 1) 컴시간 시간표에서 추출된 강좌·학반 우선 추가
+        for row in self._comcigan_rows:
+            if not isinstance(row, dict):
+                continue
+            subj = str(row.get("subject") or "").strip()
+            if not subj:
+                continue
+            g = row.get("grade")
+            c = row.get("class_no")
+            class_label = str(row.get("class_label") or row.get("target_class") or "").strip()
+            if not class_label and g and c:
+                class_label = f"{g}-{c}"
+            label = f"{subj} {class_label}".strip()
+            rk = f"comcigan_{subj}_{class_label}".strip("_")
+            dedup = (subj, class_label)
+            if dedup not in seen_keys:
+                seen_keys.add(dedup)
+                entries.append((label, {"roster_key": rk, "subject": subj, "class_label": class_label}))
+
+        # 2) 등록된 교과 명렬표 추가
+        for grp in self.db.get_roster_groups(group_type="subject"):
+            subj = str(grp.get("group_name") or "").strip()
+            class_label = str(grp.get("extra_info") or "").strip()
+            rk = f"subject_{grp['id']}"
+            label = f"{subj} {class_label}".strip()
+            dedup = (subj, class_label)
+            if dedup not in seen_keys:
+                seen_keys.add(dedup)
+                entries.append((label, {"roster_key": rk, "subject": subj, "class_label": class_label}))
+
+        self.combo_progress_course.blockSignals(True)
+        self.combo_progress_course.clear()
+        self.combo_progress_course.addItem("전체 강좌 · 학반 보기", {"roster_key": "", "subject": "", "class_label": ""})
+        for label, meta in entries:
+            self.combo_progress_course.addItem(label, meta)
+        if isinstance(prev_data, dict):
+            for i in range(self.combo_progress_course.count()):
+                d = self.combo_progress_course.itemData(i)
+                if isinstance(d, dict) and d.get("subject") == prev_data.get("subject") and d.get("class_label") == prev_data.get("class_label"):
+                    self.combo_progress_course.setCurrentIndex(i)
+                    break
+        elif self.combo_progress_course.count() > 1:
+            self.combo_progress_course.setCurrentIndex(1)
+        self.combo_progress_course.blockSignals(False)
+
+        self._populate_comcigan_slots_list()
+
+    def _populate_comcigan_slots_list(self) -> None:
+        if getattr(self, "list_comcigan_slots", None) is None:
             return
-        rel_key = str(curr.data(0, self.ROLE_REL_PATH) or "").strip()
-        if not rel_key:
-            return
-        status_val = self.combo_material_status.currentText().strip() or "예정"
-        memo_val = self.edit_material_memo.text().strip()
-        self.db.upsert_subject_material_progress(
-            self._current_subject_key(),
-            rel_key,
-            status_val,
-            memo_val,
+        self.list_comcigan_slots.clear()
+        day_names = ["월", "화", "수", "목", "금", "토", "일"]
+        today_day = day_names[datetime.now().weekday()]
+        day_order = {d: i for i, d in enumerate(day_names)}
+        sorted_rows = sorted(
+            [r for r in self._comcigan_rows if isinstance(r, dict) and str(r.get("subject") or "").strip()],
+            key=lambda r: (
+                0 if str(r.get("day") or "").strip() == today_day else 1,
+                day_order.get(str(r.get("day") or "").strip(), 9),
+                int(r.get("period") or 99),
+            ),
         )
-        self._populate_unit_tree(
-            filter_title=self.combo_unit_filter.currentText(),
-            preserve_rel_path=rel_key,
+        for r in sorted_rows:
+            day_str = str(r.get("day") or "").strip()
+            period_val = r.get("period") or ""
+            subj = str(r.get("subject") or "").strip()
+            g = r.get("grade")
+            c = r.get("class_no")
+            class_label = str(r.get("class_label") or r.get("target_class") or "").strip()
+            if not class_label and g and c:
+                class_label = f"{g}-{c}"
+            prefix = "[오늘] " if day_str == today_day else ""
+            text = f"{prefix}{day_str} {period_val}교시 · {subj} {class_label}".strip()
+            item = QListWidgetItem(text)
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                {
+                    "day": day_str,
+                    "period": period_val,
+                    "subject": subj,
+                    "class_label": class_label,
+                },
+            )
+            self.list_comcigan_slots.addItem(item)
+
+    def _on_comcigan_slot_clicked(self, item: QListWidgetItem) -> None:
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        subj = str(data.get("subject") or "").strip()
+        clbl = str(data.get("class_label") or "").strip()
+        for i in range(self.combo_progress_course.count()):
+            d = self.combo_progress_course.itemData(i)
+            if isinstance(d, dict) and d.get("subject") == subj and d.get("class_label") == clbl:
+                self.combo_progress_course.setCurrentIndex(i)
+                break
+        if data.get("period"):
+            try:
+                self.spin_prog_period.setValue(int(data["period"]))
+            except Exception:
+                pass
+
+    def _on_progress_course_changed(self, _idx: int = 0) -> None:
+        self._refresh_progress_table()
+
+    def load_comcigan_timetable_courses(self) -> None:
+        """Firestore `시간표_기본`에서 컴시간 교사 시간표를 불러와 강좌·학반 목록을 갱신합니다."""
+        cfg = ConfigManager()
+        tp = cfg.get_section("teacher_profile") or {}
+        api = cfg.get_section("api_and_integrations") or {}
+        teacher_name = str(tp.get("name") or api.get("comcigan_teacher_name") or "").strip()
+        school_code = str(tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+
+        self.btn_load_comcigan_schedule.setEnabled(False)
+        self.btn_load_comcigan_schedule.setText("불러오는 중...")
+
+        def _work(_worker: Any) -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=cfg)
+            return svc.fetch_timetable_base(teacher_name=teacher_name, school_code=school_code)
+
+        def _on_result(rows: Any) -> None:
+            row_list = list(rows or [])
+            self._refresh_progress_course_combo(comcigan_rows=row_list)
+            self._refresh_progress_table()
+            self.lbl_comcigan_status.setText(f"컴시간 연동 완료 ({len(row_list)}개 교시)")
+
+        def _on_error(err: str) -> None:
+            QMessageBox.warning(
+                self,
+                "컴시간 시간표 조회 실패",
+                f"시간표를 불러오지 못했습니다:\n{str(err or '').splitlines()[0]}",
+            )
+
+        def _on_finished() -> None:
+            self.btn_load_comcigan_schedule.setEnabled(True)
+            self.btn_load_comcigan_schedule.setText("컴시간 시간표 불러오기")
+
+        worker = FunctionWorker("컴시간 시간표 불러오기", _work)
+        self.task_runner.start_worker(
+            worker,
+            task_key="grade_material_load_comcigan",
+            on_result=_on_result,
+            on_error=_on_error,
+            on_finished=_on_finished,
         )
+
+    def _on_new_lesson_progress(self) -> None:
+        self._editing_progress_id = None
+        self.edit_prog_date.setText(datetime.now().strftime("%Y-%m-%d"))
+        self.edit_prog_unit.clear()
+        self.edit_prog_lesson_no.clear()
+        self.edit_prog_content.clear()
+        self.edit_prog_next_plan.clear()
+        self.edit_prog_memo.clear()
+        self.combo_prog_status.setCurrentIndex(0)
+
+    def _on_save_lesson_progress(self) -> None:
+        meta = self._get_selected_progress_course_meta()
+        subject = meta.get("subject") or ""
+        class_label = meta.get("class_label") or ""
+        roster_key = meta.get("roster_key") or ""
+        if not subject:
+            QMessageBox.warning(self, "진도 저장", "먼저 강좌·학반을 선택하거나 등록해 주세요.")
+            return
+
+        period_val = self.spin_prog_period.value()
+        period = period_val if period_val > 0 else None
+        log_id, _ = self.db.upsert_lesson_progress_log(
+            log_id=self._editing_progress_id,
+            roster_key=roster_key,
+            subject=subject,
+            class_label=class_label,
+            date=self.edit_prog_date.text().strip() or datetime.now().strftime("%Y-%m-%d"),
+            period=period,
+            unit_title=self.edit_prog_unit.text().strip(),
+            lesson_no=self.edit_prog_lesson_no.text().strip(),
+            content=self.edit_prog_content.text().strip(),
+            next_plan=self.edit_prog_next_plan.text().strip(),
+            status=self.combo_prog_status.currentText().strip() or "예정",
+            memo=self.edit_prog_memo.text().strip(),
+        )
+        self._editing_progress_id = log_id
+        self._refresh_progress_table()
+
+    def _on_delete_lesson_progress(self) -> None:
+        row = self.table_progress.currentRow()
+        if row < 0:
+            return
+        it = self.table_progress.item(row, 0)
+        log_id = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+        if not log_id:
+            return
+        self.db.delete_lesson_progress_log(int(log_id))
+        if self._editing_progress_id == int(log_id):
+            self._on_new_lesson_progress()
+        self._refresh_progress_table()
+
+    def _on_progress_row_clicked(self, row: int, _col: int) -> None:
+        it = self.table_progress.item(row, 0)
+        rec = it.data(Qt.ItemDataRole.UserRole + 1) if it is not None else None
+        if not isinstance(rec, dict):
+            return
+        self._editing_progress_id = int(rec.get("id") or 0) or None
+        self.edit_prog_date.setText(str(rec.get("date") or ""))
+        self.spin_prog_period.setValue(int(rec["period"]) if rec.get("period") else 0)
+        self.edit_prog_unit.setText(str(rec.get("unit_title") or ""))
+        self.edit_prog_lesson_no.setText(str(rec.get("lesson_no") or ""))
+        self.edit_prog_content.setText(str(rec.get("content") or ""))
+        self.edit_prog_next_plan.setText(str(rec.get("next_plan") or ""))
+        self.edit_prog_memo.setText(str(rec.get("memo") or ""))
+        st_idx = self.combo_prog_status.findText(str(rec.get("status") or "예정"))
+        self.combo_prog_status.setCurrentIndex(st_idx if st_idx >= 0 else 0)
+
+    def _refresh_progress_table(self) -> None:
+        if getattr(self, "table_progress", None) is None:
+            return
+        meta = self._get_selected_progress_course_meta()
+        logs = self.db.get_lesson_progress_logs(
+            roster_key=meta.get("roster_key", ""),
+            subject=meta.get("subject", ""),
+            class_label=meta.get("class_label", ""),
+        )
+        self.table_progress.setRowCount(0)
+        for idx, rec in enumerate(logs):
+            self.table_progress.insertRow(idx)
+            course_disp = f"{rec.get('subject', '')} {rec.get('class_label', '')}".strip()
+            period_disp = f"{rec['period']}교시" if rec.get("period") else "-"
+            items = [
+                QTableWidgetItem(str(rec.get("date") or "")),
+                QTableWidgetItem(period_disp),
+                QTableWidgetItem(course_disp),
+                QTableWidgetItem(str(rec.get("unit_title") or "")),
+                QTableWidgetItem(str(rec.get("lesson_no") or "")),
+                QTableWidgetItem(str(rec.get("content") or "")),
+                QTableWidgetItem(str(rec.get("next_plan") or "")),
+                QTableWidgetItem(str(rec.get("status") or "예정")),
+            ]
+            items[0].setData(Qt.ItemDataRole.UserRole, int(rec["id"]))
+            items[0].setData(Qt.ItemDataRole.UserRole + 1, rec)
+            for c_idx, it in enumerate(items):
+                if c_idx in (0, 1, 4, 7):
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table_progress.setItem(idx, c_idx, it)
 
     def _current_subject_meta(self) -> Dict[str, str]:
         subject_key = self._current_subject_key()
@@ -1636,49 +1998,52 @@ class GradeMaterialTab(QWidget):
         self,
         config: Optional[ConfigManager] = None,
     ) -> List[Dict[str, Any]]:
-        """현재 선택된 교과 강좌의 로컬 진도 기록을 `수업_진도` 업로드 페이로드로 변환합니다."""
+        """로컬 진도 관리 기록(`lesson_progress_logs`)을 `수업_진도` 업로드 페이로드로 변환합니다."""
         cfg = config or ConfigManager()
         tp = cfg.get_section("teacher_profile") or {}
         school_code = str(tp.get("school_code") or tp.get("neis_school_code") or "").strip()
         teacher_id = str(tp.get("teacher_id") or "").strip()
-        meta = self._current_subject_meta()
-        subject_key = meta["roster_key"]
-        progress_map = self.db.get_subject_material_progress_map(subject_key)
-
+        meta = self._get_selected_progress_course_meta()
+        logs = self.db.get_lesson_progress_logs(
+            roster_key=meta.get("roster_key", ""),
+            subject=meta.get("subject", ""),
+            class_label=meta.get("class_label", ""),
+        )
         items: List[Dict[str, Any]] = []
-        for rel_path, entry in progress_map.items():
-            updated_at = str(entry.get("updated_at") or "").strip()
-            date_str = updated_at[:10] if len(updated_at) >= 10 else datetime.now().strftime("%Y-%m-%d")
-            status = str(entry.get("status") or "예정").strip()
-            memo = str(entry.get("memo") or "").strip()
-            unit_title = rel_path.split("/")[0] if "/" in rel_path else rel_path
-            items.append(
-                {
-                    "school_code": school_code,
-                    "teacher_id": teacher_id,
-                    "date": date_str,
-                    "period": None,
-                    "subject": meta["subject"],
-                    "class_label": meta["class_label"],
-                    "roster_key": subject_key,
-                    "unit_title": unit_title,
-                    "lesson_no": "",
-                    "content": status,
-                    "next_plan": "",
-                    "memo": memo,
-                    "status": status,
-                    "rel_path": rel_path,
-                    "updated_at": updated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                }
-            )
+        for rec in logs:
+            item: Dict[str, Any] = {
+                "school_code": school_code,
+                "teacher_id": teacher_id,
+                "date": str(rec.get("date") or "").strip(),
+                "period": rec.get("period"),
+                "subject": str(rec.get("subject") or meta.get("subject") or "").strip(),
+                "class_label": str(rec.get("class_label") or meta.get("class_label") or "").strip(),
+                "roster_key": str(rec.get("roster_key") or meta.get("roster_key") or "").strip(),
+                "unit_title": str(rec.get("unit_title") or "").strip(),
+                "lesson_no": str(rec.get("lesson_no") or "").strip(),
+                "content": str(rec.get("content") or "").strip(),
+                "next_plan": str(rec.get("next_plan") or "").strip(),
+                "memo": str(rec.get("memo") or "").strip(),
+                "status": str(rec.get("status") or "예정").strip(),
+                "updated_at": str(rec.get("updated_at") or "").strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            if rec.get("remote_id"):
+                item["remote_id"] = str(rec["remote_id"]).strip()
+            items.append(item)
         return items
 
     def _apply_remote_lesson_progress(self, remote_items: List[Dict[str, Any]]) -> int:
-        """모바일(`수업_진도`)에서 불러온 진도 기록을 로컬 SQLite 진도 테이블에 반영합니다."""
-        meta = self._current_subject_meta()
-        subject_key = meta["roster_key"]
-        subject_name = meta["subject"]
-        local_map = self.db.get_subject_material_progress_map(subject_key)
+        """모바일(`수업_진도`)에서 불러온 진도 기록을 로컬 `lesson_progress_logs`에 반영합니다."""
+        meta = self._get_selected_progress_course_meta()
+        filter_rk = meta.get("roster_key", "")
+        filter_subj = meta.get("subject", "")
+        filter_clbl = meta.get("class_label", "")
+
+        local_by_rid = {
+            str(r.get("remote_id") or "").strip(): r
+            for r in self.db.get_lesson_progress_logs()
+            if str(r.get("remote_id") or "").strip()
+        }
         applied = 0
 
         for item in remote_items or []:
@@ -1686,61 +2051,54 @@ class GradeMaterialTab(QWidget):
                 continue
             r_key = str(item.get("roster_key") or "").strip()
             r_subj = str(item.get("subject") or "").strip()
-            if r_key and r_key != subject_key and r_subj and r_subj != subject_name:
+            r_clbl = str(item.get("class_label") or "").strip()
+            if filter_subj and r_subj and r_subj != filter_subj:
                 continue
-            if not r_key and r_subj and r_subj != subject_name:
+            if filter_clbl and r_clbl and r_clbl != filter_clbl:
                 continue
 
-            rel_path = str(item.get("rel_path") or "").strip()
-            if not rel_path:
-                unit_title = str(item.get("unit_title") or "").strip()
-                lesson_no = str(item.get("lesson_no") or "").strip()
-                if unit_title and lesson_no:
-                    rel_path = f"{unit_title} ({lesson_no})"
-                elif unit_title:
-                    rel_path = unit_title
-                else:
-                    date_part = str(item.get("date") or "").strip()
-                    period_part = str(item.get("period") or "").strip()
-                    rel_path = f"모바일_{date_part}_{period_part}".strip("_") or "모바일_수업진도"
-
+            rid = str(item.get("remote_id") or "").strip()
             remote_updated = str(item.get("updated_at") or "").strip()
-            local_updated = str((local_map.get(rel_path) or {}).get("updated_at") or "").strip()
-            if local_updated and remote_updated and remote_updated < local_updated:
+            local_rec = local_by_rid.get(rid) if rid else None
+            if local_rec and local_rec.get("updated_at") and remote_updated and remote_updated < str(local_rec["updated_at"]):
                 continue
 
             raw_status = str(item.get("status") or "").strip()
-            if raw_status in MATERIAL_STATUS_OPTIONS:
+            if raw_status in PROGRESS_STATUS_OPTIONS:
                 status_val = raw_status
-            elif str(item.get("content") or "").strip() in MATERIAL_STATUS_OPTIONS:
-                status_val = str(item.get("content") or "").strip()
-            elif str(item.get("content") or "").strip() or str(item.get("memo") or "").strip():
-                status_val = "진도 완료"
+            elif raw_status == "진도 완료":
+                status_val = "완료"
+            elif raw_status == "수업 중":
+                status_val = "진행중"
+            elif str(item.get("content") or "").strip():
+                status_val = "완료"
             else:
                 status_val = "예정"
 
-            memo_parts: List[str] = []
-            content_str = str(item.get("content") or "").strip()
-            if content_str and content_str not in MATERIAL_STATUS_OPTIONS:
-                memo_parts.append(content_str)
-            next_plan = str(item.get("next_plan") or "").strip()
-            if next_plan:
-                memo_parts.append(f"다음: {next_plan}")
-            raw_memo = str(item.get("memo") or "").strip()
-            if raw_memo and raw_memo not in memo_parts:
-                memo_parts.append(raw_memo)
-            memo_val = " / ".join(memo_parts)
-
-            self.db.upsert_subject_material_progress(subject_key, rel_path, status_val, memo_val)
+            self.db.upsert_lesson_progress_log(
+                remote_id=rid,
+                roster_key=r_key or filter_rk,
+                subject=r_subj or filter_subj,
+                class_label=r_clbl or filter_clbl,
+                date=str(item.get("date") or "").strip(),
+                period=item.get("period"),
+                unit_title=str(item.get("unit_title") or "").strip(),
+                lesson_no=str(item.get("lesson_no") or "").strip(),
+                content=str(item.get("content") or "").strip(),
+                next_plan=str(item.get("next_plan") or "").strip(),
+                status=status_val,
+                memo=str(item.get("memo") or "").strip(),
+                updated_at=remote_updated,
+            )
             applied += 1
 
         return applied
 
     def _on_sync_mobile_progress(self) -> None:
-        """[모바일 진도 동기화(업로드/불러오기)] 버튼 핸들러."""
+        """[모바일·어드민 진도 동기화] 버튼 핸들러."""
         cfg = ConfigManager()
         upload_items = self._build_lesson_progress_items_for_sync(config=cfg)
-        meta = self._current_subject_meta()
+        meta = self._get_selected_progress_course_meta()
 
         self.btn_sync_mobile_progress.setEnabled(False)
         self.btn_sync_mobile_progress.setText("진도 동기화 중...")
@@ -1754,8 +2112,8 @@ class GradeMaterialTab(QWidget):
                 if upload_ok:
                     uploaded = len(upload_items)
             remote_items = svc.fetch_lesson_progress(
-                roster_key=meta["roster_key"],
-                subject=meta["subject"],
+                roster_key=meta.get("roster_key", ""),
+                subject=meta.get("subject", ""),
             )
             return {
                 "upload_ok": upload_ok,
@@ -1767,7 +2125,7 @@ class GradeMaterialTab(QWidget):
             data = res if isinstance(res, dict) else {}
             remote_items = data.get("remote_items") or []
             pulled = self._apply_remote_lesson_progress(remote_items)
-            self._populate_unit_tree(filter_title=self.combo_unit_filter.currentText())
+            self._refresh_progress_table()
             uploaded = int(data.get("uploaded") or 0)
             if not data.get("upload_ok", True):
                 QMessageBox.warning(
@@ -1780,7 +2138,7 @@ class GradeMaterialTab(QWidget):
                     self,
                     "모바일 진도 동기화 완료",
                     f"업로드: {uploaded}건 · 모바일 진도 반영: {pulled}건\n"
-                    f"({meta['subject']} 진도가 모바일 수업_진도와 동기화되었습니다.)",
+                    f"({meta.get('subject') or '전체'} 진도가 모바일 수업_진도와 동기화되었습니다.)",
                 )
 
         def _on_error(err: str) -> None:
@@ -1792,7 +2150,7 @@ class GradeMaterialTab(QWidget):
 
         def _on_finished() -> None:
             self.btn_sync_mobile_progress.setEnabled(True)
-            self.btn_sync_mobile_progress.setText("모바일 진도 동기화(업로드/불러오기)")
+            self.btn_sync_mobile_progress.setText("모바일·어드민 진도 동기화")
 
         worker = FunctionWorker("모바일 수업 진도 동기화", _work)
         self.task_runner.start_worker(
