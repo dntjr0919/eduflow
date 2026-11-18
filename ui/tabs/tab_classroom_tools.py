@@ -1795,7 +1795,15 @@ class ClassroomToolsTab(QWidget):
         )
         self.btn_refresh_mobile_att.clicked.connect(self._on_sync_mobile_attendance)
 
+        self.chk_include_simple_present = QCheckBox("단순 출석 포함")
+        self.chk_include_simple_present.setChecked(False)
+        self.chk_include_simple_present.setToolTip(
+            "체크 해제 시 교사가 모바일에서 체크한 단순 '출석' 건은 숨기고 결석·지각·조퇴·체험학습 등 변동 건만 표시합니다."
+        )
+        self.chk_include_simple_present.stateChanged.connect(lambda _s: self._refresh_attendance_view())
+
         att_mobile_bar.addWidget(self.lbl_mobile_att_pending)
+        att_mobile_bar.addWidget(self.chk_include_simple_present)
         att_mobile_bar.addStretch(1)
         att_mobile_bar.addWidget(self.btn_refresh_mobile_att)
         c1_lay.addLayout(att_mobile_bar)
@@ -3094,17 +3102,25 @@ class ClassroomToolsTab(QWidget):
     def _merge_mobile_attendance_rows(self, rows: List[Dict[str, Any]]) -> Tuple[int, int]:
         """Firestore `일일_출결`에서 조회한 모바일 출결 보고를 로컬 출결 대장에 병합합니다."""
         hk = self._current_homeroom_key()
+        include_simple_present = (
+            self.chk_include_simple_present.isChecked()
+            if getattr(self, "chk_include_simple_present", None) is not None
+            else False
+        )
         added = 0
         updated = 0
         for row in rows or []:
             if not isinstance(row, dict):
                 continue
-            sid = str(row.get("student_id") or "").strip()
+            sid_raw = str(row.get("student_id") or "").strip()
+            sid = re.sub(r"^(\d+)\.0+$", r"\1", sid_raw)
             sname = str(row.get("student_name") or row.get("name") or "").strip()
             if not sid and not sname:
                 continue
             rid = str(row.get("remote_id") or row.get("id") or "").strip()
-            cat = str(row.get("category") or row.get("type") or row.get("attendance_type") or "질병결석").strip()
+            cat = str(row.get("attendance_type") or row.get("category") or row.get("type") or "질병결석").strip()
+            if cat == "출석" and not include_simple_present:
+                continue
             reason = str(row.get("reason") or row.get("memo") or "").strip()
             date_str = str(row.get("date") or row.get("start_date") or "").strip()
             raw_dates = row.get("selected_dates")
@@ -4623,7 +4639,17 @@ class ClassroomToolsTab(QWidget):
     def _refresh_attendance_view(self, select_log_id: Optional[int] = None) -> None:
         roster = self._get_active_roster()
         total = len(roster)
-        logs = self.db.get_attendance_logs(self._current_homeroom_key())
+        all_logs = self.db.get_attendance_logs(self._current_homeroom_key())
+        include_simple_present = (
+            self.chk_include_simple_present.isChecked()
+            if getattr(self, "chk_include_simple_present", None) is not None
+            else False
+        )
+        logs = (
+            all_logs
+            if include_simple_present
+            else [r for r in all_logs if str(r.get("category") or "").strip() != "출석"]
+        )
 
         pending_cnt = sum(
             1
@@ -4671,7 +4697,7 @@ class ClassroomToolsTab(QWidget):
         for idx, row_data in enumerate(logs):
             self.table_attendance.insertRow(idx)
             log_id = int(row_data["id"])
-            sid = str(row_data["student_id"])
+            sid = re.sub(r"^(\d+)\.0+$", r"\1", str(row_data["student_id"] or "").strip())
             name = str(row_data["student_name"])
             cat = str(row_data["category"])
             reason = str(row_data["reason"])

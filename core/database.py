@@ -8,6 +8,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime
@@ -36,6 +37,14 @@ DEFAULT_SUBJECT_EVAL_COLUMNS: List[Dict[str, str]] = [
     {"id": "exam_2", "name": "2차 지필"},
     {"id": "perf_1", "name": "수행평가"},
 ]
+
+
+def _normalize_student_id(val: Any) -> str:
+    """학번 문자열 끝의 불필요한 '.0' 소수점 접미사를 제거합니다."""
+    s = str(val if val is not None else "").strip()
+    if not s:
+        return ""
+    return re.sub(r"^(\d+)\.0+$", r"\1", s)
 
 
 class DatabaseManager:
@@ -1381,7 +1390,7 @@ class DatabaseManager:
                             "id": int(r["id"]),
                             "homeroom_key": str(r["homeroom_key"]),
                             "remote_id": str(r["remote_id"] or ""),
-                            "student_id": str(r["student_id"] or ""),
+                            "student_id": _normalize_student_id(r["student_id"]),
                             "student_name": str(r["student_name"] or ""),
                             "category": str(r["category"] or "질병결석"),
                             "reason": str(r["reason"] or ""),
@@ -1455,7 +1464,7 @@ class DatabaseManager:
         """모바일(`일일_출결`) 출결 보고를 로컬 출결 대장에 중복 없이 병합합니다."""
         key = (homeroom_key or "").strip() or "__sample__"
         rid = str(remote_id or "").strip()
-        sid = str(student_id or "").strip()
+        sid = _normalize_student_id(student_id)
         sname = str(student_name or "").strip()
         cat = str(category or "질병결석").strip() or "질병결석"
         rsn = str(reason or "").strip()

@@ -322,16 +322,29 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
 
         _ensure_qapp()
 
-        # Direct Admin 모드에서 문자열 grade/class_no, 미확인, 타 날짜 출결 보고 조회 검증
+        # Direct Admin 모드에서 문자열 grade/class_no, 미확인, 타 날짜 출결 보고 및 .0 학번 정규화 검증
         fake_fs = MagicMock()
         fake_fs.collection.return_value.stream.return_value = [
+            _FakeDocSnap(
+                "att_present",
+                {
+                    "school_code": "8140246",
+                    "grade": "1",
+                    "class_no": "3",
+                    "student_id": "10532.0",
+                    "student_name": "단순출석학생",
+                    "attendance_type": "출석",
+                    "date": "2026-11-18",
+                    "teacher_confirmed": True,
+                },
+            ),
             _FakeDocSnap(
                 "att_1",
                 {
                     "school_code": "8140246",
                     "grade": "1",
                     "class_no": "3",
-                    "student_id": "10301",
+                    "student_id": "10301.0",
                     "student_name": "홍길동",
                     "category": "질병결석",
                     "reason": "감기",
@@ -345,7 +358,7 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
                     "school_code": "8140246",
                     "grade": 1,
                     "class_no": 3,
-                    "student_id": "10302",
+                    "student_id": 10302.0,
                     "student_name": "김철수",
                     "category": "교외체험학습",
                     "reason": "가족여행",
@@ -368,10 +381,26 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
         ]
         svc = FirestoreSyncService(db=self.db, config=self.cfg, firestore_client=fake_fs)
         rows = svc.fetch_homeroom_attendance(grade=1, class_no=3, school_code="8140246")
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[0]["student_id"], "10301")
+        self.assertEqual(rows[1]["student_id"], "10532")
+        self.assertEqual(rows[2]["student_id"], "10302")
 
         ctab = ClassroomToolsTab(task_runner=TaskRunner())
         ctab.db = self.db
+        # 기존 로컬 DB에 이미 들어온 단순 '출석' 행 + .0 학번 행 시뮬레이션
+        self.db.add_attendance_log(
+            ctab._current_homeroom_key(),
+            student_id="10532.0",
+            student_name="기존출석",
+            category="출석",
+            reason="",
+            period_text="2026-11-18",
+            proof_status="확인 완료",
+        )
+
+        # 기본값(chk_include_simple_present=False)에서는 단순 '출석' 제외
+        self.assertFalse(ctab.chk_include_simple_present.isChecked())
         added, updated = ctab._merge_mobile_attendance_rows(rows)
         self.assertEqual(added, 2)
         self.assertEqual(updated, 0)
@@ -382,7 +411,15 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
 
         ctab._refresh_attendance_view()
         self.assertEqual(ctab.table_attendance.rowCount(), 2)
+        displayed_sids = {ctab.table_attendance.item(r, 0).text() for r in range(ctab.table_attendance.rowCount())}
+        self.assertEqual(displayed_sids, {"10301", "10302"})
         self.assertIn("1건", ctab.lbl_mobile_att_pending.text())
+
+        # [단순 출석 포함] 토글 시 기존 로컬 '출석' 행도 .0 제거되어 표시됨
+        ctab.chk_include_simple_present.setChecked(True)
+        self.assertEqual(ctab.table_attendance.rowCount(), 3)
+        displayed_sids_all = {ctab.table_attendance.item(r, 0).text() for r in range(ctab.table_attendance.rowCount())}
+        self.assertIn("10532", displayed_sids_all)
         ctab.close()
 
     def test_settings_batch_roster_import_continues_on_error_and_syncs_once(self) -> None:

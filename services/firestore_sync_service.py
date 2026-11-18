@@ -800,7 +800,11 @@ class FirestoreSyncService:
                     "include_unconfirmed": True,
                 },
             )
-            return list(res.get("attendance") or [])
+            rows = list(res.get("attendance") or [])
+            for r in rows:
+                if isinstance(r, dict) and r.get("student_id") is not None:
+                    r["student_id"] = re.sub(r"^(\d+)\.0+$", r"\1", str(r.get("student_id") or "").strip())
+            return rows
 
         fs = self._get_client()
         ref: Any = fs.collection("일일_출결")
@@ -820,6 +824,8 @@ class FirestoreSyncService:
                 continue
             if c_int is not None and doc_c is not None and doc_c != c_int:
                 continue
+            if d.get("student_id") is not None:
+                d["student_id"] = re.sub(r"^(\d+)\.0+$", r"\1", str(d.get("student_id") or "").strip())
             rows.append(d)
         rows.sort(key=lambda x: str(x.get("date") or x.get("updated_at") or ""), reverse=True)
         return rows
