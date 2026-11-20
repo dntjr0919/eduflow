@@ -1810,11 +1810,11 @@ class SettingsTab(QWidget):
         QMessageBox.information(self, "저장 완료", "환경설정이 config.json에 안전하게 저장되었습니다.")
 
     def _on_provision_homeroom_accounts(self) -> None:
-        hr_group = self.db.get_homeroom_group()
+        hr_group = self.db.get_active_homeroom_group()
         if not hr_group:
             QMessageBox.warning(self, "모바일 계정 발급", "먼저 나이스 학급명렬표를 등록해 주세요.")
             return
-        students = self.db.get_students(group_id=hr_group["id"])
+        students = self.db.get_roster_students(hr_group["id"])
         if not students:
             QMessageBox.warning(self, "모바일 계정 발급", "등록된 학생이 없습니다.")
             return

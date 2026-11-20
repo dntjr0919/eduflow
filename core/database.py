@@ -865,13 +865,19 @@ class DatabaseManager:
             finally:
                 conn.close()
 
+    def get_homeroom_group(self) -> Optional[Dict[str, Any]]:
+        """get_active_homeroom_group() 호환 래퍼."""
+        return self.get_active_homeroom_group()
+
     def get_active_homeroom_students(self) -> List[Dict[str, Any]]:
         hr_group = self.get_active_homeroom_group()
         if hr_group:
             return self.get_roster_students(hr_group["id"])
         return []
 
-    def get_students(self) -> List[Dict[str, Any]]:
+    def get_students(self, group_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        if group_id is not None:
+            return self.get_roster_students(group_id)
         with self._lock:
             # 1. 활성화된 학급담임 명렬표 우선 반환
             hr_students = self.get_active_homeroom_students()

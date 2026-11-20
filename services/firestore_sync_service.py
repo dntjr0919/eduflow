@@ -969,7 +969,7 @@ class FirestoreSyncService:
         """
         `학생_안면데이터` 컬렉션 문서 스키마로 정규화합니다:
         {remote_id: "{school_code}_{student_id}", school_code, school_name, grade, class_no,
-         student_id, student_name, photo_file_id, photo_drive_url, updated_at}
+         student_id, student_name, photo_file_id, photo_drive_url, photo_data_url, photo_hash, updated_at}
         """
         meta = default_meta or {}
         school_code = str(
@@ -1016,6 +1016,15 @@ class FirestoreSyncService:
         if not photo_drive_url and photo_file_id:
             photo_drive_url = f"https://drive.google.com/uc?export=view&id={photo_file_id}"
 
+        photo_data_url = str(
+            raw.get("photo_data_url")
+            or raw.get("data_url")
+            or ""
+        ).strip()
+        photo_hash = str(raw.get("photo_hash") or "").strip()
+        if not photo_hash and photo_data_url:
+            photo_hash = hashlib.sha256(photo_data_url.encode("utf-8")).hexdigest().lower()
+
         raw_remote_id = str(raw.get("remote_id") or "").strip().replace("/", "_")
         if raw_remote_id:
             remote_id = raw_remote_id
@@ -1035,6 +1044,8 @@ class FirestoreSyncService:
             "student_name": student_name,
             "photo_file_id": photo_file_id,
             "photo_drive_url": photo_drive_url,
+            "photo_data_url": photo_data_url,
+            "photo_hash": photo_hash,
             "updated_at": updated_at,
         }
 
@@ -1050,7 +1061,7 @@ class FirestoreSyncService:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> bool:
         """
-        학생 얼굴 사진 메타데이터 목록을 Firestore `학생_안면데이터` 컬렉션에 일괄 저장합니다.
+        학생 얼굴 사진 메타데이터(경량 JPEG Data URL 포함) 목록을 Firestore `학생_안면데이터` 컬렉션에 일괄 저장합니다.
         Direct Admin 모드(Firestore Batch Upsert) 및 Vercel API 모드(`upsert_student_face_photos_batch`) 모두 지원합니다.
         """
         if not items:
@@ -1079,19 +1090,27 @@ class FirestoreSyncService:
             return False
 
         if self.is_vercel_api_mode():
+            # Data URL 포함 페이로드가 Vercel 요청 크기 제한(4.5MB)을 넘지 않도록 소단위 분할 전송
+            api_chunk_size = max(1, min(int(chunk_size or 20), 20))
+            total_batches = (len(normalized) + api_chunk_size - 1) // api_chunk_size
             try:
-                self._post_vercel_api(
-                    "upsert_student_face_photos_batch",
-                    {
-                        "items": normalized,
-                        "photos": normalized,
-                        "rows": normalized,
-                        "school_code": default_meta["school_code"],
-                        "school_name": default_meta["school_name"],
-                        "grade": default_meta["grade"],
-                        "class_no": default_meta["class_no"],
-                    },
-                )
+                for batch_idx, start in enumerate(range(0, len(normalized), api_chunk_size), start=1):
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(batch_idx, total_batches)
+                        except Exception:
+                            pass
+                    chunk = normalized[start : start + api_chunk_size]
+                    self._post_vercel_api(
+                        "upsert_student_face_photos_batch",
+                        {
+                            "items": chunk,
+                            "school_code": default_meta["school_code"],
+                            "school_name": default_meta["school_name"],
+                            "grade": default_meta["grade"],
+                            "class_no": default_meta["class_no"],
+                        },
+                    )
                 return True
             except Exception as exc:
                 self.db.add_log("WARN", "FirestoreSync", f"Vercel API 학생 안면데이터 일괄 저장 실패: {exc}")

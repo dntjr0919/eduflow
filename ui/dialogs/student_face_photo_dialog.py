@@ -1,15 +1,15 @@
 """
-학생 얼굴 사진 일괄 매칭 · 경량 리사이즈 · 업로드 서비스 및 다이얼로그 (ui/dialogs/student_face_photo_dialog.py).
+학생 얼굴 사진 일괄 매칭 · 경량 리사이즈 · 동기화 서비스 및 다이얼로그 (ui/dialogs/student_face_photo_dialog.py).
 - 파일명에서 학번(예: 10501) 또는 학생 이름(예: 김유민)을 추출해 현재 담임 학급 명렬표와 자동 매칭
 - 미리보기 표(파일명 ↔ 매칭된 학생)에서 교사가 확인·수정 가능
-- [업로드 및 동기화] 클릭 시 Pillow(PIL)로 최대 640px JPEG로 경량 리사이즈한 뒤
-  Google Drive(`EduFlow_Student_Photos/{school_name}_{grade}학년{class_no}반`)에 업로드하고
-  Firestore `학생_안면데이터` 컬렉션에 일괄 저장
+- [업로드 및 동기화] 클릭 시 Pillow(PIL)로 최대 400px 경량 JPEG(약 20KB 이하)로 리사이즈한 뒤
+  Data URL(`data:image/jpeg;base64,...`) 형태로 Firestore `학생_안면데이터` 컬렉션에 직접 일괄 저장
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import re
 from pathlib import Path
@@ -45,8 +45,9 @@ from ui.components.file_drop_helper import enable_file_drop
 from ui.utils import COMBOBOX_STYLE, install_no_scroll_wheel_filter
 
 SUPPORTED_IMAGE_EXTENSIONS: Tuple[str, ...] = (".jpg", ".jpeg", ".png", ".webp")
-DEFAULT_MAX_PHOTO_PX = 640
-DEFAULT_JPEG_QUALITY = 85
+DEFAULT_MAX_PHOTO_PX = 400
+DEFAULT_JPEG_QUALITY = 80
+TARGET_MAX_JPEG_BYTES = 20 * 1024
 
 
 def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
@@ -82,10 +83,11 @@ def resize_image_to_jpeg_bytes(
     image_path: str | Path,
     max_px: int = DEFAULT_MAX_PHOTO_PX,
     quality: int = DEFAULT_JPEG_QUALITY,
+    target_max_bytes: int = TARGET_MAX_JPEG_BYTES,
 ) -> bytes:
     """
-    Pillow(PIL)를 사용해 이미지를 EXIF 회전 보정 후 긴 변 기준 최대 `max_px`(기본 640px) 이하의
-    RGB JPEG 바이트로 경량 리사이즈합니다.
+    Pillow(PIL)를 사용해 이미지를 EXIF 회전 보정 후 긴 변 기준 최대 `max_px`(기본 400px) 이하의
+    경량 RGB JPEG 바이트(기본 약 20KB 이하)로 리사이즈합니다.
     """
     from PIL import Image, ImageOps
 
@@ -112,9 +114,16 @@ def resize_image_to_jpeg_bytes(
             resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
             rgb_img.thumbnail((limit, limit), resample=resample)
 
-        buf = io.BytesIO()
-        rgb_img.save(buf, format="JPEG", quality=int(quality or DEFAULT_JPEG_QUALITY), optimize=True)
-        return buf.getvalue()
+        cur_quality = int(quality or DEFAULT_JPEG_QUALITY)
+        out_bytes = b""
+        while True:
+            buf = io.BytesIO()
+            rgb_img.save(buf, format="JPEG", quality=cur_quality, optimize=True)
+            out_bytes = buf.getvalue()
+            if not target_max_bytes or len(out_bytes) <= target_max_bytes or cur_quality <= 50:
+                break
+            cur_quality = max(50, cur_quality - 10)
+        return out_bytes
 
 
 def _normalize_roster_students(
@@ -327,7 +336,7 @@ def collect_image_files_from_folder(folder_path: str | Path) -> List[str]:
 
 
 class StudentFacePhotoBatchDialog(QDialog):
-    """학생 얼굴 사진 일괄 매칭 & Google Drive 업로드 · Firestore `학생_안면데이터` 동기화 다이얼로그."""
+    """학생 얼굴 사진 일괄 매칭 & 경량 JPEG Data URL · Firestore `학생_안면데이터` 직접 동기화 다이얼로그."""
 
     def __init__(
         self,
@@ -343,7 +352,7 @@ class StudentFacePhotoBatchDialog(QDialog):
         task_runner: Optional[TaskRunner] = None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("학생 얼굴 사진 일괄 등록 (자동 매칭 · Google Drive 업로드)")
+        self.setWindowTitle("학생 얼굴 사진 일괄 등록 (자동 매칭 · Firestore 직접 저장)")
         self.resize(900, 620)
         self.setMinimumSize(780, 520)
         apply_qss_role(self, obj_name="StudentFacePhotoBatchModal")
@@ -387,19 +396,13 @@ class StudentFacePhotoBatchDialog(QDialog):
         lay.setContentsMargins(18, 18, 18, 18)
         lay.setSpacing(12)
 
-        # 1. 상단 안내 및 대상 학급/Drive 폴더 표시 카드
+        # 1. 상단 안내 및 대상 학급 표시 카드
         info_frame = QFrame()
         apply_qss_role(info_frame, role="subCard", obj_name="FacePhotoHeaderCard")
         info_lay = QVBoxLayout(info_frame)
         info_lay.setContentsMargins(14, 12, 14, 12)
         info_lay.setSpacing(6)
 
-        folder_path = build_student_photo_drive_folder(
-            school_name=self.school_name,
-            grade=self.grade,
-            class_no=self.class_no,
-            school_code=self.school_code,
-        )
         lbl_title = QLabel(
             f"대상 학급: {self.school_name or self.school_code or '소속학교'} "
             f"{self.grade}학년 {self.class_no}반 (명렬표 {len(self.students)}명)"
@@ -409,8 +412,8 @@ class StudentFacePhotoBatchDialog(QDialog):
         lbl_guide = QLabel(
             "폴더 또는 다중 이미지(.jpg, .jpeg, .png, .webp)를 선택(또는 아래 표에 드래그 앤 드롭)하면 파일명에서 "
             "학번(예: 10501) 또는 이름(예: 김유민)을 추출해 자동 매칭합니다.\n"
-            f"업로드 시 최대 640px JPEG로 경량 리사이즈 후 Google Drive [{folder_path}]에 저장하고 "
-            "`학생_안면데이터` 컬렉션에 동기화합니다."
+            "동기화 시 최대 400px 경량 JPEG(약 20KB 이하) Data URL로 변환하여 "
+            "Firestore `학생_안면데이터` 컬렉션에 직접 저장합니다."
         )
         apply_qss_role(lbl_guide, role="mutedText")
         lbl_guide.setWordWrap(True)
@@ -753,20 +756,15 @@ class StudentFacePhotoBatchDialog(QDialog):
             )
             return
 
-        drive_folder = build_student_photo_drive_folder(
-            school_name=self.school_name,
-            grade=self.grade,
-            class_no=self.class_no,
-            school_code=self.school_code,
-        )
-
         self._set_uploading_ui_state(True)
         self.progress_bar.setValue(0)
-        self.lbl_status.setText(f"총 {len(targets)}명의 사진을 640px JPEG로 변환 후 Google Drive에 업로드 중...")
+        self.lbl_status.setText(
+            f"총 {len(targets)}명의 사진을 400px 경량 JPEG Data URL로 변환하여 `학생_안면데이터`에 동기화 중..."
+        )
 
         def _work(worker: FunctionWorker) -> Dict[str, Any]:
             svc = FirestoreSyncService(db=self.db, config=self.config)
-            uploaded_docs: List[Dict[str, Any]] = []
+            prepared_docs: List[Dict[str, Any]] = []
             row_outcomes: List[Tuple[int, bool, str]] = []
             total = len(targets)
 
@@ -775,29 +773,14 @@ class StudentFacePhotoBatchDialog(QDialog):
                 sid = str(item["student_id"])
                 sname = str(item["student_name"])
                 fp = str(item["file_path"])
-                pct = int((idx - 1) / max(1, total) * 85)
-                worker.emit_progress(pct, f"[{idx}/{total}] {sid} {sname} 리사이즈 및 업로드 중...")
+                pct = int((idx - 1) / max(1, total) * 80)
+                worker.emit_progress(pct, f"[{idx}/{total}] {sid} {sname} 400px JPEG 변환 중...")
 
                 try:
                     jpeg_bytes = resize_image_to_jpeg_bytes(fp, max_px=DEFAULT_MAX_PHOTO_PX)
                     b64_data = base64.b64encode(jpeg_bytes).decode("ascii")
-                    target_fname = f"{sid}_{sname}.jpg" if sname else f"{sid}.jpg"
-
-                    up_res = svc.upload_file(
-                        file_name=target_fname,
-                        file_base64=b64_data,
-                        mime_type="image/jpeg",
-                        folder_name=drive_folder,
-                    )
-                    if not up_res.get("ok"):
-                        err = str(up_res.get("error") or "업로드 실패")
-                        row_outcomes.append((r_idx, False, f"실패: {err}"))
-                        continue
-
-                    photo_file_id = str(up_res.get("file_id") or "").strip()
-                    photo_drive_url = str(
-                        up_res.get("download_url") or up_res.get("url") or ""
-                    ).strip()
+                    photo_data_url = f"data:image/jpeg;base64,{b64_data}"
+                    photo_hash = hashlib.sha256(jpeg_bytes).hexdigest().lower()
 
                     doc = svc.normalize_student_face_photo_doc(
                         {
@@ -807,33 +790,32 @@ class StudentFacePhotoBatchDialog(QDialog):
                             "class_no": item.get("class_no") or self.class_no,
                             "student_id": sid,
                             "student_name": sname,
-                            "photo_file_id": photo_file_id,
-                            "photo_drive_url": photo_drive_url,
+                            "photo_data_url": photo_data_url,
+                            "photo_hash": photo_hash,
                         }
                     )
-                    uploaded_docs.append(doc)
-                    row_outcomes.append((r_idx, True, "업로드 완료"))
+                    prepared_docs.append(doc)
+                    row_outcomes.append((r_idx, True, f"변환 완료 ({len(jpeg_bytes) // 1024 or 1}KB)"))
                 except Exception as exc:
                     row_outcomes.append((r_idx, False, f"오류: {exc}"))
 
             batch_ok = False
-            if uploaded_docs:
-                worker.emit_progress(90, f"학생_안면데이터 컬렉션 일괄 동기화 중 ({len(uploaded_docs)}건)...")
+            if prepared_docs:
+                worker.emit_progress(85, f"학생_안면데이터 컬렉션 일괄 동기화 중 ({len(prepared_docs)}건)...")
                 batch_ok = svc.upsert_student_face_photos_batch(
-                    uploaded_docs,
+                    prepared_docs,
                     school_code=self.school_code,
                     school_name=self.school_name,
                     grade=self.grade,
                     class_no=self.class_no,
                 )
 
-            worker.emit_progress(100, "학생 얼굴 사진 업로드 및 동기화 완료")
+            worker.emit_progress(100, "학생 얼굴 사진 변환 및 동기화 완료")
             return {
-                "uploaded_count": len(uploaded_docs),
+                "uploaded_count": len(prepared_docs),
                 "total_count": total,
                 "batch_ok": batch_ok,
                 "row_outcomes": row_outcomes,
-                "drive_folder": drive_folder,
             }
 
         def _on_progress(pct: int, msg: str) -> None:
@@ -854,35 +836,34 @@ class StudentFacePhotoBatchDialog(QDialog):
                     if ok and batch_ok:
                         it_status.setText("동기화 완료")
                     elif ok and not batch_ok:
-                        it_status.setText("Drive 완료 (DB 실패)")
+                        it_status.setText("DB 저장 실패")
                     else:
                         it_status.setText(status_txt)
 
             if uploaded_cnt > 0 and batch_ok:
                 self.lbl_status.setText(
-                    f"총 {uploaded_cnt}/{total_cnt}명 업로드 및 `학생_안면데이터` 저장 완료"
+                    f"총 {uploaded_cnt}/{total_cnt}명 400px JPEG 변환 및 `학생_안면데이터` 저장 완료"
                 )
                 QMessageBox.information(
                     self,
                     "학생 얼굴 사진 등록 완료",
-                    f"총 {uploaded_cnt}명의 학생 사진이 640px JPEG로 최적화되어\n"
-                    f"Google Drive [{data.get('drive_folder', '')}]에 업로드되고\n"
-                    "`학생_안면데이터` 컬렉션에 동기화되었습니다.",
+                    f"총 {uploaded_cnt}명의 학생 사진이 400px 경량 JPEG Data URL로 최적화되어\n"
+                    "Firestore `학생_안면데이터` 컬렉션에 직접 동기화되었습니다.",
                 )
             elif uploaded_cnt > 0 and not batch_ok:
-                self.lbl_status.setText("Google Drive 업로드는 완료되었으나 Firestore 저장에 실패했습니다.")
+                self.lbl_status.setText("이미지 변환은 완료되었으나 Firestore `학생_안면데이터` 저장에 실패했습니다.")
                 QMessageBox.warning(
                     self,
-                    "일부 동기화 실패",
-                    f"Google Drive에는 {uploaded_cnt}건이 업로드되었으나\n"
-                    "`학생_안면데이터` 컬렉션 일괄 저장에 실패했습니다. 연결 설정을 확인해 주세요.",
+                    "동기화 실패",
+                    f"{uploaded_cnt}건의 이미지 변환은 완료되었으나\n"
+                    "`학생_안면데이터` 컬렉션 일괄 저장에 실패했습니다. 네트워크 및 Firebase/Vercel API 연결을 확인해 주세요.",
                 )
             else:
-                self.lbl_status.setText("업로드에 실패했습니다. 상태 열의 오류 메시지를 확인해 주세요.")
+                self.lbl_status.setText("이미지 처리에 실패했습니다. 상태 열의 오류 메시지를 확인해 주세요.")
                 QMessageBox.warning(
                     self,
-                    "업로드 실패",
-                    "학생 사진 업로드에 실패했습니다. 네트워크 및 Google Drive/Vercel API 연동 설정을 확인해 주세요.",
+                    "처리 실패",
+                    "학생 사진 변환에 실패했습니다. 이미지 파일이 손상되지 않았는지 확인해 주세요.",
                 )
 
         def _on_error(err: str) -> None:
@@ -891,7 +872,7 @@ class StudentFacePhotoBatchDialog(QDialog):
             QMessageBox.critical(self, "학생 사진 업로드 오류", str(err))
 
         worker = FunctionWorker("학생 얼굴 사진 일괄 업로드", _work)
-        worker.progress.connect(_on_progress)
+        worker.signals.progress.connect(_on_progress)
         self.task_runner.start_worker(
             worker,
             task_key="student_face_photos_batch_upload",

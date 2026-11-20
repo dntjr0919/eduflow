@@ -135,26 +135,27 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         self.assertEqual(results[1]["matched_student_name"], "박시우")
         self.assertEqual(results[2]["matched_student_id"], "")
 
-    def test_resize_image_to_max_640px_jpeg(self) -> None:
+    def test_resize_image_to_max_400px_jpeg(self) -> None:
         src_path = self.tmp_path / "large_rgba.png"
         img = Image.new("RGBA", (1600, 1200), (30, 144, 255, 200))
         img.save(src_path, format="PNG")
 
-        jpeg_bytes = resize_image_to_jpeg_bytes(src_path, max_px=640)
+        jpeg_bytes = resize_image_to_jpeg_bytes(src_path)
         self.assertGreater(len(jpeg_bytes), 100)
+        self.assertLessEqual(len(jpeg_bytes), 20 * 1024)
 
         with Image.open(io.BytesIO(jpeg_bytes)) as out_img:
             self.assertEqual(out_img.format, "JPEG")
             self.assertEqual(out_img.mode, "RGB")
-            self.assertEqual(out_img.size, (640, 480))
+            self.assertEqual(out_img.size, (400, 300))
 
     def test_normalize_student_face_photo_doc_schema(self) -> None:
+        sample_data_url = "data:image/jpeg;base64," + base64.b64encode(b"fake_jpeg_bytes").decode("ascii")
         doc = FirestoreSyncService.normalize_student_face_photo_doc(
             {
                 "student_id": "10501",
                 "student_name": "김유민",
-                "photo_file_id": "drive_fid_10501",
-                "photo_drive_url": "https://drive.google.com/uc?export=view&id=drive_fid_10501",
+                "photo_data_url": sample_data_url,
                 "updated_at": "2026-11-20 12:00:00",
             },
             default_meta={
@@ -174,6 +175,8 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
             "student_name",
             "photo_file_id",
             "photo_drive_url",
+            "photo_data_url",
+            "photo_hash",
             "updated_at",
         }
         self.assertEqual(set(doc.keys()), expected_keys)
@@ -184,11 +187,10 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         self.assertEqual(doc["class_no"], 5)
         self.assertEqual(doc["student_id"], "10501")
         self.assertEqual(doc["student_name"], "김유민")
-        self.assertEqual(doc["photo_file_id"], "drive_fid_10501")
-        self.assertEqual(
-            doc["photo_drive_url"],
-            "https://drive.google.com/uc?export=view&id=drive_fid_10501",
-        )
+        self.assertEqual(doc["photo_file_id"], "")
+        self.assertEqual(doc["photo_drive_url"], "")
+        self.assertEqual(doc["photo_data_url"], sample_data_url)
+        self.assertEqual(len(doc["photo_hash"]), 64)
         self.assertEqual(doc["updated_at"], "2026-11-20 12:00:00")
 
         folder = build_student_photo_drive_folder(
@@ -200,7 +202,7 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         self.assertEqual(folder, "EduFlow_Student_Photos/천안오성고_1학년5반")
 
     @patch("services.firestore_sync_service.has_local_credentials", return_value=False)
-    def test_vercel_api_mode_upload_and_upsert_batch(self, _mock_cred) -> None:
+    def test_vercel_api_mode_upsert_batch_with_data_url(self, _mock_cred) -> None:
         svc = FirestoreSyncService(db=self.db, config=self.cfg, firestore_client=None)
         self.assertTrue(svc.is_vercel_api_mode())
 
@@ -211,47 +213,26 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
             resp = MagicMock()
             resp.ok = True
             resp.status_code = 200
-            if json.get("action") == "upload_file":
-                resp.json.return_value = {
-                    "ok": True,
-                    "file_id": "fid_10501",
-                    "url": "https://drive.google.com/file/d/fid_10501/view",
-                    "download_url": "https://drive.google.com/uc?export=view&id=fid_10501",
-                }
-            else:
-                resp.json.return_value = {"ok": True, "upserted": 1}
+            resp.json.return_value = {"ok": True, "upserted": 1}
             return resp
 
+        sample_data_url = "data:image/jpeg;base64," + base64.b64encode(b"fake_jpeg").decode("ascii")
         with patch("requests.post", side_effect=_fake_post):
-            up_res = svc.upload_file(
-                file_name="10501_김유민.jpg",
-                file_base64=base64.b64encode(b"fake_jpeg").decode("ascii"),
-                mime_type="image/jpeg",
-                folder_name="EduFlow_Student_Photos/천안오성고_1학년5반",
-            )
-            self.assertTrue(up_res["ok"])
-            self.assertEqual(up_res["file_id"], "fid_10501")
-
             ok = svc.upsert_student_face_photos_batch(
                 [
                     {
                         "student_id": "10501",
                         "student_name": "김유민",
-                        "photo_file_id": up_res["file_id"],
-                        "photo_drive_url": up_res["download_url"],
+                        "photo_data_url": sample_data_url,
+                        "photo_hash": "abc123hash",
                     }
                 ]
             )
             self.assertTrue(ok)
 
-        self.assertEqual(len(captured_calls), 2)
-        self.assertEqual(captured_calls[0]["action"], "upload_file")
-        self.assertEqual(
-            captured_calls[0]["folder_name"],
-            "EduFlow_Student_Photos/천안오성고_1학년5반",
-        )
-        self.assertEqual(captured_calls[1]["action"], "upsert_student_face_photos_batch")
-        saved_item = captured_calls[1]["items"][0]
+        self.assertEqual(len(captured_calls), 1)
+        self.assertEqual(captured_calls[0]["action"], "upsert_student_face_photos_batch")
+        saved_item = captured_calls[0]["items"][0]
         self.assertEqual(saved_item["remote_id"], "8140246_10501")
         self.assertEqual(saved_item["school_code"], "8140246")
         self.assertEqual(saved_item["school_name"], "천안오성고")
@@ -259,11 +240,8 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         self.assertEqual(saved_item["class_no"], 5)
         self.assertEqual(saved_item["student_id"], "10501")
         self.assertEqual(saved_item["student_name"], "김유민")
-        self.assertEqual(saved_item["photo_file_id"], "fid_10501")
-        self.assertEqual(
-            saved_item["photo_drive_url"],
-            "https://drive.google.com/uc?export=view&id=fid_10501",
-        )
+        self.assertEqual(saved_item["photo_data_url"], sample_data_url)
+        self.assertEqual(saved_item["photo_hash"], "abc123hash")
 
     def test_direct_admin_mode_upsert_student_face_photos_batch(self) -> None:
         fake_fs = MagicMock()
@@ -276,19 +254,21 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         svc = FirestoreSyncService(db=self.db, config=self.cfg, firestore_client=fake_fs)
         self.assertEqual(svc.get_backend_mode(), "direct_admin")
 
+        data_url_1 = "data:image/jpeg;base64," + base64.b64encode(b"img1").decode("ascii")
+        data_url_2 = "data:image/jpeg;base64," + base64.b64encode(b"img2").decode("ascii")
         ok = svc.upsert_student_face_photos_batch(
             [
                 {
                     "student_id": "10501",
                     "student_name": "김유민",
-                    "photo_file_id": "fid_10501",
-                    "photo_drive_url": "https://drive.google.com/uc?export=view&id=fid_10501",
+                    "photo_data_url": data_url_1,
+                    "photo_hash": "hash1",
                 },
                 {
                     "student_id": "10502",
                     "student_name": "박시우",
-                    "photo_file_id": "fid_10502",
-                    "photo_drive_url": "https://drive.google.com/uc?export=view&id=fid_10502",
+                    "photo_data_url": data_url_2,
+                    "photo_hash": "hash2",
                 },
             ]
         )
@@ -302,6 +282,8 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         self.assertEqual(doc_payload["student_name"], "김유민")
         self.assertEqual(doc_payload["grade"], 1)
         self.assertEqual(doc_payload["class_no"], 5)
+        self.assertEqual(doc_payload["photo_data_url"], data_url_1)
+        self.assertEqual(doc_payload["photo_hash"], "hash1")
         fake_batch.commit.assert_called_once()
 
     def test_dialog_preview_table_and_manual_override(self) -> None:
@@ -340,6 +322,71 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
         self.assertEqual(len(targets_after), 2)
         self.assertEqual(targets_after[1]["student_id"], "10503")
         self.assertEqual(targets_after[1]["student_name"], "이서진")
+        dlg.close()
+
+    @patch("PyQt6.QtWidgets.QMessageBox.information")
+    def test_on_upload_and_sync_connects_function_worker_signals_progress(self, _mock_info) -> None:
+        _ensure_qapp()
+        from core.base_worker import FunctionWorker
+
+        img1 = self.tmp_path / "10501.jpg"
+        Image.new("RGB", (300, 300), (120, 160, 210)).save(img1, format="JPEG")
+
+        captured_workers = []
+
+        class _InlineTaskRunner:
+            def start_worker(
+                self,
+                worker,
+                task_key=None,
+                on_result=None,
+                on_error=None,
+                on_finished=None,
+            ):
+                captured_workers.append(worker)
+                res = worker.execute()
+                if on_result is not None:
+                    on_result(res)
+                if on_finished is not None:
+                    on_finished()
+                return task_key or "inline"
+
+        dlg = StudentFacePhotoBatchDialog(
+            roster=self.roster,
+            school_code="8140246",
+            school_name="천안오성고",
+            grade=1,
+            class_no=5,
+            db=self.db,
+            config=self.cfg,
+            task_runner=_InlineTaskRunner(),
+        )
+        dlg.add_image_files([img1])
+
+        with patch.object(
+            FirestoreSyncService,
+            "upload_file",
+            side_effect=AssertionError("Google Drive upload_file은 호출되면 안 됩니다."),
+        ) as mock_upload, patch.object(
+            FirestoreSyncService,
+            "upsert_student_face_photos_batch",
+            return_value=True,
+        ) as mock_upsert:
+            # 실제 FunctionWorker 인스턴스를 생성해 worker.signals.progress.connect(...)가
+            # AttributeError 없이 정상 연결되고, upload_file 없이 photo_data_url이 직접 전송되는지 검증
+            dlg._on_upload_and_sync()
+
+        mock_upload.assert_not_called()
+        mock_upsert.assert_called_once()
+        sent_docs = mock_upsert.call_args[0][0]
+        self.assertEqual(len(sent_docs), 1)
+        self.assertEqual(sent_docs[0]["remote_id"], "8140246_10501")
+        self.assertTrue(sent_docs[0]["photo_data_url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(len(sent_docs[0]["photo_hash"]), 64)
+        self.assertEqual(len(captured_workers), 1)
+        self.assertIsInstance(captured_workers[0], FunctionWorker)
+        self.assertEqual(dlg.progress_bar.value(), 100)
+        self.assertEqual(dlg.table.item(0, 4).text(), "동기화 완료")
         dlg.close()
 
 
