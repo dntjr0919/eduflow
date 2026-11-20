@@ -830,6 +830,281 @@ class FirestoreSyncService:
         rows.sort(key=lambda x: str(x.get("date") or x.get("updated_at") or ""), reverse=True)
         return rows
 
+    def upload_file(
+        self,
+        file_name: str,
+        file_base64: str = "",
+        *,
+        file_bytes: Optional[bytes] = None,
+        file_path: str = "",
+        mime_type: str = "image/jpeg",
+        folder_name: str = "EduFlow_Student_Photos",
+    ) -> Dict[str, Any]:
+        """
+        Eduflow_mobile `/api/firestore`의 `upload_file` 액션(또는 GAS 엔드포인트)을 호출해
+        Google Drive에 파일을 업로드하고 `{ok, file_id, url, download_url}`을 반환합니다.
+        Direct Admin 및 Vercel API 모드 모두에서 동일하게 동작합니다.
+        """
+        import base64
+        import mimetypes
+        from pathlib import Path
+
+        clean_name = str(file_name or "").strip()
+        b64_str = str(file_base64 or "").strip()
+
+        if not b64_str and file_bytes is not None:
+            b64_str = base64.b64encode(bytes(file_bytes)).decode("ascii")
+
+        if not b64_str and file_path:
+            p = Path(str(file_path).strip())
+            if not p.exists() or not p.is_file():
+                return {
+                    "ok": False,
+                    "file_id": "",
+                    "url": "",
+                    "download_url": "",
+                    "error": f"파일을 찾을 수 없습니다: {file_path}",
+                }
+            if not clean_name:
+                clean_name = p.name
+            if not mime_type:
+                guessed, _ = mimetypes.guess_type(str(p))
+                mime_type = guessed or "application/octet-stream"
+            b64_str = base64.b64encode(p.read_bytes()).decode("ascii")
+
+        if not b64_str:
+            return {
+                "ok": False,
+                "file_id": "",
+                "url": "",
+                "download_url": "",
+                "error": "업로드할 파일 데이터(file_base64)가 비어 있습니다.",
+            }
+
+        if not clean_name:
+            clean_name = f"photo_{int(datetime.now().timestamp() * 1000)}.jpg"
+
+        req_payload = {
+            "file_name": clean_name,
+            "mime_type": str(mime_type or "image/jpeg").strip() or "image/jpeg",
+            "file_base64": b64_str,
+            "folder_name": str(folder_name or "EduFlow_Student_Photos").strip() or "EduFlow_Student_Photos",
+        }
+
+        last_err = ""
+        # 1) Vercel /api/firestore `upload_file` 액션 우선 호출 (Direct Admin 및 Vercel API 모드 모두 지원)
+        try:
+            res = self._post_vercel_api("upload_file", req_payload)
+            file_id = str(
+                res.get("file_id")
+                or res.get("photo_file_id")
+                or res.get("attachment_file_id")
+                or ""
+            ).strip()
+            file_url = str(
+                res.get("download_url")
+                or res.get("url")
+                or res.get("photo_drive_url")
+                or res.get("attachment_url")
+                or ""
+            ).strip()
+            if not file_url and file_id:
+                file_url = f"https://drive.google.com/uc?export=view&id={file_id}"
+            if file_url or file_id:
+                return {
+                    "ok": True,
+                    "file_id": file_id,
+                    "url": str(res.get("url") or file_url).strip(),
+                    "download_url": file_url,
+                }
+        except Exception as exc:
+            last_err = str(exc)
+            self.db.add_log("WARN", "FirestoreSync", f"Vercel API upload_file 실패 ({clean_name}): {exc}")
+
+        # 2) GAS URL이 설정된 경우 폴백 지원
+        gas_url = str(
+            self.config.get("api_and_integrations", "google_apps_script_url", "") or ""
+        ).strip()
+        if gas_url:
+            try:
+                sess = self._get_http_session()
+                gas_payload = dict(req_payload, action="upload_notice_file")
+                resp = sess.post(gas_url, json=gas_payload, timeout=DEFAULT_VERCEL_TIMEOUT)
+                if resp.ok:
+                    data = resp.json()
+                    if isinstance(data, dict) and data.get("ok"):
+                        file_id = str(
+                            data.get("file_id") or data.get("attachment_file_id") or ""
+                        ).strip()
+                        file_url = str(
+                            data.get("download_url") or data.get("url") or data.get("attachment_url") or ""
+                        ).strip()
+                        if not file_url and file_id:
+                            file_url = f"https://drive.google.com/uc?export=view&id={file_id}"
+                        if file_url or file_id:
+                            return {
+                                "ok": True,
+                                "file_id": file_id,
+                                "url": str(data.get("url") or file_url).strip(),
+                                "download_url": file_url,
+                            }
+            except Exception as exc:
+                last_err = str(exc)
+                self.db.add_log("WARN", "FirestoreSync", f"GAS 파일 업로드 실패 ({clean_name}): {exc}")
+
+        return {
+            "ok": False,
+            "file_id": "",
+            "url": "",
+            "download_url": "",
+            "error": last_err or "Google Drive 파일 업로드에 실패했습니다.",
+        }
+
+    @classmethod
+    def normalize_student_face_photo_doc(
+        cls,
+        raw: Dict[str, Any],
+        default_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        `학생_안면데이터` 컬렉션 문서 스키마로 정규화합니다:
+        {remote_id: "{school_code}_{student_id}", school_code, school_name, grade, class_no,
+         student_id, student_name, photo_file_id, photo_drive_url, updated_at}
+        """
+        meta = default_meta or {}
+        school_code = str(
+            raw.get("school_code")
+            or raw.get("neis_school_code")
+            or meta.get("school_code")
+            or ""
+        ).strip()
+        school_name = str(
+            raw.get("school_name")
+            or meta.get("school_name")
+            or ""
+        ).strip()
+        student_id = re.sub(
+            r"^(\d+)\.0+$",
+            r"\1",
+            str(raw.get("student_id") or "").strip(),
+        )
+        student_name = str(
+            raw.get("student_name")
+            or raw.get("name")
+            or ""
+        ).strip()
+
+        grade = _to_int_or_none(raw.get("grade") if raw.get("grade") is not None else meta.get("grade"))
+        class_no = _to_int_or_none(raw.get("class_no") if raw.get("class_no") is not None else meta.get("class_no"))
+        if (grade is None or class_no is None) and len(student_id) == 5 and student_id.isdigit():
+            if grade is None:
+                grade = _to_int_or_none(student_id[0])
+            if class_no is None:
+                class_no = _to_int_or_none(student_id[1:3])
+
+        photo_file_id = str(
+            raw.get("photo_file_id")
+            or raw.get("file_id")
+            or ""
+        ).strip()
+        photo_drive_url = str(
+            raw.get("photo_drive_url")
+            or raw.get("download_url")
+            or raw.get("url")
+            or ""
+        ).strip()
+        if not photo_drive_url and photo_file_id:
+            photo_drive_url = f"https://drive.google.com/uc?export=view&id={photo_file_id}"
+
+        raw_remote_id = str(raw.get("remote_id") or "").strip().replace("/", "_")
+        if raw_remote_id:
+            remote_id = raw_remote_id
+        elif school_code and student_id:
+            remote_id = f"{school_code}_{student_id}"
+        else:
+            remote_id = f"_{student_id}" if student_id else ""
+
+        updated_at = str(raw.get("updated_at") or "").strip() or _now_str()
+        return {
+            "remote_id": remote_id,
+            "school_code": school_code,
+            "school_name": school_name,
+            "grade": grade,
+            "class_no": class_no,
+            "student_id": student_id,
+            "student_name": student_name,
+            "photo_file_id": photo_file_id,
+            "photo_drive_url": photo_drive_url,
+            "updated_at": updated_at,
+        }
+
+    def upsert_student_face_photos_batch(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        school_code: str = "",
+        school_name: str = "",
+        grade: Optional[int] = None,
+        class_no: Optional[int] = None,
+        chunk_size: int = FIRESTORE_BATCH_LIMIT,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        """
+        학생 얼굴 사진 메타데이터 목록을 Firestore `학생_안면데이터` 컬렉션에 일괄 저장합니다.
+        Direct Admin 모드(Firestore Batch Upsert) 및 Vercel API 모드(`upsert_student_face_photos_batch`) 모두 지원합니다.
+        """
+        if not items:
+            return False
+
+        tp = self.config.get_section("teacher_profile") or {}
+        default_meta = {
+            "school_code": str(
+                school_code or tp.get("school_code") or tp.get("neis_school_code") or ""
+            ).strip(),
+            "school_name": str(school_name or tp.get("school_name") or "").strip(),
+            "grade": grade if grade is not None else _to_int_or_none(tp.get("grade")),
+            "class_no": class_no if class_no is not None else _to_int_or_none(tp.get("class_no")),
+        }
+
+        normalized: List[Dict[str, Any]] = []
+        for raw_item in items:
+            if not isinstance(raw_item, dict):
+                continue
+            doc = self.normalize_student_face_photo_doc(raw_item, default_meta=default_meta)
+            if not doc.get("student_id") or not doc.get("remote_id"):
+                continue
+            normalized.append(doc)
+
+        if not normalized:
+            return False
+
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api(
+                    "upsert_student_face_photos_batch",
+                    {
+                        "items": normalized,
+                        "photos": normalized,
+                        "rows": normalized,
+                        "school_code": default_meta["school_code"],
+                        "school_name": default_meta["school_name"],
+                        "grade": default_meta["grade"],
+                        "class_no": default_meta["class_no"],
+                    },
+                )
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 학생 안면데이터 일괄 저장 실패: {exc}")
+                return False
+
+        return self._batch_upsert(
+            collection_name="학생_안면데이터",
+            rows=normalized,
+            label="학생 안면데이터 Batch Upsert",
+            chunk_size=chunk_size,
+            progress_callback=progress_callback,
+        )
+
     def upload_notice_attachment(
         self,
         file_path: str,

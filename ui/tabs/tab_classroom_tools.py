@@ -104,6 +104,7 @@ from services.notice_parser_service import (
 from services.roster_parser_service import parse_homeroom_roster
 from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
+from ui.dialogs.student_face_photo_dialog import StudentFacePhotoBatchDialog
 from ui.utils import install_no_scroll_wheel_filter
 from utils.path_helper import get_data_path, get_resource_path
 
@@ -1802,9 +1803,19 @@ class ClassroomToolsTab(QWidget):
         )
         self.chk_include_simple_present.stateChanged.connect(lambda _s: self._refresh_attendance_view())
 
+        self.btn_batch_face_photos = QPushButton("학생 얼굴 사진 일괄 등록")
+        apply_qss_role(self.btn_batch_face_photos, role="secondary", obj_name="BtnClassroomBatchFacePhotos")
+        self.btn_batch_face_photos.setMinimumHeight(32)
+        self.btn_batch_face_photos.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_batch_face_photos.setToolTip(
+            "사진 폴더 또는 다중 이미지 파일명(학번/이름)으로 현재 담임학급 명렬표와 자동 매칭하여 Google Drive 및 학생_안면데이터에 업로드합니다."
+        )
+        self.btn_batch_face_photos.clicked.connect(self._on_open_batch_face_photos)
+
         att_mobile_bar.addWidget(self.lbl_mobile_att_pending)
         att_mobile_bar.addWidget(self.chk_include_simple_present)
         att_mobile_bar.addStretch(1)
+        att_mobile_bar.addWidget(self.btn_batch_face_photos)
         att_mobile_bar.addWidget(self.btn_refresh_mobile_att)
         c1_lay.addLayout(att_mobile_bar)
 
@@ -3098,6 +3109,30 @@ class ClassroomToolsTab(QWidget):
             "teacher_name": str(tp.get("name") or "담임교사").strip(),
             "is_admin": bool(tp.get("is_admin") is True),
         }
+
+    def _on_open_batch_face_photos(self) -> None:
+        meta = self._teacher_meta()
+        roster = self._get_active_roster()
+        if not roster:
+            QMessageBox.warning(
+                self,
+                "학생 얼굴 사진 일괄 등록",
+                "연동된 담임 학급 명렬표가 없습니다. 명렬표를 먼저 등록하거나 연동해 주세요.",
+            )
+            return
+
+        dlg = StudentFacePhotoBatchDialog(
+            self,
+            roster=roster,
+            school_code=str(meta.get("school_code") or ""),
+            school_name=str(meta.get("school_name") or ""),
+            grade=meta.get("grade"),
+            class_no=meta.get("class_no"),
+            db=self.db,
+            config=self.config,
+            task_runner=self.task_runner,
+        )
+        dlg.exec()
 
     def _merge_mobile_attendance_rows(self, rows: List[Dict[str, Any]]) -> Tuple[int, int]:
         """Firestore `일일_출결`에서 조회한 모바일 출결 보고를 로컬 출결 대장에 병합합니다."""

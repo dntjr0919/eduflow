@@ -72,6 +72,7 @@ from ui.components.collapsible_card import AccordionCard, AccordionGroup
 from ui.components.file_drop_helper import enable_file_drop
 from ui.components.hover_zoom_card import HoverZoomCard
 from ui.dialogs.manual_llm_dialog import ManualLlmDialog
+from ui.dialogs.student_face_photo_dialog import StudentFacePhotoBatchDialog
 from ui.utils import (
     COMBOBOX_STYLE,
     NoScrollWheelFilter,
@@ -1847,6 +1848,47 @@ class SettingsTab(QWidget):
             on_error=lambda err: QMessageBox.critical(self, "모바일 계정 발급 오류", str(err or "").splitlines()[0]),
         )
 
+    def _on_open_batch_face_photos(self) -> None:
+        self._persist_settings_silently()
+        active_group = self.db.get_active_homeroom_group()
+        students: List[Dict[str, Any]] = []
+        if active_group:
+            students = self.db.get_roster_students(active_group["id"])
+        if not students:
+            students = self.db.get_students()
+        if not students:
+            QMessageBox.warning(
+                self,
+                "학생 얼굴 사진 일괄 등록",
+                "먼저 나이스 학급명렬표를 등록하거나 학생을 추가해 주세요.",
+            )
+            return
+
+        school_code = self.edit_neis_school_code.text().strip()
+        school_name = self.edit_school_name.text().strip()
+        grade_val = self.spin_teacher_grade.value()
+        class_val = self.spin_teacher_class.value()
+        for stu in students:
+            if stu.get("grade"):
+                grade_val = int(stu["grade"])
+            if stu.get("class_no"):
+                class_val = int(stu["class_no"])
+            if stu.get("grade") and stu.get("class_no"):
+                break
+
+        dlg = StudentFacePhotoBatchDialog(
+            self,
+            roster=students,
+            school_code=school_code,
+            school_name=school_name,
+            grade=grade_val,
+            class_no=class_val,
+            db=self.db,
+            config=self.config,
+            task_runner=self.task_runner,
+        )
+        dlg.exec()
+
     def _on_open_pending_approvals(self) -> None:
         requester_id = self.edit_teacher_id.text().strip()
         grade_val = self.spin_teacher_grade.value()
@@ -2340,6 +2382,13 @@ class SettingsTab(QWidget):
         self.btn_sync_mobile_accounts.setToolTip("등록된 담임학급 명렬표로 학생·학부모 초기 계정을 Firestore에 일괄 생성합니다.")
         self.btn_sync_mobile_accounts.clicked.connect(self._on_provision_homeroom_accounts)
 
+        self.btn_batch_face_photos = QPushButton("학생 얼굴 사진 일괄 등록")
+        apply_qss_role(self.btn_batch_face_photos, role="secondary", obj_name="BtnBatchStudentFacePhotos")
+        self.btn_batch_face_photos.setToolTip(
+            "사진 폴더 또는 다중 이미지 파일명(학번/이름)으로 담임학급 명렬표와 자동 매칭하여 Google Drive 및 학생_안면데이터에 업로드합니다."
+        )
+        self.btn_batch_face_photos.clicked.connect(self._on_open_batch_face_photos)
+
         self.btn_pending_approvals = QPushButton("가입 승인 대기 목록")
         apply_qss_role(self.btn_pending_approvals, role="secondary", obj_name="BtnPendingApprovals")
         self.btn_pending_approvals.clicked.connect(self._on_open_pending_approvals)
@@ -2347,6 +2396,7 @@ class SettingsTab(QWidget):
         t1_top.addWidget(self.lbl_homeroom_badge)
         t1_top.addStretch()
         t1_top.addWidget(self.btn_import_hr)
+        t1_top.addWidget(self.btn_batch_face_photos)
         t1_top.addWidget(self.btn_sync_mobile_accounts)
         t1_top.addWidget(self.btn_pending_approvals)
         t1_top.addWidget(btn_add_hr_stu)

@@ -1,5 +1,6 @@
 # 1. 코어 데스크톱 UI 및 문서/감시 필수 패키지
 PyQt6>=6.6.0
+Pillow>=10.0.0
 watchdog>=4.0.0
 openpyxl>=3.1.2
 pypdf>=4.0.0
