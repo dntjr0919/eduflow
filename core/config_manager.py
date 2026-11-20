@@ -52,7 +52,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_output_tokens": 2048,
         "thinking_budget_mode": "low",    # "off"(추론 끄기), "low"(최소 추론 - 채점/세특 권장), "auto"(모델 기본값)
         "custom_web_selectors": {},       # 도메인별 학습된 커스텀 웹 AI 입력창 CSS 셀렉터 캐시
-        # Google Sheets & Apps Script & 카카오톡 외부 연동 설정
+        # Google Calendar & Google Tasks OAuth 멀티 계정(개인/Workspace) 연동 설정
+        "google_calendar_enabled": False,
+        "google_calendar_id": "primary",
+        "google_calendar_credentials_path": "",
+        "google_calendar_token_path": "data/gcal_token_personal.json",
+        "google_calendar_token_personal_path": "data/gcal_token_personal.json",
+        "google_calendar_token_workspace_path": "data/gcal_token_workspace.json",
+        "google_calendar_export_account": "personal",
+        "google_calendar_exclude_personal": False,
+        # 카카오톡 & 학교 연동 설정
         "google_credentials_path": "",
         "google_sheet_url": "",
         "google_apps_script_url": "",

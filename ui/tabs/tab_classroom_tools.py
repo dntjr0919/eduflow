@@ -1608,6 +1608,9 @@ class ClassroomToolsTab(QWidget):
         self._remote_task_timer.setInterval(self.REMOTE_TASK_POLL_INTERVAL_MS)
         self._remote_task_timer.timeout.connect(self._on_remote_task_poll_tick)
         self._selected_notice_pdf_path: str = ""
+        self._selected_notice_attachment_file_id: str = ""
+        self._notice_pdf_field_map: List[Dict[str, Any]] = []
+        self._last_notice_replies: List[Dict[str, Any]] = []
         self._parsed_excel_timetable_rows: List[Dict[str, Any]] = []
         self._seat_cells: List[ClickableSeatCell] = []
         self._seat_labels: List[Tuple[QLabel, QLabel]] = []
@@ -2234,7 +2237,7 @@ class ClassroomToolsTab(QWidget):
         self.table_reply_schema.setColumnWidth(0, 115)
         self.table_reply_schema.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table_reply_schema.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table_reply_schema.setColumnWidth(2, 120)
+        self.table_reply_schema.setColumnWidth(2, 155)
         self.table_reply_schema.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.table_reply_schema.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.table_reply_schema.setColumnWidth(4, 56)
@@ -2260,9 +2263,19 @@ class ClassroomToolsTab(QWidget):
         self.btn_nudge_unsubmitted = QPushButton("미제출자 일괄 알림")
         apply_qss_role(self.btn_nudge_unsubmitted, role="warningOutline")
         self.btn_nudge_unsubmitted.clicked.connect(self._on_nudge_unsubmitted_notice)
+        self.btn_map_notice_pdf = QPushButton("PDF 양식 위치 지정")
+        apply_qss_role(self.btn_map_notice_pdf, role="secondary")
+        self.btn_map_notice_pdf.setToolTip("PDF/HWP/HWPX 양식 위에 회신 항목·체크박스·서명 좌표를 지정합니다.")
+        self.btn_map_notice_pdf.clicked.connect(self._on_open_notice_pdf_mapper)
+        self.btn_export_filled_pdfs = QPushButton("응답 취합 PDF 일괄 생성")
+        apply_qss_role(self.btn_export_filled_pdfs, role="primary")
+        self.btn_export_filled_pdfs.setToolTip("학생별 회신과 서명 이미지를 원본 PDF 양식에 합성해 일괄 출력합니다.")
+        self.btn_export_filled_pdfs.clicked.connect(self._on_export_filled_notice_pdfs)
         reply_bar.addWidget(self.edit_active_notice_id, stretch=1)
         reply_bar.addWidget(self.btn_refresh_replies)
         reply_bar.addWidget(self.btn_nudge_unsubmitted)
+        reply_bar.addWidget(self.btn_map_notice_pdf)
+        reply_bar.addWidget(self.btn_export_filled_pdfs)
         c3_lay.addWidget(self._notice_reply_bar_widget)
 
         self.table_notice_replies = QTableWidget(0, 5)
@@ -2774,10 +2787,21 @@ class ClassroomToolsTab(QWidget):
 
         self._remote_task_poll_running = True
 
-        def _work(_worker: Any) -> List[Dict[str, Any]]:
+        def _work(worker: Any) -> List[Dict[str, Any]]:
             svc = FirestoreSyncService(db=self.db, config=self.config)
             executor = RemoteTaskExecutor(db=self.db, config=self.config, sync_service=svc)
-            return executor.poll_and_execute_due_tasks()
+            results = executor.poll_and_execute_due_tasks()
+            for item in results or []:
+                if not isinstance(item, dict):
+                    continue
+                ok = bool(item.get("ok", True))
+                task_type = str(item.get("task_type") or "remote").strip()
+                summary = str(item.get("summary") or item.get("error") or "").strip()
+                if not ok or str(item.get("exec_status") or "").lower() == "error":
+                    worker.emit_log("ERROR", f"[{task_type}] {summary or '원격 작업 실행 실패'}")
+                else:
+                    worker.emit_log("SUCCESS", f"[{task_type}] {summary or '원격 작업 실행 완료'}")
+            return results
 
         def _on_finished() -> None:
             self._remote_task_poll_running = False
@@ -3410,10 +3434,10 @@ class ClassroomToolsTab(QWidget):
                 f"{NOTICE_OCR_JSON_PROMPT}\n\n"
                 f"[가정통신문 본문(사용자 확인·편집 텍스트)]\n{content_text[:12000]}"
             )
-        elif self._selected_notice_pdf_path and Path(self._selected_notice_pdf_path).suffix.lower() in (".hwp", ".hwpx"):
+        elif self._selected_notice_pdf_path and Path(self._selected_notice_pdf_path).suffix.lower() in (".hwp", ".hwpx", ".pdf"):
             extracted = extract_notice_source_text(self._selected_notice_pdf_path)
             if extracted:
-                prompt = f"{NOTICE_OCR_JSON_PROMPT}\n\n[문서 본문(HWP/HWPX 추출 텍스트)]\n{extracted}"
+                prompt = f"{NOTICE_OCR_JSON_PROMPT}\n\n[문서 본문(로컬 추출 텍스트)]\n{extracted}"
         return {
             "target_id": "notice_ocr",
             "kind": "ocr",
@@ -3497,7 +3521,14 @@ class ClassroomToolsTab(QWidget):
         type_lay.setSpacing(0)
         type_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         type_combo = QComboBox(type_container)
-        type_combo.addItems(list(VALID_REPLY_FIELD_TYPES))
+        type_labels = {
+            "text": "단답형 입력",
+            "textarea": "서술형 입력",
+            "radio": "객관식 (단일 선택)",
+            "checkbox": "체크박스 (다중 선택)",
+        }
+        for ftype_key in VALID_REPLY_FIELD_TYPES:
+            type_combo.addItem(type_labels.get(ftype_key, ftype_key), ftype_key)
         type_combo.setFixedHeight(32)
         type_combo.setStyleSheet(
             "QComboBox {"
@@ -3519,8 +3550,11 @@ class ClassroomToolsTab(QWidget):
             "}"
         )
         ftype = str(item.get("type") or "text").strip().lower()
-        if ftype in VALID_REPLY_FIELD_TYPES:
-            type_combo.setCurrentText(ftype)
+        type_idx = type_combo.findData(ftype)
+        if type_idx < 0:
+            type_idx = type_combo.findData("text")
+        if type_idx >= 0:
+            type_combo.setCurrentIndex(type_idx)
         install_no_scroll_wheel_filter(type_combo)
         type_lay.addWidget(type_combo)
 
@@ -3559,7 +3593,11 @@ class ClassroomToolsTab(QWidget):
                 if isinstance(type_widget, QComboBox)
                 else (type_widget.findChild(QComboBox) if type_widget is not None else None)
             )
-            ftype = combo.currentText().strip() if isinstance(combo, QComboBox) else "text"
+            ftype = (
+                str(combo.currentData() or "text").strip()
+                if isinstance(combo, QComboBox)
+                else "text"
+            )
             opts_raw = opts_item.text().strip() if opts_item else ""
             options = [o.strip() for o in re.split(r"[,/|]", opts_raw) if o.strip()]
             required = req_item.checkState() == Qt.CheckState.Checked if req_item else True
@@ -3703,6 +3741,9 @@ class ClassroomToolsTab(QWidget):
     def _set_notice_pdf_file(self, file_path: str, *, force_ai: bool = False) -> None:
         self._selected_notice_pdf_path = str(file_path).strip()
         self._selected_notice_attachment_file_id = ""
+        self._notice_pdf_field_map = []
+        if hasattr(self, "edit_notice_attachment_url"):
+            self.edit_notice_attachment_url.clear()
         fname = Path(self._selected_notice_pdf_path).name
 
         if not force_ai:
@@ -3747,15 +3788,63 @@ class ClassroomToolsTab(QWidget):
             override_text=self.txt_notice_content.toPlainText().strip(),
         )
 
+    def _dispatch_to_ai_dock_if_non_api(
+        self,
+        *,
+        target_id: str,
+        status_label: Optional[QLabel],
+        manual_msg: str,
+        pw_msg: str,
+        empty_msg: str = "",
+    ) -> bool:
+        """AI 실행 패널이 수동 복붙(1) 또는 Playwright(2) 모드이면 패널 실행으로 위임하고 True를 반환합니다."""
+        win = self.window()
+        ai_dock = getattr(win, "ai_dock", None) if win is not None else None
+        if ai_dock is not None and hasattr(ai_dock, "current_mode_index"):
+            mode_idx = int(ai_dock.current_mode_index())
+        else:
+            mode_idx = 1 if MultiLlmClient().is_manual_mode_active() else 0
+
+        if mode_idx == 1:
+            if ai_dock is not None and hasattr(ai_dock, "prepare_manual_prompt_for_target"):
+                if hasattr(win, "toggle_ai_dock") and not getattr(win, "_ai_dock_expanded", True):
+                    win.toggle_ai_dock(True)
+                prompt_text = ai_dock.prepare_manual_prompt_for_target(target_id)
+                if status_label is not None:
+                    status_label.setText(manual_msg if prompt_text or not empty_msg else empty_msg)
+            elif status_label is not None:
+                status_label.setText(manual_msg)
+            return True
+
+        if mode_idx == 2 and ai_dock is not None:
+            if hasattr(win, "toggle_ai_dock") and not getattr(win, "_ai_dock_expanded", True):
+                win.toggle_ai_dock(True)
+            ai_dock.set_target(target_id, force=True)
+            ai_dock._on_pw_start_clicked()
+            if status_label is not None:
+                status_label.setText(pw_msg)
+            return True
+
+        return False
+
     def _run_notice_ai_extraction(self, *, file_path: str = "", override_text: str = "") -> None:
         self.ai_context_changed.emit()
         self.ai_target_requested.emit("notice_ocr")
 
         fname = Path(file_path).name if file_path else "직접 입력 본문"
+        if self._dispatch_to_ai_dock_if_non_api(
+            target_id="notice_ocr",
+            status_label=self.lbl_notice_pdf_status,
+            manual_msg=f"수동 복붙 대기: {fname} — 우측 AI 실행 패널에 프롬프트를 띄웠습니다. 복붙 후 [응답 회수]를 눌러 반영하세요.",
+            pw_msg=f"Playwright 자동 추출 실행: {fname} — 우측 AI 실행 패널 진행 상태를 확인하세요.",
+            empty_msg=f"선택된 대상: {fname} — 프롬프트를 생성할 본문 또는 파일이 없습니다.",
+        ):
+            return
+
         client = MultiLlmClient()
         if client.is_manual_mode_active():
             self.lbl_notice_pdf_status.setText(
-                f"선택된 대상: {fname} → 우측 AI 실행 패널에서 API / 수동 복붙 / Playwright로 추출하세요."
+                f"선택된 대상: {fname} → API Key가 없어 수동 모드로 대기 중입니다. 우측 AI 실행 패널에서 진행하세요."
             )
             return
 
@@ -3928,6 +4017,10 @@ class ClassroomToolsTab(QWidget):
             "reply_schema": reply_schema,
             "reply_schema_json": json.dumps(reply_schema, ensure_ascii=False),
             "reply_fields": reply_fields,
+            "pdf_field_map": list(getattr(self, "_notice_pdf_field_map", []) or []),
+            "pdf_field_map_json": json.dumps(
+                list(getattr(self, "_notice_pdf_field_map", []) or []), ensure_ascii=False
+            ),
             "attachment_url": self.edit_notice_attachment_url.text().strip(),
             "attachment_file_id": getattr(self, "_selected_notice_attachment_file_id", ""),
             "target_grade": target_grade,
@@ -3956,17 +4049,36 @@ class ClassroomToolsTab(QWidget):
             else getattr(self, "btn_save_notice_candidate", None)
         )
 
-        def _work() -> Tuple[bool, str, str, str]:
+        def _work() -> Tuple[bool, str, str, str, str]:
+            import shutil
+            from services.notice_parser_service import convert_hwp_to_pdf
+
             svc = FirestoreSyncService(db=self.db, config=self.config)
             uploaded_url = str(payload.get("attachment_url") or "").strip()
             uploaded_id = str(payload.get("attachment_file_id") or "").strip()
+            upload_err = ""
             if not uploaded_url and local_src_path and Path(local_src_path).is_file():
-                up_res = svc.upload_notice_attachment(local_src_path)
-                if up_res.get("ok") and up_res.get("attachment_url"):
-                    uploaded_url = str(up_res["attachment_url"]).strip()
-                    uploaded_id = str(up_res.get("attachment_file_id") or "").strip()
-                    payload["attachment_url"] = uploaded_url
-                    payload["attachment_file_id"] = uploaded_id
+                converted_pdf: Optional[Path] = None
+                upload_target_path = local_src_path
+                try:
+                    if Path(local_src_path).suffix.lower() in (".hwp", ".hwpx"):
+                        converted_pdf = convert_hwp_to_pdf(local_src_path)
+                        if converted_pdf is not None and converted_pdf.is_file():
+                            upload_target_path = str(converted_pdf)
+
+                    up_res = svc.upload_notice_attachment(upload_target_path)
+                    if up_res.get("ok") and up_res.get("attachment_url"):
+                        uploaded_url = str(up_res["attachment_url"]).strip()
+                        uploaded_id = str(up_res.get("attachment_file_id") or "").strip()
+                        payload["attachment_url"] = uploaded_url
+                        payload["attachment_file_id"] = uploaded_id
+                    else:
+                        upload_err = str(up_res.get("error") or "원본 파일 업로드에 실패했습니다.").strip()
+                except Exception as exc:
+                    upload_err = str(exc)
+                finally:
+                    if converted_pdf is not None:
+                        shutil.rmtree(converted_pdf.parent, ignore_errors=True)
 
             ok, rid = svc.publish_mobile_notice(payload)
             if ok and is_published:
@@ -3983,10 +4095,13 @@ class ClassroomToolsTab(QWidget):
                     channel="notice_publish",
                     notice_id=rid,
                 )
-            return ok, rid, uploaded_url, uploaded_id
+            return ok, rid, uploaded_url, uploaded_id, upload_err
 
         def _on_result(res: Any) -> None:
-            if isinstance(res, tuple) and len(res) >= 4:
+            upload_err = ""
+            if isinstance(res, tuple) and len(res) >= 5:
+                ok, rid, uploaded_url, uploaded_id, upload_err = res[:5]
+            elif isinstance(res, tuple) and len(res) >= 4:
                 ok, rid, uploaded_url, uploaded_id = res[:4]
             elif isinstance(res, tuple) and len(res) >= 2:
                 ok, rid, uploaded_url, uploaded_id = res[0], res[1], "", ""
@@ -3999,19 +4114,24 @@ class ClassroomToolsTab(QWidget):
 
             if ok:
                 self.edit_active_notice_id.setText(str(rid or ""))
+                warn_tail = (
+                    f"\n\n※ 단, 원본 파일 Google Drive 업로드는 실패하여 본문·회신 양식만 저장되었습니다.\n(사유: {upload_err})"
+                    if upload_err
+                    else ""
+                )
                 if is_published:
                     self.lbl_notice_pdf_status.setText(f"바로 게시 완료 (ID: {rid}) — Notifications 알림 등록됨")
                     QMessageBox.information(
                         self,
                         "게시 완료",
-                        f"모바일 가정통신문이 즉시 게시되고 대상 학급 알림이 등록되었습니다.\n(ID: {rid})",
+                        f"모바일 가정통신문이 즉시 게시되고 대상 학급 알림이 등록되었습니다.\n(ID: {rid}){warn_tail}",
                     )
                 else:
                     self.lbl_notice_pdf_status.setText(f"모바일 후보 저장 완료 (ID: {rid}, is_published=false)")
                     QMessageBox.information(
                         self,
                         "후보 저장 완료",
-                        f"가정통신문이 모바일 후보(is_published=false)로 저장되었습니다.\n(ID: {rid})",
+                        f"가정통신문이 모바일 후보(is_published=false)로 저장되었습니다.\n(ID: {rid}){warn_tail}",
                     )
             else:
                 QMessageBox.warning(self, "저장 실패", "가정통신문 저장에 실패했습니다.")
@@ -4037,7 +4157,8 @@ class ClassroomToolsTab(QWidget):
             return svc.fetch_notice_replies(nid)
 
         def _on_result(replies: Any) -> None:
-            rep_map = {str(r.get("student_id") or ""): r for r in (replies or [])}
+            self._last_notice_replies = list(replies or [])
+            rep_map = {str(r.get("student_id") or ""): r for r in self._last_notice_replies}
             roster = self._get_active_roster()
             self.table_notice_replies.setRowCount(0)
             for sid, name in roster:
@@ -4058,6 +4179,170 @@ class ClassroomToolsTab(QWidget):
             work_fn=_work,
             on_result=_on_result,
             on_error=lambda err: QMessageBox.warning(self, "회신 조회 오류", str(err or "").splitlines()[0]),
+        )
+
+    def _on_open_notice_pdf_mapper(self) -> None:
+        src = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
+        if not src or not Path(src).is_file():
+            QMessageBox.information(
+                self,
+                "양식 파일 필요",
+                "먼저 PDF, HWP 또는 HWPX 가정통신문 양식 파일을 선택해 주세요.",
+            )
+            return
+        from ui.dialogs.notice_pdf_mapper_dialog import NoticePdfMapperDialog
+
+        schema = self._collect_reply_schema_from_table()
+        win = self.window()
+        ai_dock = getattr(win, "ai_dock", None) if win is not None else None
+        try:
+            dlg = NoticePdfMapperDialog(
+                pdf_path=src,
+                reply_schema=schema,
+                initial_field_map=self._notice_pdf_field_map,
+                task_runner=self.task_runner,
+                ai_dock=ai_dock,
+                parent=self,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "양식 열기 오류", str(exc))
+            return
+
+        def _on_accepted() -> None:
+            self._notice_pdf_field_map = dlg.get_field_map()
+            updated_schema = dlg.get_reply_schema()
+            self._populate_reply_schema_table(updated_schema)
+            if updated_schema:
+                self.chk_notice_requires_reply.setChecked(True)
+            self.lbl_notice_pdf_status.setText(
+                f"PDF 양식 좌표 {len(self._notice_pdf_field_map)}개 · 회신 항목 {len(updated_schema)}개 동기화 완료 — 저장/게시 시 함께 반영됩니다."
+            )
+
+        dlg.accepted.connect(_on_accepted)
+        dlg.setModal(False)
+        self._active_pdf_mapper_dialog = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_export_filled_notice_pdfs(self) -> None:
+        src = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
+        if not src or not Path(src).is_file():
+            QMessageBox.information(
+                self,
+                "양식 파일 필요",
+                "합성에 사용할 PDF/HWP/HWPX 원본 양식 파일을 먼저 선택해 주세요.",
+            )
+            return
+        if not self._notice_pdf_field_map:
+            ans = QMessageBox.question(
+                self,
+                "좌표 매핑 없음",
+                "저장된 PDF 양식 좌표가 없습니다. 지금 [PDF 양식 위치 지정] 창을 열까요?",
+            )
+            if ans == QMessageBox.StandardButton.Yes:
+                self._on_open_notice_pdf_mapper()
+            if not self._notice_pdf_field_map:
+                return
+
+        nid = self.edit_active_notice_id.text().strip()
+        if not nid and not self._last_notice_replies:
+            QMessageBox.information(
+                self,
+                "회신 내역 필요",
+                "먼저 가정통신문 ID를 입력해 [제출 현황 조회]를 실행해 주세요.",
+            )
+            return
+
+        box = QMessageBox(self)
+        box.setWindowTitle("응답 취합 PDF 출력 방식 선택")
+        box.setText("학급 응답을 어떤 형식으로 출력할까요?")
+        btn_indiv = box.addButton("학생별 개별 PDF 폴더 저장", QMessageBox.ButtonRole.AcceptRole)
+        btn_merged = box.addButton("전체 학급 통합 PDF 1개 저장", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (btn_indiv, btn_merged):
+            return
+
+        if clicked == btn_indiv:
+            export_mode = "individual"
+            out_target = QFileDialog.getExistingDirectory(self, "학생별 개별 PDF 저장 폴더 선택")
+        else:
+            export_mode = "merged"
+            default_name = f"{self.edit_notice_title.text().strip() or '가정통신문'}_취합본.pdf"
+            out_target, _ = QFileDialog.getSaveFileName(
+                self, "통합 PDF 저장", default_name, "PDF Files (*.pdf)"
+            )
+        if not out_target:
+            return
+
+        meta = self._teacher_meta()
+        cached_replies = list(self._last_notice_replies or [])
+        field_map = list(self._notice_pdf_field_map)
+
+        def _work() -> Dict[str, Any]:
+            import shutil
+            from services.notice_parser_service import convert_hwp_to_pdf
+            from services.notice_pdf_fill_service import batch_export_notice_pdfs
+
+            replies = cached_replies
+            if not replies and nid:
+                svc = FirestoreSyncService(db=self.db, config=self.config)
+                replies = svc.fetch_notice_replies(nid)
+            if not replies:
+                raise ValueError("출력할 제출 완료 회신 내역이 없습니다.")
+
+            temp_dir: Optional[Path] = None
+            pdf_src = Path(src)
+            try:
+                if pdf_src.suffix.lower() in (".hwp", ".hwpx"):
+                    conv = convert_hwp_to_pdf(pdf_src)
+                    if conv is None or not conv.is_file():
+                        raise RuntimeError("HWP/HWPX 파일을 PDF로 변환하지 못했습니다.")
+                    temp_dir = conv.parent
+                    pdf_src = conv
+
+                return batch_export_notice_pdfs(
+                    source_pdf_path=pdf_src,
+                    field_map=field_map,
+                    replies=replies,
+                    output_target=out_target,
+                    mode=export_mode,
+                    class_meta={
+                        "grade": meta.get("grade"),
+                        "class_no": meta.get("class_no"),
+                    },
+                )
+            finally:
+                if temp_dir is not None:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+
+        def _on_result(res: Any) -> None:
+            if not isinstance(res, dict):
+                return
+            cnt = int(res.get("count", 0))
+            if res.get("mode") == "merged":
+                QMessageBox.information(
+                    self,
+                    "통합 PDF 생성 완료",
+                    f"총 {cnt}명 응답이 합쳐진 통합 PDF를 생성했습니다.\n\n저장 경로:\n{res.get('output_file')}",
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "개별 PDF 생성 완료",
+                    f"총 {cnt}명의 학생별 PDF를 생성했습니다.\n\n저장 폴더:\n{res.get('output_dir')}",
+                )
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_export_filled_pdfs", None),
+            loading_text="PDF 생성 중...",
+            task_name="가정통신문 응답 취합 PDF 일괄 생성",
+            task_key="classroom_export_filled_notice_pdfs",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda err: QMessageBox.warning(self, "PDF 생성 오류", str(err or "").splitlines()[0]),
         )
 
     def _on_nudge_unsubmitted_notice(self) -> None:
@@ -4357,6 +4642,14 @@ class ClassroomToolsTab(QWidget):
         self.ai_context_changed.emit()
         self.ai_target_requested.emit("class_notice_digest")
 
+        if self._dispatch_to_ai_dock_if_non_api(
+            target_id="class_notice_digest",
+            status_label=self.lbl_kakao_status,
+            manual_msg="수동 복붙 대기 — 우측 AI 실행 패널에 프롬프트를 띄우고 웹 AI를 열었습니다. [응답 회수]를 눌러 반영하세요.",
+            pw_msg="Playwright 자동 공지 추출 실행 — 우측 AI 실행 패널 진행 상태를 확인하세요.",
+        ):
+            return
+
         client = MultiLlmClient()
         if client.is_manual_mode_active():
             self.lbl_kakao_status.setText(
@@ -4429,6 +4722,14 @@ class ClassroomToolsTab(QWidget):
         }
         self.ai_context_changed.emit()
         self.ai_target_requested.emit("class_notice_digest")
+
+        if self._dispatch_to_ai_dock_if_non_api(
+            target_id="class_notice_digest",
+            status_label=self.lbl_schoolbell_status,
+            manual_msg="3줄 요약 수동 복붙 대기 — 우측 AI 실행 패널에 프롬프트를 띄우고 웹 AI를 열었습니다. [응답 회수]를 눌러 반영하세요.",
+            pw_msg="3줄 요약 Playwright 자동 실행 — 우측 AI 실행 패널 진행 상태를 확인하세요.",
+        ):
+            return
 
         client = MultiLlmClient()
         if client.is_manual_mode_active():

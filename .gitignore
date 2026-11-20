@@ -59,6 +59,8 @@ data/
 eduflow-db-b44f3-5692e5dea8c3.json
 #firebaseconfig
 eduflow-mobile-firebaseconfig.json
+#google_oauth_credentials
+Google_OAuth_credentials.json
 
 
 # One-off migration archive

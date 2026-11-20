@@ -28,12 +28,13 @@ VALID_SIGNATURE_MODES = ("single", "both")
 NOTICE_CATEGORIES = ("가정통신문", "수요조사", "체험학습", "동의서", "기타")
 
 NOTICE_OCR_JSON_PROMPT = (
-    "첨부된 가정통신문 PDF(또는 이미지)를 정확히 판독하여 아래 JSON 스키마로만 응답하세요.\n"
+    "첨부된 가정통신문 PDF(또는 이미지/본문 텍스트)를 정확히 판독하여 아래 JSON 스키마로만 응답하세요.\n"
     "코드블록(```json ... ```)을 포함해도 되며, 다른 설명 문장은 출력하지 마세요.\n"
     "{\n"
     '  "title": "가정통신문 제목",\n'
     '  "category": "가정통신문 | 수요조사 | 체험학습 | 동의서 중 택1",\n'
-    '  "content": "학생·학부모용 핵심 요약 본문",\n'
+    '  "corrected_text": "안내 문구, 제출 기한, 기준, 유의사항, 문의처 등 원문 핵심 내용을 누락 없이 읽기 좋게 전체 정리한 본문",\n'
+    '  "content": "corrected_text와 동일한 전체 정리 본문",\n'
     '  "due_date": "YYYY-MM-DD (회신 마감일이 없으면 빈 문자열 \\"\\")",\n'
     '  "requires_reply": true,\n'
     '  "signature_mode": "single | both (기본 single)",\n'
@@ -47,9 +48,16 @@ NOTICE_OCR_JSON_PROMPT = (
     "    }\n"
     "  ]\n"
     "}\n"
-    "- type은 radio, checkbox, text, textarea 중 하나만 사용하세요.\n"
-    "- signature_mode: 원문에 '학생 성명 (서명/인)'과 '학부모(보호자) 성명 (서명/인)'처럼 학생과 학부모 서명이 각각 별도로 요구되는 경우 \"both\", 일반 단일 서명만 있으면 \"single\"로 응답하세요.\n"
-    "- 회신/서명이 필요 없는 단순 안내문이면 requires_reply는 false, reply_schema는 []로 응답하세요."
+    "[필수 추출 규칙 — 반드시 준수]\n"
+    "1. corrected_text(및 content) 작성 규칙: 문서를 2~3줄로 과도하게 요약하지 마세요. "
+    "가정통신문의 안내 문구, 일시·장소, 대상, 제출 기한, 참여/선정 기준, 준비물·유의사항, 문의처 등 원문의 핵심 내용을 누락 없이 읽기 좋게 전체 정리하세요.\n"
+    "2. reply_schema 누락·병합 금지 규칙: 문서에 포함된 모든 설문 문항, 표 안의 개별 질문(예: 18개 건강생활행동 설문 문항 각각의 문항), "
+    "동의 여부(동의/비동의), 각종 기입란을 임의로 하나로 합치거나 생략하지 말고 문항 하나당 항목 하나씩 전부 개별 추출하세요.\n"
+    "3. 선택지(type/options) 생성 규칙: type은 radio, checkbox, text, textarea 중 하나만 사용하세요. "
+    "예/아니오, 동의/비동의, 동의/미동의, 찬성/반대, 복수 선택 체크박스 등 선택지가 있는 문항은 "
+    "반드시 type을 \"radio\" 또는 \"checkbox\"로 지정하고, 선택지 목록을 \"options\" 배열(예: [\"예\", \"아니오\"], [\"동의\", \"비동의\"])로 정확히 생성하세요.\n"
+    "4. signature_mode: 원문에 '학생 성명 (서명/인)'과 '학부모(보호자) 성명 (서명/인)'처럼 학생과 학부모 서명이 각각 별도로 요구되는 경우 \"both\", 일반 단일 서명만 있으면 \"single\"로 응답하세요.\n"
+    "5. 회신/서명이 전혀 필요 없는 단순 안내문이면 requires_reply는 false, reply_schema는 []로 응답하세요."
 )
 
 
@@ -425,7 +433,9 @@ def extract_notice_from_text(
         prompt="\n".join(prompt_parts),
         system_prompt=(
             "당신은 한국 초·중·고등학교 가정통신문 구조화 및 학부모 회신서 설계 전문 AI입니다. "
-            "요청된 JSON 스키마만 정확하게 출력하세요."
+            "corrected_text는 2~3줄 요약이 아니라 안내 문구·제출 기한·기준·유의사항·문의처 등 원문 핵심 내용을 누락 없이 전체 정리하고, "
+            "reply_schema는 문서·표 안의 모든 설문 문항과 동의 여부·기입란을 합치거나 생략하지 말고 문항당 하나씩 개별 추출하며, "
+            "예/아니오·동의/비동의 등 선택지 문항은 반드시 radio/checkbox와 options 배열로 생성해 요청된 JSON 스키마만 정확하게 출력하세요."
         ),
         image_bytes=None,
     )
@@ -482,7 +492,9 @@ def extract_notice_from_pdf(
         prompt="\n".join(prompt_parts),
         system_prompt=(
             "당신은 한국 초·중·고등학교 가정통신문 OCR 및 학부모 회신서 구조화 전문 AI입니다. "
-            "요청된 JSON 스키마만 정확하게 출력하세요."
+            "corrected_text는 2~3줄 요약이 아니라 안내 문구·제출 기한·기준·유의사항·문의처 등 원문 핵심 내용을 누락 없이 전체 정리하고, "
+            "reply_schema는 문서·표 안의 모든 설문 문항과 동의 여부·기입란을 합치거나 생략하지 말고 문항당 하나씩 개별 추출하며, "
+            "예/아니오·동의/비동의 등 선택지 문항은 반드시 radio/checkbox와 options 배열로 생성해 요청된 JSON 스키마만 정확하게 출력하세요."
         ),
         image_bytes=image_bytes,
         mime_type=mime_type,
@@ -490,3 +502,75 @@ def extract_notice_from_pdf(
     parsed = parse_notice_ai_json(raw_reply)
     parsed["source_path"] = str(p)
     return parsed
+
+
+def convert_hwp_to_pdf(
+    hwp_path: str | Path,
+    output_dir: Optional[str | Path] = None,
+) -> Optional[Path]:
+    """
+    Windows 한컴오피스 COM(HWPFrame.HwpObject)을 이용해 .hwp / .hwpx 파일을 임시 .pdf 파일로 변환합니다.
+    한글 미설치 또는 COM 오류 시 예외를 발생시키지 않고 None을 반환합니다.
+    """
+    import tempfile
+
+    from services.multi_doc_extractor_service import (
+        HAS_WIN32COM,
+        _hwp_security_popup_watcher,
+        pythoncom,
+        win32com,
+    )
+
+    p = Path(str(hwp_path or "").strip())
+    if not p.is_file() or p.suffix.lower() not in (".hwp", ".hwpx"):
+        return None
+    if not HAS_WIN32COM or win32com is None or pythoncom is None:
+        return None
+
+    out_dir = (
+        Path(output_dir)
+        if output_dir is not None
+        else Path(tempfile.mkdtemp(prefix="eduflow_notice_pdf_"))
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_pdf = out_dir / f"{p.stem}.pdf"
+
+    hwp = None
+    com_initialized = False
+    try:
+        pythoncom.CoInitialize()
+        com_initialized = True
+        hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+        try:
+            hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
+        except Exception:
+            pass
+        try:
+            hwp.SetMessageBoxMode(0x00010000)
+        except Exception:
+            pass
+
+        fmt = "HWPX" if p.suffix.lower() == ".hwpx" else "HWP"
+        with _hwp_security_popup_watcher():
+            opened = hwp.Open(str(p.resolve()), fmt, "forceopen:true")
+            if not opened:
+                opened = hwp.Open(str(p.resolve()), "", "forceopen:true")
+        if not opened:
+            return None
+
+        if hwp.SaveAs(str(out_pdf.resolve()), "PDF") and out_pdf.is_file() and out_pdf.stat().st_size > 0:
+            return out_pdf
+        return None
+    except Exception:
+        return None
+    finally:
+        if hwp is not None:
+            try:
+                hwp.Quit()
+            except Exception:
+                pass
+        if com_initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass

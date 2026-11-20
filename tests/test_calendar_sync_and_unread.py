@@ -991,5 +991,534 @@ class TestSidebarUnreadBadgesAndMainWindow(unittest.TestCase):
             self.app.processEvents()
 
 
+class TestGoogleCalendarPushAndFirebaseCleanup(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.db = DatabaseManager(db_rel_path=str(Path(self.tmp_dir.name) / "test.db"))
+        self.cfg = ConfigManager()
+
+    def tearDown(self) -> None:
+        self.tmp_dir.cleanup()
+
+    def test_google_calendar_push_insert_patch_delete_and_exclude_personal(self) -> None:
+        from services.google_calendar_service import GoogleCalendarService
+
+        # 일정 2건 등록 (학사일정 1, 개인 1)
+        sch_id = self.db.add_schedule(
+            title="개교기념일",
+            category="학사일정",
+            start_date="2026-05-01",
+            end_date="2026-05-01",
+            memo="휴업일",
+        )
+        self.db.add_schedule(
+            title="개인 병원 예약",
+            category="개인",
+            start_date="2026-05-02",
+            end_date="2026-05-02",
+        )
+
+        class _FakeExec:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def execute(self):
+                return self._payload
+
+        class _FakeEventsApi:
+            def __init__(self):
+                self.inserted = []
+                self.patched = []
+                self.deleted = []
+
+            def insert(self, calendarId, body):
+                self.inserted.append((calendarId, body))
+                return _FakeExec({"id": f"gcal_{len(self.inserted)}"})
+
+            def patch(self, calendarId, eventId, body):
+                self.patched.append((calendarId, eventId, body))
+                return _FakeExec({"id": eventId})
+
+            def delete(self, calendarId, eventId):
+                self.deleted.append((calendarId, eventId))
+                return _FakeExec({})
+
+        events_api = _FakeEventsApi()
+
+        class _FakeGcalService:
+            def events(self):
+                return events_api
+
+        svc = GoogleCalendarService(db=self.db, config=self.cfg)
+        # 1) 개인 일정 제외하고 푸시 -> insert 1건, skipped 1건
+        res1 = svc.push_schedules(exclude_personal=True, service_override=_FakeGcalService())
+        self.assertTrue(res1["ok"])
+        self.assertEqual(res1["inserted"], 1)
+        self.assertEqual(res1["skipped"], 1)
+        self.assertEqual(events_api.inserted[0][1]["summary"], "개교기념일")
+        self.assertEqual(events_api.inserted[0][1]["end"]["date"], "2026-05-02")  # exclusive end date
+
+        # 2) 로컬 일정 수정 후 재푸시 -> patch 1건
+        self.db.update_schedule(
+            sch_id,
+            title="개교기념일(변경)",
+            category="학사일정",
+            start_date="2026-05-01",
+            end_date="2026-05-01",
+            memo="휴업일 확정",
+        )
+        # gcal_updated_at보다 updated_at이 같거나 큰 경우 보장을 위해 과거 시각으로 세팅
+        self.db.update_schedule_gcal_meta(sch_id, "gcal_1", "2000-01-01 00:00:00")
+        res2 = svc.push_schedules(exclude_personal=True, service_override=_FakeGcalService())
+        self.assertEqual(res2["patched"], 1)
+        self.assertEqual(events_api.patched[0][1], "gcal_1")
+
+        # 3) 로컬 일정 삭제 후 재푸시 -> delete 1건
+        self.db.delete_schedule(sch_id)
+        res3 = svc.push_schedules(exclude_personal=True, service_override=_FakeGcalService())
+        self.assertEqual(res3["deleted"], 1)
+        self.assertEqual(events_api.deleted[0][1], "gcal_1")
+        self.assertEqual(self.db.get_pending_gcal_deletions(), [])
+
+    def test_calendar_tab_firebase_button_and_gcal_export_worker(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+        from core.base_worker import TaskRunner
+        from ui.tabs.tab_calendar_todo import CalendarTodoTab
+
+        app = QApplication.instance() or QApplication(sys.argv[:1])
+        runner = TaskRunner()
+        cal = CalendarTodoTab(
+            task_runner=runner,
+            db=self.db,
+            config=self.cfg,
+            start_timer=False,
+        )
+        try:
+            self.assertEqual(cal.btn_sync_sheets.text(), "Firebase 동기화")
+            self.assertEqual(cal.btn_export_gcal.text(), "Google 캘린더")
+            gcal_menu = cal.btn_export_gcal.menu()
+            self.assertIsNotNone(gcal_menu)
+            action_texts = [a.text() for a in gcal_menu.actions()]
+            self.assertEqual(
+                action_texts,
+                [
+                    "Google 캘린더에서 가져오기 (연결된 계정 → EduFlow)",
+                    "",
+                    "Google 캘린더로 내보내기 (개인 계정)",
+                    "Google 캘린더로 내보내기 (Workspace 계정)",
+                ],
+            )
+            self.assertEqual(cal.btn_sync_gtasks.text(), "Google Tasks 동기화")
+            self.assertIsNotNone(cal.btn_sync_gtasks.menu())
+            self.assertIn(
+                cal.lbl_sync_status_pill.text(),
+                ("Firebase 클라우드 실시간 연동 활성화", "로컬 캘린더 모드"),
+            )
+        finally:
+            cal.close()
+            cal.deleteLater()
+            app.processEvents()
+
+    def test_google_calendar_pull_schedules_and_dedup(self) -> None:
+        from services.google_calendar_service import GoogleCalendarService
+
+        # 기존 학사일정에 gcal_event_id 연결
+        existing_id = self.db.add_schedule(
+            title="기존 학사일정",
+            category="학사일정",
+            start_date="2026-06-10",
+            end_date="2026-06-10",
+            memo="초기 메모",
+        )
+        self.db.update_schedule_gcal_meta(existing_id, "gcal_existing", "2026-06-01 09:00:00")
+
+        class _FakeExec:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def execute(self):
+                return self._payload
+
+        class _FakeListApi:
+            def __init__(self, items):
+                self._items = items
+                self.last_kwargs = None
+
+            def list(self, **kwargs):
+                self.last_kwargs = kwargs
+                return _FakeExec({"items": self._items})
+
+        items = [
+            {
+                "id": "gcal_existing",
+                "status": "confirmed",
+                "summary": "기존 학사일정(구글에서 수정)",
+                "description": "수정된 메모",
+                "start": {"date": "2026-06-11"},
+                "end": {"date": "2026-06-12"},
+            },
+            {
+                "id": "gcal_new_1",
+                "status": "confirmed",
+                "summary": "개인 치과 예약",
+                "description": "오후 방문",
+                "start": {"date": "2026-06-01"},
+                "end": {"date": "2026-06-03"},
+            },
+            {
+                "id": "gcal_cancelled",
+                "status": "cancelled",
+                "summary": "취소된 일정",
+                "start": {"date": "2026-06-05"},
+                "end": {"date": "2026-06-06"},
+            },
+        ]
+        list_api = _FakeListApi(items)
+
+        class _FakeGcalService:
+            def events(self):
+                return list_api
+
+        svc = GoogleCalendarService(db=self.db, config=self.cfg)
+        res1 = svc.pull_schedules(service_override=_FakeGcalService())
+        self.assertTrue(res1["ok"])
+        self.assertEqual(res1["added"], 1)
+        self.assertEqual(res1["updated"], 1)
+        self.assertEqual(res1["skipped"], 1)
+        self.assertTrue(list_api.last_kwargs.get("singleEvents"))
+        self.assertEqual(list_api.last_kwargs.get("orderBy"), "startTime")
+
+        all_sch = {s["gcal_event_id"]: s for s in self.db.get_schedules() if s.get("gcal_event_id")}
+        # 기존 일정은 학사일정 카테고리 유지
+        self.assertEqual(all_sch["gcal_existing"]["category"], "학사일정")
+        self.assertEqual(all_sch["gcal_existing"]["title"], "기존 학사일정(구글에서 수정)")
+        self.assertEqual(all_sch["gcal_existing"]["start_date"], "2026-06-11")
+
+        # 신규 일정은 학생·학부모 노출 방지를 위해 반드시 '개인' 카테고리 저장
+        self.assertEqual(all_sch["gcal_new_1"]["category"], "개인")
+        self.assertEqual(all_sch["gcal_new_1"]["start_date"], "2026-06-01")
+        self.assertEqual(all_sch["gcal_new_1"]["end_date"], "2026-06-02")
+
+        # 재실행 시 중복 생성되지 않고 갱신만 수행됨
+        res2 = svc.pull_schedules(service_override=_FakeGcalService())
+        self.assertEqual(res2["added"], 0)
+        self.assertEqual(res2["updated"], 2)
+
+    def test_google_tasks_pull_and_push_sync(self) -> None:
+        from services.google_calendar_service import GoogleCalendarService
+
+        class _FakeExec:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def execute(self):
+                return self._payload
+
+        class _FakeTasksApi:
+            def __init__(self):
+                self.remote_items = [
+                    {
+                        "id": "gtask_1",
+                        "title": "나이스 출결 마감",
+                        "notes": "오후 4시 전",
+                        "due": "2026-06-15T00:00:00.000Z",
+                        "status": "needsAction",
+                    },
+                    {
+                        "id": "gtask_2",
+                        "title": "완료된 과제",
+                        "status": "completed",
+                    },
+                ]
+                self.inserted = []
+                self.patched = []
+
+            def list(self, **kwargs):
+                return _FakeExec({"items": self.remote_items})
+
+            def insert(self, tasklist, body):
+                self.inserted.append((tasklist, body))
+                return _FakeExec({"id": f"gtask_new_{len(self.inserted)}"})
+
+            def patch(self, tasklist, task, body):
+                self.patched.append((tasklist, task, body))
+                return _FakeExec({"id": task})
+
+        tasks_api = _FakeTasksApi()
+
+        class _FakeTasksService:
+            def tasks(self):
+                return tasks_api
+
+        svc = GoogleCalendarService(db=self.db, config=self.cfg)
+        res_pull = svc.pull_tasks(account="workspace", service_override=_FakeTasksService())
+        self.assertTrue(res_pull["ok"])
+        self.assertEqual(res_pull["added"], 2)
+
+        todos = {t["gtask_id"]: t for t in self.db.get_todos() if t.get("gtask_id")}
+        self.assertEqual(todos["gtask_1"]["title"], "나이스 출결 마감")
+        self.assertEqual(todos["gtask_1"]["due_date"], "2026-06-15")
+        self.assertEqual(todos["gtask_1"]["gtask_account"], "workspace")
+        self.assertEqual(todos["gtask_2"]["is_done"], 1)
+
+        # 로컬 신규 할일 추가 후 push_tasks 검증
+        self.db.add_todo(title="학부모 상담 안내", due_date="2026-06-20", memo="문자 발송")
+        res_push = svc.push_tasks(account="workspace", service_override=_FakeTasksService())
+        self.assertTrue(res_push["ok"])
+        self.assertEqual(res_push["inserted"], 1)
+        self.assertEqual(tasks_api.inserted[0][1]["title"], "학부모 상담 안내")
+
+    def test_upload_notice_attachment_uses_upload_file_in_direct_admin_fallback(self) -> None:
+        from services.firestore_sync_service import FirestoreSyncService
+
+        pdf_path = Path(self.tmp_dir.name) / "notice.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 sample")
+
+        svc = FirestoreSyncService(db=self.db, config=self.cfg)
+        # Direct Admin 모드(is_vercel_api_mode() == False)이고 GAS URL이 비어 있는 상황 시뮬레이션
+        svc.is_vercel_api_mode = lambda: False
+        svc.get_vercel_api_url = lambda: "https://m.eduflow.kro.kr/api/firestore"
+        self.cfg._config.setdefault("api_and_integrations", {})["google_apps_script_url"] = ""
+
+        called = []
+
+        def _fake_post(action, payload=None):
+            called.append((action, payload))
+            return {"ok": True, "downloadUrl": "https://drive.google.com/uc?id=abc", "fileId": "abc"}
+
+        svc._post_vercel_api = _fake_post
+        res = svc.upload_notice_attachment(str(pdf_path))
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["attachment_url"], "https://drive.google.com/uc?id=abc")
+        self.assertEqual(res["attachment_file_id"], "abc")
+        self.assertEqual(called[0][0], "upload_file")
+        self.assertEqual(called[0][1]["action"], "upload_file")
+
+    def test_oauth_drive_upload_file_and_anyone_permission(self) -> None:
+        from services.google_calendar_service import GoogleCalendarService
+
+        pdf_path = Path(self.tmp_dir.name) / "notice.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 oauth")
+
+        class _FakeExec:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def execute(self):
+                return self._payload
+
+        class _FakeFilesApi:
+            def __init__(self):
+                self.created_bodies = []
+
+            def list(self, **kwargs):
+                return _FakeExec({"files": []})
+
+            def create(self, **kwargs):
+                body = kwargs.get("body") or {}
+                self.created_bodies.append(body)
+                if body.get("mimeType") == "application/vnd.google-apps.folder":
+                    return _FakeExec({"id": "folder_1"})
+                return _FakeExec(
+                    {
+                        "id": "oauth_file_1",
+                        "webViewLink": "https://drive.google.com/file/d/oauth_file_1/view",
+                        "webContentLink": "https://drive.google.com/uc?export=download&id=oauth_file_1",
+                    }
+                )
+
+        class _FakePermApi:
+            def __init__(self):
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return _FakeExec({"id": "perm_1"})
+
+        files_api = _FakeFilesApi()
+        perm_api = _FakePermApi()
+
+        class _FakeDriveService:
+            def files(self):
+                return files_api
+
+            def permissions(self):
+                return perm_api
+
+        svc = GoogleCalendarService(db=self.db, config=self.cfg)
+        res = svc.upload_file_to_drive(
+            str(pdf_path),
+            account="personal",
+            folder_name="EduFlow_가정통신문",
+            service_override=_FakeDriveService(),
+        )
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["file_id"], "oauth_file_1")
+        self.assertEqual(res["attachment_url"], "https://drive.google.com/file/d/oauth_file_1/view")
+        self.assertEqual(perm_api.calls[0]["body"], {"role": "reader", "type": "anyone"})
+
+    def test_upload_notice_attachment_handles_non_json_gas_and_oauth_priority(self) -> None:
+        from unittest.mock import patch
+        from services.firestore_sync_service import FirestoreSyncService
+        from services.google_calendar_service import GoogleCalendarService
+
+        pdf_path = Path(self.tmp_dir.name) / "notice2.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4 test")
+
+        svc = FirestoreSyncService(db=self.db, config=self.cfg)
+        self.cfg._config.setdefault("api_and_integrations", {})["google_apps_script_url"] = (
+            "https://script.google.com/macros/s/fake/exec"
+        )
+        svc.get_vercel_api_url = lambda: ""
+
+        class _HtmlResp:
+            ok = False
+            status_code = 502
+            text = "<html><body>Bad Gateway</body></html>"
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        class _FakeSess:
+            def post(self, *args, **kwargs):
+                return _HtmlResp()
+
+        svc._get_http_session = lambda: _FakeSess()
+
+        # 1) OAuth 미연결 + GAS 비JSON 응답 시 예외 없이 안전한 실패 dict 반환
+        with patch.object(GoogleCalendarService, "get_connected_accounts", return_value=[]):
+            res_fail = svc.upload_notice_attachment(str(pdf_path))
+        self.assertFalse(res_fail["ok"])
+        self.assertIn("GAS 비JSON 응답 (HTTP 502)", res_fail["error"])
+
+        # 2) OAuth 연결 시 GAS/Vercel보다 우선해 OAuth Drive 직접 업로드 사용
+        with patch.object(
+            GoogleCalendarService, "get_connected_accounts", return_value=["personal"]
+        ), patch.object(
+            GoogleCalendarService,
+            "upload_file_to_drive",
+            return_value={
+                "ok": True,
+                "attachment_url": "https://drive.google.com/file/d/oauth_99/view",
+                "attachment_file_id": "oauth_99",
+            },
+        ) as mock_oauth:
+            res_ok = svc.upload_notice_attachment(str(pdf_path))
+        self.assertTrue(res_ok["ok"])
+        self.assertEqual(res_ok["attachment_file_id"], "oauth_99")
+        mock_oauth.assert_called_once()
+
+    def test_oauth_connect_cancel_check_and_timeout_close_server(self) -> None:
+        import time
+        from services.google_calendar_service import GoogleCalendarService
+
+        class _FakeFlow:
+            def __init__(self):
+                self.redirect_uri = ""
+                self.credentials = None
+
+            def authorization_url(self, **_kwargs):
+                return "http://localhost/fake_auth", "state_1"
+
+            def fetch_token(self, **_kwargs):
+                raise AssertionError("취소/타임아웃 시 fetch_token이 호출되면 안 됩니다.")
+
+        svc = GoogleCalendarService(db=self.db, config=self.cfg)
+
+        # 1) cancel_check가 즉시 True를 반환하면 블로킹 없이 취소 반환
+        t0 = time.monotonic()
+        ok_cancel, msg_cancel = svc.connect(
+            account="personal",
+            cancel_check=lambda: True,
+            timeout_sec=30,
+            flow_override=_FakeFlow(),
+            open_browser=False,
+        )
+        elapsed_cancel = time.monotonic() - t0
+        self.assertFalse(ok_cancel)
+        self.assertIn("취소", msg_cancel)
+        self.assertLess(elapsed_cancel, 1.5)
+
+        # 2) timeout_sec=1 설정 시 약 1초 내 타임아웃 반환 및 서버 종료
+        t1 = time.monotonic()
+        ok_to, msg_to = svc.connect(
+            account="workspace",
+            cancel_check=lambda: False,
+            timeout_sec=1,
+            flow_override=_FakeFlow(),
+            open_browser=False,
+        )
+        elapsed_to = time.monotonic() - t1
+        self.assertFalse(ok_to)
+        self.assertIn("초과", msg_to)
+        self.assertLess(elapsed_to, 3.0)
+
+    def test_convert_hwp_to_pdf_com_mock_and_fallback(self) -> None:
+        from unittest.mock import patch
+        from services.notice_parser_service import convert_hwp_to_pdf
+
+        hwpx_path = Path(self.tmp_dir.name) / "notice_sample.hwpx"
+        hwpx_path.write_bytes(b"fake-hwpx")
+        out_dir = Path(self.tmp_dir.name) / "pdf_out"
+
+        class _FakeHwp:
+            def __init__(self):
+                self.quit_called = False
+                self.registered = False
+                self.saved_args = None
+
+            def RegisterModule(self, name, val):
+                self.registered = (name, val)
+
+            def SetMessageBoxMode(self, mode):
+                pass
+
+            def Open(self, path, fmt, arg):
+                return True
+
+            def SaveAs(self, out_path, fmt):
+                self.saved_args = (out_path, fmt)
+                Path(out_path).write_bytes(b"%PDF-1.4 converted")
+                return True
+
+            def Quit(self):
+                self.quit_called = True
+
+        fake_hwp = _FakeHwp()
+
+        class _FakeWin32:
+            class client:
+                @staticmethod
+                def Dispatch(prog_id):
+                    return fake_hwp
+
+        class _FakePyCom:
+            @staticmethod
+            def CoInitialize():
+                pass
+
+            @staticmethod
+            def CoUninitialize():
+                pass
+
+        # 1) COM 성공 시 PDF 변환 및 Quit 호출 확인
+        with patch("services.multi_doc_extractor_service.HAS_WIN32COM", True), patch(
+            "services.multi_doc_extractor_service.win32com", _FakeWin32
+        ), patch("services.multi_doc_extractor_service.pythoncom", _FakePyCom):
+            pdf_out = convert_hwp_to_pdf(hwpx_path, output_dir=out_dir)
+
+        self.assertIsNotNone(pdf_out)
+        self.assertTrue(pdf_out.is_file())
+        self.assertEqual(pdf_out.suffix.lower(), ".pdf")
+        self.assertTrue(fake_hwp.quit_called)
+        self.assertEqual(fake_hwp.registered, ("FilePathCheckDLL", "FilePathCheckerModule"))
+        self.assertEqual(fake_hwp.saved_args[1], "PDF")
+
+        # 2) win32com 미설치/예외 시 예외 없이 None 반환 (원본 업로드 fallback 가능)
+        with patch("services.multi_doc_extractor_service.HAS_WIN32COM", False):
+            res_none = convert_hwp_to_pdf(hwpx_path, output_dir=out_dir)
+        self.assertIsNone(res_none)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -528,13 +528,26 @@ class ScheduleImportPreviewDialog(QDialog):
         _apply_role(btn_apply_cat, role="outline")
         btn_apply_cat.clicked.connect(self._apply_bulk_category)
 
+        self.btn_add_row = QPushButton("+ 행 추가")
+        _apply_role(self.btn_add_row, role="secondary", obj_name="BtnPreviewAddScheduleRow")
+        self.btn_add_row.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_add_row.clicked.connect(self._on_add_row)
+
+        self.btn_delete_rows = QPushButton("선택 삭제")
+        _apply_role(self.btn_delete_rows, role="outline", obj_name="BtnPreviewDeleteScheduleRows")
+        self.btn_delete_rows.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete_rows.clicked.connect(self._on_delete_selected_rows)
+
         total_init = len(self.parsed_items) + (len(self.parsed_todos) if self._has_todo_section else 0)
         self.lbl_checked_count = QLabel(f"선택됨: {total_init}건")
         _apply_role(self.lbl_checked_count, role="badgePrimary")
 
         toolbar.addWidget(btn_sel_all)
         toolbar.addWidget(btn_desel_all)
-        toolbar.addSpacing(10)
+        toolbar.addSpacing(8)
+        toolbar.addWidget(self.btn_add_row)
+        toolbar.addWidget(self.btn_delete_rows)
+        toolbar.addSpacing(8)
         toolbar.addWidget(self.combo_bulk_category)
         toolbar.addWidget(btn_apply_cat)
         toolbar.addStretch()
@@ -607,44 +620,94 @@ class ScheduleImportPreviewDialog(QDialog):
         footer.addWidget(self.btn_confirm)
         layout.addLayout(footer)
 
+    def _append_schedule_row(self, item: Dict[str, Any]) -> int:
+        idx = self.table.rowCount()
+        self.table.insertRow(idx)
+
+        chk_item = QTableWidgetItem()
+        chk_item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        chk_item.setCheckState(Qt.CheckState.Checked)
+        chk_item.setData(Qt.ItemDataRole.UserRole, item.get("remote_id", ""))
+        chk_item.setData(
+            Qt.ItemDataRole.UserRole + 1,
+            str(item.get("reminder_type") or item.get("reminder") or "none"),
+        )
+        self.table.setItem(idx, 0, chk_item)
+
+        self.table.setItem(idx, 1, QTableWidgetItem(str(item.get("start_date", ""))))
+        self.table.setItem(idx, 2, QTableWidgetItem(str(item.get("end_date", ""))))
+        self.table.setItem(idx, 3, QTableWidgetItem(str(item.get("start_time", ""))))
+        self.table.setItem(idx, 4, QTableWidgetItem(str(item.get("title", ""))))
+
+        cat_combo = QComboBox()
+        cat_combo.setMinimumHeight(28)
+        for cat in VALID_SCHEDULE_CATEGORIES:
+            cat_combo.addItem(cat, cat)
+        cur_cat = str(item.get("category", "학사일정"))
+        c_idx = cat_combo.findData(cur_cat)
+        if c_idx >= 0:
+            cat_combo.setCurrentIndex(c_idx)
+        install_no_scroll_wheel_filter(cat_combo)
+        self.table.setCellWidget(idx, 5, cat_combo)
+
+        self.table.setItem(idx, 6, QTableWidgetItem(str(item.get("memo", ""))))
+        return idx
+
+    def _on_add_row(self) -> None:
+        today_str = date.today().isoformat()
+        self.table.blockSignals(True)
+        try:
+            row_idx = self._append_schedule_row(
+                {
+                    "start_date": today_str,
+                    "end_date": today_str,
+                    "start_time": "",
+                    "title": "",
+                    "category": "학사일정",
+                    "memo": "",
+                }
+            )
+        finally:
+            self.table.blockSignals(False)
+        self._update_checked_count()
+        self.table.setCurrentCell(row_idx, 4)
+        title_item = self.table.item(row_idx, 4)
+        if title_item is not None:
+            self.table.editItem(title_item)
+
+    def _on_delete_selected_rows(self) -> None:
+        selected_rows = sorted(
+            {idx.row() for idx in self.table.selectedIndexes()},
+            reverse=True,
+        )
+        if not selected_rows:
+            # 선택된 행이 없으면 체크된 행을 삭제 대상으로 확인
+            selected_rows = [
+                r
+                for r in range(self.table.rowCount() - 1, -1, -1)
+                if self.table.item(r, 0) is not None
+                and self.table.item(r, 0).checkState() == Qt.CheckState.Checked
+            ]
+        if not selected_rows:
+            return
+        self.table.blockSignals(True)
+        try:
+            for r in selected_rows:
+                self.table.removeRow(r)
+        finally:
+            self.table.blockSignals(False)
+        self._update_checked_count()
+
     def _populate_table(self) -> None:
         self.table.blockSignals(True)
         try:
             self.table.setRowCount(0)
-            for idx, item in enumerate(self.parsed_items):
-                self.table.insertRow(idx)
-
-                chk_item = QTableWidgetItem()
-                chk_item.setFlags(
-                    Qt.ItemFlag.ItemIsEnabled
-                    | Qt.ItemFlag.ItemIsSelectable
-                    | Qt.ItemFlag.ItemIsUserCheckable
-                )
-                chk_item.setCheckState(Qt.CheckState.Checked)
-                chk_item.setData(Qt.ItemDataRole.UserRole, item.get("remote_id", ""))
-                chk_item.setData(
-                    Qt.ItemDataRole.UserRole + 1,
-                    str(item.get("reminder_type") or item.get("reminder") or "none"),
-                )
-                self.table.setItem(idx, 0, chk_item)
-
-                self.table.setItem(idx, 1, QTableWidgetItem(str(item.get("start_date", ""))))
-                self.table.setItem(idx, 2, QTableWidgetItem(str(item.get("end_date", ""))))
-                self.table.setItem(idx, 3, QTableWidgetItem(str(item.get("start_time", ""))))
-                self.table.setItem(idx, 4, QTableWidgetItem(str(item.get("title", ""))))
-
-                cat_combo = QComboBox()
-                cat_combo.setMinimumHeight(28)
-                for cat in VALID_SCHEDULE_CATEGORIES:
-                    cat_combo.addItem(cat, cat)
-                cur_cat = str(item.get("category", "학사일정"))
-                c_idx = cat_combo.findData(cur_cat)
-                if c_idx >= 0:
-                    cat_combo.setCurrentIndex(c_idx)
-                install_no_scroll_wheel_filter(cat_combo)
-                self.table.setCellWidget(idx, 5, cat_combo)
-
-                self.table.setItem(idx, 6, QTableWidgetItem(str(item.get("memo", ""))))
+            for item in self.parsed_items:
+                self._append_schedule_row(item)
         finally:
             self.table.blockSignals(False)
 

@@ -508,15 +508,24 @@ def parse_ics_schedules(file_path: str) -> List[Dict[str, Any]]:
 def parse_schedule_file(
     file_path: str, default_year: Optional[int] = None
 ) -> List[Dict[str, Any]]:
-    """확장자(.xlsx, .csv, .ics)에 따라 적절한 학사일정 파서를 호출합니다."""
+    """확장자(.xlsx, .xls, .csv, .ics)에 따라 적절한 학사일정 파서를 호출합니다."""
     ext = Path(file_path).suffix.lower()
     if ext in (".xlsx", ".xlsm"):
         return parse_xlsx_schedules(file_path, default_year=default_year)
+    if ext == ".xls":
+        import pandas as pd
+
+        df = pd.read_excel(file_path, header=None, dtype=object)
+        rows = [
+            [None if pd.isna(v) else v for v in row]
+            for row in df.values.tolist()
+        ]
+        return _parse_tabular_rows(rows, default_year=default_year)
     if ext == ".csv":
         return parse_csv_schedules(file_path, default_year=default_year)
     if ext == ".ics":
         return parse_ics_schedules(file_path)
-    raise ValueError(f"지원하지 않는 학사일정 파일 형식입니다: {ext} (.xlsx, .csv, .ics 지원)")
+    raise ValueError(f"지원하지 않는 학사일정 파일 형식입니다: {ext} (.xlsx, .xls, .csv, .ics 지원)")
 
 
 def _escape_ics_text(val: str) -> str:
@@ -807,22 +816,33 @@ def parse_calendar_ai_response(
     today: Optional[date] = None,
 ) -> Dict[str, Any]:
     """
-    AI 응답(마크다운 ```json 블록 또는 일반 JSON/dict)을 파싱하여
+    AI 응답(마크다운 ```json 블록, JSON 배열 또는 일반 JSON/dict)을 파싱하여
     정규화된 {"summary": str, "schedules": [...], "todos": [...]} 딕셔너리를 반환합니다.
     """
     ref = today or date.today()
-    if isinstance(raw_response, dict):
+    if isinstance(raw_response, list):
+        parsed: Any = {"summary": f"학사일정 {len(raw_response)}건 추출", "schedules": raw_response, "todos": []}
+    elif isinstance(raw_response, dict):
         parsed = raw_response
     else:
         parsed = extract_json_from_llm_response(str(raw_response or ""))
 
+    if isinstance(parsed, list):
+        parsed = {"summary": f"학사일정 {len(parsed)}건 추출", "schedules": parsed, "todos": []}
+
     if not isinstance(parsed, dict):
-        raise ValueError("AI 응답이 JSON 객체 형식이 아닙니다.")
+        raise ValueError("AI 응답이 JSON 객체 또는 배열 형식이 아닙니다.")
 
     summary = str(parsed.get("summary") or "").strip()
     raw_schedules = parsed.get("schedules")
     if not isinstance(raw_schedules, list):
-        raw_schedules = []
+        # extract_json_from_llm_response()가 최상위 JSON 배열을 {"items": [...]}로 감싸는 경우 지원
+        if isinstance(parsed.get("items"), list):
+            raw_schedules = parsed.get("items")
+        elif parsed.get("title") and parsed.get("start_date"):
+            raw_schedules = [parsed]
+        else:
+            raw_schedules = []
     raw_todos = parsed.get("todos")
     if not isinstance(raw_todos, list):
         raw_todos = []
@@ -893,6 +913,122 @@ def parse_calendar_ai_response(
         "schedules": norm_schedules,
         "todos": norm_todos,
     }
+
+
+def extract_schedule_text_from_document(
+    file_path: str | Path, max_chars: int = 24000
+) -> Tuple[str, bool]:
+    """
+    HWP, HWPX, PDF 학사일정 문서에서 표(행/셀)와 본문 텍스트를 로컬로 1차 추출합니다.
+    반환값: (extracted_text, is_scanned_pdf)
+    """
+    import tempfile
+
+    from services.multi_doc_extractor_service import (
+        HAS_OLEFILE,
+        PDF_MIN_CHARS_PER_PAGE,
+        _convert_hwp_via_com,
+        _extract_hwp_text_olefile,
+        _extract_pdf_text_layers,
+        extract_raw_text_preview,
+        parse_hwpx_content,
+    )
+
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"파일을 찾을 수 없습니다: {p}")
+
+    ext = p.suffix.lower()
+    if ext not in (".hwp", ".hwpx", ".pdf"):
+        raise ValueError(
+            f"지원하지 않는 파일 형식입니다 ({ext}). .hwp, .hwpx, .pdf 파일만 지원합니다."
+        )
+
+    if ext == ".pdf":
+        pages, avg = _extract_pdf_text_layers(p)
+        txt = "\n\n".join(pages).strip()
+        if avg < PDF_MIN_CHARS_PER_PAGE or not txt:
+            return (
+                "(스캔/이미지 기반 PDF 문서입니다. 첨부된 PDF 파일을 직접 판독하여 학사일정을 추출해 주세요.)",
+                True,
+            )
+        if max_chars > 0 and len(txt) > max_chars:
+            txt = txt[:max_chars] + "\n... (이하 생략)"
+        return txt, False
+
+    extracted = ""
+    if ext == ".hwpx":
+        parsed = parse_hwpx_content(p)
+        extracted = str(parsed.get("raw_text") or "").strip()
+        if not extracted and parsed.get("tables"):
+            lines = [
+                " | ".join(str(c or "").strip() for c in row)
+                for tbl in parsed["tables"]
+                for row in tbl
+            ]
+            extracted = "\n".join(ln for ln in lines if ln).strip()
+    else:
+        if HAS_OLEFILE:
+            try:
+                extracted = str(_extract_hwp_text_olefile(p) or "").strip()
+            except Exception:
+                extracted = ""
+        if not extracted:
+            try:
+                with tempfile.TemporaryDirectory(prefix="eduflow_hwp_") as tmp_dir:
+                    conv = _convert_hwp_via_com(p, Path(tmp_dir))
+                    if conv and conv.exists():
+                        extracted = str(parse_hwpx_content(conv).get("raw_text") or "").strip()
+            except Exception:
+                pass
+        if not extracted:
+            preview = extract_raw_text_preview(p, max_chars=max_chars)
+            if preview and not preview.startswith("("):
+                extracted = preview.strip()
+
+    if not extracted:
+        raise ValueError(
+            "HWP/HWPX 문서에서 텍스트 또는 표를 추출하지 못했습니다. "
+            "암호화된 문서이거나 이미지 스캔본인지 확인해 주세요."
+        )
+
+    if max_chars > 0 and len(extracted) > max_chars:
+        extracted = extracted[:max_chars] + "\n... (이하 생략)"
+    return extracted, False
+
+
+def extract_schedule_text_from_hwp_hwpx(
+    file_path: str | Path, max_chars: int = 24000
+) -> str:
+    """HWP/HWPX 학사일정 문서에서 표와 본문 텍스트를 추출합니다."""
+    text, _ = extract_schedule_text_from_document(file_path, max_chars=max_chars)
+    return text
+
+
+def build_hwp_schedule_ai_prompt(
+    extracted_text: str,
+    file_name: str = "",
+    today: Optional[date] = None,
+) -> str:
+    """
+    HWP/HWPX/PDF에서 추출된 학사일정 텍스트를 AI 실행 패널(calendar_todo)에 전달하기 위한
+    구조화 JSON 배열 추출 프롬프트를 생성합니다.
+    """
+    ref = today or date.today()
+    src_line = f"[원본 파일: {file_name}]\n" if file_name else ""
+    return (
+        f"{src_line}"
+        f"기준 연도/날짜: {ref.isoformat()}\n"
+        "아래 학사일정 문서(표 및 본문)에서 모든 학사일정을 추출하여 "
+        "반드시 아래 형식의 JSON 배열로만 응답해 주세요.\n"
+        '- 형식: [{"title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", '
+        '"category": "학사일정", "memo": "..."}]\n'
+        "- category는 '학사일정', '수행평가', '업무', '개인' 중 하나로 분류하세요 (기본: '학사일정').\n"
+        "- 날짜 범위(예: 5.1~5.3, 3월 4일~6일)는 start_date와 end_date에 YYYY-MM-DD 형식으로 채우고, "
+        "단일 날짜는 start_date와 end_date를 동일하게 설정하세요.\n\n"
+        "--- [추출된 학사일정 원문] ---\n"
+        f"{str(extracted_text or '').strip()}"
+    )
 
 
 def calculate_dday_badge(

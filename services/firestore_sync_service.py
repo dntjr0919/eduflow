@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.base_worker import BaseWorker
@@ -57,6 +57,26 @@ BOOL_FIELDS = {
 }
 
 FIRESTORE_BATCH_LIMIT = 400
+
+DB_MANAGER_COLLECTIONS: List[str] = [
+    "Schedules",
+    "일일_출결",
+    "서류_추적",
+    "가정통신문_목록",
+    "가정통신문_회신",
+    "계정_학생",
+    "계정_학부모",
+    "계정_교사",
+    "학급회비",
+    "수업_진도",
+    "교과_출결",
+    "학급_공지게시판",
+    "시간표_기본",
+    "시간표_변동",
+    "급식_식단표",
+    "Tasks",
+    "Notifications",
+]
 
 
 def _is_truthy(val: Any) -> bool:
@@ -237,8 +257,12 @@ class FirestoreSyncService:
             )
         try:
             data = resp.json()
-        except Exception:
-            data = {}
+        except ValueError as exc:
+            snippet = (resp.text or "")[:160].replace("\n", " ").strip()
+            raise RuntimeError(
+                f"Vercel API 비JSON 응답 (HTTP {resp.status_code}, action={action}): "
+                f"{snippet or '(빈 응답)'}"
+            ) from exc
         if not resp.ok or (isinstance(data, dict) and data.get("ok") is False):
             err_msg = (data.get("error") if isinstance(data, dict) else "") or f"HTTP {resp.status_code}"
             raise RuntimeError(err_msg)
@@ -246,7 +270,13 @@ class FirestoreSyncService:
 
     def _get_client(self) -> Any:
         if self._firestore_client is None:
-            self._firestore_client = get_firestore_client(self._cred_path())
+            cred = self._cred_path()
+            try:
+                self._firestore_client = get_firestore_client(cred)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Firebase Direct Admin 초기화 실패 (키 경로: {cred or '자동 탐색'}): {exc}"
+                ) from exc
         return self._firestore_client
 
     def _find_account_doc(self, role: str, user_id: str) -> Tuple[Any, Optional[str], Optional[Dict[str, Any]]]:
@@ -452,7 +482,7 @@ class FirestoreSyncService:
 
     @staticmethod
     def extract_birth_6digits(student: Dict[str, Any]) -> str:
-        """명렬표 학생의 extra_data/필드에서 생년월일/주민번호 앞 6자리를 추출합니다."""
+        """명렬표 학생의 extra_data/필드에서 생년월일/주민번호 앞 6자리(YYMMDD)를 추출합니다."""
         extra = student.get("extra_data")
         if isinstance(extra, str):
             try:
@@ -469,7 +499,29 @@ class FirestoreSyncService:
         for key, val in sources:
             k_norm = str(key or "").replace(" ", "").lower()
             if any(tok in k_norm for tok in ("주민", "생년월일", "생일", "birth", "rrn")):
-                digits = re.sub(r"\D", "", str(val or ""))
+                raw_val = str(val or "").strip()
+                if not raw_val:
+                    continue
+                # "2009-05-03 00:00:00" / "2009-05-03T00:00:00" 등 시간 부분 제거
+                date_part = re.sub(
+                    r"[T\s]+\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?.*$", "", raw_val
+                ).strip()
+                # 구분자(., -, /, 년월일)가 있는 YYYY.M.D / YY.M.D 형태 zero-pad 파싱
+                m_delim = re.match(
+                    r"^((?:19|20)?\d{2})\s*[.\-/년]\s*(\d{1,2})\s*[.\-/월]\s*(\d{1,2})\s*일?$",
+                    date_part,
+                )
+                if m_delim:
+                    y_str, m_str, d_str = m_delim.groups()
+                    mm = int(m_str)
+                    dd = int(d_str)
+                    if 1 <= mm <= 12 and 1 <= dd <= 31:
+                        return f"{y_str[-2:]}{mm:02d}{dd:02d}"
+
+                digits = re.sub(r"\D", "", raw_val)
+                # 14자리 YYYYMMDDHHMMSS가 주민번호로 오인되지 않도록 먼저 판별
+                if len(digits) == 14 and digits.startswith(("19", "20")):
+                    return digits[2:8]
                 if len(digits) >= 13:
                     return digits[:6]
                 if len(digits) == 8 and digits.startswith(("19", "20")):
@@ -483,28 +535,39 @@ class FirestoreSyncService:
         students: List[Dict[str, Any]],
         school_code: str = "",
         school_name: str = "",
+        overwrite_password: bool = False,
     ) -> Dict[str, int]:
         """
         나이스(NEIS) 담임학급 명렬표 학생 목록을 기반으로 Firestore에 학생·학부모 초기 계정을 일괄 생성합니다.
-        이미 존재하는 계정(또는 커스텀 ID/비밀번호 변경 계정)은 덮어쓰지 않고 신규 계정만 Batch Upsert합니다.
+        overwrite_password=False(기본): 이미 존재하는 계정은 덮어쓰지 않고 건너뜁니다.
+        overwrite_password=True: 기존 계정의 password_hash도 현재 명렬표 생년월일(없으면 학번)로 재설정합니다.
         """
         if self.is_vercel_api_mode():
-            res = self._post_vercel_api(
-                "provision_homeroom_accounts",
-                {
-                    "students": list(students or []),
-                    "school_code": str(school_code or "").strip(),
-                    "school_name": str(school_name or "").strip(),
-                },
-            )
+            try:
+                res = self._post_vercel_api(
+                    "provision_homeroom_accounts",
+                    {
+                        "students": list(students or []),
+                        "school_code": str(school_code or "").strip(),
+                        "school_name": str(school_name or "").strip(),
+                        "overwrite_password": bool(overwrite_password),
+                    },
+                )
+            except Exception as exc:
+                raise RuntimeError(f"[Vercel API 일괄 발급 실패] {exc}") from exc
             return {
                 "students_created": int(res.get("students_created") or 0),
                 "students_skipped": int(res.get("students_skipped") or 0),
+                "students_updated": int(res.get("students_updated") or 0),
                 "parents_created": int(res.get("parents_created") or 0),
                 "parents_skipped": int(res.get("parents_skipped") or 0),
+                "parents_updated": int(res.get("parents_updated") or 0),
             }
 
-        fs = self._get_client()
+        try:
+            fs = self._get_client()
+        except Exception as exc:
+            raise RuntimeError(f"[Firebase 인증 초기화 실패] {exc}") from exc
         col_stu = fs.collection("계정_학생")
         col_par = fs.collection("계정_학부모")
 
@@ -512,26 +575,28 @@ class FirestoreSyncService:
         sn = str(school_name or "").strip()
         now = _now_str()
 
-        # 기존 계정 ID 집합 조회(덮어쓰기 방지)
-        existing_stu_ids = set()
+        # 기존 계정 ID 집합 조회(덮어쓰기 방지 또는 재설정 대상 문서 ID 매핑)
+        existing_stu_doc_map: Dict[str, str] = {}
         for d in col_stu.stream():
-            existing_stu_ids.add(d.id)
+            existing_stu_doc_map[d.id] = d.id
             data = d.to_dict() or {}
             if data.get("student_id"):
-                existing_stu_ids.add(str(data["student_id"]))
+                existing_stu_doc_map.setdefault(str(data["student_id"]), d.id)
 
-        existing_par_ids = set()
+        existing_par_doc_map: Dict[str, str] = {}
         for d in col_par.stream():
-            existing_par_ids.add(d.id)
+            existing_par_doc_map[d.id] = d.id
             data = d.to_dict() or {}
             if data.get("parent_id"):
-                existing_par_ids.add(str(data["parent_id"]))
+                existing_par_doc_map.setdefault(str(data["parent_id"]), d.id)
 
         pending_writes: List[Tuple[Any, Dict[str, Any]]] = []
         students_created = 0
         students_skipped = 0
+        students_updated = 0
         parents_created = 0
         parents_skipped = 0
+        parents_updated = 0
 
         for s in students:
             sid = str(s.get("student_id") or "").strip()
@@ -548,8 +613,21 @@ class FirestoreSyncService:
             par_login_id = f"p{sid}"
             par_doc_id = f"{sc}_{par_login_id}" if sc else par_login_id
 
-            if stu_doc_id in existing_stu_ids or (not sc and sid in existing_stu_ids):
-                students_skipped += 1
+            existing_stu_target = existing_stu_doc_map.get(stu_doc_id) or (
+                existing_stu_doc_map.get(sid) if not sc else None
+            )
+            if existing_stu_target:
+                if overwrite_password:
+                    pending_writes.append((
+                        col_stu.document(existing_stu_target),
+                        {
+                            "password_hash": pw_hash,
+                            "updated_at": now,
+                        },
+                    ))
+                    students_updated += 1
+                else:
+                    students_skipped += 1
             else:
                 pending_writes.append((
                     col_stu.document(stu_doc_id),
@@ -570,11 +648,24 @@ class FirestoreSyncService:
                         "updated_at": now,
                     },
                 ))
-                existing_stu_ids.add(stu_doc_id)
+                existing_stu_doc_map[stu_doc_id] = stu_doc_id
                 students_created += 1
 
-            if par_doc_id in existing_par_ids or (not sc and par_login_id in existing_par_ids):
-                parents_skipped += 1
+            existing_par_target = existing_par_doc_map.get(par_doc_id) or (
+                existing_par_doc_map.get(par_login_id) if not sc else None
+            )
+            if existing_par_target:
+                if overwrite_password:
+                    pending_writes.append((
+                        col_par.document(existing_par_target),
+                        {
+                            "password_hash": pw_hash,
+                            "updated_at": now,
+                        },
+                    ))
+                    parents_updated += 1
+                else:
+                    parents_skipped += 1
             else:
                 pending_writes.append((
                     col_par.document(par_doc_id),
@@ -597,7 +688,7 @@ class FirestoreSyncService:
                         "updated_at": now,
                     },
                 ))
-                existing_par_ids.add(par_doc_id)
+                existing_par_doc_map[par_doc_id] = par_doc_id
                 parents_created += 1
 
         for start in range(0, len(pending_writes), FIRESTORE_BATCH_LIMIT):
@@ -609,8 +700,10 @@ class FirestoreSyncService:
         return {
             "students_created": students_created,
             "students_skipped": students_skipped,
+            "students_updated": students_updated,
             "parents_created": parents_created,
             "parents_skipped": parents_skipped,
+            "parents_updated": parents_updated,
         }
 
     def is_super_admin(self, requester_id: str) -> bool:
@@ -1128,9 +1221,12 @@ class FirestoreSyncService:
         self,
         file_path: str,
         *,
-        folder_name: str = "EduFlow_Notices",
+        folder_name: str = "EduFlow_가정통신문",
     ) -> Dict[str, Any]:
-        """가정통신문 원본 파일(PDF/HWP/HWPX/이미지)을 Google Drive(GAS 또는 연동 API)에 업로드하고 URL·파일 ID를 반환합니다."""
+        """
+        가정통신문 원본 파일(PDF/HWP/HWPX/이미지)을 Google Drive에 업로드하고 URL·파일 ID를 반환합니다.
+        우선순위: ① 연결된 Google OAuth Drive 직접 업로드 → ② Apps Script 웹 앱 → ③ Vercel /api/firestore (upload_file)
+        """
         import base64
         import mimetypes
         from pathlib import Path
@@ -1138,6 +1234,32 @@ class FirestoreSyncService:
         p = Path(str(file_path or "").strip())
         if not p.exists() or not p.is_file():
             return {"ok": False, "attachment_url": "", "attachment_file_id": "", "error": "파일을 찾을 수 없습니다."}
+
+        last_error = ""
+
+        # 1) 연결된 Google OAuth Drive 직접 업로드
+        try:
+            from services.google_calendar_service import GoogleCalendarService
+
+            gcal_svc = GoogleCalendarService(db=self.db, config=self.config)
+            connected_accs = gcal_svc.get_connected_accounts()
+            if connected_accs:
+                oauth_res = gcal_svc.upload_file_to_drive(
+                    str(p),
+                    account=connected_accs[0],
+                    folder_name=folder_name,
+                )
+                if oauth_res.get("ok") and oauth_res.get("attachment_url"):
+                    return {
+                        "ok": True,
+                        "attachment_url": str(oauth_res["attachment_url"]).strip(),
+                        "attachment_file_id": str(oauth_res.get("attachment_file_id") or "").strip(),
+                    }
+                if oauth_res.get("error"):
+                    last_error = f"OAuth Drive: {oauth_res['error']}"
+        except Exception as exc:
+            last_error = f"OAuth Drive: {exc}"
+            self.db.add_log("WARN", "FirestoreSync", f"OAuth Google Drive 업로드 실패 ({p.name}): {exc}")
 
         raw_bytes = p.read_bytes()
         ext = p.suffix.lower()
@@ -1156,9 +1278,10 @@ class FirestoreSyncService:
             "file_name": p.name,
             "mime_type": mime_type,
             "file_base64": base64.b64encode(raw_bytes).decode("ascii"),
-            "folder_name": str(folder_name or "EduFlow_Notices").strip(),
+            "folder_name": str(folder_name or "EduFlow_가정통신문").strip(),
         }
 
+        # 2) Apps Script 웹 앱 URL
         gas_url = str(
             self.config.get("api_and_integrations", "google_apps_script_url", "") or ""
         ).strip()
@@ -1166,43 +1289,69 @@ class FirestoreSyncService:
             try:
                 sess = self._get_http_session()
                 resp = sess.post(gas_url, json=req_payload, timeout=DEFAULT_VERCEL_TIMEOUT)
-                if resp.ok:
+                try:
                     data = resp.json()
-                    if isinstance(data, dict) and data.get("ok"):
-                        att_url = str(
-                            data.get("attachment_url") or data.get("url") or data.get("download_url") or ""
-                        ).strip()
-                        att_id = str(data.get("attachment_file_id") or data.get("file_id") or "").strip()
-                        if att_url:
-                            return {
-                                "ok": True,
-                                "attachment_url": att_url,
-                                "attachment_file_id": att_id,
-                            }
+                except ValueError:
+                    snippet = (resp.text or "")[:120].replace("\n", " ").strip()
+                    last_error = f"GAS 비JSON 응답 (HTTP {resp.status_code}): {snippet or '(빈 응답)'}"
+                    self.db.add_log("WARN", "FirestoreSync", f"GAS Google Drive {last_error}")
+                    data = None
+
+                if resp.ok and isinstance(data, dict) and data.get("ok"):
+                    att_url = str(
+                        data.get("attachment_url") or data.get("url") or data.get("download_url") or ""
+                    ).strip()
+                    att_id = str(data.get("attachment_file_id") or data.get("file_id") or "").strip()
+                    if att_url:
+                        return {
+                            "ok": True,
+                            "attachment_url": att_url,
+                            "attachment_file_id": att_id,
+                        }
+                elif isinstance(data, dict) and data.get("error"):
+                    last_error = f"GAS 오류 (HTTP {resp.status_code}): {data.get('error')}"
+                elif not resp.ok and not last_error:
+                    last_error = f"GAS HTTP {resp.status_code}"
             except Exception as exc:
+                last_error = f"GAS 요청 실패: {exc}"
                 self.db.add_log("WARN", "FirestoreSync", f"GAS Google Drive 업로드 실패 ({p.name}): {exc}")
 
-        if self.is_vercel_api_mode():
+        # 3) Vercel /api/firestore (upload_file)
+        if self.get_vercel_api_url():
             try:
-                res = self._post_vercel_api("upload_notice_file", req_payload)
+                vercel_payload = dict(req_payload)
+                vercel_payload["action"] = "upload_file"
+                res = self._post_vercel_api("upload_file", vercel_payload)
                 att_url = str(
-                    res.get("attachment_url") or res.get("url") or res.get("download_url") or ""
+                    res.get("attachment_url")
+                    or res.get("downloadUrl")
+                    or res.get("url")
+                    or res.get("download_url")
+                    or ""
                 ).strip()
-                att_id = str(res.get("attachment_file_id") or res.get("file_id") or "").strip()
+                att_id = str(
+                    res.get("attachment_file_id")
+                    or res.get("fileId")
+                    or res.get("file_id")
+                    or ""
+                ).strip()
                 if att_url:
                     return {
                         "ok": True,
                         "attachment_url": att_url,
                         "attachment_file_id": att_id,
                     }
+                if res.get("error"):
+                    last_error = f"Vercel API: {res['error']}"
             except Exception as exc:
+                last_error = f"Vercel API: {exc}"
                 self.db.add_log("WARN", "FirestoreSync", f"Vercel API Google Drive 업로드 실패 ({p.name}): {exc}")
 
         return {
             "ok": False,
             "attachment_url": "",
             "attachment_file_id": "",
-            "error": "Google Drive 업로드 엔드포인트(GAS URL 또는 연동 API)가 설정되지 않았거나 응답이 없습니다.",
+            "error": last_error or "Google Drive 업로드 엔드포인트(OAuth/GAS/연동 API)가 설정되지 않았거나 응답이 없습니다.",
         }
 
     def publish_mobile_notice(self, notice_data: Dict[str, Any]) -> Tuple[bool, str]:
@@ -1252,6 +1401,18 @@ class FirestoreSyncService:
         raw_sig_mode = str(notice_data.get("signature_mode") or "single").strip().lower()
         signature_mode = "both" if raw_sig_mode == "both" else "single"
 
+        raw_pdf_map = notice_data.get("pdf_field_map")
+        if isinstance(raw_pdf_map, str):
+            try:
+                raw_pdf_map = json.loads(raw_pdf_map)
+            except Exception:
+                raw_pdf_map = []
+        if not isinstance(raw_pdf_map, list):
+            raw_pdf_map = []
+        pdf_field_map_json = str(notice_data.get("pdf_field_map_json") or "").strip()
+        if not pdf_field_map_json:
+            pdf_field_map_json = json.dumps(raw_pdf_map, ensure_ascii=False)
+
         now_ts = _now_str()
         payload = {
             "remote_id": rid,
@@ -1264,6 +1425,8 @@ class FirestoreSyncService:
             "reply_schema": raw_schema,
             "reply_schema_json": reply_schema_json,
             "reply_fields": reply_fields,
+            "pdf_field_map": raw_pdf_map,
+            "pdf_field_map_json": pdf_field_map_json,
             "attachment_url": str(notice_data.get("attachment_url") or "").strip(),
             "attachment_file_id": str(notice_data.get("attachment_file_id") or "").strip(),
             "target_grade": target_grade,
@@ -2525,6 +2688,188 @@ class FirestoreSyncService:
         except Exception as exc:
             self.db.add_log("WARN", "FirestoreSync", f"항목 Push 실패 ({action}): {exc}")
             return False
+
+
+    def upsert_schedules(self, rows: List[Dict[str, Any]]) -> bool:
+        """일정(Schedules) 목록을 Firestore에 일괄 Upsert합니다."""
+        if not rows:
+            return False
+        return self._batch_upsert("Schedules", rows, label="학사일정 일괄 등록")
+
+    @staticmethod
+    def _sanitize_doc_for_cache(doc_id: str, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in (raw_data or {}).items():
+            if hasattr(v, "isoformat") and callable(getattr(v, "isoformat")):
+                try:
+                    out[k] = v.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    out[k] = str(v)
+            else:
+                out[k] = v
+        if not str(out.get("remote_id") or "").strip():
+            out["remote_id"] = doc_id
+        return out
+
+    @staticmethod
+    def _parse_sync_timestamp(ts_str: str) -> Optional[datetime]:
+        s = str(ts_str or "").strip()
+        if not s:
+            return None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(s[:19], fmt)
+            except Exception:
+                continue
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    def sync_collection_full(self, collection_name: str) -> Dict[str, Any]:
+        """선택된 컬렉션 전체 문서를 Firestore에서 다시 받아 로컬 캐시를 교체합니다."""
+        col_name = str(collection_name or "").strip()
+        if not col_name:
+            return {"ok": False, "error": "컬렉션 이름이 비어 있습니다."}
+        try:
+            fs = self._get_client()
+            rows: List[Dict[str, Any]] = []
+            for doc in fs.collection(col_name).stream():
+                data = self._sanitize_doc_for_cache(doc.id, doc.to_dict() or {})
+                rows.append(data)
+            sync_ts = _now_str()
+            cached = self.db.replace_collection_cache(col_name, rows, last_sync_at=sync_ts)
+            return {
+                "ok": True,
+                "mode": "full",
+                "collection": col_name,
+                "fetched_count": len(rows),
+                "total_count": int(cached.get("total_count", len(rows))),
+                "last_sync_at": cached.get("last_sync_at", sync_ts),
+                "rows": cached.get("rows", rows),
+            }
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"컬렉션 전체 동기화 실패 ({col_name}): {exc}")
+            return {"ok": False, "mode": "full", "collection": col_name, "error": str(exc)}
+
+    def sync_collection_delta(
+        self, collection_name: str, overlap_minutes: int = 2
+    ) -> Dict[str, Any]:
+        """
+        로컬 캐시의 last_sync_at - overlap_minutes 이후 변경·추가된 문서만
+        단일 필드 쿼리로 조회해 로컬 캐시에 병합합니다.
+        """
+        col_name = str(collection_name or "").strip()
+        if not col_name:
+            return {"ok": False, "error": "컬렉션 이름이 비어 있습니다."}
+        cache = self.db.get_collection_cache(col_name)
+        last_sync_at = str(cache.get("last_sync_at") or "").strip()
+        last_dt = self._parse_sync_timestamp(last_sync_at)
+        if last_dt is None:
+            return self.sync_collection_full(col_name)
+
+        cutoff_dt = last_dt - timedelta(minutes=max(0, int(overlap_minutes)))
+        cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+        ts_field = "created_at" if col_name == "Notifications" else "updated_at"
+
+        try:
+            fs = self._get_client()
+            query = fs.collection(col_name).where(ts_field, ">", cutoff_str)
+            delta_rows: List[Dict[str, Any]] = []
+            for doc in query.stream():
+                data = self._sanitize_doc_for_cache(doc.id, doc.to_dict() or {})
+                delta_rows.append(data)
+            sync_ts = _now_str()
+            merged = self.db.merge_collection_cache(
+                col_name,
+                delta_rows,
+                last_sync_at=sync_ts,
+            )
+            return {
+                "ok": True,
+                "mode": "delta",
+                "collection": col_name,
+                "cutoff": cutoff_str,
+                "ts_field": ts_field,
+                "fetched_count": len(delta_rows),
+                "total_count": int(merged.get("total_count", 0)),
+                "last_sync_at": merged.get("last_sync_at", sync_ts),
+                "rows": merged.get("rows", []),
+            }
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"컬렉션 증분 동기화 실패 ({col_name}): {exc}")
+            return {"ok": False, "mode": "delta", "collection": col_name, "error": str(exc)}
+
+    def upsert_collection_rows(
+        self, collection_name: str, rows: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """수정/추가된 행을 Firestore에 Upsert(Direct Admin 기준)하고 로컬 캐시를 갱신합니다."""
+        col_name = str(collection_name or "").strip()
+        if not col_name:
+            return {"ok": False, "error": "컬렉션 이름이 비어 있습니다."}
+        if not rows:
+            return {"ok": True, "saved_count": 0, "rows": []}
+        try:
+            fs = self._get_client()
+            col_ref = fs.collection(col_name)
+            now_ts = _now_str()
+            saved_rows: List[Dict[str, Any]] = []
+            size = max(1, min(FIRESTORE_BATCH_LIMIT, 450))
+
+            for start in range(0, len(rows), size):
+                chunk = rows[start : start + size]
+                batch = fs.batch()
+                for offset, raw_row in enumerate(chunk):
+                    if not isinstance(raw_row, dict):
+                        continue
+                    doc_id = _resolve_doc_id(col_name, raw_row, start + offset)
+                    doc_data = _normalize_doc_fields(raw_row)
+                    doc_data["remote_id"] = doc_id
+                    doc_data["updated_at"] = now_ts
+                    if not str(doc_data.get("created_at") or "").strip():
+                        doc_data["created_at"] = now_ts
+                    batch.set(col_ref.document(doc_id), doc_data, merge=True)
+                    saved_rows.append(doc_data)
+                batch.commit()
+
+            merged = self.db.merge_collection_cache(
+                col_name,
+                saved_rows,
+                last_sync_at=now_ts,
+            )
+            return {
+                "ok": True,
+                "collection": col_name,
+                "saved_count": len(saved_rows),
+                "last_sync_at": merged.get("last_sync_at", now_ts),
+                "rows": merged.get("rows", []),
+            }
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"컬렉션 일괄 저장 실패 ({col_name}): {exc}")
+            return {"ok": False, "collection": col_name, "error": str(exc)}
+
+    def delete_collection_rows(
+        self, collection_name: str, doc_ids: List[str]
+    ) -> Dict[str, Any]:
+        """선택된 문서 ID를 Firestore에서 삭제하고 로컬 캐시에서도 제거합니다."""
+        col_name = str(collection_name or "").strip()
+        clean_ids = [str(d).strip() for d in (doc_ids or []) if str(d).strip()]
+        if not col_name or not clean_ids:
+            return {"ok": True, "deleted_count": 0}
+        try:
+            fs = self._get_client()
+            col_ref = fs.collection(col_name)
+            size = max(1, min(FIRESTORE_BATCH_LIMIT, 450))
+            for start in range(0, len(clean_ids), size):
+                batch = fs.batch()
+                for doc_id in clean_ids[start : start + size]:
+                    batch.delete(col_ref.document(doc_id))
+                batch.commit()
+            self.db.remove_from_collection_cache(col_name, clean_ids)
+            return {"ok": True, "collection": col_name, "deleted_count": len(clean_ids)}
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"컬렉션 문서 삭제 실패 ({col_name}): {exc}")
+            return {"ok": False, "collection": col_name, "error": str(exc)}
 
 
 class FirestoreSyncWorker(BaseWorker):

@@ -2919,6 +2919,22 @@ class DocOcrTab(QWidget):
         API 키가 설정되어 있고 수동 모드가 해제된 경우 -> 백그라운드 Worker로 자동 처리.
         API 키가 없거나 '수동 프롬프트 모드'가 체크된 경우 -> ManualLlmDialog 모달 자동 팝업.
         """
+        win = self.window()
+        ai_dock = getattr(win, "ai_dock", None) if win is not None else None
+        if ai_dock is not None and hasattr(ai_dock, "current_mode_index"):
+            mode_idx = int(ai_dock.current_mode_index())
+            if mode_idx == 1 and hasattr(ai_dock, "prepare_manual_prompt_for_target"):
+                if hasattr(win, "toggle_ai_dock") and not getattr(win, "_ai_dock_expanded", True):
+                    win.toggle_ai_dock(True)
+                ai_dock.prepare_manual_prompt_for_target("ocr")
+                return
+            if mode_idx == 2:
+                if hasattr(win, "toggle_ai_dock") and not getattr(win, "_ai_dock_expanded", True):
+                    win.toggle_ai_dock(True)
+                ai_dock.set_target("ocr", force=True)
+                ai_dock._on_pw_start_clicked()
+                return
+
         client = MultiLlmClient()
         if client.is_manual_mode_active():
             self._on_open_manual_llm_dialog()

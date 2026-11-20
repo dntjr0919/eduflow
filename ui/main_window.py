@@ -71,6 +71,7 @@ from ui.components.ai_execution_dock import AiExecutionDock
 from ui.components.sidebar_nav_delegate import SidebarNavDelegate
 from ui.tabs.tab_calendar_todo import CalendarTodoTab
 from ui.tabs.tab_classroom_tools import ClassroomToolsTab
+from ui.tabs.tab_db_manager import DbManagerTab
 from ui.tabs.tab_doc_ocr import DocOcrTab
 from ui.tabs.tab_file_sorter import FileSorterTab
 from ui.tabs.tab_grade_material import GradeMaterialTab
@@ -737,6 +738,16 @@ class MainWindow(QMainWindow):
             return
         self.ai_dock.on_central_target_clicked(target_id)
 
+    def _on_calendar_hwp_ai_requested(self, prompt_text: str, _file_name: str = "") -> None:
+        self.ai_dock.set_target("calendar_todo", force=True)
+        self.ai_dock.txt_calendar_instruction.setPlainText(prompt_text)
+        if not self._ai_dock_expanded:
+            self.toggle_ai_dock(True)
+        if self.ai_dock.current_mode_index() == 1:
+            self.ai_dock.prepare_manual_prompt_for_target("calendar_todo")
+        elif self.ai_dock.current_mode_index() == 2:
+            self.ai_dock._on_pw_start_clicked()
+
     def _on_app_focus_changed(self, _old: Optional[QWidget], new: Optional[QWidget]) -> None:
         if new is None:
             return
@@ -802,6 +813,12 @@ class MainWindow(QMainWindow):
             config=self.config,
             notifier=self.notifier,
         )
+        self.tab_db_manager = DbManagerTab(
+            task_runner=self.task_runner,
+            parent=self,
+            db=self.db,
+            config=self.config,
+        )
         self.tab_settings = SettingsTab(parent=self, db=self.db, config=self.config)
 
         self.register_tab(
@@ -842,9 +859,16 @@ class MainWindow(QMainWindow):
         self._calendar_nav_row = self.register_tab(
             self.tab_calendar,
             "캘린더 & 할일",
-            "학사일정 캘린더, 할일(Tasks), 모바일 예약 작업 및 Google Sheets 양방향 동기화",
+            "학사일정 캘린더, 할일(Tasks), 모바일 예약 작업 및 Firebase 클라우드 동기화",
             short_code="CAL",
             icon_name="calendar",
+        )
+        self.register_tab(
+            self.tab_db_manager,
+            "통합 DB 관리",
+            "Cloud Firestore 17개 컬렉션 로컬 증분 캐시 조회·수정·일괄 저장 및 CSV 내보내기",
+            short_code="DB",
+            icon_name="file-spreadsheet",
         )
         self.register_tab(
             self.tab_settings,
@@ -859,6 +883,7 @@ class MainWindow(QMainWindow):
         self.tab_calendar.unread_changed.connect(self._on_calendar_unread_changed)
         self.tab_calendar.mobile_task_execute_requested.connect(self._on_execute_mobile_task)
         self.tab_calendar.sync_completed.connect(self._on_sheets_sync_completed)
+        self.tab_calendar.ai_hwp_schedule_requested.connect(self._on_calendar_hwp_ai_requested)
         self.tab_settings.sync_completed.connect(self._on_sheets_sync_completed)
 
         # 우측 AiExecutionDock AI 대상 등록 및 양방향 동기화 연결
@@ -989,7 +1014,7 @@ class MainWindow(QMainWindow):
     def _on_sheets_sync_completed(self, result: dict) -> None:
         if not result.get("ok"):
             if result.get("error"):
-                self.append_log("WARN", f"Google Sheets 동기화 실패: {result.get('error')}")
+                self.append_log("WARN", f"Firebase 클라우드 동기화 실패: {result.get('error')}")
             return
 
         if hasattr(self, "tab_calendar"):
@@ -1000,7 +1025,7 @@ class MainWindow(QMainWindow):
 
         pending_mobile = result.get("pending_mobile_tasks") or []
         msg = (
-            f"Google Sheets 동기화 완료 — 일정 +{result.get('schedules_added', 0)}, "
+            f"Firebase 클라우드 동기화 완료 — 일정 +{result.get('schedules_added', 0)}, "
             f"할일 +{result.get('todos_added', 0)}, "
             f"예약작업 +{result.get('mobile_tasks_added', 0)}, "
             f"알림 +{result.get('notifications_added', 0)}"
@@ -1150,7 +1175,14 @@ class MainWindow(QMainWindow):
         sig.error.connect(self._on_worker_error)
         sig.task_finished.connect(self._on_worker_finished)
 
+    _SILENT_BACKGROUND_TASKS = frozenset({
+        "PC 에이전트 온라인 하트비트",
+        "모바일 원격 작업 큐 실행",
+    })
+
     def _on_worker_started(self, task_name: str) -> None:
+        if task_name in self._SILENT_BACKGROUND_TASKS:
+            return
         self._active_worker_count += 1
         self.lbl_current_task.setText(f"실행 중: {task_name}")
         self.progress_bar.setRange(0, 0)
@@ -1169,6 +1201,8 @@ class MainWindow(QMainWindow):
         self.append_log("ERROR", err_msg)
 
     def _on_worker_finished(self, task_name: str) -> None:
+        if task_name in self._SILENT_BACKGROUND_TASKS:
+            return
         self._active_worker_count = max(0, self._active_worker_count - 1)
         self.lbl_current_task.setText(f"완료: {task_name}")
         if self._active_worker_count == 0:

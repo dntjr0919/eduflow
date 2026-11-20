@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -38,18 +39,22 @@ from PyQt6.QtWidgets import (
 from core.base_worker import FunctionWorker, TaskRunner
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+from core.firebase_client import has_local_credentials
 from services.firestore_sync_service import (
     FirestoreSyncService,
     FirestoreSyncWorker,
 )
+from services.google_calendar_service import GoogleCalendarService
 from services.notifier import NotificationService
 from services.schedule_parser_service import (
     REMINDER_LABELS,
     ScheduleReminderChecker,
     VALID_SCHEDULE_CATEGORIES,
+    build_hwp_schedule_ai_prompt,
     calculate_dday_badge,
     export_schedules_to_ics,
     export_schedules_to_xlsx,
+    extract_schedule_text_from_document,
     parse_calendar_ai_response,
     parse_schedule_file,
 )
@@ -231,6 +236,7 @@ class CalendarTodoTab(QWidget):
     unread_changed = pyqtSignal()
     mobile_task_execute_requested = pyqtSignal(dict)
     sync_completed = pyqtSignal(dict)
+    ai_hwp_schedule_requested = pyqtSignal(str, str)
 
     SYNC_TASK_KEY = "calendar_google_sheets_sync"
 
@@ -258,6 +264,8 @@ class CalendarTodoTab(QWidget):
         self._view_mode = "month"  # "month" | "week"
         self._active_category = "전체"
         self._banner_dismissed = False
+        self._pending_ai_source_name = ""
+        self._pending_ai_attachment_paths: List[str] = []
         self._category_buttons: Dict[str, QPushButton] = {}
 
         self._init_ui()
@@ -293,20 +301,22 @@ class CalendarTodoTab(QWidget):
         action_bar = QHBoxLayout()
         action_bar.setSpacing(10)
 
-        self.lbl_sync_status_pill = QLabel("Google Sheets 연동 대기")
+        self.lbl_sync_status_pill = QLabel("Firebase 클라우드 연동 대기")
         _apply_role(self.lbl_sync_status_pill, role="badgeNeutral", obj_name="CalendarSyncPill")
 
-        self.btn_bulk_import = QPushButton("학사일정 일괄 등록 (.xlsx)")
+        self.btn_bulk_import = QPushButton("학사일정 일괄 등록")
         _apply_role(self.btn_bulk_import, role="secondary", obj_name="BtnBulkImportSchedule")
         self.btn_bulk_import.setIcon(load_svg_icon("file-spreadsheet", "#059669", 15))
         self.btn_bulk_import.setIconSize(QSize(15, 15))
         self.btn_bulk_import.setMinimumHeight(34)
-        self.btn_bulk_import.setToolTip("학사일정 일괄 등록 (.xlsx / .csv / .ics 파일을 클릭하거나 드래그하세요)")
+        self.btn_bulk_import.setToolTip(
+            "학사일정 일괄 등록 (.xlsx / .xls / .csv / .ics / .hwp / .hwpx / .pdf 파일을 클릭하거나 드래그하세요)"
+        )
         self.btn_bulk_import.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_bulk_import.clicked.connect(self._on_bulk_import_clicked)
         enable_file_drop(
             self.btn_bulk_import,
-            allowed_exts=[".xlsx", ".csv", ".ics"],
+            allowed_exts=[".xlsx", ".xls", ".csv", ".ics", ".hwp", ".hwpx", ".pdf"],
             allow_dirs=False,
             allow_files=True,
             multiple=False,
@@ -314,13 +324,34 @@ class CalendarTodoTab(QWidget):
             context_label="학사일정 일괄 등록 파일",
         )
 
-        self.btn_sync_sheets = QPushButton("Google Sheets 동기화")
+        self.btn_sync_sheets = QPushButton("Firebase 동기화")
         _apply_role(self.btn_sync_sheets, role="primary", obj_name="BtnCalendarSyncSheets")
         self.btn_sync_sheets.setIcon(load_svg_icon("refresh-cw", "#FFFFFF", 14))
         self.btn_sync_sheets.setIconSize(QSize(14, 14))
         self.btn_sync_sheets.setMinimumHeight(34)
         self.btn_sync_sheets.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_sync_sheets.clicked.connect(lambda: self.sync_with_google_sheets(interactive=True))
+
+        self.btn_export_gcal = QPushButton("Google 캘린더")
+        _apply_role(self.btn_export_gcal, role="secondary", obj_name="BtnExportGoogleCalendar")
+        self.btn_export_gcal.setIcon(load_svg_icon("calendar", "#2563EB", 14))
+        self.btn_export_gcal.setIconSize(QSize(14, 14))
+        self.btn_export_gcal.setMinimumHeight(34)
+        self.btn_export_gcal.setToolTip(
+            "Google 캘린더에서 일정을 가져오거나 로컬 일정을 내보냅니다."
+        )
+        self.btn_export_gcal.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        gcal_menu = QMenu(self.btn_export_gcal)
+        self.act_gcal_import = gcal_menu.addAction("Google 캘린더에서 가져오기 (연결된 계정 → EduFlow)")
+        self.act_gcal_import.triggered.connect(self._on_import_gcal_clicked)
+        gcal_menu.addSeparator()
+        self.act_gcal_export_personal = gcal_menu.addAction("Google 캘린더로 내보내기 (개인 계정)")
+        self.act_gcal_export_personal.triggered.connect(lambda: self._on_export_gcal_clicked("personal"))
+        self.act_gcal_export_workspace = gcal_menu.addAction("Google 캘린더로 내보내기 (Workspace 계정)")
+        self.act_gcal_export_workspace.triggered.connect(lambda: self._on_export_gcal_clicked("workspace"))
+        self.act_gcal_export = self.act_gcal_export_personal
+        self.btn_export_gcal.setMenu(gcal_menu)
 
         self.btn_new_item = QPushButton("새 일정/할일")
         _apply_role(self.btn_new_item, role="slate", obj_name="BtnNewCalendarItem")
@@ -333,6 +364,7 @@ class CalendarTodoTab(QWidget):
         action_bar.addWidget(self.lbl_sync_status_pill)
         action_bar.addStretch()
         action_bar.addWidget(self.btn_bulk_import)
+        action_bar.addWidget(self.btn_export_gcal)
         action_bar.addWidget(self.btn_sync_sheets)
         action_bar.addWidget(self.btn_new_item)
         root.addLayout(action_bar)
@@ -400,7 +432,7 @@ class CalendarTodoTab(QWidget):
         for cal_drop_w in (self.left_calendar_card, self.month_grid_host):
             enable_file_drop(
                 cal_drop_w,
-                allowed_exts=[".xlsx", ".csv", ".ics"],
+                allowed_exts=[".xlsx", ".xls", ".csv", ".ics", ".hwp", ".hwpx", ".pdf"],
                 allow_dirs=False,
                 allow_files=True,
                 multiple=False,
@@ -686,9 +718,25 @@ class CalendarTodoTab(QWidget):
         self.lbl_todo_sec.setStyleSheet("color: #0F172A; font-size: 12px; font-weight: 700;")
         self.lbl_todo_progress = QLabel("0 / 0 완료")
         _apply_role(self.lbl_todo_progress, role="mutedText")
+
+        self.btn_sync_gtasks = QPushButton("Google Tasks 동기화")
+        _apply_role(self.btn_sync_gtasks, role="outline", obj_name="BtnSyncGoogleTasks")
+        self.btn_sync_gtasks.setMinimumHeight(24)
+        self.btn_sync_gtasks.setCursor(Qt.CursorShape.PointingHandCursor)
+        gtasks_menu = QMenu(self.btn_sync_gtasks)
+        self.act_gtasks_import = gtasks_menu.addAction("Google Tasks에서 가져오기 (연결된 계정 → EduFlow)")
+        self.act_gtasks_import.triggered.connect(self._on_import_gtasks_clicked)
+        gtasks_menu.addSeparator()
+        self.act_gtasks_export_personal = gtasks_menu.addAction("Google Tasks로 내보내기 (개인 계정)")
+        self.act_gtasks_export_personal.triggered.connect(lambda: self._on_export_gtasks_clicked("personal"))
+        self.act_gtasks_export_workspace = gtasks_menu.addAction("Google Tasks로 내보내기 (Workspace 계정)")
+        self.act_gtasks_export_workspace.triggered.connect(lambda: self._on_export_gtasks_clicked("workspace"))
+        self.btn_sync_gtasks.setMenu(gtasks_menu)
+
         todo_hdr.addWidget(self.lbl_todo_sec_icon)
         todo_hdr.addWidget(self.lbl_todo_sec)
         todo_hdr.addStretch()
+        todo_hdr.addWidget(self.btn_sync_gtasks)
         todo_hdr.addWidget(self.lbl_todo_progress)
         scroll_lay.addLayout(todo_hdr)
 
@@ -831,12 +879,19 @@ class CalendarTodoTab(QWidget):
         self._update_sync_pill()
 
     def _update_sync_pill(self) -> None:
-        gas_url = str(self.config.get("api_and_integrations", "google_apps_script_url", "") or "").strip()
-        if gas_url:
-            self.lbl_sync_status_pill.setText("Google Sheets 실시간 연동 활성화")
+        is_connected = bool(
+            has_local_credentials()
+            or (
+                hasattr(self, "sync_service")
+                and self.sync_service.is_vercel_api_mode()
+                and bool(self.sync_service.get_vercel_api_url())
+            )
+        )
+        if is_connected:
+            self.lbl_sync_status_pill.setText("Firebase 클라우드 실시간 연동 활성화")
             _apply_role(self.lbl_sync_status_pill, role="badgeSuccess", obj_name="CalendarSyncPill")
         else:
-            self.lbl_sync_status_pill.setText("로컬 캘린더 모드 (환경설정에서 시트 연동 가능)")
+            self.lbl_sync_status_pill.setText("로컬 캘린더 모드")
             _apply_role(self.lbl_sync_status_pill, role="badgeNeutral", obj_name="CalendarSyncPill")
 
     def refresh_calendar(self) -> None:
@@ -1397,18 +1452,57 @@ class CalendarTodoTab(QWidget):
     # =========================================================================
     # 학사일정 일괄 등록(.xlsx/.csv/.ics) 미리보기 후 확정 & ICS 내보내기
     # =========================================================================
+    def import_hwp_schedule_file(self, file_path: str) -> str:
+        """HWP/HWPX/PDF 학사일정에서 표·본문 텍스트를 추출해 AI 실행 도크(calendar_todo)로 전달합니다."""
+        try:
+            extracted_text, is_scanned_pdf = extract_schedule_text_from_document(file_path)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "문서 추출 오류",
+                f"학사일정 문서를 읽는 중 오류가 발생했습니다:\n{exc}",
+            )
+            return ""
+
+        file_name = Path(file_path).name
+        prompt_text = build_hwp_schedule_ai_prompt(extracted_text, file_name=file_name)
+        self._pending_ai_source_name = file_name
+        self._pending_ai_attachment_paths = [str(file_path)] if is_scanned_pdf else []
+        self.ai_hwp_schedule_requested.emit(prompt_text, file_name)
+        return prompt_text
+
+    def _push_schedules_async(self, schedules: List[Dict[str, Any]]) -> None:
+        if not schedules:
+            return
+
+        def _push(_worker: FunctionWorker) -> bool:
+            return self.sync_service.upsert_schedules(schedules)
+
+        worker = FunctionWorker("Cloud Firestore 학사일정 일괄 동기화", _push)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="calendar_bulk_push_schedules",
+        )
+
     def _on_bulk_import_clicked(self) -> None:
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "학사일정 파일 선택 (.xlsx, .csv, .ics)",
+            "학사일정 파일 선택",
             "",
-            "Schedule Files (*.xlsx *.csv *.ics);;Excel (*.xlsx);;CSV (*.csv);;iCalendar (*.ics)",
+            "학사일정 파일 (*.xlsx *.xls *.csv *.ics *.hwp *.hwpx *.pdf);;"
+            "스프레드시트/캘린더 (*.xlsx *.xls *.csv *.ics);;"
+            "한글/PDF 문서 (*.hwp *.hwpx *.pdf)",
         )
         if not file_path:
             return
         self.import_schedule_file(file_path)
 
     def import_schedule_file(self, file_path: str) -> int:
+        ext = Path(file_path).suffix.lower()
+        if ext in (".hwp", ".hwpx", ".pdf"):
+            self.import_hwp_schedule_file(file_path)
+            return 0
+
         try:
             parsed = parse_schedule_file(file_path, default_year=self._current_year)
         except Exception as exc:
@@ -1433,6 +1527,7 @@ class CalendarTodoTab(QWidget):
 
         selected = dlg.get_selected_schedules()
         added = self.db.bulk_add_schedules(selected, is_read=1)
+        self._push_schedules_async(selected)
         skipped = max(0, len(selected) - added)
         self.refresh_calendar()
         self.unread_changed.emit()
@@ -1499,12 +1594,15 @@ class CalendarTodoTab(QWidget):
     # 우측 AiExecutionDock 연동 (자연어/공문 → 일정·할일 JSON 추출)
     # =========================================================================
     def get_ai_context(self) -> Dict[str, Any]:
-        return {
+        ctx: Dict[str, Any] = {
             "target_id": "calendar_todo",
             "kind": "calendar_todo",
             "task_label": "일정·할일 자동 추출",
             "selected_date": self._selected_date_str,
         }
+        if self._pending_ai_attachment_paths:
+            ctx["attachment_paths"] = list(self._pending_ai_attachment_paths)
+        return ctx
 
     def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
@@ -1540,9 +1638,12 @@ class CalendarTodoTab(QWidget):
             )
             return
 
+        src_label = self._pending_ai_source_name or "AI 자동 추출"
+        self._pending_ai_source_name = ""
+        self._pending_ai_attachment_paths = []
         dlg = ScheduleImportPreviewDialog(
             parsed_items=schedules,
-            file_name="AI 자동 추출",
+            file_name=src_label,
             parent=self,
             parsed_todos=todos,
             summary=summary,
@@ -1553,6 +1654,8 @@ class CalendarTodoTab(QWidget):
         sel_schedules = dlg.get_selected_schedules()
         sel_todos = dlg.get_selected_todos()
         added_sch = self.db.bulk_add_schedules(sel_schedules, is_read=1) if sel_schedules else 0
+        if sel_schedules:
+            self._push_schedules_async(sel_schedules)
         skipped_sch = max(0, len(sel_schedules) - added_sch)
         added_todo = 0
         for td in sel_todos:
@@ -1573,19 +1676,9 @@ class CalendarTodoTab(QWidget):
         QMessageBox.information(self, "AI 일정·할일 등록 완료", done_msg)
 
     # =========================================================================
-    # Google Sheets 동기화 및 1분 주기 알림 타이머
+    # Firebase 클라우드 동기화 · Google 캘린더 내보내기 · 1분 주기 알림 타이머
     # =========================================================================
     def sync_with_google_sheets(self, interactive: bool = True) -> None:
-        gas_url = str(self.config.get("api_and_integrations", "google_apps_script_url", "") or "").strip()
-        if not gas_url:
-            if interactive:
-                QMessageBox.information(
-                    self,
-                    "Google Apps Script URL 미설정",
-                    "먼저 [환경설정 & 명렬표] -> [외부 연동]에서\nGoogle Apps Script 웹 앱 URL을 입력하고 저장해 주세요.",
-                )
-            return
-
         self.btn_sync_sheets.setEnabled(False)
         self.btn_sync_sheets.setText("동기화 중...")
         worker = FirestoreSyncWorker(sync_service=self.sync_service)
@@ -1599,7 +1692,7 @@ class CalendarTodoTab(QWidget):
 
     def _restore_sync_button(self) -> None:
         self.btn_sync_sheets.setEnabled(True)
-        self.btn_sync_sheets.setText("Google Sheets 동기화")
+        self.btn_sync_sheets.setText("Firebase 동기화")
 
     def _on_sync_finished(self, res: Dict[str, Any], interactive: bool = False) -> None:
         if not res.get("ok"):
@@ -1616,11 +1709,11 @@ class CalendarTodoTab(QWidget):
         if interactive:
             QMessageBox.information(
                 self,
-                "Google Sheets 동기화 완료",
+                "Firebase 클라우드 동기화 완료",
                 (
                     f"일정 +{res.get('schedules_added', 0)}건 · "
                     f"할일 +{res.get('todos_added', 0)}건 · "
-                    f"모바일 예약 +{res.get('mobile_tasks_added', 0)}건 · "
+                    f"예약작업 +{res.get('mobile_tasks_added', 0)}건 · "
                     f"외부 알림 +{res.get('notifications_added', 0)}건 반영됨\n"
                     f"(현재 미처리 모바일 예약 작업: {len(res.get('pending_mobile_tasks', []))}건)"
                 ),
@@ -1629,6 +1722,200 @@ class CalendarTodoTab(QWidget):
     def _on_sync_error(self, err_msg: str, interactive: bool = False) -> None:
         if interactive:
             QMessageBox.warning(self, "동기화 오류", err_msg.splitlines()[0])
+
+    def _on_export_gcal_clicked(self, account: Optional[str] = None) -> None:
+        gcal_svc = GoogleCalendarService(db=self.db, config=self.config)
+        self.btn_export_gcal.setEnabled(False)
+        self.btn_export_gcal.setText("내보내는 중...")
+
+        def _push(_worker: FunctionWorker) -> Dict[str, Any]:
+            return gcal_svc.push_schedules(account=account)
+
+        worker = FunctionWorker("Google 캘린더 내보내기", _push)
+
+        def _on_done(res: Dict[str, Any]) -> None:
+            if not res.get("ok"):
+                QMessageBox.warning(
+                    self,
+                    "Google 캘린더 내보내기 실패",
+                    str(res.get("error") or "Google 캘린더 연동에 실패했습니다."),
+                )
+                return
+            QMessageBox.information(
+                self,
+                "Google 캘린더 내보내기 완료",
+                (
+                    f"추가: {res.get('inserted', 0)}건 · "
+                    f"수정: {res.get('patched', 0)}건 · "
+                    f"삭제: {res.get('deleted', 0)}건 · "
+                    f"건너뜀: {res.get('skipped', 0)}건"
+                ),
+            )
+
+        def _on_err(err: str) -> None:
+            QMessageBox.warning(
+                self,
+                "Google 캘린더 내보내기 오류",
+                str(err or "").splitlines()[0],
+            )
+
+        def _restore() -> None:
+            self.btn_export_gcal.setEnabled(True)
+            self.btn_export_gcal.setText("Google 캘린더")
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="calendar_export_google_calendar",
+            on_result=_on_done,
+            on_error=_on_err,
+            on_finished=_restore,
+        )
+
+    def _on_import_gcal_clicked(self) -> None:
+        gcal_svc = GoogleCalendarService(db=self.db, config=self.config)
+        self.btn_export_gcal.setEnabled(False)
+        self.btn_export_gcal.setText("가져오는 중...")
+
+        def _pull(_worker: FunctionWorker) -> Dict[str, Any]:
+            return gcal_svc.pull_schedules()
+
+        worker = FunctionWorker("Google 캘린더 가져오기", _pull)
+
+        def _on_done(res: Dict[str, Any]) -> None:
+            if not res.get("ok"):
+                QMessageBox.warning(
+                    self,
+                    "Google 캘린더 가져오기 실패",
+                    str(res.get("error") or "Google 캘린더 가져오기에 실패했습니다."),
+                )
+                return
+            self.refresh_all()
+            self.unread_changed.emit()
+            QMessageBox.information(
+                self,
+                "Google 캘린더 가져오기 완료",
+                (
+                    f"신규 추가('개인' 분류): {res.get('added', 0)}건 · "
+                    f"기존 갱신: {res.get('updated', 0)}건 · "
+                    f"건너뜀: {res.get('skipped', 0)}건\n\n"
+                    "※ 필요한 경우 상단 [Firebase 동기화]를 눌러 클라우드에도 반영해 주세요."
+                ),
+            )
+
+        def _on_err(err: str) -> None:
+            QMessageBox.warning(
+                self,
+                "Google 캘린더 가져오기 오류",
+                str(err or "").splitlines()[0],
+            )
+
+        def _restore() -> None:
+            self.btn_export_gcal.setEnabled(True)
+            self.btn_export_gcal.setText("Google 캘린더")
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="calendar_import_google_calendar",
+            on_result=_on_done,
+            on_error=_on_err,
+            on_finished=_restore,
+        )
+
+    def _on_import_gtasks_clicked(self) -> None:
+        gcal_svc = GoogleCalendarService(db=self.db, config=self.config)
+        self.btn_sync_gtasks.setEnabled(False)
+        self.btn_sync_gtasks.setText("가져오는 중...")
+
+        def _pull(_worker: FunctionWorker) -> Dict[str, Any]:
+            return gcal_svc.pull_tasks()
+
+        worker = FunctionWorker("Google Tasks 가져오기", _pull)
+
+        def _on_done(res: Dict[str, Any]) -> None:
+            if not res.get("ok"):
+                QMessageBox.warning(
+                    self,
+                    "Google Tasks 가져오기 실패",
+                    str(res.get("error") or "Google Tasks 가져오기에 실패했습니다."),
+                )
+                return
+            self.refresh_todos()
+            self.unread_changed.emit()
+            QMessageBox.information(
+                self,
+                "Google Tasks 가져오기 완료",
+                (
+                    f"신규 할일: {res.get('added', 0)}건 · "
+                    f"갱신: {res.get('updated', 0)}건 · "
+                    f"건너뜀: {res.get('skipped', 0)}건"
+                ),
+            )
+
+        def _on_err(err: str) -> None:
+            QMessageBox.warning(
+                self,
+                "Google Tasks 가져오기 오류",
+                str(err or "").splitlines()[0],
+            )
+
+        def _restore() -> None:
+            self.btn_sync_gtasks.setEnabled(True)
+            self.btn_sync_gtasks.setText("Google Tasks 동기화")
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="calendar_import_google_tasks",
+            on_result=_on_done,
+            on_error=_on_err,
+            on_finished=_restore,
+        )
+
+    def _on_export_gtasks_clicked(self, account: Optional[str] = None) -> None:
+        gcal_svc = GoogleCalendarService(db=self.db, config=self.config)
+        self.btn_sync_gtasks.setEnabled(False)
+        self.btn_sync_gtasks.setText("내보내는 중...")
+
+        def _push(_worker: FunctionWorker) -> Dict[str, Any]:
+            return gcal_svc.push_tasks(account=account)
+
+        worker = FunctionWorker("Google Tasks 내보내기", _push)
+
+        def _on_done(res: Dict[str, Any]) -> None:
+            if not res.get("ok"):
+                QMessageBox.warning(
+                    self,
+                    "Google Tasks 내보내기 실패",
+                    str(res.get("error") or "Google Tasks 내보내기에 실패했습니다."),
+                )
+                return
+            QMessageBox.information(
+                self,
+                "Google Tasks 내보내기 완료",
+                (
+                    f"추가: {res.get('inserted', 0)}건 · "
+                    f"수정: {res.get('patched', 0)}건 · "
+                    f"건너뜀: {res.get('skipped', 0)}건"
+                ),
+            )
+
+        def _on_err(err: str) -> None:
+            QMessageBox.warning(
+                self,
+                "Google Tasks 내보내기 오류",
+                str(err or "").splitlines()[0],
+            )
+
+        def _restore() -> None:
+            self.btn_sync_gtasks.setEnabled(True)
+            self.btn_sync_gtasks.setText("Google Tasks 동기화")
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="calendar_export_google_tasks",
+            on_result=_on_done,
+            on_error=_on_err,
+            on_finished=_restore,
+        )
 
     def check_reminders_now(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
         triggered = ScheduleReminderChecker.check_and_trigger_reminders(

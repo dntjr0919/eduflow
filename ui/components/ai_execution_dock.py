@@ -3461,6 +3461,12 @@ class AiExecutionDock(QFrame):
             user_p = self._append_quote_to_prompt(user_p)
             return f"[System 지시문]\n{sys_p}\n\n{user_p}" if sys_p else user_p
         if kind == "ocr":
+            if self._active_target_id == "notice_ocr" or ctx.get("target_id") == "notice_ocr":
+                notice_prompt = str(ctx.get("ocr_prompt", "") or "").strip()
+                if not notice_prompt:
+                    return ""
+                return self._append_quote_to_prompt(notice_prompt)
+
             from ui.tabs.tab_doc_ocr import extract_local_text_from_files
 
             files = ctx.get("ocr_files") or []
@@ -3503,6 +3509,52 @@ class AiExecutionDock(QFrame):
         webbrowser.open(url)
         self.lbl_manual_verify.setText("프롬프트를 클립보드에 복사하고 웹 AI를 열었습니다.")
 
+    def _extract_context_attachment_paths(self, ctx: Optional[Dict[str, Any]] = None) -> List[Path]:
+        """컨텍스트에서 실제 존재하는 첨부파일 경로 목록을 중복 없이 추출합니다."""
+        active_ctx = ctx or self._fetch_fresh_context() or self._last_context or {}
+        kind = str(active_ctx.get("kind", "") or "")
+        if kind == "hwpx_agent":
+            return []
+        raw_atts = active_ctx.get("attachment_paths")
+        if raw_atts is None:
+            raw_atts = active_ctx.get("attached_files")
+        if raw_atts is None and kind == "ocr":
+            raw_atts = active_ctx.get("ocr_files") or []
+
+        candidates: List[str] = [str(p).strip() for p in (raw_atts or []) if str(p).strip()]
+        for att in getattr(self, "_chat_extra_attachments", []) or []:
+            if isinstance(att, dict) and att.get("path"):
+                candidates.append(str(att["path"]).strip())
+            elif isinstance(att, str) and att.strip():
+                candidates.append(att.strip())
+
+        seen: set[str] = set()
+        paths: List[Path] = []
+        for raw in candidates:
+            p = Path(raw)
+            key = str(p).lower()
+            if key in seen or not p.exists():
+                continue
+            seen.add(key)
+            paths.append(p)
+        return paths
+
+    def _open_attachment_in_explorer(self, paths: List[Path]) -> Optional[Path]:
+        """첨부파일 위치를 OS 탐색기(Windows는 explorer /select)로 엽니다. 오프스크린/테스트 환경에서는 건너뜁니다."""
+        target = next((p for p in paths if p.exists()), None)
+        if target is None:
+            return None
+        if os.environ.get("QT_QPA_PLATFORM", "").strip().lower() == "offscreen":
+            return target
+        if sys.platform == "win32" and target.is_file():
+            import subprocess
+
+            subprocess.Popen(["explorer", "/select,", str(target.resolve())])
+        else:
+            parent_dir = target.parent if target.is_file() else target
+            os.startfile(str(parent_dir.resolve()))
+        return target
+
     def _on_open_attachment_dir(self) -> None:
         """수동 복붙 모드에서 첨부파일이 위치한 폴더를 엽니다."""
         ctx = self._fetch_fresh_context() or self._last_context
@@ -3510,22 +3562,12 @@ class AiExecutionDock(QFrame):
         if kind == "hwpx_agent":
             QMessageBox.information(self, "파일 없음", "HWPX 에이전트 타겟에는 별도 첨부파일이 없습니다.")
             return
-        raw_atts = ctx.get("attachment_paths")
-        if raw_atts is None and kind == "ocr":
-            raw_atts = ctx.get("ocr_files") or []
-        paths = [Path(str(p).strip()) for p in (raw_atts or []) if str(p).strip()]
-        target = next((p for p in paths if p.exists()), None)
-        if target is None:
+        paths = self._extract_context_attachment_paths(ctx)
+        if not paths:
             QMessageBox.information(self, "파일 없음", "열 수 있는 첨부파일 경로를 찾지 못했습니다.")
             return
         try:
-            if sys.platform == "win32" and target.is_file():
-                import subprocess
-
-                subprocess.Popen(["explorer", "/select,", str(target.resolve())])
-            else:
-                parent_dir = target.parent if target.is_file() else target
-                os.startfile(str(parent_dir.resolve()))
+            self._open_attachment_in_explorer(paths)
         except Exception as exc:
             QMessageBox.warning(self, "폴더 열기 실패", f"폴더를 여는 중 오류가 발생했습니다:\n{exc}")
 
@@ -4258,6 +4300,109 @@ class AiExecutionDock(QFrame):
         except Exception:
             pass
 
+    def run_playwright_single_prompt(
+        self,
+        *,
+        prompt_text: str,
+        attachment_paths: List[str],
+        task_label: str,
+        on_result: Any,
+        on_error: Optional[Any] = None,
+    ) -> bool:
+        """외부 다이얼로그/모듈에서 단일 프롬프트와 첨부 이미지를 Playwright 자동으로 실행하고 콜백으로 결과를 전달합니다."""
+        if self._active_pw_worker is not None:
+            QMessageBox.information(
+                self,
+                "Playwright 실행 중",
+                "이미 다른 Playwright 자동 작업이 실행 중입니다. 완료 후 다시 시도해 주세요.",
+            )
+            return False
+
+        custom_url = ""
+        if self._pw_provider == "custom":
+            custom_url = normalize_web_url(self.edit_pw_custom_url.text())
+            if not custom_url:
+                QMessageBox.warning(
+                    self, "URL 확인", "직접 URL 모드에서는 접속할 웹 AI 주소를 입력해 주세요."
+                )
+                return False
+
+        exec_mode = str(self.combo_pw_exec_mode.currentData() or "auto")
+        keep_login = bool(self.chk_pw_keep_login.isChecked())
+        use_temp_chat = bool(self.chk_pw_temp_chat.isChecked())
+
+        worker = WebGeminiAutoWorker(
+            excel_path=None,
+            single_prompt=str(prompt_text or ""),
+            attachment_paths=[str(p).strip() for p in (attachment_paths or []) if str(p).strip()],
+            provider=self._pw_provider,
+            custom_url=custom_url,
+            execution_mode=exec_mode,
+            require_login=False,
+            keep_login_session=keep_login,
+            use_temp_chat=use_temp_chat,
+            headless=False,
+            task_label=task_label,
+        )
+
+        self._active_pw_worker = worker
+        self._pw_single_batches_applied = False
+        self.btn_pw_start.setEnabled(False)
+        self.btn_pw_stop.setEnabled(True)
+        self.progress_dock.setValue(0)
+        self.lbl_dock_progress_meta.setText(f"[{task_label}] Playwright 브라우저 실행 중...")
+        self._append_pw_inline_card(f"[{task_label}] Playwright 브라우저 실행 중...")
+
+        delivered_payload: Dict[str, Any] = {}
+        delivered_flag = {"sent": False}
+
+        def _on_batch(payload: Dict[str, Any]) -> None:
+            if isinstance(payload, dict):
+                delivered_payload.update(payload)
+                if payload.get("raw_response") or payload.get("formatted_text") or payload.get("parsed_json"):
+                    delivered_flag["sent"] = True
+                    if callable(on_result):
+                        on_result(payload)
+
+        worker.signals.progress.connect(self._on_dock_worker_progress)
+        worker.waiting_for_login.connect(self._on_pw_waiting_for_login)
+        worker.waiting_for_semi_auto_collect.connect(self._on_pw_waiting_for_collect)
+        worker.waiting_for_element_click.connect(self._on_pw_waiting_for_click)
+        worker.batch_completed.connect(_on_batch)
+
+        def _handle_result(res: Dict[str, Any]) -> None:
+            if isinstance(res, dict) and res.get("missing_playwright"):
+                QMessageBox.warning(
+                    self,
+                    "Playwright 패키지 필요",
+                    "Playwright가 설치되어 있지 않습니다.\n"
+                    "터미널에서 'pip install playwright && playwright install chromium'을 실행해 주세요.",
+                )
+                if callable(on_error):
+                    on_error("Playwright 패키지가 설치되어 있지 않습니다.")
+                return
+            if delivered_flag["sent"]:
+                return
+            merged = dict(delivered_payload)
+            if isinstance(res, dict):
+                merged.update({k: v for k, v in res.items() if v not in (None, "")})
+            if callable(on_result):
+                on_result(merged)
+
+        def _handle_error(err: str) -> None:
+            self._on_pw_worker_error(err)
+            if callable(on_error):
+                on_error(err)
+
+        self.task_runner.start_worker(
+            worker,
+            task_key=self.TASK_DOCK_PLAYWRIGHT,
+            on_result=_handle_result,
+            on_error=_handle_error,
+            on_finished=self._on_pw_worker_finished,
+        )
+        return True
+
     def _set_progress_meta_alert(self, text: str, alert: bool = True) -> None:
         self.lbl_dock_progress_meta.setText(text)
         if alert:
@@ -4939,6 +5084,44 @@ class AiExecutionDock(QFrame):
             "프롬프트가 복사되었습니다. 열린 웹 AI 창에 붙여넣기(Ctrl+V)한 뒤, 답변을 복사해 [응답 회수]를 눌러주세요."
         )
 
+    def _notify_manual_attachments(self, target_id: str, att_paths: List[Path]) -> None:
+        """수동 복붙 모드에서 첨부파일 안내를 타임라인에 표시하고 탐색기를 엽니다."""
+        if not att_paths:
+            return
+        file_names = ", ".join(p.name for p in att_paths)
+        self._append_chat_message(
+            role="assistant",
+            content=(
+                f"📎 첨부파일 안내: {file_names}\n"
+                "열린 웹 AI 창으로 파일을 드래그하여 함께 첨부한 뒤, 답변을 복사해 [응답 회수]를 눌러주세요."
+            ),
+            exec_mode="manual",
+            tool_name=target_id,
+        )
+        try:
+            self._open_attachment_in_explorer(att_paths)
+        except Exception:
+            pass
+
+    def prepare_manual_prompt_for_target(self, target_id: str) -> str:
+        """지정 타겟의 수동 복붙용 프롬프트를 패널 타임라인·클립보드에 띄우고 웹 AI 창을 열어 응답 회수 대기로 전환합니다."""
+        self.set_target(target_id, force=True)
+        ctx = self._fetch_fresh_context()
+        prompt_text = self._build_current_manual_prompt()
+        if not prompt_text:
+            return ""
+        att_paths = self._extract_context_attachment_paths(ctx)
+        self._append_chat_message(
+            role="user",
+            content=prompt_text,
+            exec_mode="manual",
+            tool_name=target_id,
+            attachments=[{"path": str(p), "name": p.name} for p in att_paths],
+        )
+        self._notify_manual_attachments(target_id, att_paths)
+        self._copy_and_open_manual_web(prompt_text)
+        return prompt_text
+
     def _enter_manual_collect_waiting(self, prompt_text: str) -> None:
         self._last_manual_prompt = str(prompt_text or "")
         self._manual_waiting_collect = True
@@ -5053,6 +5236,8 @@ class AiExecutionDock(QFrame):
                         "복사할 프롬프트가 없습니다. 대상 파일과 배치를 확인해 주세요.",
                     )
                     return
+                att_paths = self._extract_context_attachment_paths()
+                self._notify_manual_attachments(tid, att_paths)
                 self._copy_and_open_manual_web(prompt_text)
             else:
                 self._on_pw_start_clicked()

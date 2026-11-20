@@ -12,7 +12,7 @@ import csv
 import html
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt6.QtCore import QEvent, QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QKeySequence
@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QListView,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -822,7 +823,7 @@ class SettingsTab(QWidget):
         gas_btn_row.addWidget(self.btn_view_gas_template)
         gas_btn_row.addWidget(self.lbl_gas_status, stretch=1)
 
-        self.chk_sync_on_startup = QCheckBox("앱 시작 시 Google Sheets 자동 동기화 실행")
+        self.chk_sync_on_startup = QCheckBox("앱 시작 시 Firebase 클라우드 자동 동기화 실행")
         self.chk_sync_on_startup.setMinimumHeight(28)
 
         self.spin_sheet_interval = QSpinBox()
@@ -925,13 +926,71 @@ class SettingsTab(QWidget):
 
         ext_form.addRow("Firebase 연결 모드:", self.lbl_firebase_backend_mode)
         ext_form.addRow("연동 서버 URL (Vercel):", self.edit_vercel_api_url)
-        ext_form.addRow("credentials.json:", cred_container)
-        ext_form.addRow("Google 시트 URL:", self.edit_sheet_url)
-        ext_form.addRow("Apps Script 웹 앱 URL:", self.edit_apps_script_url)
-        ext_form.addRow("Apps Script API Secret:", self.edit_gas_api_secret)
-        ext_form.addRow("Apps Script 동기화:", gas_btn_container)
+        ext_form.addRow("Firebase 서비스 계정 키 JSON:", cred_container)
+        ext_form.addRow("가정통신문 PDF Drive 업로드 URL (Apps Script):", self.edit_apps_script_url)
+        self.edit_gcal_cred_path = QLineEdit()
+        configure_input_widget(self.edit_gcal_cred_path)
+        self.edit_gcal_cred_path.setPlaceholderText("Google Calendar/Tasks OAuth credentials.json 경로")
+        btn_browse_gcal_cred = QPushButton("찾아보기")
+        apply_qss_role(btn_browse_gcal_cred, role="secondary")
+        btn_browse_gcal_cred.setMinimumHeight(34)
+        btn_browse_gcal_cred.clicked.connect(self._on_browse_gcal_cred)
+        gcal_cred_container = QWidget()
+        gcal_cred_row = QHBoxLayout(gcal_cred_container)
+        gcal_cred_row.setContentsMargins(0, 0, 0, 0)
+        gcal_cred_row.setSpacing(6)
+        gcal_cred_row.addWidget(self.edit_gcal_cred_path, stretch=1)
+        gcal_cred_row.addWidget(btn_browse_gcal_cred)
+
+        self.edit_gcal_calendar_id = QLineEdit()
+        configure_input_widget(self.edit_gcal_calendar_id)
+        self.edit_gcal_calendar_id.setPlaceholderText("primary (기본 캘린더) 또는 전용 캘린더 ID")
+
+        self.combo_gcal_export_account = QComboBox()
+        configure_input_widget(self.combo_gcal_export_account)
+        self.combo_gcal_export_account.addItem("개인 Google 계정 (personal)", "personal")
+        self.combo_gcal_export_account.addItem("Workspace Google 계정 (workspace)", "workspace")
+
+        self.chk_gcal_exclude_personal = QCheckBox("Google 캘린더 내보내기 시 '개인' 카테고리 제외")
+        self.chk_gcal_exclude_personal.setMinimumHeight(28)
+
+        gcal_personal_container = QWidget()
+        gcal_personal_row = QHBoxLayout(gcal_personal_container)
+        gcal_personal_row.setContentsMargins(0, 0, 0, 0)
+        gcal_personal_row.setSpacing(8)
+        self.btn_gcal_connect_personal = QPushButton("개인 계정 연결")
+        apply_qss_role(self.btn_gcal_connect_personal, role="secondary", obj_name="BtnGcalConnectPersonal")
+        self.btn_gcal_connect_personal.setMinimumHeight(34)
+        self.btn_gcal_connect_personal.clicked.connect(lambda: self._on_toggle_gcal_connect("personal"))
+        self.lbl_gcal_status_personal = QLabel("미연결")
+        apply_qss_role(self.lbl_gcal_status_personal, role="mutedText", obj_name="LblGcalStatusPersonal")
+        gcal_personal_row.addWidget(self.btn_gcal_connect_personal)
+        gcal_personal_row.addWidget(self.lbl_gcal_status_personal, stretch=1)
+
+        gcal_ws_container = QWidget()
+        gcal_ws_row = QHBoxLayout(gcal_ws_container)
+        gcal_ws_row.setContentsMargins(0, 0, 0, 0)
+        gcal_ws_row.setSpacing(8)
+        self.btn_gcal_connect_workspace = QPushButton("Workspace 계정 연결")
+        apply_qss_role(self.btn_gcal_connect_workspace, role="secondary", obj_name="BtnGcalConnectWorkspace")
+        self.btn_gcal_connect_workspace.setMinimumHeight(34)
+        self.btn_gcal_connect_workspace.clicked.connect(lambda: self._on_toggle_gcal_connect("workspace"))
+        self.lbl_gcal_status_workspace = QLabel("미연결")
+        apply_qss_role(self.lbl_gcal_status_workspace, role="mutedText", obj_name="LblGcalStatusWorkspace")
+        gcal_ws_row.addWidget(self.btn_gcal_connect_workspace)
+        gcal_ws_row.addWidget(self.lbl_gcal_status_workspace, stretch=1)
+
+        # 하위 호환 별칭 유지
+        self.btn_gcal_connect = self.btn_gcal_connect_personal
+        self.lbl_gcal_status = self.lbl_gcal_status_personal
+
         ext_form.addRow("", self.chk_sync_on_startup)
-        ext_form.addRow("구글 시트 감시 주기:", self.spin_sheet_interval)
+        ext_form.addRow("Google OAuth JSON:", gcal_cred_container)
+        ext_form.addRow("대상 Google 캘린더 ID:", self.edit_gcal_calendar_id)
+        ext_form.addRow("기본 내보내기 계정:", self.combo_gcal_export_account)
+        ext_form.addRow("", self.chk_gcal_exclude_personal)
+        ext_form.addRow("개인 Google 계정:", gcal_personal_container)
+        ext_form.addRow("Workspace Google 계정:", gcal_ws_container)
         ext_form.addRow("알림/카톡 연동 방식:", self.combo_kakao_mode)
         ext_form.addRow("PC 카톡 채팅방명:", self.edit_kakao_room)
         ext_form.addRow("Webhook URL:", self.edit_kakao_webhook)
@@ -1708,6 +1767,16 @@ class SettingsTab(QWidget):
             self.spin_sheet_interval.setValue(
                 int(api.get("google_sheet_poll_interval_sec", 30))
             )
+            self.edit_gcal_cred_path.setText(str(api.get("google_calendar_credentials_path", "") or ""))
+            self.edit_gcal_calendar_id.setText(str(api.get("google_calendar_id", "primary") or "primary"))
+            exp_acc = str(api.get("google_calendar_export_account", "personal") or "personal").strip()
+            exp_idx = self.combo_gcal_export_account.findData(exp_acc)
+            if exp_idx >= 0:
+                self.combo_gcal_export_account.setCurrentIndex(exp_idx)
+            self.chk_gcal_exclude_personal.setChecked(
+                bool(api.get("google_calendar_exclude_personal", False))
+            )
+            self._refresh_gcal_status()
 
             k_idx = self.combo_kakao_mode.findData(
                 api.get("kakao_notify_mode", "toast_only")
@@ -1772,6 +1841,10 @@ class SettingsTab(QWidget):
                 "gas_api_secret": self.edit_gas_api_secret.text().strip(),
                 "sync_on_startup": self.chk_sync_on_startup.isChecked(),
                 "google_sheet_poll_interval_sec": self.spin_sheet_interval.value(),
+                "google_calendar_credentials_path": self.edit_gcal_cred_path.text().strip(),
+                "google_calendar_id": self.edit_gcal_calendar_id.text().strip() or "primary",
+                "google_calendar_export_account": str(self.combo_gcal_export_account.currentData() or "personal"),
+                "google_calendar_exclude_personal": self.chk_gcal_exclude_personal.isChecked(),
                 "kakao_notify_mode": self.combo_kakao_mode.currentData(),
                 "kakao_target_room_name": self.edit_kakao_room.text().strip(),
                 "kakao_webhook_url": self.edit_kakao_webhook.text().strip(),
@@ -1820,6 +1893,9 @@ class SettingsTab(QWidget):
             return
         school_code = self.edit_neis_school_code.text().strip()
         school_name = self.edit_school_name.text().strip()
+        overwrite_pw = bool(
+            hasattr(self, "chk_overwrite_mobile_pw") and self.chk_overwrite_mobile_pw.isChecked()
+        )
 
         def _work() -> Dict[str, Any]:
             svc = FirestoreSyncService(db=self.db, config=self.config)
@@ -1827,15 +1903,28 @@ class SettingsTab(QWidget):
                 students=students,
                 school_code=school_code,
                 school_name=school_name,
+                overwrite_password=overwrite_pw,
             )
 
         def _on_result(res: Any) -> None:
             data = res if isinstance(res, dict) else {}
+            stu_upd = int(data.get("students_updated", 0) or 0)
+            par_upd = int(data.get("parents_updated", 0) or 0)
+            stu_tail = (
+                f"비번 재설정 {stu_upd}명"
+                if overwrite_pw or stu_upd > 0
+                else f"기존 보호 {data.get('students_skipped', 0)}명"
+            )
+            par_tail = (
+                f"비번 재설정 {par_upd}명"
+                if overwrite_pw or par_upd > 0
+                else f"기존 보호 {data.get('parents_skipped', 0)}명"
+            )
             QMessageBox.information(
                 self,
                 "모바일 계정 일괄 발급 완료",
-                f"학생 신규 생성: {data.get('students_created', 0)}명 (기존 보호 {data.get('students_skipped', 0)}명)\n"
-                f"학부모 신규 생성: {data.get('parents_created', 0)}명 (기존 보호 {data.get('parents_skipped', 0)}명)",
+                f"학생 신규 생성: {data.get('students_created', 0)}명 ({stu_tail})\n"
+                f"학부모 신규 생성: {data.get('parents_created', 0)}명 ({par_tail})",
             )
 
         self._run_async_button_task(
@@ -1845,7 +1934,11 @@ class SettingsTab(QWidget):
             task_key="settings_provision_mobile_accounts",
             work_fn=_work,
             on_result=_on_result,
-            on_error=lambda err: QMessageBox.critical(self, "모바일 계정 발급 오류", str(err or "").splitlines()[0]),
+            on_error=lambda err: QMessageBox.critical(
+                self,
+                "모바일 계정 발급 오류",
+                f"모바일 계정 일괄 발급 중 오류가 발생했습니다.\n\n{str(err or '').strip()[:600]}",
+            ),
         )
 
     def _on_open_batch_face_photos(self) -> None:
@@ -2201,14 +2294,14 @@ class SettingsTab(QWidget):
                 self.sync_completed.emit(data)
                 QMessageBox.information(
                     self,
-                    "Google Sheets 동기화 완료",
+                    "Firebase 클라우드 동기화 완료",
                     f"로컬 SQLite 동기화가 완료되었습니다.\n{summary}",
                 )
             else:
                 err_msg = str(data.get("error") or "동기화에 실패했습니다.")
                 self.lbl_gas_status.setText("동기화 실패")
                 apply_qss_role(self.lbl_gas_status, role="badgeWarning", obj_name="LblGasStatus")
-                QMessageBox.warning(self, "Google Sheets 동기화 실패", err_msg)
+                QMessageBox.warning(self, "Firebase 클라우드 동기화 실패", err_msg)
 
         def _on_error(err: str) -> None:
             self.lbl_gas_status.setText("동기화 오류")
@@ -2221,6 +2314,119 @@ class SettingsTab(QWidget):
             on_result=_on_result,
             on_error=_on_error,
             on_finished=lambda: self.btn_sync_gas_now.setEnabled(True),
+        )
+
+    def _on_browse_gcal_cred(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Google Calendar OAuth credentials.json 선택",
+            "",
+            "JSON (*.json);;모든 파일 (*)",
+        )
+        if file_path:
+            self.edit_gcal_cred_path.setText(file_path)
+
+    def _refresh_gcal_status(self) -> None:
+        if not hasattr(self, "lbl_gcal_status_personal"):
+            return
+        from services.google_calendar_service import GoogleCalendarService
+
+        svc = GoogleCalendarService(db=self.db, config=self.config)
+        for acc, btn, lbl, conn_label in (
+            ("personal", self.btn_gcal_connect_personal, self.lbl_gcal_status_personal, "개인 계정 연결"),
+            ("workspace", self.btn_gcal_connect_workspace, self.lbl_gcal_status_workspace, "Workspace 계정 연결"),
+        ):
+            if svc.is_connected(acc):
+                lbl.setText("연결됨 (Calendar · Tasks 활성)")
+                apply_qss_role(lbl, role="badgeSuccess")
+                btn.setText("연결 해제")
+            else:
+                lbl.setText("미연결")
+                apply_qss_role(lbl, role="mutedText")
+                btn.setText(conn_label)
+
+    def _on_toggle_gcal_connect(self, account: str = "personal") -> None:
+        from services.google_calendar_service import GoogleCalendarService
+
+        self._persist_settings_silently()
+        svc = GoogleCalendarService(db=self.db, config=self.config)
+        label = "Workspace" if account == "workspace" else "개인"
+        if svc.is_connected(account):
+            svc.disconnect(account)
+            self._refresh_gcal_status()
+            QMessageBox.information(self, "Google 계정", f"{label} Google 계정 연결이 해제되었습니다.")
+            return
+
+        cred_path = self.edit_gcal_cred_path.text().strip()
+        if not cred_path or not Path(cred_path).is_file():
+            QMessageBox.warning(
+                self,
+                "Google 계정 연결 실패",
+                "Google OAuth credentials.json 파일을 먼저 선택해 주세요.",
+            )
+            return
+
+        cancel_flag = {"cancelled": False}
+        wait_dlg = QProgressDialog(
+            "브라우저에서 Google 계정 인증을 진행 중입니다.\n창을 닫으셨다면 취소를 눌러주세요.",
+            "취소",
+            0,
+            0,
+            self,
+        )
+        wait_dlg.setWindowTitle(f"{label} Google 계정 연결 중")
+        wait_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        wait_dlg.setMinimumDuration(0)
+        wait_dlg.setAutoClose(False)
+        wait_dlg.setAutoReset(False)
+        wait_dlg.canceled.connect(lambda: cancel_flag.__setitem__("cancelled", True))
+        wait_dlg.show()
+
+        self.btn_gcal_connect_personal.setEnabled(False)
+        self.btn_gcal_connect_workspace.setEnabled(False)
+
+        def _work(_worker: FunctionWorker) -> Tuple[bool, str]:
+            return svc.connect(
+                cred_path,
+                account=account,
+                cancel_check=lambda: cancel_flag["cancelled"],
+                timeout_sec=120,
+            )
+
+        def _cleanup_ui() -> None:
+            try:
+                wait_dlg.close()
+                wait_dlg.deleteLater()
+            except Exception:
+                pass
+            self.btn_gcal_connect_personal.setEnabled(True)
+            self.btn_gcal_connect_workspace.setEnabled(True)
+            self._refresh_gcal_status()
+
+        def _on_result(res: Any) -> None:
+            _cleanup_ui()
+            ok, msg = res if isinstance(res, tuple) and len(res) >= 2 else (False, str(res))
+            if ok:
+                QMessageBox.information(self, "Google 계정 연결 완료", msg)
+            elif cancel_flag["cancelled"]:
+                QMessageBox.information(self, "Google 계정 연결 취소", "Google 계정 인증이 취소되었습니다.")
+            else:
+                QMessageBox.warning(self, "Google 계정 연결 실패", msg)
+
+        def _on_error(err: str) -> None:
+            _cleanup_ui()
+            QMessageBox.warning(
+                self,
+                "Google 계정 연결 오류",
+                str(err or "").splitlines()[0],
+            )
+
+        worker = FunctionWorker(f"{label} Google 계정 OAuth 연결", _work)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key=f"settings_gcal_oauth_{account}",
+            on_result=_on_result,
+            on_error=_on_error,
         )
 
     def _on_view_gas_template(self) -> None:
@@ -2377,6 +2583,11 @@ class SettingsTab(QWidget):
         apply_qss_role(btn_reset_hr, role="warningOutline", obj_name="BtnResetHomeroom")
         btn_reset_hr.clicked.connect(self._on_reset_homeroom)
 
+        self.chk_overwrite_mobile_pw = QCheckBox("기존 계정 비번 재설정")
+        self.chk_overwrite_mobile_pw.setToolTip(
+            "체크 시 이미 생성된 학생·학부모 계정의 비밀번호도 현재 명렬표 생년월일(없으면 학번)로 재설정합니다."
+        )
+
         self.btn_sync_mobile_accounts = QPushButton("모바일 계정 일괄 발급")
         apply_qss_role(self.btn_sync_mobile_accounts, role="secondary", obj_name="BtnProvisionMobileAccounts")
         self.btn_sync_mobile_accounts.setToolTip("등록된 담임학급 명렬표로 학생·학부모 초기 계정을 Firestore에 일괄 생성합니다.")
@@ -2397,6 +2608,7 @@ class SettingsTab(QWidget):
         t1_top.addStretch()
         t1_top.addWidget(self.btn_import_hr)
         t1_top.addWidget(self.btn_batch_face_photos)
+        t1_top.addWidget(self.chk_overwrite_mobile_pw)
         t1_top.addWidget(self.btn_sync_mobile_accounts)
         t1_top.addWidget(self.btn_pending_approvals)
         t1_top.addWidget(btn_add_hr_stu)

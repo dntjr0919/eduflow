@@ -353,8 +353,37 @@ class DatabaseManager:
                         reminder_sent INTEGER NOT NULL DEFAULT 0,
                         memo TEXT NOT NULL DEFAULT '',
                         is_read INTEGER NOT NULL DEFAULT 1,
+                        gtask_id TEXT NOT NULL DEFAULT '',
+                        gtask_account TEXT NOT NULL DEFAULT '',
+                        gtask_updated_at TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                for col_ddl in (
+                    "ALTER TABLE todos ADD COLUMN gtask_id TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE todos ADD COLUMN gtask_account TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE todos ADD COLUMN gtask_updated_at TEXT NOT NULL DEFAULT ''",
+                ):
+                    try:
+                        cur.execute(col_ddl)
+                    except sqlite3.OperationalError:
+                        pass
+                for col_ddl in (
+                    "ALTER TABLE schedules ADD COLUMN gcal_event_id TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE schedules ADD COLUMN gcal_updated_at TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE schedules ADD COLUMN gcal_account TEXT NOT NULL DEFAULT ''",
+                ):
+                    try:
+                        cur.execute(col_ddl)
+                    except sqlite3.OperationalError:
+                        pass
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gcal_deleted_events (
+                        gcal_event_id TEXT PRIMARY KEY,
+                        deleted_at TEXT NOT NULL
                     )
                     """
                 )
@@ -373,8 +402,37 @@ class DatabaseManager:
                         completed_at TEXT NOT NULL DEFAULT '',
                         memo TEXT NOT NULL DEFAULT '',
                         is_read INTEGER NOT NULL DEFAULT 1,
+                        gtask_id TEXT NOT NULL DEFAULT '',
+                        gtask_account TEXT NOT NULL DEFAULT '',
+                        gtask_updated_at TEXT NOT NULL DEFAULT '',
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                for col_ddl in (
+                    "ALTER TABLE todos ADD COLUMN gtask_id TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE todos ADD COLUMN gtask_account TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE todos ADD COLUMN gtask_updated_at TEXT NOT NULL DEFAULT ''",
+                ):
+                    try:
+                        cur.execute(col_ddl)
+                    except sqlite3.OperationalError:
+                        pass
+                for col_ddl in (
+                    "ALTER TABLE schedules ADD COLUMN gcal_event_id TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE schedules ADD COLUMN gcal_updated_at TEXT NOT NULL DEFAULT ''",
+                    "ALTER TABLE schedules ADD COLUMN gcal_account TEXT NOT NULL DEFAULT ''",
+                ):
+                    try:
+                        cur.execute(col_ddl)
+                    except sqlite3.OperationalError:
+                        pass
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS gcal_deleted_events (
+                        gcal_event_id TEXT PRIMARY KEY,
+                        deleted_at TEXT NOT NULL
                     )
                     """
                 )
@@ -454,6 +512,16 @@ class DatabaseManager:
                 )
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_ai_chat_messages_session ON ai_chat_messages(session_id, id ASC)"
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS firestore_collection_cache (
+                        collection_name TEXT PRIMARY KEY,
+                        rows_by_id_json TEXT NOT NULL DEFAULT '{}',
+                        last_sync_at TEXT NOT NULL DEFAULT '',
+                        updated_at TEXT NOT NULL DEFAULT ''
+                    )
+                    """
                 )
                 conn.commit()
             finally:
@@ -2162,8 +2230,9 @@ class DatabaseManager:
             conn = self._get_connection()
             try:
                 cur = conn.cursor()
-                cur.execute("SELECT remote_id FROM schedules WHERE id = ?", (int(schedule_id),))
+                cur.execute("SELECT remote_id, gcal_event_id FROM schedules WHERE id = ?", (int(schedule_id),))
                 row = cur.fetchone()
+                now_str = self._now_str()
                 if row and row["remote_id"]:
                     self._upsert_sync_state_row(
                         cur,
@@ -2171,9 +2240,113 @@ class DatabaseManager:
                         item_type="schedule",
                         is_read=1,
                         exec_status="acknowledged",
-                        now_str=self._now_str(),
+                        now_str=now_str,
+                    )
+                if row and str(row["gcal_event_id"] or "").strip():
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO gcal_deleted_events (gcal_event_id, deleted_at)
+                        VALUES (?, ?)
+                        """,
+                        (str(row["gcal_event_id"]).strip(), now_str),
                     )
                 cur.execute("DELETE FROM schedules WHERE id = ?", (int(schedule_id),))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def update_schedule_gcal_meta(
+        self,
+        schedule_id: int,
+        gcal_event_id: str,
+        gcal_updated_at: str = "",
+        gcal_account: str = "",
+    ) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                if gcal_account:
+                    cur.execute(
+                        """
+                        UPDATE schedules
+                        SET gcal_event_id = ?, gcal_updated_at = ?, gcal_account = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(gcal_event_id or "").strip(),
+                            str(gcal_updated_at or "").strip(),
+                            str(gcal_account).strip(),
+                            int(schedule_id),
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE schedules
+                        SET gcal_event_id = ?, gcal_updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            str(gcal_event_id or "").strip(),
+                            str(gcal_updated_at or "").strip(),
+                            int(schedule_id),
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def update_todo_gtask_meta(
+        self,
+        todo_id: int,
+        gtask_id: str,
+        gtask_account: str = "personal",
+        gtask_updated_at: str = "",
+    ) -> None:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE todos
+                    SET gtask_id = ?, gtask_account = ?, gtask_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(gtask_id or "").strip(),
+                        str(gtask_account or "personal").strip(),
+                        str(gtask_updated_at or "").strip(),
+                        int(todo_id),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_pending_gcal_deletions(self) -> List[str]:
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT gcal_event_id FROM gcal_deleted_events ORDER BY deleted_at ASC")
+                return [str(r["gcal_event_id"]) for r in cur.fetchall() if str(r["gcal_event_id"] or "").strip()]
+            finally:
+                conn.close()
+
+    def clear_gcal_deletions(self, event_ids: List[str]) -> None:
+        clean = [str(e).strip() for e in (event_ids or []) if str(e).strip()]
+        if not clean:
+            return
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.executemany(
+                    "DELETE FROM gcal_deleted_events WHERE gcal_event_id = ?",
+                    [(eid,) for eid in clean],
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -3480,4 +3653,199 @@ class DatabaseManager:
                 conn.commit()
             finally:
                 conn.close()
+
+    # =========================================================================
+    # 통합 DB 관리 — Firestore 컬렉션 로컬 증분(델타) 캐시
+    # =========================================================================
+    @staticmethod
+    def _extract_cache_doc_id(row: Dict[str, Any], fallback_idx: int = 0) -> str:
+        rid = str(row.get("remote_id") or row.get("id") or "").strip()
+        return rid if rid else f"row_{fallback_idx}"
+
+    def get_collection_cache(self, collection_name: str) -> Dict[str, Any]:
+        col_name = str(collection_name or "").strip()
+        if not col_name:
+            return {
+                "collection_name": "",
+                "rows_by_id": {},
+                "rows": [],
+                "last_sync_at": "",
+                "updated_at": "",
+            }
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    SELECT collection_name, rows_by_id_json, last_sync_at, updated_at
+                    FROM firestore_collection_cache
+                    WHERE collection_name = ?
+                    """,
+                    (col_name,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return {
+                        "collection_name": col_name,
+                        "rows_by_id": {},
+                        "rows": [],
+                        "last_sync_at": "",
+                        "updated_at": "",
+                    }
+                try:
+                    rows_by_id = json.loads(row["rows_by_id_json"] or "{}")
+                    if not isinstance(rows_by_id, dict):
+                        rows_by_id = {}
+                except Exception:
+                    rows_by_id = {}
+                return {
+                    "collection_name": str(row["collection_name"]),
+                    "rows_by_id": rows_by_id,
+                    "rows": list(rows_by_id.values()),
+                    "last_sync_at": str(row["last_sync_at"] or ""),
+                    "updated_at": str(row["updated_at"] or ""),
+                }
+            finally:
+                conn.close()
+
+    def replace_collection_cache(
+        self,
+        collection_name: str,
+        rows: List[Dict[str, Any]],
+        last_sync_at: str = "",
+    ) -> Dict[str, Any]:
+        col_name = str(collection_name or "").strip()
+        if not col_name:
+            return {"collection_name": "", "total_count": 0, "last_sync_at": "", "rows": []}
+        sync_ts = str(last_sync_at or "").strip() or self._now_str()
+        now_str = self._now_str()
+        rows_by_id: Dict[str, Dict[str, Any]] = {}
+        for idx, item in enumerate(rows or []):
+            if not isinstance(item, dict):
+                continue
+            doc_id = self._extract_cache_doc_id(item, fallback_idx=idx)
+            doc_copy = dict(item)
+            if not doc_copy.get("remote_id"):
+                doc_copy["remote_id"] = doc_id
+            rows_by_id[doc_id] = doc_copy
+
+        serialized = json.dumps(rows_by_id, ensure_ascii=False, default=str)
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO firestore_collection_cache (
+                        collection_name, rows_by_id_json, last_sync_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(collection_name) DO UPDATE SET
+                        rows_by_id_json = excluded.rows_by_id_json,
+                        last_sync_at = excluded.last_sync_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (col_name, serialized, sync_ts, now_str),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return {
+            "collection_name": col_name,
+            "total_count": len(rows_by_id),
+            "last_sync_at": sync_ts,
+            "rows": list(rows_by_id.values()),
+        }
+
+    def merge_collection_cache(
+        self,
+        collection_name: str,
+        delta_rows: List[Dict[str, Any]],
+        last_sync_at: str = "",
+        deleted_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        col_name = str(collection_name or "").strip()
+        if not col_name:
+            return {"collection_name": "", "total_count": 0, "merged_count": 0, "last_sync_at": "", "rows": []}
+        sync_ts = str(last_sync_at or "").strip() or self._now_str()
+        now_str = self._now_str()
+        with self._lock:
+            existing = self.get_collection_cache(col_name)
+            rows_by_id: Dict[str, Dict[str, Any]] = dict(existing.get("rows_by_id") or {})
+            merged_count = 0
+            for idx, item in enumerate(delta_rows or []):
+                if not isinstance(item, dict):
+                    continue
+                doc_id = self._extract_cache_doc_id(item, fallback_idx=len(rows_by_id) + idx)
+                doc_copy = dict(item)
+                if not doc_copy.get("remote_id"):
+                    doc_copy["remote_id"] = doc_id
+                rows_by_id[doc_id] = doc_copy
+                merged_count += 1
+            for del_id in (deleted_ids or []):
+                rows_by_id.pop(str(del_id).strip(), None)
+
+            serialized = json.dumps(rows_by_id, ensure_ascii=False, default=str)
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO firestore_collection_cache (
+                        collection_name, rows_by_id_json, last_sync_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(collection_name) DO UPDATE SET
+                        rows_by_id_json = excluded.rows_by_id_json,
+                        last_sync_at = excluded.last_sync_at,
+                        updated_at = excluded.updated_at
+                    """,
+                    (col_name, serialized, sync_ts, now_str),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return {
+            "collection_name": col_name,
+            "total_count": len(rows_by_id),
+            "merged_count": merged_count,
+            "last_sync_at": sync_ts,
+            "rows": list(rows_by_id.values()),
+        }
+
+    def remove_from_collection_cache(
+        self, collection_name: str, doc_ids: List[str]
+    ) -> int:
+        col_name = str(collection_name or "").strip()
+        clean_ids = [str(d).strip() for d in (doc_ids or []) if str(d).strip()]
+        if not col_name or not clean_ids:
+            return 0
+        with self._lock:
+            existing = self.get_collection_cache(col_name)
+            rows_by_id: Dict[str, Dict[str, Any]] = dict(existing.get("rows_by_id") or {})
+            removed = 0
+            for doc_id in clean_ids:
+                if doc_id in rows_by_id:
+                    rows_by_id.pop(doc_id, None)
+                    removed += 1
+            if removed == 0:
+                return 0
+            serialized = json.dumps(rows_by_id, ensure_ascii=False, default=str)
+            now_str = self._now_str()
+            conn = self._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE firestore_collection_cache
+                    SET rows_by_id_json = ?, updated_at = ?
+                    WHERE collection_name = ?
+                    """,
+                    (serialized, now_str, col_name),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return removed
 
