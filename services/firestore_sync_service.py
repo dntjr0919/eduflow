@@ -1709,6 +1709,174 @@ class FirestoreSyncService:
                 "pending_mobile_tasks": self.db.get_mobile_tasks(pending_only=True),
             }
 
+    def update_pc_agent_status(
+        self,
+        online: bool,
+        hostname: str = "",
+        app_version: str = "",
+        *,
+        teacher_id: str = "",
+        school_code: str = "",
+    ) -> bool:
+        """
+        교사 PC 에이전트의 온라인/오프라인 하트비트 상태를 Firestore `계정_교사`에 갱신합니다.
+        Direct Admin 및 Vercel API 모드 모두 지원합니다.
+        """
+        import socket
+
+        tp = self.config.get_section("teacher_profile") or {}
+        tid = str(teacher_id or tp.get("teacher_id") or tp.get("login_id") or "").strip()
+        if not tid:
+            return False
+        sc = str(school_code or tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+        host = str(hostname or "").strip() or socket.gethostname()
+        ver = str(app_version or "2.0").strip()
+        now_ts = _now_str()
+
+        payload: Dict[str, Any] = {
+            "teacher_id": tid,
+            "school_code": sc,
+            "online": bool(online),
+            "pc_agent_online": bool(online),
+            "hostname": host,
+            "pc_agent_hostname": host,
+            "app_version": ver,
+            "pc_agent_version": ver,
+            "last_seen": now_ts,
+            "pc_agent_last_seen": now_ts,
+            "updated_at": now_ts,
+        }
+
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api("update_pc_agent_status", payload)
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API PC 에이전트 상태 갱신 실패 ({tid}): {exc}")
+                return False
+
+        try:
+            col_ref, doc_id, _existing = self._find_account_doc("teacher", tid)
+            target_id = doc_id or tid
+            col_ref.document(target_id).set(
+                {
+                    "pc_agent_online": bool(online),
+                    "pc_agent_hostname": host,
+                    "pc_agent_version": ver,
+                    "pc_agent_last_seen": now_ts,
+                    "updated_at": now_ts,
+                },
+                merge=True,
+            )
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"PC 에이전트 상태 갱신 실패 ({tid}): {exc}")
+            return False
+
+    def fetch_pending_remote_tasks(
+        self,
+        *,
+        teacher_id: str = "",
+        school_code: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        모바일에서 등록된 실행 대기(`exec_status == 'pending'`) 원격 작업 큐(`Tasks`)를 조회합니다.
+        Direct Admin 및 Vercel API 모드 모두 지원합니다.
+        """
+        tp = self.config.get_section("teacher_profile") or {}
+        tid = str(teacher_id or tp.get("teacher_id") or tp.get("login_id") or "").strip()
+        sc = str(school_code or tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api(
+                    "fetch_pending_remote_tasks",
+                    {"teacher_id": tid, "school_code": sc},
+                )
+                raw_tasks = res.get("tasks") or res.get("items") or res.get("rows") or []
+                return [dict(t) for t in raw_tasks if isinstance(t, dict)]
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 대기 원격 작업 조회 실패: {exc}")
+                return []
+
+        try:
+            fs = self._get_client()
+            rows: List[Dict[str, Any]] = []
+            for doc in fs.collection("Tasks").where("exec_status", "==", "pending").stream():
+                d = doc.to_dict() or {}
+                d.setdefault("remote_id", doc.id)
+                if _is_truthy(d.get("is_done")):
+                    continue
+                is_mobile_flag = d.get("is_mobile_task")
+                task_type = str(d.get("task_type") or "general").strip().lower()
+                if is_mobile_flag is not None and not _is_truthy(is_mobile_flag):
+                    continue
+                if is_mobile_flag is None and task_type == "todo":
+                    continue
+                doc_tid = str(d.get("teacher_id") or d.get("requested_by_teacher_id") or "").strip()
+                doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
+                if tid and doc_tid and doc_tid != tid:
+                    continue
+                if sc and doc_sc and doc_sc != sc:
+                    continue
+                rows.append(d)
+
+            rows.sort(
+                key=lambda x: (
+                    str(x.get("scheduled_time") or ""),
+                    str(x.get("created_at") or x.get("updated_at") or ""),
+                )
+            )
+            return rows
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"대기 원격 작업 조회 실패: {exc}")
+            return []
+
+    def update_remote_task_status(
+        self,
+        remote_id: str,
+        exec_status: str,
+        memo: Optional[str] = None,
+        is_done: Optional[bool] = None,
+    ) -> bool:
+        """
+        원격 작업(`Tasks`)의 실행 상태(`running` / `done` / `error` 등) 및 결과 요약을 갱신합니다.
+        Direct Admin 및 Vercel API 모드 모두 지원합니다.
+        """
+        rid = str(remote_id or "").strip().replace("/", "_")
+        if not rid:
+            return False
+        status_clean = str(exec_status or "").strip()
+        done_flag = (
+            bool(is_done)
+            if is_done is not None
+            else status_clean.lower() in ("done", "completed")
+        )
+        update_data: Dict[str, Any] = {
+            "remote_id": rid,
+            "exec_status": status_clean,
+            "is_done": done_flag,
+            "updated_at": _now_str(),
+        }
+        if memo is not None:
+            update_data["memo"] = str(memo)
+
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api("update_remote_task_status", update_data)
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 원격 작업 상태 갱신 실패 ({rid}): {exc}")
+                return False
+
+        try:
+            fs = self._get_client()
+            fs.collection("Tasks").document(rid).set(update_data, merge=True)
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"원격 작업 상태 갱신 실패 ({rid}): {exc}")
+            return False
+
     def push_task_status(
         self,
         remote_id: str,
@@ -1718,24 +1886,12 @@ class FirestoreSyncService:
         *args: Any,
         **kwargs: Any,
     ) -> bool:
-        rid = str(remote_id or "").strip().replace("/", "_")
-        if not rid:
-            return False
-        update_data: Dict[str, Any] = {
-            "remote_id": rid,
-            "exec_status": str(exec_status or "").strip(),
-            "is_done": bool(is_done),
-            "updated_at": _now_str(),
-        }
-        if memo is not None:
-            update_data["memo"] = str(memo)
-        try:
-            fs = self._get_client()
-            fs.collection("Tasks").document(rid).set(update_data, merge=True)
-            return True
-        except Exception as exc:
-            self.db.add_log("WARN", "FirestoreSync", f"상태 Push 실패 ({rid}): {exc}")
-            return False
+        return self.update_remote_task_status(
+            remote_id=remote_id,
+            exec_status=exec_status,
+            memo=memo,
+            is_done=is_done,
+        )
 
     def _batch_upsert(
         self,

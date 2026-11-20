@@ -1291,6 +1291,11 @@ class MainWindow(QMainWindow):
         if getattr(self, "_cleaned_up_on_quit", False):
             return
         self._cleaned_up_on_quit = True
+        if hasattr(self, "tab_classroom") and self.tab_classroom is not None:
+            try:
+                self.tab_classroom.notify_pc_agent_offline()
+            except Exception:
+                pass
         try:
             from services.hwpx_ref_session_service import clear_hwpx_ref_session_cache
 

@@ -12,6 +12,7 @@ import json
 import os
 import random
 import re
+import socket
 import tempfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1580,6 +1581,10 @@ class FrontCareStudentsDialog(QDialog):
 class ClassroomToolsTab(QWidget):
     """[탭 4] 학급 경영 도구함 2x2 Instrument Station 탭 위젯."""
 
+    PC_AGENT_HEARTBEAT_INTERVAL_MS = 90_000
+    REMOTE_TASK_POLL_INTERVAL_MS = 60_000
+    PC_AGENT_APP_VERSION = "2.0"
+
     ai_target_requested = pyqtSignal(str)
     ai_context_changed = pyqtSignal()
     schoolbell_login_required = pyqtSignal(object, str)
@@ -1593,6 +1598,15 @@ class ClassroomToolsTab(QWidget):
         self.config = ConfigManager()
         self._logged_in_teacher: Optional[Dict[str, Any]] = None
         self._firebase_roster: List[Tuple[str, str]] = []
+        self._pc_agent_sync_service: Optional[FirestoreSyncService] = None
+        self._heartbeat_running: bool = False
+        self._remote_task_poll_running: bool = False
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(self.PC_AGENT_HEARTBEAT_INTERVAL_MS)
+        self._heartbeat_timer.timeout.connect(self._on_pc_agent_heartbeat_tick)
+        self._remote_task_timer = QTimer(self)
+        self._remote_task_timer.setInterval(self.REMOTE_TASK_POLL_INTERVAL_MS)
+        self._remote_task_timer.timeout.connect(self._on_remote_task_poll_tick)
         self._selected_notice_pdf_path: str = ""
         self._parsed_excel_timetable_rows: List[Dict[str, Any]] = []
         self._seat_cells: List[ClickableSeatCell] = []
@@ -2640,7 +2654,7 @@ class ClassroomToolsTab(QWidget):
     # =========================================================================
     # 교사 계정 로그인 / 세션 복원 / Firebase 명렬표 동적 연동
     # =========================================================================
-    def _apply_teacher_auth_state(self) -> None:
+    def _apply_teacher_auth_state(self, trigger_heartbeat: bool = True) -> None:
         logged_in = bool(self._logged_in_teacher)
         self.auth_status_widget.setVisible(logged_in)
         self.auth_overlay_backdrop.setVisible(not logged_in)
@@ -2648,6 +2662,7 @@ class ClassroomToolsTab(QWidget):
         self.tool_stack.setVisible(True)
 
         if not logged_in:
+            self._stop_pc_agent_timers()
             blur = QGraphicsBlurEffect(self._main_scroll)
             blur.setBlurRadius(9.0)
             self._main_scroll.setGraphicsEffect(blur)
@@ -2670,6 +2685,139 @@ class ClassroomToolsTab(QWidget):
                 self.spin_notice_target_grade.setValue(int(g))
             if hasattr(self, "spin_notice_target_class") and c is not None:
                 self.spin_notice_target_class.setValue(int(c))
+            self._start_pc_agent_timers(send_immediate=trigger_heartbeat)
+
+    def _start_pc_agent_timers(self, send_immediate: bool = True) -> None:
+        if not self._logged_in_teacher:
+            return
+        if not self._heartbeat_timer.isActive():
+            self._heartbeat_timer.start()
+        if not self._remote_task_timer.isActive():
+            self._remote_task_timer.start()
+        if send_immediate:
+            self._on_pc_agent_heartbeat_tick()
+
+    def _stop_pc_agent_timers(self) -> None:
+        if hasattr(self, "_heartbeat_timer") and self._heartbeat_timer.isActive():
+            self._heartbeat_timer.stop()
+        if hasattr(self, "_remote_task_timer") and self._remote_task_timer.isActive():
+            self._remote_task_timer.stop()
+
+    def _on_pc_agent_heartbeat_tick(
+        self,
+        sync_service: Optional[FirestoreSyncService] = None,
+    ) -> bool:
+        if not self._logged_in_teacher:
+            return False
+        meta = self._teacher_meta()
+        tid = str(meta.get("teacher_id") or "").strip()
+        sc = str(meta.get("school_code") or "").strip()
+        if not tid:
+            return False
+        hostname = socket.gethostname()
+        app_ver = self.PC_AGENT_APP_VERSION
+
+        injected_svc = sync_service or self._pc_agent_sync_service
+        if injected_svc is not None:
+            try:
+                return bool(
+                    injected_svc.update_pc_agent_status(
+                        online=True,
+                        hostname=hostname,
+                        app_version=app_ver,
+                        teacher_id=tid,
+                        school_code=sc,
+                    )
+                )
+            except Exception as exc:
+                self.db.add_log("WARN", "ClassroomTools", f"PC 에이전트 하트비트 갱신 실패: {exc}")
+                return False
+
+        if self._heartbeat_running:
+            return False
+        self._heartbeat_running = True
+
+        def _work(_worker: Any) -> bool:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.update_pc_agent_status(
+                online=True,
+                hostname=hostname,
+                app_version=app_ver,
+                teacher_id=tid,
+                school_code=sc,
+            )
+
+        def _on_finished() -> None:
+            self._heartbeat_running = False
+
+        worker = FunctionWorker("PC 에이전트 온라인 하트비트", _work)
+        self.task_runner.start_worker(
+            worker,
+            task_key="classroom_pc_agent_heartbeat",
+            on_finished=_on_finished,
+        )
+        return True
+
+    def _on_remote_task_poll_tick(
+        self,
+        sync_service: Optional[FirestoreSyncService] = None,
+    ) -> None:
+        if not self._logged_in_teacher or self._remote_task_poll_running:
+            return
+        from services.remote_task_executor import RemoteTaskExecutor
+
+        injected_svc = sync_service or self._pc_agent_sync_service
+        if injected_svc is not None:
+            executor = RemoteTaskExecutor(db=self.db, config=self.config, sync_service=injected_svc)
+            executor.poll_and_execute_due_tasks()
+            return
+
+        self._remote_task_poll_running = True
+
+        def _work(_worker: Any) -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            executor = RemoteTaskExecutor(db=self.db, config=self.config, sync_service=svc)
+            return executor.poll_and_execute_due_tasks()
+
+        def _on_finished() -> None:
+            self._remote_task_poll_running = False
+
+        worker = FunctionWorker("모바일 원격 작업 큐 실행", _work)
+        self.task_runner.start_worker(
+            worker,
+            task_key="classroom_remote_task_poll",
+            on_finished=_on_finished,
+        )
+
+    def notify_pc_agent_offline(
+        self,
+        sync_service: Optional[FirestoreSyncService] = None,
+    ) -> bool:
+        """로그아웃 또는 앱 종료 시 PC 에이전트 상태를 즉시 오프라인(`online=False`)으로 보고합니다."""
+        self._stop_pc_agent_timers()
+        if not self._logged_in_teacher:
+            return False
+        meta = self._teacher_meta()
+        tid = str(meta.get("teacher_id") or "").strip()
+        sc = str(meta.get("school_code") or "").strip()
+        if not tid:
+            return False
+        try:
+            svc = sync_service or self._pc_agent_sync_service or FirestoreSyncService(
+                db=self.db, config=self.config
+            )
+            return bool(
+                svc.update_pc_agent_status(
+                    online=False,
+                    hostname=socket.gethostname(),
+                    app_version=self.PC_AGENT_APP_VERSION,
+                    teacher_id=tid,
+                    school_code=sc,
+                )
+            )
+        except Exception as exc:
+            self.db.add_log("WARN", "ClassroomTools", f"PC 에이전트 오프라인 보고 실패: {exc}")
+            return False
 
     def _start_spinner_for_buttons(
         self,
@@ -2886,33 +3034,39 @@ class ClassroomToolsTab(QWidget):
         tp_sec["auth_password_hash"] = hash_password_sha256(password) if password else ""
         self.config.update_section("teacher_profile", tp_sec)
 
+        if sync_service is not None:
+            self._pc_agent_sync_service = sync_service
+
         self.refresh_firebase_roster(sync_service=svc, silent=True)
-        self._apply_teacher_auth_state()
+        self._apply_teacher_auth_state(trigger_heartbeat=True)
         return True, ""
 
-    def logout_teacher(self) -> None:
+    def logout_teacher(self, sync_service: Optional[FirestoreSyncService] = None) -> None:
+        self.notify_pc_agent_offline(sync_service=sync_service)
         self._logged_in_teacher = None
         self._firebase_roster = []
         self.config.update_section(
             "teacher_profile",
             {"session_logged_in": False, "auth_password_hash": ""},
         )
-        self._apply_teacher_auth_state()
+        self._apply_teacher_auth_state(trigger_heartbeat=False)
         self._refresh_roster_dependent_views()
 
     def restore_saved_teacher_session(
         self,
         sync_service: Optional[FirestoreSyncService] = None,
     ) -> bool:
+        if sync_service is not None:
+            self._pc_agent_sync_service = sync_service
         tp_sec = dict(self.config.get_section("teacher_profile") or {})
         if not tp_sec.get("session_logged_in"):
             self._logged_in_teacher = None
-            self._apply_teacher_auth_state()
+            self._apply_teacher_auth_state(trigger_heartbeat=False)
             return False
         tid = str(tp_sec.get("teacher_id") or tp_sec.get("login_id") or tp_sec.get("name") or "").strip()
         if not tid:
             self._logged_in_teacher = None
-            self._apply_teacher_auth_state()
+            self._apply_teacher_auth_state(trigger_heartbeat=False)
             return False
 
         self._logged_in_teacher = {
@@ -2926,7 +3080,7 @@ class ClassroomToolsTab(QWidget):
             "class_no": int(tp_sec["class_no"]) if str(tp_sec.get("class_no") or "").isdigit() else None,
             "is_admin": bool(tp_sec.get("is_admin") is True),
         }
-        self._apply_teacher_auth_state()
+        self._apply_teacher_auth_state(trigger_heartbeat=True)
         if sync_service is not None:
             self.refresh_firebase_roster(sync_service=sync_service, silent=True)
         return True
@@ -2959,7 +3113,7 @@ class ClassroomToolsTab(QWidget):
                     QMessageBox.warning(self, "명렬표 동기화 오류", f"Firestore 명렬표 조회 실패:\n{exc}")
                 return 0
 
-            self._apply_teacher_auth_state()
+            self._apply_teacher_auth_state(trigger_heartbeat=False)
             self._refresh_roster_dependent_views()
             return len(self._firebase_roster)
 
@@ -2993,7 +3147,7 @@ class ClassroomToolsTab(QWidget):
 
         def _on_result(rows: Any) -> None:
             self._firebase_roster = list(rows or [])
-            self._apply_teacher_auth_state()
+            self._apply_teacher_auth_state(trigger_heartbeat=False)
             self._refresh_roster_dependent_views()
 
         def _on_error(err_msg: str) -> None:
