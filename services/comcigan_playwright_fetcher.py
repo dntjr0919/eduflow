@@ -331,6 +331,27 @@ class ComciganPlaywrightFetcher:
         mode: str = "class",
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """HTML 문자열에서 시간표_기본(base_rows)과 시간표_변동(change_rows)을 파싱합니다."""
+        base_rows, change_rows, _ = cls.parse_html_with_grid(
+            html_content=html_content,
+            grade_hint=grade_hint,
+            class_hint=class_hint,
+            target_date=target_date,
+            teacher_name=teacher_name,
+            mode=mode,
+        )
+        return base_rows, change_rows
+
+    @classmethod
+    def parse_html_with_grid(
+        cls,
+        html_content: str,
+        grade_hint: str = "1",
+        class_hint: str = "1",
+        target_date: str = "",
+        teacher_name: str = "",
+        mode: str = "class",
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """HTML 문자열에서 시간표_기본(base_rows), 시간표_변동(change_rows), 빈 셀 포함 전체 그리드(grid_slots)를 파싱합니다."""
         date_str = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()
         parser = _TimetableHTMLParser()
         parser.feed(html_content or "")
@@ -338,6 +359,7 @@ class ComciganPlaywrightFetcher:
 
         base_rows: List[Dict[str, Any]] = []
         change_rows: List[Dict[str, Any]] = []
+        grid_slots: Dict[str, Dict[str, Any]] = {}
 
         for tbl in parser.tables:
             rows = tbl["rows"]
@@ -368,6 +390,9 @@ class ComciganPlaywrightFetcher:
                     tbl.get("caption", ""), default_grade=grade_hint, default_class=class_hint
                 )
 
+            norm_default_teacher = _resolve_normalized_teacher(teacher_name, "")
+            entry_type = "teacher" if mode == "teacher" else "class"
+
             for row in rows[header_idx + 1 :]:
                 if not row:
                     continue
@@ -378,19 +403,44 @@ class ComciganPlaywrightFetcher:
                 period = m_per.group(1)
 
                 for c_idx, day_name in day_cols.items():
-                    if c_idx >= len(row):
-                        continue
-                    cell = row[c_idx]
-                    raw_text = cell.full_text()
-                    deleted_txt = cell.deleted_text()
-                    is_changed = cell.has_change_hint()
+                    cell = row[c_idx] if c_idx < len(row) else None
+                    raw_text = cell.full_text() if cell is not None else ""
+                    deleted_txt = cell.deleted_text() if cell is not None else ""
+                    is_changed = cell.has_change_hint() if cell is not None else False
+                    row_date = _resolve_day_date(date_str, day_name)
 
-                    # 교사 시간표(mode="teacher")의 빈 셀(원래 공강)은 변동으로 기록하지 않음
-                    if mode == "teacher" and not raw_text and not deleted_txt:
-                        continue
-
-                    # 텍스트가 비어 있어도 class="변경" 등 변동 힌트가 있으면 수업 취소/공강으로 처리
-                    if not raw_text and not deleted_txt and not is_changed:
+                    # 텍스트와 변동 힌트가 모두 없는 빈 셀(및 교사 시간표의 텍스트 없는 빈 셀)도 전체 그리드(grid_slots)에 ""로 수집
+                    if (not raw_text and not deleted_txt and not is_changed) or (
+                        mode == "teacher" and not raw_text and not deleted_txt
+                    ):
+                        if mode == "teacher":
+                            slot_key = f"t|{norm_default_teacher}|{day_name}|{period}"
+                            grid_slots[slot_key] = {
+                                "slot_key": slot_key,
+                                "entry_type": "teacher",
+                                "grade": "",
+                                "class_no": "",
+                                "day_of_week": day_name,
+                                "date": row_date,
+                                "period": period,
+                                "subject": "",
+                                "teacher_name": norm_default_teacher,
+                                "is_changed": bool(is_changed),
+                            }
+                        else:
+                            slot_key = f"c|{caption_grade}|{caption_class}|{day_name}|{period}"
+                            grid_slots[slot_key] = {
+                                "slot_key": slot_key,
+                                "entry_type": "class",
+                                "grade": caption_grade,
+                                "class_no": caption_class,
+                                "day_of_week": day_name,
+                                "date": row_date,
+                                "period": period,
+                                "subject": "",
+                                "teacher_name": "",
+                                "is_changed": False,
+                            }
                         continue
 
                     arrow_match = re.search(
@@ -492,6 +542,24 @@ class ComciganPlaywrightFetcher:
                             }
                         )
 
+                    slot_key = (
+                        f"t|{eff_teacher or norm_default_teacher}|{day_name}|{period}"
+                        if entry_type == "teacher"
+                        else f"c|{eff_grade}|{eff_class}|{day_name}|{period}"
+                    )
+                    grid_slots[slot_key] = {
+                        "slot_key": slot_key,
+                        "entry_type": entry_type,
+                        "grade": eff_grade,
+                        "class_no": eff_class,
+                        "day_of_week": day_name,
+                        "date": row_date,
+                        "period": period,
+                        "subject": chg_subj,
+                        "teacher_name": eff_teacher,
+                        "is_changed": bool(is_changed),
+                    }
+
                     if is_changed:
                         row_date = _resolve_day_date(date_str, day_name)
                         if mode == "teacher" and (not eff_grade or not eff_class):
@@ -515,7 +583,7 @@ class ComciganPlaywrightFetcher:
                             }
                         )
 
-        return base_rows, change_rows
+        return base_rows, change_rows, grid_slots
 
     def _save_debug_snapshot(self, page: Any) -> None:
         try:
@@ -686,6 +754,7 @@ class ComciganPlaywrightFetcher:
 
             seen_base: Dict[str, Dict[str, Any]] = {}
             seen_chg: Dict[str, Dict[str, Any]] = {}
+            seen_grid: Dict[str, Dict[str, Any]] = {}
             class_base_keys: set[str] = set()
             teacher_base_keys: set[str] = set()
 
@@ -714,7 +783,7 @@ class ComciganPlaywrightFetcher:
                     class_select.select_option(val)
                     target_frame.wait_for_timeout(350)
                     g, c = _extract_grade_class(txt)
-                    b_list, c_list = self.parse_html(
+                    b_list, c_list, g_map = self.parse_html_with_grid(
                         target_frame.content(),
                         grade_hint=g,
                         class_hint=c,
@@ -727,9 +796,10 @@ class ComciganPlaywrightFetcher:
                         class_base_keys.add(row["remote_id"])
                     for row in c_list:
                         seen_chg[row["remote_id"]] = row
+                    seen_grid.update(g_map)
             else:
                 _report(35, f"학급 시간표 파싱 중 ({self.target_grade or '1'}학년 {self.target_class or '1'}반)")
-                b_list, c_list = self.parse_html(
+                b_list, c_list, g_map = self.parse_html_with_grid(
                     target_frame.content(),
                     grade_hint=self.target_grade or "1",
                     class_hint=self.target_class or "1",
@@ -742,6 +812,7 @@ class ComciganPlaywrightFetcher:
                     class_base_keys.add(row["remote_id"])
                 for row in c_list:
                     seen_chg[row["remote_id"]] = row
+                seen_grid.update(g_map)
 
             # 2) 교사 개인 시간표 추출 (comcigan_teacher_name 설정 시)
             if self.teacher_name and teacher_select is not None and teacher_options:
@@ -752,7 +823,7 @@ class ComciganPlaywrightFetcher:
                     _report(70, f"교사 시간표 파싱 중 ({self.teacher_name})")
                     teacher_select.select_option(chosen[0][0])
                     target_frame.wait_for_timeout(450)
-                    b_t_list, c_t_list = self.parse_html(
+                    b_t_list, c_t_list, g_t_map = self.parse_html_with_grid(
                         target_frame.content(),
                         grade_hint=self.target_grade or "1",
                         class_hint=self.target_class or "1",
@@ -767,12 +838,15 @@ class ComciganPlaywrightFetcher:
                     for row in c_t_list:
                         if row["remote_id"] not in seen_chg:
                             seen_chg[row["remote_id"]] = row
+                    for k, v in g_t_map.items():
+                        if k not in seen_grid:
+                            seen_grid[k] = v
 
             base_rows = list(seen_base.values())
             change_rows = list(seen_chg.values())
             _report(75, f"시간표 파싱 완료 (기본 {len(base_rows)}건, 변동 {len(change_rows)}건)")
 
-            if not base_rows and not change_rows:
+            if not base_rows and not change_rows and not seen_grid:
                 self._save_debug_snapshot(page)
                 raise RuntimeError(
                     f"시간표 테이블을 파싱하지 못했습니다. 디버그 파일: {self.debug_html_path}"
@@ -785,6 +859,7 @@ class ComciganPlaywrightFetcher:
                 "target_date": self.target_date,
                 "base_rows": base_rows,
                 "change_rows": change_rows,
+                "grid_slots": seen_grid,
                 "base_count": len(base_rows),
                 "class_base_count": len(class_base_keys),
                 "teacher_base_count": len(teacher_base_keys),

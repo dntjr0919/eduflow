@@ -131,14 +131,140 @@ def push_comcigan_changes(
 def compute_comcigan_snapshot_hash(
     base_rows: List[Dict[str, Any]],
     change_rows: List[Dict[str, Any]],
+    grid_slots: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """파싱된 기본/변동 시간표 스냅샷의 결정적 SHA-256 해시를 계산합니다."""
+    """파싱된 기본/변동 시간표 및 전체 그리드 스냅샷의 결정적 SHA-256 해시를 계산합니다."""
+    payload_obj: Dict[str, Any] = {
+        "base_rows": base_rows,
+        "change_rows": change_rows,
+    }
+    if grid_slots:
+        payload_obj["grid_slots"] = grid_slots
     payload = json.dumps(
-        {"base_rows": base_rows, "change_rows": change_rows},
+        payload_obj,
         sort_keys=True,
         ensure_ascii=False,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def reconcile_grid_with_base(
+    grid_slots: Dict[str, Dict[str, Any]],
+    base_rows: List[Dict[str, Any]],
+    change_rows: List[Dict[str, Any]],
+    prev_base_rows: List[Dict[str, Any]],
+    school_code: str = "",
+    comcigan_school_code: str = "",
+    school_name: str = "",
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    빈 셀("")을 포함한 전체 파싱 그리드(grid_slots)와 기존 기본 시간표(prev_base_rows)를
+    1:1로 비교하여 수업 삭제(공강) 차분을 생성하고, 기본 시간표 레코드가 불필요하게 삭제되지 않도록 보존합니다.
+    """
+    if not grid_slots or not prev_base_rows:
+        return base_rows, change_rows
+
+    from services.timetable_manual_service import normalize_teacher_name
+
+    prev_class_base: Dict[Tuple[str, str, str, str], Dict[str, Any]] = {}
+    prev_teacher_base: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for b in prev_base_rows:
+        if not isinstance(b, dict):
+            continue
+        subj = str(b.get("subject") or "").strip()
+        d_val = str(b.get("day_of_week") or "").strip()
+        p_val = str(b.get("period") or "").strip()
+        if not subj or not d_val or not p_val:
+            continue
+        e_type = str(b.get("entry_type") or "").strip().lower()
+        g_val = str(b.get("grade") or "").strip()
+        c_val = str(b.get("class_no") or "").strip()
+        t_val = normalize_teacher_name(b.get("teacher_name") or b.get("teacher") or "")
+        if g_val and c_val and e_type in ("", "class"):
+            prev_class_base[(g_val, c_val, d_val, p_val)] = b
+        if t_val and (e_type == "teacher" or (t_val, d_val, p_val) not in prev_teacher_base):
+            prev_teacher_base[(t_val, d_val, p_val)] = b
+
+    curr_base_ids = {
+        str(b.get("remote_id") or "").strip()
+        for b in base_rows
+        if isinstance(b, dict) and str(b.get("remote_id") or "").strip()
+    }
+    existing_chg_ids = {
+        str(c.get("remote_id") or "").strip()
+        for c in change_rows
+        if isinstance(c, dict) and str(c.get("remote_id") or "").strip()
+    }
+
+    for slot in grid_slots.values():
+        if not isinstance(slot, dict):
+            continue
+        subj = str(slot.get("subject") or "").strip()
+        is_changed = bool(slot.get("is_changed"))
+        if subj and not is_changed:
+            continue
+
+        e_type = str(slot.get("entry_type") or "class").strip().lower()
+        day_name = str(slot.get("day_of_week") or "").strip()
+        period = str(slot.get("period") or "").strip()
+        row_date = str(slot.get("date") or "").strip()
+        if not day_name or not period:
+            continue
+
+        if e_type == "teacher":
+            t_name = normalize_teacher_name(slot.get("teacher_name") or "")
+            base_match = prev_teacher_base.get((t_name, day_name, period))
+        else:
+            t_name = ""
+            g_val = str(slot.get("grade") or "").strip()
+            c_val = str(slot.get("class_no") or "").strip()
+            base_match = prev_class_base.get((g_val, c_val, day_name, period))
+
+        if not base_match:
+            continue
+
+        base_subj = str(base_match.get("subject") or "").strip()
+        base_rid = str(base_match.get("remote_id") or "").strip()
+        if base_rid and base_rid not in curr_base_ids:
+            base_rows.append(dict(base_match))
+            curr_base_ids.add(base_rid)
+
+        if not subj and base_subj and row_date:
+            eff_g = str(slot.get("grade") or base_match.get("grade") or "").strip()
+            eff_c = str(slot.get("class_no") or base_match.get("class_no") or "").strip()
+            base_teacher = normalize_teacher_name(
+                base_match.get("teacher_name") or base_match.get("teacher") or t_name
+            )
+            if e_type == "teacher" and (not eff_g or not eff_c):
+                chg_rid = f"tc_t_{row_date.replace('-', '')}_{base_teacher or t_name}_{period}"
+            else:
+                chg_rid = f"tc_{row_date.replace('-', '')}_{eff_g}_{eff_c}_{period}"
+
+            if chg_rid not in existing_chg_ids:
+                chg_row: Dict[str, Any] = {
+                    "remote_id": chg_rid,
+                    "date": row_date,
+                    "target_date": row_date,
+                    "grade": eff_g,
+                    "class_no": eff_c,
+                    "period": period,
+                    "original_subject": base_subj,
+                    "changed_subject": "",
+                    "original_teacher": base_teacher,
+                    "changed_teacher": "",
+                    "reason": "컴시간 웹 자동 감지 (수업 삭제/공강)",
+                    "source": "comcigan",
+                }
+                if school_code:
+                    chg_row["school_code"] = school_code
+                if comcigan_school_code:
+                    chg_row["comcigan_school_code"] = comcigan_school_code
+                if school_name:
+                    chg_row["school_name"] = school_name
+                change_rows.append(chg_row)
+                existing_chg_ids.add(chg_rid)
+
+    return base_rows, change_rows
 
 
 def _compute_row_hash(row: Dict[str, Any]) -> str:
@@ -333,6 +459,7 @@ def sync_comcigan_from_web(
     )
     base_rows = list(fetched.get("base_rows") or [])
     change_rows = list(fetched.get("change_rows") or [])
+    grid_slots = dict(fetched.get("grid_slots") or {})
 
     import re
     from services.timetable_manual_service import normalize_teacher_name
@@ -395,7 +522,8 @@ def sync_comcigan_from_web(
 
     cls_cnt = int(fetched.get("class_base_count", len(base_rows)) or 0)
     tch_cnt = int(fetched.get("teacher_base_count", 0) or 0)
-    snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows)
+    snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows, grid_slots)
+    raw_snap_hash = snap_hash
 
     resolved_cache_path = Path(cache_path) if cache_path is not None else _default_comcigan_cache_path()
     cache_key = f"{eff_neis_code or eff_comcigan_code or 'default'}|{eff_teacher}|{scope}|{target_grade}|{target_class}"
@@ -440,22 +568,38 @@ def sync_comcigan_from_web(
                 "error": "",
             }
 
+    cached_base_rows = list((prev_cache.get("base_rows") or {}).values())
+    has_empty_grid_slots = any(
+        isinstance(s, dict) and not str(s.get("subject") or "").strip()
+        for s in grid_slots.values()
+    )
+    needs_orig_lookup = any(
+        str(c.get("original_subject") or "").strip() == "(기존수업)"
+        for c in change_rows
+    )
+    if not cached_base_rows and (needs_orig_lookup or has_empty_grid_slots) and sync_service is not None:
+        try:
+            cached_base_rows = sync_service.fetch_sheet_rows("시간표_기본") or []
+        except Exception:
+            cached_base_rows = []
+
+    if grid_slots and cached_base_rows:
+        base_rows, change_rows = reconcile_grid_with_base(
+            grid_slots=grid_slots,
+            base_rows=base_rows,
+            change_rows=change_rows,
+            prev_base_rows=cached_base_rows,
+            school_code=eff_neis_code,
+            comcigan_school_code=eff_comcigan_code,
+            school_name=eff_school_name,
+        )
+
     # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 로컬 캐시 기준으로 보완 (Firestore 전체 읽기 제거)
     if change_rows:
         _report(78, "로컬 기본 시간표와 변동 과목 매칭 중...")
         class_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
         fallback_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
         teacher_lookup: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
-        cached_base_rows = list((prev_cache.get("base_rows") or {}).values())
-        needs_orig_lookup = any(
-            str(c.get("original_subject") or "").strip() == "(기존수업)"
-            for c in change_rows
-        )
-        if not cached_base_rows and needs_orig_lookup and sync_service is not None:
-            try:
-                cached_base_rows = sync_service.fetch_sheet_rows("시간표_기본") or []
-            except Exception:
-                cached_base_rows = []
         for b in cached_base_rows + list(base_rows):
             if not isinstance(b, dict):
                 continue
@@ -506,7 +650,7 @@ def sync_comcigan_from_web(
                 if not chg.get("original_teacher"):
                     chg["original_teacher"] = matched[1]
 
-    snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows)
+    snap_hash = raw_snap_hash
     delta = (
         compute_timetable_delta(prev_cache, base_rows, change_rows)
         if (use_local_cache and not force_full)

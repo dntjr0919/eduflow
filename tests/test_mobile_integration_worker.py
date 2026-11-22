@@ -269,6 +269,7 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             target_date="2026-11-16",
             sync_service=fake_sync,
             fetcher=fake_fetcher,
+            cache_path=self.tmp_path / "prefs_cache.json",
         )
         self.assertFalse(res["ok"])
         self.assertEqual(res["base_pushed"], 1)
@@ -342,6 +343,157 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         self.assertIn("function _bulkUpsertRowsByRemoteId", text)
         self.assertIn("_bulkUpsertRowsByRemoteId(tbSheet", text)
         self.assertIn("_bulkUpsertRowsByRemoteId(tcSheet", text)
+
+    def test_comcigan_full_grid_empty_cell_diff_snapshot_skip_and_restore(self) -> None:
+        from services.comcigan_playwright_fetcher import ComciganPlaywrightFetcher
+        from services.mobile_integration_worker import sync_comcigan_from_web
+
+        # 1) parse_html_with_grid가 하이라이트 없는 빈 셀(td.내용)도 ""로 전수 수집하는지 검증
+        html_initial = """
+        <html><body>
+          <table>
+            <caption>1학년 5반 시간표</caption>
+            <tr><th>교시</th><th>월</th><th>화</th></tr>
+            <tr><td>1</td><td class="내용">국어<br>(김교사)</td><td class="내용"></td></tr>
+            <tr><td>3</td><td class="내용">자율<br>(이교사)</td><td class="내용">수학<br>(박교사)</td></tr>
+          </table>
+        </body></html>
+        """
+        base1, chg1, grid1 = ComciganPlaywrightFetcher.parse_html_with_grid(
+            html_initial, grade_hint="1", class_hint="5", target_date="2026-11-16", mode="class"
+        )
+        self.assertEqual(len(base1), 3)
+        self.assertEqual(len(chg1), 0)
+        self.assertEqual(len(grid1), 4)
+        self.assertEqual(grid1["c|1|5|화|1"]["subject"], "")
+        self.assertEqual(grid1["c|1|5|월|3"]["subject"], "자율")
+
+        html_deleted = """
+        <html><body>
+          <table>
+            <caption>1학년 5반 시간표</caption>
+            <tr><th>교시</th><th>월</th><th>화</th></tr>
+            <tr><td>1</td><td class="내용">국어<br>(김교사)</td><td class="내용"></td></tr>
+            <tr><td>3</td><td class="내용"></td><td class="내용">수학<br>(박교사)</td></tr>
+          </table>
+        </body></html>
+        """
+        current_html = {"val": html_initial}
+
+        class _GridStubFetcher:
+            def fetch(self):
+                b, c, g = ComciganPlaywrightFetcher.parse_html_with_grid(
+                    current_html["val"],
+                    grade_hint="1",
+                    class_hint="5",
+                    target_date="2026-11-16",
+                    mode="class",
+                )
+                return {
+                    "ok": True,
+                    "base_rows": b,
+                    "change_rows": c,
+                    "grid_slots": g,
+                    "class_base_count": len(b),
+                    "teacher_base_count": 0,
+                }
+
+        stored_base: dict = {}
+        stored_chg: dict = {}
+
+        class _MemSyncService:
+            def has_timetable_base_docs(self, **kwargs):
+                return len(stored_base) > 0
+
+            def upsert_timetable_base(self, rows, **kwargs):
+                for r in rows:
+                    stored_base[r["remote_id"]] = dict(r)
+                return True
+
+            def push_timetable_changes(self, rows, **kwargs):
+                for r in rows:
+                    stored_chg[r["remote_id"]] = dict(r)
+                return True
+
+            def delete_timetable_docs(self, col_name, ids):
+                target = stored_base if col_name == "시간표_기본" else stored_chg
+                for rid in ids:
+                    target.pop(rid, None)
+                return True
+
+            def update_teacher_comcigan_code(self, *args, **kwargs):
+                return True
+
+        mem_svc = _MemSyncService()
+        cache_file = self.tmp_path / "comcigan_grid_cache.json"
+
+        # Step 1: 초기 동기화
+        r1 = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            target_grade="1",
+            target_class="5",
+            sync_service=mem_svc,
+            fetcher=_GridStubFetcher(),
+            cache_path=cache_file,
+        )
+        self.assertTrue(r1["ok"])
+        self.assertEqual(r1["base_pushed"], 3)
+        self.assertEqual(r1["changes_pushed"], 0)
+        self.assertIn("tb_c_1_5_월_3", stored_base)
+
+        # Step 2: 3교시 '자율'이 하이라이트 없는 빈 셀("")로 삭제됨 -> changed_subject="" 변동 생성, 기본시간표 유지
+        current_html["val"] = html_deleted
+        r2 = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            target_grade="1",
+            target_class="5",
+            sync_service=mem_svc,
+            fetcher=_GridStubFetcher(),
+            cache_path=cache_file,
+        )
+        self.assertTrue(r2["ok"])
+        self.assertFalse(r2["skipped"])
+        self.assertEqual(r2["base_pushed"], 0)
+        self.assertEqual(r2["base_deleted"], 0)
+        self.assertEqual(r2["changes_pushed"], 1)
+        self.assertIn("tb_c_1_5_월_3", stored_base)
+        self.assertIn("tc_20261116_1_5_3", stored_chg)
+        self.assertEqual(stored_chg["tc_20261116_1_5_3"]["changed_subject"], "")
+        self.assertEqual(stored_chg["tc_20261116_1_5_3"]["original_subject"], "자율")
+
+        # Step 3: 동일 빈 셀 상태로 재실행 -> 스냅샷 스킵
+        r3 = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            target_grade="1",
+            target_class="5",
+            sync_service=mem_svc,
+            fetcher=_GridStubFetcher(),
+            cache_path=cache_file,
+        )
+        self.assertTrue(r3["ok"])
+        self.assertTrue(r3["skipped"])
+        self.assertEqual(r3["changes_pushed"], 0)
+        self.assertEqual(r3["base_pushed"], 0)
+
+        # Step 4: 3교시 '자율' 원상복귀 -> 시간표_변동 레코드 자동 삭제
+        current_html["val"] = html_initial
+        r4 = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            target_grade="1",
+            target_class="5",
+            sync_service=mem_svc,
+            fetcher=_GridStubFetcher(),
+            cache_path=cache_file,
+        )
+        self.assertTrue(r4["ok"])
+        self.assertFalse(r4["skipped"])
+        self.assertEqual(r4["changes_deleted"], 1)
+        self.assertEqual(r4["base_pushed"], 0)
+        self.assertNotIn("tc_20261116_1_5_3", stored_chg)
 
 
 if __name__ == "__main__":
