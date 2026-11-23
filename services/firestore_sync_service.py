@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.base_worker import BaseWorker
@@ -1895,18 +1895,23 @@ class FirestoreSyncService:
         host = str(hostname or "").strip() or socket.gethostname()
         ver = str(app_version or "2.0").strip()
         now_ts = _now_str()
+        now_iso_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
         payload: Dict[str, Any] = {
             "teacher_id": tid,
             "school_code": sc,
+            "pc_online": bool(online),
             "online": bool(online),
             "pc_agent_online": bool(online),
+            "pc_hostname": host,
             "hostname": host,
             "pc_agent_hostname": host,
+            "pc_app_version": ver,
             "app_version": ver,
             "pc_agent_version": ver,
-            "last_seen": now_ts,
-            "pc_agent_last_seen": now_ts,
+            "pc_last_seen_at": now_iso_utc,
+            "last_seen": now_iso_utc,
+            "pc_agent_last_seen": now_iso_utc,
             "updated_at": now_ts,
         }
 
@@ -1919,14 +1924,34 @@ class FirestoreSyncService:
                 return False
 
         try:
+            fs = self._get_client()
             col_ref, doc_id, _existing = self._find_account_doc("teacher", tid)
             target_id = doc_id or tid
+            status_fields = {
+                "remote_id": target_id,
+                "teacher_id": target_id,
+                "school_code": sc,
+                "pc_online": bool(online),
+                "pc_hostname": host,
+                "pc_app_version": ver,
+                "pc_last_seen_at": now_iso_utc,
+                "pc_agent_online": bool(online),
+                "pc_agent_hostname": host,
+                "pc_agent_version": ver,
+                "pc_agent_last_seen": now_iso_utc,
+                "updated_at": now_ts,
+            }
+            fs.collection("PC_Agent_Status").document(target_id).set(status_fields, merge=True)
             col_ref.document(target_id).set(
                 {
+                    "pc_online": bool(online),
+                    "pc_hostname": host,
+                    "pc_app_version": ver,
+                    "pc_last_seen_at": now_iso_utc,
                     "pc_agent_online": bool(online),
                     "pc_agent_hostname": host,
                     "pc_agent_version": ver,
-                    "pc_agent_last_seen": now_ts,
+                    "pc_agent_last_seen": now_iso_utc,
                     "updated_at": now_ts,
                 },
                 merge=True,
@@ -2128,25 +2153,93 @@ class FirestoreSyncService:
         *args: Any,
         chunk_size: int = FIRESTORE_BATCH_LIMIT,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        reconcile_changes: bool = False,
+        reconcile_dates: Optional[List[str]] = None,
+        keep_remote_ids: Optional[List[str]] = None,
+        school_code: str = "",
+        comcigan_school_code: str = "",
+        school_name: str = "",
         **kwargs: Any,
     ) -> bool:
         """컴시간 알리미 등에서 파싱한 시간표 변동 내역을 Firestore `시간표_변동` 컬렉션으로 Batch Upsert합니다."""
+        clean_dates = sorted({
+            str(d or "").strip()[:10]
+            for d in (reconcile_dates or [])
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(d or "").strip()[:10])
+        })
+        keep_ids = {
+            str(rid or "").strip().replace("/", "_")
+            for rid in (keep_remote_ids or [])
+            if str(rid or "").strip()
+        }
+        for r in (rows or []):
+            if isinstance(r, dict) and str(r.get("remote_id") or "").strip():
+                keep_ids.add(str(r["remote_id"]).strip().replace("/", "_"))
+
         if self.is_vercel_api_mode():
-            if not rows:
+            if not rows and not reconcile_changes:
                 return False
             try:
-                self._post_vercel_api("sync_timetables_batch", {"change_rows": list(rows)})
+                api_payload: Dict[str, Any] = {"change_rows": list(rows or [])}
+                if reconcile_changes:
+                    api_payload["reconcile_changes"] = True
+                    api_payload["reconcile_dates"] = clean_dates
+                    api_payload["keep_change_ids"] = sorted(keep_ids)
+                    if school_code:
+                        api_payload["school_code"] = str(school_code).strip()
+                    if comcigan_school_code:
+                        api_payload["comcigan_school_code"] = str(comcigan_school_code).strip()
+                    if school_name:
+                        api_payload["school_name"] = str(school_name).strip()
+                self._post_vercel_api("sync_timetables_batch", api_payload)
                 return True
             except Exception as exc:
                 self.db.add_log("WARN", "FirestoreSync", f"Vercel API 시간표 변동 Push 실패: {exc}")
                 return False
-        return self._batch_upsert(
-            collection_name="시간표_변동",
-            rows=rows,
-            label="시간표 변동 Batch Upsert",
-            chunk_size=chunk_size,
-            progress_callback=progress_callback,
-        )
+
+        ok = True
+        if rows:
+            ok = self._batch_upsert(
+                collection_name="시간표_변동",
+                rows=rows,
+                label="시간표 변동 Batch Upsert",
+                chunk_size=chunk_size,
+                progress_callback=progress_callback,
+            )
+        if ok and reconcile_changes:
+            try:
+                fs = self._get_client()
+                col_ref = fs.collection("시간표_변동")
+                sc = str(school_code or "").strip()
+                cc = str(comcigan_school_code or "").strip()
+                sn = str(school_name or "").strip()
+                if sc:
+                    snaps = col_ref.where("school_code", "==", sc).stream()
+                elif cc:
+                    snaps = col_ref.where("comcigan_school_code", "==", cc).stream()
+                elif sn:
+                    snaps = col_ref.where("school_name", "==", sn).stream()
+                else:
+                    snaps = []
+                min_date = clean_dates[0] if clean_dates else ""
+                stale_ids: List[str] = []
+                for snap in snaps:
+                    rid = str(getattr(snap, "id", "") or "").strip()
+                    if not rid or rid in keep_ids:
+                        continue
+                    data = snap.to_dict() or {}
+                    src = str(data.get("source") or "").strip().lower()
+                    if src not in ("comcigan", "comcigan_playwright") and not rid.startswith("tc_"):
+                        continue
+                    doc_date = str(data.get("date") or data.get("target_date") or "").strip()[:10]
+                    if clean_dates and doc_date and doc_date not in clean_dates and (not min_date or doc_date < min_date):
+                        continue
+                    stale_ids.append(rid)
+                if stale_ids:
+                    self.delete_timetable_docs("시간표_변동", stale_ids)
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"시간표 변동 stale 문서 정리 실패: {exc}")
+        return ok
 
     def delete_timetable_docs(
         self,

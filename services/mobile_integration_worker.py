@@ -719,8 +719,31 @@ def sync_comcigan_from_web(
     if base_ok and deleted_base_ids and hasattr(svc, "delete_timetable_docs"):
         base_ok = svc.delete_timetable_docs("시간표_기본", deleted_base_ids)
 
-    if change_delta:
+    reconcile_dates_set = {eff_date} if eff_date else set()
+    for r in change_rows:
+        if isinstance(r, dict):
+            d = str(r.get("date") or r.get("target_date") or "").strip()[:10]
+            if d:
+                reconcile_dates_set.add(d)
+    for slot in (grid_slots or {}).values():
+        if isinstance(slot, dict):
+            d = str(slot.get("date") or "").strip()[:10]
+            if d:
+                reconcile_dates_set.add(d)
+    reconcile_dates = sorted(reconcile_dates_set)
+    keep_change_ids = list((delta.get("curr_chg_hashes") or {}).keys())
+
+    should_reconcile_changes = bool(change_delta) or bool(deleted_change_ids) or force_full or not prev_cache
+    if should_reconcile_changes:
         _report(93, f"Firestore 시간표 변동 변경분 반영 중 ({len(change_delta)}건)...")
+        reconcile_kwargs: Dict[str, Any] = {
+            "reconcile_changes": True,
+            "reconcile_dates": reconcile_dates,
+            "keep_remote_ids": keep_change_ids,
+            "school_code": eff_neis_code,
+            "comcigan_school_code": eff_comcigan_code,
+            "school_name": eff_school_name,
+        }
         if progress_callback is not None:
             chg_ok = svc.push_timetable_changes(
                 change_delta,
@@ -728,13 +751,14 @@ def sync_comcigan_from_web(
                     93 + int(6 * b_idx / max(1, b_tot)),
                     f"Firestore 시간표 변동 변경분 반영 중 ({b_idx}/{b_tot} 배치)",
                 ),
+                **reconcile_kwargs,
             )
         else:
-            chg_ok = svc.push_timetable_changes(change_delta)
+            chg_ok = svc.push_timetable_changes(change_delta, **reconcile_kwargs)
     else:
         chg_ok = True
 
-    if chg_ok and deleted_change_ids and hasattr(svc, "delete_timetable_docs"):
+    if chg_ok and deleted_change_ids and not should_reconcile_changes and hasattr(svc, "delete_timetable_docs"):
         chg_ok = svc.delete_timetable_docs("시간표_변동", deleted_change_ids)
 
     ok = base_ok and chg_ok
