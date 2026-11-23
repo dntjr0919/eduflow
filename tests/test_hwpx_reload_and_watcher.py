@@ -172,6 +172,46 @@ class TestHwpxReloadAndWatcher(unittest.TestCase):
         self.assertIn("외부 변경 내용", self.tab.browser_hwpx_preview.toPlainText())
         self.assertFalse(self.tab._hwpx_dirty)
 
+    def test_reload_preserves_scroll_position_while_new_load_resets_to_top(self):
+        doc = create_minimal_hwpx_document(title="긴 문서", empty=True)
+        for i in range(60):
+            apply_single_hwpx_operation(
+                doc, {"op": "append_paragraph", "text": f"테스트 문단 {i:02d} - 스크롤 유지 검증"}
+            )
+        hwpx_path = self.tmp_path / "long_doc.hwpx"
+        doc.save(hwpx_path)
+
+        self.tab.resize(900, 600)
+        self.tab.browser_hwpx_preview.setFixedHeight(220)
+        self.tab.show()
+        self.tab._load_hwpx_document_into_agent(hwpx_path, "긴 문서 로드")
+        QApplication.processEvents()
+
+        vsb = self.tab.browser_hwpx_preview.verticalScrollBar()
+        self.assertGreater(vsb.maximum(), 0)
+        target_scroll = max(1, vsb.maximum() // 2)
+        vsb.setValue(target_scroll)
+        QApplication.processEvents()
+        self.assertEqual(vsb.value(), target_scroll)
+
+        # Update file on disk and silently reload -> scroll should remain at target_scroll
+        doc2 = create_minimal_hwpx_document(title="긴 문서", empty=True)
+        for i in range(60):
+            apply_single_hwpx_operation(
+                doc2, {"op": "append_paragraph", "text": f"수정 문단 {i:02d} - 스크롤 유지 검증"}
+            )
+        doc2.save(hwpx_path)
+
+        self.assertTrue(self.tab._reload_hwpx_silently())
+        QApplication.processEvents()
+        self.assertGreater(vsb.value(), 0)
+        self.assertEqual(vsb.value(), target_scroll)
+
+        # Loading a document fresh resets scroll to top (0)
+        self.tab._load_hwpx_document_into_agent(hwpx_path, "새로 열기")
+        QApplication.processEvents()
+        self.assertEqual(vsb.value(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

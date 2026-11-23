@@ -4324,7 +4324,7 @@ class DocOcrTab(QWidget):
             "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
         )
         self.lbl_hwpx_summary_badge.setText(badge_text)
-        self._render_hwpx_viewer()
+        self._render_hwpx_viewer(preserve_scroll=False)
         self._sync_hwpx_file_watcher()
         self.ai_quote_selected.emit("", "")
         self.ai_target_requested.emit("hwpx_agent")
@@ -4356,7 +4356,7 @@ class DocOcrTab(QWidget):
         self.lbl_hwpx_summary_badge.setText(
             "새 HWPX 양식 생성 모드 (.hwpx 전용): 우측 [AI 실행 패널]에서 지시사항 입력 후 실행하거나 아래 참고 파일을 첨부하세요."
         )
-        self._render_hwpx_viewer()
+        self._render_hwpx_viewer(preserve_scroll=False)
         self._sync_hwpx_file_watcher()
         self.ai_quote_selected.emit("", "")
         if emit_sync:
@@ -4719,15 +4719,28 @@ class DocOcrTab(QWidget):
             return
         self.ai_quote_selected.emit(selected, "ocr_output")
 
-    def _render_hwpx_viewer(self) -> None:
+    def _render_hwpx_viewer(self, preserve_scroll: bool = True) -> None:
         if self._hwpx_doc is None:
             return
+        vsb = self.browser_hwpx_preview.verticalScrollBar()
+        hsb = self.browser_hwpx_preview.horizontalScrollBar()
+        saved_v = vsb.value() if (preserve_scroll and vsb is not None) else 0
+        saved_h = hsb.value() if (preserve_scroll and hsb is not None) else 0
         html_str = render_hwpx_to_html(
             self._hwpx_doc,
             highlighted_ids=self._hwpx_highlighted_ids,
             modified_ids=self._hwpx_modified_ids,
         )
         self.browser_hwpx_preview.setHtml(html_str)
+        if preserve_scroll:
+            def _restore_scroll() -> None:
+                if vsb is not None:
+                    vsb.setValue(min(saved_v, vsb.maximum()))
+                if hsb is not None:
+                    hsb.setValue(min(saved_h, hsb.maximum()))
+
+            _restore_scroll()
+            QTimer.singleShot(0, _restore_scroll)
 
     def _update_hwpx_nav_bar(self) -> None:
         total = len(self._hwpx_modified_ids)
@@ -5299,6 +5312,7 @@ class DocOcrTab(QWidget):
                 "task_label": "HWPX 새 양식 생성" if self._hwpx_is_create_mode else "HWPX 문서 편집",
                 "kind": "hwpx_agent",
                 "hwpx_path": str(self._hwpx_doc.source_path) if (self._hwpx_doc and self._hwpx_doc.source_path) else "",
+                "original_hwp_path": str(self._hwpx_original_hwp_path) if self._hwpx_original_hwp_path else "",
                 "hwpx_entries": dict(self._hwpx_doc.entries) if self._hwpx_doc is not None else None,
                 "doc_instance_id": id(self._hwpx_doc) if self._hwpx_doc is not None else 0,
                 "dom_map": dom_map,
