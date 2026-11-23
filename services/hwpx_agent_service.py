@@ -20,7 +20,7 @@ import uuid
 import zipfile
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from utils.path_helper import get_resource_path
 
@@ -64,7 +64,9 @@ HC_NS = HWPX_NAMESPACES["hc"]
 HH_NS = HWPX_NAMESPACES["hh"]
 OPF_NS = HWPX_NAMESPACES["opf"]
 
-_RICH_TOKEN_RE = re.compile(r"(\$\$[\s\S]+?\$\$|_\{[^{}]+\}|\^\{[^{}]+\})")
+_RICH_TOKEN_RE = re.compile(
+    r"(\$\$[\s\S]+?\$\$|\*\*__.+?__\*\*|__\*\*.+?\*\*__|\*\*[^*]+?\*\*|__[^_]+?__|_\{[^{}]+\}|\^\{[^{}]+\})"
+)
 
 
 def _qname(ns: str, tag: str) -> str:
@@ -434,14 +436,20 @@ def _clone_para_pr_with_indent(
     return new_id
 
 
+def _char_pr_has_underline(char_pr_node: Any) -> bool:
+    ul = _find_child(char_pr_node, "underline")
+    return ul is not None and str(ul.get("type", "NONE")).strip().upper() != "NONE"
+
+
 def _ensure_styled_char_pr(
     doc: HwpxDocument,
     base_char_pr_id: str = "0",
     *,
     bold: Optional[bool] = None,
+    underline: Optional[bool] = None,
     font_size_pt: Optional[float] = None,
 ) -> str:
-    """header.xml에서 charPr을 조회·복제·캐싱하여 bold 및 font_size_pt 스타일 ID를 반환합니다."""
+    """header.xml에서 charPr을 조회·복제·캐싱하여 bold/underline/font_size_pt 스타일 ID를 반환합니다."""
     header_name, header_root = _ensure_header_root(doc)
     char_props = None
     for node in header_root.iter():
@@ -466,11 +474,14 @@ def _ensure_styled_char_pr(
         all_char_prs = [base_node]
 
     resolved_base_id = str(base_node.get("id", "0"))
-    if bold is None and font_size_pt is None:
+    if bold is None and underline is None and font_size_pt is None:
         return resolved_base_id
 
     base_has_bold = _find_child(base_node, "bold") is not None
     target_bold = bool(bold) if bold is not None else base_has_bold
+
+    base_has_ul = _char_pr_has_underline(base_node)
+    target_ul = bool(underline) if underline is not None else base_has_ul
 
     base_height = str(base_node.get("height", "1000"))
     if font_size_pt is not None:
@@ -481,7 +492,7 @@ def _ensure_styled_char_pr(
     else:
         target_height = base_height
 
-    if target_bold == base_has_bold and target_height == base_height:
+    if target_bold == base_has_bold and target_ul == base_has_ul and target_height == base_height:
         return resolved_base_id
 
     base_color = str(base_node.get("textColor", "#000000"))
@@ -490,6 +501,7 @@ def _ensure_styled_char_pr(
             _find_child(ch, "subscript") is None
             and _find_child(ch, "superscript") is None
             and (_find_child(ch, "bold") is not None) == target_bold
+            and _char_pr_has_underline(ch) == target_ul
             and str(ch.get("height", "1000")) == target_height
             and str(ch.get("textColor", "#000000")) == base_color
         ):
@@ -512,6 +524,28 @@ def _ensure_styled_char_pr(
         cloned.insert(ins_idx, bold_el)
     elif not target_bold and existing_bold is not None:
         cloned.remove(existing_bold)
+
+    existing_ul = _find_child(cloned, "underline")
+    if target_ul:
+        if existing_ul is None:
+            ul_el = ET.Element(
+                _qname(HH_NS, "underline"),
+                {"type": "BOTTOM", "shape": "SOLID", "color": base_color},
+            )
+            insert_before_tags = {"strikeout", "outline", "shadow", "subscript", "superscript"}
+            ins_idx = next(
+                (i for i, c in enumerate(list(cloned)) if _local_tag(c) in insert_before_tags),
+                len(list(cloned)),
+            )
+            cloned.insert(ins_idx, ul_el)
+        else:
+            existing_ul.set("type", "BOTTOM")
+            if not existing_ul.get("shape"):
+                existing_ul.set("shape", "SOLID")
+            if not existing_ul.get("color"):
+                existing_ul.set("color", base_color)
+    elif existing_ul is not None:
+        existing_ul.set("type", "NONE")
 
     char_props.append(cloned)
     char_props.set("itemCnt", str(len([c for c in char_props if _local_tag(c) == "charPr"])))
@@ -626,8 +660,18 @@ def _ensure_styled_para_pr(
 # =============================================================================
 def _extract_paragraph_plain_text(p_elem: Any) -> str:
     parts: List[str] = []
+    memo_depth = 0
     for node in p_elem.iter():
         tag = _local_tag(node)
+        if tag == "fieldBegin" and str(node.get("type", "")).strip().upper() == "MEMO":
+            memo_depth += 1
+            continue
+        if tag == "fieldEnd":
+            if memo_depth > 0:
+                memo_depth -= 1
+            continue
+        if memo_depth > 0:
+            continue
         if tag == "t" and node.text:
             parts.append(node.text)
         elif tag == "script" and node.text:
@@ -918,6 +962,30 @@ def _build_rich_runs(
             )
             run_el.append(eq_el)
             runs.append(run_el)
+        elif (
+            (tok.startswith("**__") and tok.endswith("__**") and len(tok) > 8)
+            or (tok.startswith("__**") and tok.endswith("**__") and len(tok) > 8)
+        ):
+            inner_txt = tok[4:-4]
+            styled_id = _ensure_styled_char_pr(doc, base_char_pr_id, bold=True, underline=True)
+            run_el = ET.Element(_qname(HP_NS, "run"), {"charPrIDRef": styled_id})
+            t_el = ET.SubElement(run_el, _qname(HP_NS, "t"))
+            t_el.text = inner_txt
+            runs.append(run_el)
+        elif tok.startswith("**") and tok.endswith("**") and len(tok) > 4:
+            inner_txt = tok[2:-2]
+            styled_id = _ensure_styled_char_pr(doc, base_char_pr_id, bold=True)
+            run_el = ET.Element(_qname(HP_NS, "run"), {"charPrIDRef": styled_id})
+            t_el = ET.SubElement(run_el, _qname(HP_NS, "t"))
+            t_el.text = inner_txt
+            runs.append(run_el)
+        elif tok.startswith("__") and tok.endswith("__") and len(tok) > 4:
+            inner_txt = tok[2:-2]
+            styled_id = _ensure_styled_char_pr(doc, base_char_pr_id, underline=True)
+            run_el = ET.Element(_qname(HP_NS, "run"), {"charPrIDRef": styled_id})
+            t_el = ET.SubElement(run_el, _qname(HP_NS, "t"))
+            t_el.text = inner_txt
+            runs.append(run_el)
         elif tok.startswith("_{") and tok.endswith("}"):
             sub_txt = tok[2:-1]
             sub_id = _ensure_script_char_pr(doc, base_char_pr_id, "subscript")
@@ -980,6 +1048,11 @@ def _is_empty_secpr_placeholder(p_elem: Any) -> bool:
     return _extract_paragraph_plain_text(p_elem) == ""
 
 
+_QUESTION_NUM_PREFIX_RE = re.compile(
+    r"^(\s*(?:(?:서답형|서술형|논술형|단답형|문항|문제)\s*)?\d+\s*[.)]\s*)"
+)
+
+
 def _set_paragraph_rich_text(
     doc: HwpxDocument,
     p_elem: Any,
@@ -989,17 +1062,18 @@ def _set_paragraph_rich_text(
     base_char_pr_id: Optional[str] = None,
 ) -> None:
     """
-    텍스트 내 _{...}(아래첨자), ^{...}(위첨자), $$...$$(한글 수식)을 파싱하여
+    텍스트 내 _{...}(아래첨자), ^{...}(위첨자), $$...$$(한글 수식), **굵게**, __밑줄__을 파싱하여
     <hp:run> 노드로 분리 생성하고 <hp:linesegarray>를 제거합니다.
     첫 문단의 <hp:secPr>/<hp:ctrl> 컨트롤 run은 보존합니다.
+    기존 문단에 여러 run의 charPrIDRef가 섞여 있고 새 텍스트가 번호 접두사로 시작하면
+    첫 번째와 두 번째 run의 charPrIDRef를 각각 유지합니다.
     """
-    non_sec_run = next(
-        (ch for ch in p_elem if _local_tag(ch) == "run" and not _run_has_sec_pr_or_ctrl(ch)),
-        None,
-    )
+    existing_non_sec_runs = [
+        ch for ch in p_elem if _local_tag(ch) == "run" and not _run_has_sec_pr_or_ctrl(ch)
+    ]
     first_run = (
-        non_sec_run
-        if non_sec_run is not None
+        existing_non_sec_runs[0]
+        if existing_non_sec_runs
         else next((ch for ch in p_elem if _local_tag(ch) == "run"), None)
     )
     resolved_char_pr_id = (
@@ -1007,6 +1081,17 @@ def _set_paragraph_rich_text(
         if base_char_pr_id is not None
         else (str(first_run.get("charPrIDRef", "0")) if first_run is not None else "0")
     )
+
+    split_prefix_styles: Optional[Tuple[str, str, str, str]] = None
+    if base_char_pr_id is None and len(existing_non_sec_runs) >= 2:
+        cp0 = str(existing_non_sec_runs[0].get("charPrIDRef", "0"))
+        cp1 = str(existing_non_sec_runs[1].get("charPrIDRef", "0"))
+        if cp0 != cp1:
+            m = _QUESTION_NUM_PREFIX_RE.match(text or "")
+            if m:
+                prefix = m.group(1)
+                rest = (text or "")[m.end():]
+                split_prefix_styles = (prefix, cp0, rest, cp1)
 
     # secPr/ctrl 컨트롤 run은 보존하고, 일반 본문 run / linesegarray만 제거
     for ch in list(p_elem):
@@ -1022,6 +1107,19 @@ def _set_paragraph_rich_text(
                 p_elem.remove(ch)
 
     counter = id_counter if id_counter is not None else [0]
+    if split_prefix_styles is not None:
+        prefix, cp0, rest, cp1 = split_prefix_styles
+        for run_el in _build_rich_runs(
+            doc, prefix, base_char_pr_id=cp0, section_roots=section_roots, id_counter=counter
+        ):
+            p_elem.append(run_el)
+        if rest:
+            for run_el in _build_rich_runs(
+                doc, rest, base_char_pr_id=cp1, section_roots=section_roots, id_counter=counter
+            ):
+                p_elem.append(run_el)
+        return
+
     for run_el in _build_rich_runs(
         doc, text, base_char_pr_id=resolved_char_pr_id, section_roots=section_roots, id_counter=counter
     ):
@@ -1522,6 +1620,102 @@ def extract_hwpx_dom_map(doc_or_path: HwpxDocument | Path | str) -> Dict[str, An
     }
 
 
+def _compact_dom_map_for_prompt(dom_map: Dict[str, Any], max_chars: int = 45000) -> str:
+    """dom_map을 JSON 문자열로 직렬화하되 max_chars 초과 시 유효한 JSON 형태를 유지하며 경량화합니다."""
+    dom_json = json.dumps(dom_map, ensure_ascii=False, separators=(",", ":"))
+    if len(dom_json) <= max_chars:
+        return dom_json
+
+    compact = deepcopy(dom_map) if isinstance(dom_map, dict) else {"blocks": []}
+    blocks = compact.get("blocks")
+    if not isinstance(blocks, list):
+        return json.dumps({"truncated": True}, ensure_ascii=False, separators=(",", ":"))
+
+    # 1단계: 연속된 빈 문단 축약
+    collapsed: List[Dict[str, Any]] = []
+    empty_run_start: Optional[Dict[str, Any]] = None
+    empty_run_cnt = 0
+
+    def _flush_empty_run() -> None:
+        nonlocal empty_run_start, empty_run_cnt
+        if empty_run_start is not None:
+            entry = dict(empty_run_start)
+            if empty_run_cnt > 1:
+                entry["omitted_empty_count"] = empty_run_cnt - 1
+            collapsed.append(entry)
+            empty_run_start = None
+            empty_run_cnt = 0
+
+    for b in blocks:
+        is_empty_p = (
+            isinstance(b, dict)
+            and b.get("type") == "paragraph"
+            and not str(b.get("text", "")).strip()
+            and not b.get("page_break")
+        )
+        if is_empty_p:
+            if empty_run_start is None:
+                empty_run_start = b
+            empty_run_cnt += 1
+        else:
+            _flush_empty_run()
+            collapsed.append(b)
+    _flush_empty_run()
+    compact["blocks"] = collapsed
+
+    dom_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(dom_json) <= max_chars:
+        return dom_json
+
+    # 2단계: 긴 텍스트/표 셀 요약
+    for b in compact["blocks"]:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "paragraph":
+            txt = str(b.get("text", ""))
+            if len(txt) > 200:
+                b["text"] = txt[:200] + "..."
+        elif b.get("type") == "table":
+            rows = b.get("rows")
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, list):
+                        for cell in row:
+                            if isinstance(cell, dict):
+                                ctxt = str(cell.get("text", ""))
+                                if len(ctxt) > 120:
+                                    cell["text"] = ctxt[:120] + "..."
+                if len(rows) > 8:
+                    omitted_r = len(rows) - 6
+                    b["rows"] = rows[:4] + [[{"id": f"{b.get('id','')}_omitted", "text": f"...({omitted_r}행 생략)"}]] + rows[-2:]
+
+    dom_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(dom_json) <= max_chars:
+        return dom_json
+
+    # 3단계: 블록 단위 축약으로 유효한 JSON 유지
+    compact["truncated"] = True
+    cur_blocks = list(compact["blocks"])
+    while len(cur_blocks) > 2:
+        head_cnt = max(1, len(cur_blocks) // 3)
+        tail_cnt = max(1, len(cur_blocks) // 3)
+        if head_cnt + tail_cnt >= len(cur_blocks):
+            cur_blocks = cur_blocks[:1] + cur_blocks[-1:]
+        else:
+            omitted = len(cur_blocks) - head_cnt - tail_cnt
+            cur_blocks = (
+                cur_blocks[:head_cnt]
+                + [{"id": "_omitted", "type": "summary", "omitted_blocks": omitted}]
+                + cur_blocks[-tail_cnt:]
+            )
+        compact["blocks"] = cur_blocks
+        dom_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        if len(dom_json) <= max_chars:
+            return dom_json
+
+    return dom_json
+
+
 def build_hwpx_agent_prompt(dom_map: Dict[str, Any], user_instruction: str) -> Tuple[str, str]:
     """(system_prompt, user_prompt)를 생성합니다."""
     system_prompt = (
@@ -1541,16 +1735,17 @@ def build_hwpx_agent_prompt(dom_map: Dict[str, Any], user_instruction: str) -> T
         "11. append_table: {\"op\":\"append_table\", \"headers\":[\"항목\",\"내용\"], \"rows\":[[\"...\",\"...\"]], \"col_widths_ratio\":[1,3]}\n"
         "12. insert_table_after: {\"op\":\"insert_table_after\", \"target_id\":\"p_0\", \"headers\":[\"항목\",\"내용\"], \"rows\":[[\"...\",\"...\"]], \"col_widths_ratio\":[1,3]}\n"
         "13. page_break: {\"op\":\"page_break\"}\n"
+        "14. clone_block: {\"op\":\"clone_block\", \"source_id\":\"tbl_5\", \"after_id\":\"p_12\"}\n"
+        "15. delete_block: {\"op\":\"delete_block\", \"target_id\":\"p_5\"|\"tbl_2\"}\n"
         "핵심 규칙:\n"
+        "- 기존 서식에 `<보기>` 상자나 선택지 표(예: 3x3 상자, ①~⑤ 표)가 이미 있는 문서에 문항을 추가할 때는 `insert_exam_question` 대신 `clone_block`으로 기존 문항/표 서식을 복제한 뒤 `set_paragraph_text`/`update_cell`로 내용만 채우는 방식을 우선 사용하세요.\n"
         "- replace_text를 사용할 때 old_text는 DOM 맵에 있는 원문(공백, 중괄호 {}, $$...$$ 포함)을 임의로 고치지 말고 단 한 글자도 바꾸지 않은 채 그대로 복사하세요.\n"
         "- 표 셀(tbl_...) 내부의 수식($$...$$)이나 여러 줄 텍스트를 수정할 때는 replace_text 대신 update_cell을 우선 사용해도 됩니다.\n"
         "- new_text에는 지시사항에 맞게 실제로 수정된 최종 텍스트/수식을 반드시 반영하세요(원문 그대로 반환 금지).\n"
         "- 화학식/첨자/수식은 H_{2}O, Fe^{3+}, $$x^2 + y^2 = r^2$$, $$rm {CH}_{3}COOH(it {aq})$$처럼 "
         "한글 수식 문법(rm, it 뒤 공백 유지, 다문자 피연산자는 중괄호 {}로 감싸기, 백슬래시 금지)을 사용하세요."
     )
-    dom_json = json.dumps(dom_map, ensure_ascii=False, separators=(",", ":"))
-    if len(dom_json) > 45000:
-        dom_json = dom_json[:45000] + "\n...(이하 생략)"
+    dom_json = _compact_dom_map_for_prompt(dom_map, max_chars=45000)
 
     user_prompt = (
         f"### [교사 수정 지시사항]\n{user_instruction.strip()}\n\n"
@@ -1561,6 +1756,159 @@ def build_hwpx_agent_prompt(dom_map: Dict[str, Any], user_instruction: str) -> T
         f"### [현재 HWPX 경량 DOM 맵]\n```json\n{dom_json}\n```"
     )
     return system_prompt, user_prompt
+
+
+def build_hwpx_code_mode_prompt(dom_map: Dict[str, Any], user_instruction: str) -> Tuple[str, str]:
+    """샌드박스 Python(lxml) 편집 모드용 (system_prompt, user_prompt)를 생성합니다."""
+    system_prompt = (
+        "당신은 대한민국 교직 실무용 HWPX 문서의 XML(lxml)을 직접 편집하는 Python 코드 생성 에이전트입니다.\n"
+        "반드시 아래 시그니처의 함수 1개만 ```python ... ``` 코드블록 안에 작성하세요:\n"
+        "```python\n"
+        "def edit_hwpx(sec_root, helpers):\n"
+        "    ...\n"
+        "```\n\n"
+        "보안 및 문법 제약 (위반 시 즉시 차단됨):\n"
+        "- `import` / `from ... import` 문 절대 금지 (이미 전역에 `ET`, `deepcopy`, `re`, `helpers`가 주입되어 있음).\n"
+        "- `open`, `eval`, `exec`, `compile`, `__import__`, `getattr`, `setattr`, `delattr`, `globals`, `locals` 및 `__` 던더 속성 접근 절대 금지.\n\n"
+        "핵심 편집 규칙:\n"
+        "1. 새 XML 태그를 맨땅에서 조립하지 말고, 기존 `sec_root`의 문단(`<hp:p>`)이나 표(`<hp:tbl>`) 블록을 `deepcopy`로 복제한 뒤 `helpers`로 텍스트와 ID만 갱신하세요.\n"
+        "2. `secPr` 보존: 첫 문단 등에 들어 있는 `<hp:secPr>`/`<hp:ctrl>`은 절대 삭제하거나 손상시키지 마세요.\n"
+        "3. 복제한 모든 블록에는 반드시 `helpers['reassign_cloned_ids'](cloned_elem)`을 호출해 `tbl`/`rect`/`p`/`equation`의 `id` 중복과 `linesegarray` 잔존을 방지하세요.\n"
+        "4. 2단 편집 및 문항 서식 안내:\n"
+        "   - `<보기>` 표나 `①~⑤` 선택지 표가 기존 문서에 있으면 그 표를 감싼 `<hp:p>`(또는 `helpers['wrap_table_in_paragraph'](tbl_clone)`)를 복제해 고정 2단 폭과 테두리 서식을 그대로 유지하세요.\n"
+        "   - 새 너비 계산이 필요하면 `helpers['compute_content_width']()`로 현재 문서의 실제 1단 너비를 조회하세요.\n"
+        "5. 사용 가능한 `helpers` 목록:\n"
+        "   - `helpers['collect_dom_ids']()` -> `dict` (`id_map[dom_id] = (sec_name, parent_elem, target_elem)`)\n"
+        "   - `helpers['set_paragraph_rich_text'](p_elem, text, base_char_pr_id=None)` (**굵게**, __밑줄__, **__굵게+밑줄__**, _{...}, ^{...}, $$...$$ 지원)\n"
+        "   - `helpers['extract_paragraph_plain_text'](p_elem)` -> `str`\n"
+        "   - `helpers['next_object_id']()` -> `str`\n"
+        "   - `helpers['reassign_cloned_ids'](elem)` -> `None`\n"
+        "   - `helpers['strip_sec_pr_and_ctrl'](p_elem)` / `helpers['strip_linesegarray'](p_elem)`\n"
+        "   - `helpers['wrap_table_in_paragraph'](tbl_elem)` -> `<hp:p>`\n"
+        "   - `helpers['local_tag'](elem)` / `helpers['find_child'](parent, tag_name)` / `helpers['HP_NS']`\n"
+    )
+    dom_json = _compact_dom_map_for_prompt(dom_map, max_chars=45000)
+    user_prompt = (
+        f"### [교사 복합 편집 지시사항]\n{user_instruction.strip()}\n\n"
+        f"### [출력 형식 - 필수 준수]\n"
+        f"`def edit_hwpx(sec_root, helpers):` 함수 1개만 ```python ... ``` 블록으로 출력하세요.\n\n"
+        f"### [현재 HWPX 경량 DOM 맵]\n```json\n{dom_json}\n```"
+    )
+    return system_prompt, user_prompt
+
+
+_CODE_MODE_COMPLEX_PATTERNS = (
+    r"서식\s*복제",
+    r"기존\s*서식",
+    r"문항.*구성",
+    r"유형별",
+    r"틀\s*배치",
+    r"<보기>.*복제",
+    r"보기.*상자.*복제",
+    r"선택지\s*표",
+    r"레이아웃\s*재구성",
+    r"Python\s*코드\s*모드",
+    r"code_mode",
+)
+
+
+def should_use_hwpx_code_mode(
+    user_instruction: str,
+    dom_map: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """지시사항이 복합 양식 변형/서식 복제 작업인지 판별해 code_mode 라우팅 여부를 반환합니다."""
+    inst = str(user_instruction or "").strip()
+    if not inst:
+        return False
+    for pat in _CODE_MODE_COMPLEX_PATTERNS:
+        if re.search(pat, inst, re.IGNORECASE):
+            return True
+    return False
+
+
+def execute_hwpx_hybrid_edit(
+    doc: HwpxDocument,
+    user_instruction: str,
+    llm_generate_fn: Callable[[str, str], str],
+    *,
+    dom_map: Optional[Dict[str, Any]] = None,
+    max_retries: int = 2,
+    force_code_mode: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """
+    단순 작업은 JSON Patch 경로로, 복합 양식 변형 또는 JSON Patch 실패 시에는
+    샌드박스 Python(lxml) 코드 모드 + 최대 2회 Self-Correction 루프로 실행합니다.
+    """
+    from services.hwpx_sandbox_runner import (
+        extract_python_code_from_llm_response,
+        run_hwpx_edit_code,
+    )
+    from services.llm_client import extract_json_from_llm_response
+
+    cur_dom = dom_map if isinstance(dom_map, dict) else extract_hwpx_dom_map(doc)
+    use_code = (
+        bool(force_code_mode)
+        if force_code_mode is not None
+        else should_use_hwpx_code_mode(user_instruction, cur_dom)
+    )
+
+    if not use_code:
+        sys_p, usr_p = build_hwpx_agent_prompt(cur_dom, user_instruction)
+        raw_reply = llm_generate_fn(usr_p, sys_p)
+        try:
+            parsed = extract_json_from_llm_response(raw_reply)
+            ops = parsed.get("operations") if isinstance(parsed, dict) else None
+            if isinstance(ops, list) and ops:
+                patch_res = apply_hwpx_patch(doc, [o for o in ops if isinstance(o, dict)])
+                if patch_res.get("applied_count", 0) > 0:
+                    return {
+                        "mode": "json_patch",
+                        "success": True,
+                        "parsed_json": parsed,
+                        "raw_response": raw_reply,
+                        "patch_result": patch_res,
+                        "html_preview": render_hwpx_to_html(doc),
+                    }
+        except Exception:
+            pass
+        # JSON Patch 추출 또는 적용 실패 시 code_mode로 폴백
+
+    sys_p, base_usr_p = build_hwpx_code_mode_prompt(cur_dom, user_instruction)
+    cur_usr_p = base_usr_p
+    last_error = ""
+    last_raw = ""
+    last_code = ""
+
+    for attempt in range(max_retries + 1):
+        raw_reply = llm_generate_fn(cur_usr_p, sys_p)
+        last_raw = raw_reply
+        code = extract_python_code_from_llm_response(raw_reply)
+        last_code = code
+        run_res = run_hwpx_edit_code(doc, code)
+        if run_res.get("success"):
+            return {
+                "mode": "code_mode",
+                "success": True,
+                "code": code,
+                "raw_response": raw_reply,
+                "attempts": attempt + 1,
+                "html_preview": render_hwpx_to_html(doc),
+            }
+        last_error = str(run_res.get("error", "알 수 없는 오류"))
+        cur_usr_p = (
+            f"{base_usr_p}\n\n"
+            f"### [이전 코드 실행 오류 - 원인 수정 후 `def edit_hwpx(sec_root, helpers):` 전체를 다시 작성하세요]\n"
+            f"```text\n{last_error}\n```"
+        )
+
+    return {
+        "mode": "code_mode",
+        "success": False,
+        "code": last_code,
+        "raw_response": last_raw,
+        "error": last_error,
+        "attempts": max_retries + 1,
+    }
 
 
 def _summarize_dom_map_for_create(dom_map: Optional[Dict[str, Any]]) -> str:
@@ -1724,6 +2072,60 @@ def _get_target_section_root(
     return sec_names[-1], section_roots[sec_names[-1]]
 
 
+def _compute_section_content_width(
+    section_roots: Dict[str, Any],
+    default_width: int = 42520,
+) -> int:
+    """section0.xml의 pagePr(폭-좌우여백) 및 colPr(다단·단간격)을 읽어 실제 1단 너비를 계산합니다."""
+    if not section_roots:
+        return default_width
+    sec_root = section_roots.get("Contents/section0.xml")
+    if sec_root is None:
+        sec_root = next(iter(section_roots.values()), None)
+    if sec_root is None:
+        return default_width
+
+    page_w = 0
+    margin_l = 0
+    margin_r = 0
+    margin_g = 0
+    col_count = 1
+    same_gap = 0
+
+    for node in sec_root.iter():
+        t = _local_tag(node)
+        if t == "pagePr" and page_w == 0:
+            try:
+                page_w = int(node.get("width", "0") or 0)
+            except ValueError:
+                page_w = 0
+            m_el = _find_child(node, "margin")
+            if m_el is not None:
+                try:
+                    margin_l = int(m_el.get("left", "0") or 0)
+                    margin_r = int(m_el.get("right", "0") or 0)
+                    margin_g = int(m_el.get("gutter", "0") or 0)
+                except ValueError:
+                    pass
+        elif t == "colPr":
+            try:
+                c_val = int(node.get("colCount", "1") or 1)
+                if c_val >= 1:
+                    col_count = c_val
+                same_gap = int(node.get("sameGap", "0") or 0)
+            except ValueError:
+                pass
+
+    content_w = page_w - margin_l - margin_r - margin_g
+    if content_w <= 0:
+        content_w = default_width
+
+    if col_count >= 2:
+        col_w = (content_w - same_gap * (col_count - 1)) // col_count
+        return max(5000, col_w)
+    return max(5000, content_w)
+
+
 def _next_section_object_id(
     section_roots: Dict[str, Any],
     id_counter: Optional[List[int]] = None,
@@ -1735,7 +2137,7 @@ def _next_section_object_id(
     max_id = min_base
     for root in section_roots.values():
         for node in root.iter():
-            if _local_tag(node) in ("tbl", "equation", "p"):
+            if _local_tag(node) in ("tbl", "rect", "equation", "p"):
                 raw_id = str(node.get("id", "")).strip()
                 if raw_id:
                     used_ids.add(raw_id)
@@ -1875,7 +2277,7 @@ def _build_table_element(
     normalized_rows = [list(r) + [""] * (col_cnt - len(r)) for r in all_rows]
     row_cnt = len(normalized_rows)
 
-    total_w = 42520
+    total_w = _compute_section_content_width(section_roots, default_width=42520)
     if ratios:
         if len(ratios) < col_cnt:
             avg_r = sum(ratios) / len(ratios)
@@ -2026,15 +2428,53 @@ def _build_table_element(
     return tbl
 
 
+def _find_enclosing_block_container(
+    section_roots: Dict[str, Any],
+    parent: Any,
+    elem: Any,
+) -> Tuple[Any, Any]:
+    """tbl 등 중첩 요소를 감싸는 최상위 블록(<hp:p>)과 그 컨테이너(<hp:sec>/<hp:subList>)를 반환합니다."""
+    if _local_tag(elem) == "p" and _local_tag(parent) in ("sec", "subList"):
+        return parent, elem
+    for root in section_roots.values():
+        parent_map: Dict[Any, Any] = {child: p for p in root.iter() for child in p}
+        if elem not in parent_map and elem is not root:
+            continue
+        cur = elem
+        while cur in parent_map:
+            anc = parent_map[cur]
+            if _local_tag(anc) in ("sec", "subList"):
+                return anc, cur
+            cur = anc
+    return parent, elem
+
+
+def _reassign_cloned_ids_and_strip(cloned_elem: Any, section_roots: Dict[str, Any], counter: List[int]) -> None:
+    """복제된 블록 트리 내부의 secPr/ctrl/linesegarray를 제거하고 tbl/rect/p/equation id를 재발급합니다."""
+    nodes = [cloned_elem] + list(cloned_elem.iter())
+    for node in nodes:
+        t = _local_tag(node)
+        if t == "p":
+            _strip_sec_pr_and_ctrl(node)
+        if t in ("tbl", "rect", "p", "equation"):
+            node.set("id", _next_section_object_id(section_roots, counter))
+
+
 def apply_single_hwpx_operation(
     doc: HwpxDocument,
     op_data: Dict[str, Any],
     id_counter: Optional[List[int]] = None,
+    *,
+    preloaded_dom: Optional[Tuple[Dict[str, Tuple[str, Any, Any]], Dict[str, Any]]] = None,
+    flush: bool = True,
 ) -> List[str]:
     """단일 JSON Patch 연산을 적용하고, 하이라이트할 변경 대상 ID 목록을 반환합니다."""
     op = str(op_data.get("op", "")).strip()
     target_id = str(op_data.get("target_id", "")).strip()
-    id_map, _, section_roots = _collect_section_dom(doc)
+    if preloaded_dom is not None:
+        id_map, section_roots = preloaded_dom
+    else:
+        id_map, _, section_roots = _collect_section_dom(doc)
     touched_ids: List[str] = []
     counter = id_counter if id_counter is not None else [0]
 
@@ -2106,6 +2546,65 @@ def apply_single_hwpx_operation(
             parent.insert(ins_idx, new_p)
             touched_ids.append(target_id)
 
+    elif op == "clone_block":
+        source_id = str(op_data.get("source_id") or target_id or "").strip()
+        after_id = str(op_data.get("after_id") or target_id or source_id).strip()
+        if source_id in id_map:
+            _, _, src_elem = id_map[source_id]
+            cloned_elem = deepcopy(src_elem)
+            _reassign_cloned_ids_and_strip(cloned_elem, section_roots, counter)
+            if _local_tag(cloned_elem) == "tbl":
+                block_to_insert = _wrap_table_in_paragraph(cloned_elem, section_roots, counter)
+            else:
+                block_to_insert = cloned_elem
+
+            if after_id in id_map:
+                _, raw_parent, after_elem = id_map[after_id]
+                parent, ins_idx, _ = _resolve_block_insertion_target(
+                    section_roots, raw_parent, after_elem
+                )
+                parent.insert(ins_idx, block_to_insert)
+            else:
+                sec_info = _get_target_section_root(doc, section_roots)
+                if sec_info is not None:
+                    _, sec_root = sec_info
+                    sec_root.append(block_to_insert)
+            new_id = _find_dom_id_for_element(section_roots, cloned_elem)
+            if new_id:
+                touched_ids.append(new_id)
+
+    elif op == "delete_block":
+        if target_id in id_map:
+            _, raw_parent, elem = id_map[target_id]
+            if _local_tag(elem) == "tbl":
+                container, block_elem = _find_enclosing_block_container(
+                    section_roots, raw_parent, elem
+                )
+            else:
+                container, block_elem = raw_parent, elem
+            sec_runs = [
+                ch
+                for ch in block_elem
+                if _local_tag(ch) == "run" and _run_has_sec_pr_or_ctrl(ch)
+            ]
+            if sec_runs:
+                sibling_ps = [
+                    ch for ch in container if _local_tag(ch) == "p" and ch is not block_elem
+                ]
+                if sibling_ps:
+                    for offset, sr in enumerate(sec_runs):
+                        sibling_ps[0].insert(offset, deepcopy(sr))
+                    if block_elem in list(container):
+                        container.remove(block_elem)
+                else:
+                    _set_paragraph_rich_text(
+                        doc, block_elem, "", section_roots=section_roots, id_counter=counter
+                    )
+            else:
+                if block_elem in list(container):
+                    container.remove(block_elem)
+            touched_ids.append(target_id)
+
     elif op == "delete_paragraph":
         if target_id in id_map:
             _, parent, elem = id_map[target_id]
@@ -2140,6 +2639,8 @@ def apply_single_hwpx_operation(
                 sub_list.remove(p_old)
             for ln in lines:
                 new_p = deepcopy(template_p)
+                _strip_sec_pr_and_ctrl(new_p)
+                new_p.set("id", _next_section_object_id(section_roots, counter))
                 _set_paragraph_rich_text(
                     doc, new_p, ln, section_roots=section_roots, id_counter=counter
                 )
@@ -2177,6 +2678,8 @@ def apply_single_hwpx_operation(
                     for p_old in ps:
                         sub_list.remove(p_old)
                     new_p = deepcopy(tmpl_p)
+                    _strip_sec_pr_and_ctrl(new_p)
+                    new_p.set("id", _next_section_object_id(section_roots, counter))
                     _set_paragraph_rich_text(
                         doc, new_p, txt, section_roots=section_roots, id_counter=counter
                     )
@@ -2411,7 +2914,8 @@ def apply_single_hwpx_operation(
         else:
             sec_info = _get_target_section_root(doc, section_roots)
             if sec_info is None:
-                _flush_sections(doc, section_roots)
+                if flush:
+                    _flush_sections(doc, section_roots)
                 return touched_ids
             _, parent = sec_info
             placeholder_stem = _consume_initial_secpr_placeholder(parent)
@@ -2463,6 +2967,7 @@ def apply_single_hwpx_operation(
 
         # 2) <보기> 1x1 테두리 박스 표
         if bogi_list:
+            bogi_w = str(_compute_section_content_width(section_roots, default_width=40000))
             border_fill_id = _ensure_table_border_fill_id(doc)
             bogi_tbl_id = _next_section_object_id(section_roots, counter)
             bogi_tbl = ET.Element(
@@ -2488,7 +2993,7 @@ def apply_single_hwpx_operation(
                 bogi_tbl,
                 _qname(HP_NS, "sz"),
                 {
-                    "width": "40000",
+                    "width": bogi_w,
                     "widthRelTo": "ABSOLUTE",
                     "height": "2000",
                     "heightRelTo": "ABSOLUTE",
@@ -2585,7 +3090,7 @@ def apply_single_hwpx_operation(
                 )
             ET.SubElement(tc, _qname(HP_NS, "cellAddr"), {"colAddr": "0", "rowAddr": "0"})
             ET.SubElement(tc, _qname(HP_NS, "cellSpan"), {"colSpan": "1", "rowSpan": "1"})
-            ET.SubElement(tc, _qname(HP_NS, "cellSz"), {"width": "40000", "height": "2000"})
+            ET.SubElement(tc, _qname(HP_NS, "cellSz"), {"width": bogi_w, "height": "2000"})
             ET.SubElement(
                 tc,
                 _qname(HP_NS, "cellMargin"),
@@ -2625,7 +3130,8 @@ def apply_single_hwpx_operation(
         new_stem_id = _find_dom_id_for_element(section_roots, stem_p)
         touched_ids.append(new_stem_id or target_id or "p_0")
 
-    _flush_sections(doc, section_roots)
+    if flush:
+        _flush_sections(doc, section_roots)
     return touched_ids
 
 
@@ -2639,9 +3145,19 @@ def apply_hwpx_operations(
         doc.push_undo_snapshot()
     all_touched: List[str] = []
     id_counter = [0]
+    id_map, _, section_roots = _collect_section_dom(doc)
     for op_data in operations:
         if isinstance(op_data, dict):
-            all_touched.extend(apply_single_hwpx_operation(doc, op_data, id_counter=id_counter))
+            all_touched.extend(
+                apply_single_hwpx_operation(
+                    doc,
+                    op_data,
+                    id_counter=id_counter,
+                    preloaded_dom=(id_map, section_roots),
+                    flush=False,
+                )
+            )
+    _flush_sections(doc, section_roots)
     return list(dict.fromkeys(all_touched))
 
 

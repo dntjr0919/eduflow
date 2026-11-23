@@ -4902,6 +4902,32 @@ class DocOcrTab(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "저장 실패", f"정답지 저장 중 오류가 발생했습니다:\n{exc}")
 
+    def apply_hwpx_code_mode_result(self, code: str) -> None:
+        """하이브리드 샌드박스 Python(lxml) 코드 편집 결과를 현재 문서에 적용하고 미리보기를 갱신합니다."""
+        if self._hwpx_doc is None:
+            self._on_hwpx_create_new(emit_sync=False)
+        from services.hwpx_sandbox_runner import run_hwpx_edit_code
+
+        res = run_hwpx_edit_code(self._hwpx_doc, code)
+        if not res.get("success"):
+            QMessageBox.warning(
+                self,
+                "코드 편집 실패",
+                f"하이브리드 코드 편집 적용 중 오류가 발생했습니다:\n{res.get('error', '')}",
+            )
+            return
+        self._hwpx_dirty = True
+        self._hwpx_highlighted_ids = set()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self.btn_hwpx_undo.setEnabled(self._hwpx_doc.can_undo())
+        self.btn_hwpx_save_answers.setEnabled(bool(self._hwpx_doc.exam_answers))
+        self._render_hwpx_viewer()
+        self._update_hwpx_nav_bar()
+        self.lbl_hwpx_summary_badge.setText("적용 완료: 하이브리드 코드 편집 모드 반영됨")
+        self.lbl_hwpx_summary_badge.setStyleSheet("")
+        self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+
     def apply_hwpx_patch_payload(self, payload: Dict[str, Any], immediate: bool = False) -> None:
         """AI가 반환한 JSON Patch(summary + operations)를 순차 적용하며 하이라이트합니다."""
         if self._hwpx_doc is None:
@@ -5034,6 +5060,7 @@ class DocOcrTab(QWidget):
                 "task_label": "HWPX 새 양식 생성" if self._hwpx_is_create_mode else "HWPX 문서 편집",
                 "kind": "hwpx_agent",
                 "hwpx_path": str(self._hwpx_doc.source_path) if (self._hwpx_doc and self._hwpx_doc.source_path) else "",
+                "hwpx_entries": dict(self._hwpx_doc.entries) if self._hwpx_doc is not None else None,
                 "doc_instance_id": id(self._hwpx_doc) if self._hwpx_doc is not None else 0,
                 "dom_map": dom_map,
                 "is_create_mode": bool(self._hwpx_is_create_mode),
@@ -5219,6 +5246,9 @@ class DocOcrTab(QWidget):
         """우측 AiExecutionDock에서 실행된 결과를 중앙 탭 UI 및 미리보기 테이블에 반영합니다."""
         tid = str(payload.get("target_id", "") or self._active_ai_target_id)
         if tid == "hwpx_agent":
+            if payload.get("exec_kind") == "code_mode" and payload.get("code"):
+                self.apply_hwpx_code_mode_result(str(payload.get("code", "")))
+                return
             parsed = payload.get("parsed_json")
             if isinstance(parsed, dict):
                 self.apply_hwpx_patch_payload(parsed, immediate=bool(payload.get("immediate", False)))

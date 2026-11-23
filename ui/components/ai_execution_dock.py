@@ -80,6 +80,7 @@ from services.hwpx_agent_service import (
     build_hwpx_agent_prompt,
     build_hwpx_create_prompt,
     create_minimal_hwpx_document,
+    execute_hwpx_hybrid_edit,
     extract_hwpx_dom_map,
     extract_hwpx_reference_chunks,
 )
@@ -552,6 +553,7 @@ class _DockApiHwpxAgentWorker(BaseWorker):
         ref_chunks: Optional[List[Dict[str, Any]]] = None,
         reference_files: Optional[List[str]] = None,
         preselected_chunk_ids: Optional[List[str]] = None,
+        hwpx_doc_snapshot: Optional[HwpxDocument] = None,
     ):
         super().__init__(task_name="HWPX AI 문서 에이전트 (API)")
         self.dom_map = dom_map
@@ -560,6 +562,7 @@ class _DockApiHwpxAgentWorker(BaseWorker):
         self.ref_chunks: List[Dict[str, Any]] = list(ref_chunks or [])
         self.reference_files: List[str] = [str(p).strip() for p in (reference_files or []) if str(p).strip()]
         self.preselected_chunk_ids: List[str] = list(preselected_chunk_ids or [])
+        self.hwpx_doc_snapshot = hwpx_doc_snapshot
 
     def _ocr_scanned_pages_in_batches(
         self,
@@ -716,11 +719,44 @@ class _DockApiHwpxAgentWorker(BaseWorker):
                     current_dom_map=self.dom_map,
                 )
             else:
-                self.emit_progress(25, "HWPX DOM 맵 분석 및 AI 프롬프트 전송 중...")
-                sys_p, usr_p = build_hwpx_agent_prompt(self.dom_map or {}, self.instruction)
-
-            raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
-            parsed = extract_json_from_llm_response(raw_reply)
+                if self.hwpx_doc_snapshot is not None:
+                    self.emit_progress(25, "HWPX 하이브리드 편집 실행 중...")
+                    hybrid_res = execute_hwpx_hybrid_edit(
+                        self.hwpx_doc_snapshot,
+                        self.instruction,
+                        lambda u, s: client.generate(prompt=u, system_prompt=s),
+                        dom_map=self.dom_map,
+                        max_retries=2,
+                    )
+                    if hybrid_res.get("mode") == "code_mode":
+                        if not hybrid_res.get("success"):
+                            raise RuntimeError(
+                                f"하이브리드 코드 편집 실패 ({hybrid_res.get('attempts', 3)}회 시도): "
+                                f"{hybrid_res.get('error', '')}"
+                            )
+                        self.emit_progress(100, "하이브리드 코드 편집 완료")
+                        return {
+                            "target_id": "hwpx_agent",
+                            "mode": "api",
+                            "exec_kind": "code_mode",
+                            "code": hybrid_res["code"],
+                            "raw_response": hybrid_res.get("raw_response", ""),
+                            "attempts": hybrid_res.get("attempts", 1),
+                            "immediate": True,
+                            "already_applied_parts": False,
+                            "completed_parts": 1,
+                            "total_parts": 1,
+                        }
+                    parsed = hybrid_res.get("parsed_json") or {}
+                    raw_reply = str(hybrid_res.get("raw_response", ""))
+                else:
+                    self.emit_progress(25, "HWPX DOM 맵 분석 및 AI 프롬프트 전송 중...")
+                    sys_p, usr_p = build_hwpx_agent_prompt(self.dom_map or {}, self.instruction)
+                    raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+                    parsed = extract_json_from_llm_response(raw_reply)
+            if self.is_create_mode or ref_content:
+                raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+                parsed = extract_json_from_llm_response(raw_reply)
             self.emit_progress(100, "JSON Patch 생성 완료")
             return {
                 "target_id": "hwpx_agent",
@@ -3019,6 +3055,14 @@ class AiExecutionDock(QFrame):
                 return
             effective_inst = inst or "참고 문서의 구조와 내용을 충실히 반영하여 새 HWPX 양식을 생성하세요."
             ref_files_list = [str(p).strip() for p in (ctx.get("reference_files") or []) if str(p).strip()]
+            raw_entries = ctx.get("hwpx_entries")
+            doc_snap = None
+            if isinstance(raw_entries, dict) and raw_entries:
+                hwpx_path_str = str(ctx.get("hwpx_path") or "").strip()
+                doc_snap = HwpxDocument(
+                    source_path=Path(hwpx_path_str) if hwpx_path_str else None,
+                    entries=dict(raw_entries),
+                )
             worker = _DockApiHwpxAgentWorker(
                 dom_map=dom_map if isinstance(dom_map, dict) else None,
                 instruction=self._append_quote_to_prompt(effective_inst),
@@ -3026,6 +3070,7 @@ class AiExecutionDock(QFrame):
                 ref_chunks=chunks,
                 reference_files=ref_files_list,
                 preselected_chunk_ids=list(self._hwpx_selected_chunk_ids),
+                hwpx_doc_snapshot=doc_snap,
             )
             worker.part_completed.connect(
                 lambda p_payload, tid=str(ctx.get("target_id", self._active_target_id)): self._on_api_hwpx_part_completed(
