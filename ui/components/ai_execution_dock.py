@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -95,6 +96,10 @@ from services.hwpx_ref_session_service import (
     parse_stage1_selection_response,
     parse_stage2_response_status,
     resolve_selected_chunks,
+)
+from services.hwpx_sandbox_runner import (
+    extract_python_code_from_llm_response,
+    validate_generated_code,
 )
 from services.llm_client import (
     MultiLlmClient,
@@ -1567,6 +1572,41 @@ class _ManualExtraPasteDialog(QDialog):
         return self.txt_response.toPlainText().strip()
 
 
+def detect_hwpx_clipboard_payload(raw_text: str) -> Optional[Dict[str, Any]]:
+    """
+    클립보드 텍스트가 유효한 HWPX JSON("operations" 포함) 또는 코드 모드 Python 함수(def edit_hwpx)인지 판별합니다.
+    일반 문장 등 무관한 텍스트는 None을 반환합니다.
+    """
+    txt = str(raw_text or "").strip()
+    if not txt:
+        return None
+
+    try:
+        parsed = extract_json_from_llm_response(txt)
+        if isinstance(parsed, dict) and isinstance(parsed.get("operations"), list):
+            return {
+                "kind": "json",
+                "parsed": parsed,
+                "ops_count": len(parsed["operations"]),
+            }
+    except Exception:
+        pass
+
+    if "def edit_hwpx" in txt:
+        try:
+            code = extract_python_code_from_llm_response(txt)
+            if "def edit_hwpx" in code:
+                validate_generated_code(code)
+                return {
+                    "kind": "code_mode",
+                    "code": code,
+                }
+        except Exception:
+            pass
+
+    return None
+
+
 class AiExecutionDock(QFrame):
     """EduFlow 우측 접이식 AI 실행 사이드바 위젯 (폭 340px)."""
 
@@ -1578,6 +1618,8 @@ class AiExecutionDock(QFrame):
     go_to_settings_requested = pyqtSignal()
     execution_completed = pyqtSignal(str, dict)
     ai_mode_changed = pyqtSignal()
+    sidepanel_mode_requested = pyqtSignal(bool)
+    always_on_top_requested = pyqtSignal(bool)
 
     def __init__(
         self,
@@ -1638,6 +1680,14 @@ class AiExecutionDock(QFrame):
         self._quoted_text: str = ""
         self._quoted_target_id: str = ""
 
+        # 사이드패널 모드 & 수동 복붙 클립보드 자동 감지 상태
+        self._sidepanel_mode: bool = False
+        self._always_on_top: bool = False
+        self._panel_root: Optional[QFrame] = None
+        self._last_clipboard_payload_hash: str = ""
+        self._detected_clipboard_payload: Optional[Dict[str, Any]] = None
+        self._detected_clipboard_text: str = ""
+
         self.setMinimumWidth(0)
         self.setMaximumWidth(0)
 
@@ -1666,6 +1716,7 @@ class AiExecutionDock(QFrame):
         panel = QFrame(clip_scroll)
         _apply_role(panel, obj_name="AiDockPanelRoot")
         panel.setFixedWidth(self.EXPANDED_WIDTH)
+        self._panel_root = panel
 
         root_lay = QVBoxLayout(panel)
         root_lay.setContentsMargins(10, 12, 10, 10)
@@ -1705,6 +1756,22 @@ class AiExecutionDock(QFrame):
         )
         self.btn_session_menu.clicked.connect(self._on_session_menu_clicked)
 
+        self.btn_sidepanel_mode = QPushButton("사이드패널 모드")
+        _apply_role(self.btn_sidepanel_mode, role="outline", obj_name="AiDockSidepanelBtn")
+        self.btn_sidepanel_mode.setCheckable(True)
+        self.btn_sidepanel_mode.setFixedHeight(26)
+        self.btn_sidepanel_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sidepanel_mode.setToolTip("화면 오른쪽 끝 420px 미니 사이드패널 모드로 전환")
+        self.btn_sidepanel_mode.toggled.connect(self.sidepanel_mode_requested.emit)
+
+        self.btn_always_on_top = QPushButton("항상 위에")
+        _apply_role(self.btn_always_on_top, role="outline", obj_name="AiDockPinBtn")
+        self.btn_always_on_top.setCheckable(True)
+        self.btn_always_on_top.setFixedHeight(26)
+        self.btn_always_on_top.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_always_on_top.setToolTip("창을 다른 프로그램(한/글 등) 위에 항상 고정")
+        self.btn_always_on_top.toggled.connect(self.always_on_top_requested.emit)
+
         self._session_popover = _SessionPopover(self)
         self._session_popover.new_session_requested.connect(self.create_new_session)
         self._session_popover.session_selected.connect(self.load_session)
@@ -1712,6 +1779,8 @@ class AiExecutionDock(QFrame):
 
         th_top_row.addWidget(lbl_target_cap)
         th_top_row.addStretch()
+        th_top_row.addWidget(self.btn_sidepanel_mode)
+        th_top_row.addWidget(self.btn_always_on_top)
         th_top_row.addWidget(self.btn_session_menu)
         th_lay.addLayout(th_top_row)
 
@@ -1721,6 +1790,17 @@ class AiExecutionDock(QFrame):
         self.combo_target_selector.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.combo_target_selector.currentIndexChanged.connect(self._on_target_combo_changed)
         th_lay.addWidget(self.combo_target_selector)
+
+        # 사이드패널 모드 전용 1줄 작업 파일명 배지
+        self.lbl_sidepanel_file_badge = QLabel("")
+        self.lbl_sidepanel_file_badge.setObjectName("SidepanelFileBadge")
+        self.lbl_sidepanel_file_badge.setStyleSheet(
+            "QLabel#SidepanelFileBadge { "
+            "background-color: #EFF6FF; color: #1E40AF; border: 1px solid #BFDBFE; "
+            "border-radius: 5px; padding: 4px 8px; font-size: 11.5px; font-weight: 700; }"
+        )
+        self.lbl_sidepanel_file_badge.setVisible(False)
+        th_lay.addWidget(self.lbl_sidepanel_file_badge)
 
         root_lay.addWidget(target_header)
 
@@ -1770,6 +1850,38 @@ class AiExecutionDock(QFrame):
         seg_row.addWidget(seg_frame, stretch=1)
         seg_row.addWidget(self.btn_mode_options)
         root_lay.addLayout(seg_row)
+
+        # [2.2단] 수동 복붙 모드 클립보드 AI 응답 감지 원클릭 배너 (기본 숨김)
+        self.clipboard_detect_banner = QFrame(panel)
+        self.clipboard_detect_banner.setObjectName("ClipboardDetectBanner")
+        self.clipboard_detect_banner.setStyleSheet(
+            "QFrame#ClipboardDetectBanner { "
+            "background-color: #ECFDF5; border: 1px solid #10B981; border-radius: 6px; }"
+        )
+        cdb_lay = QHBoxLayout(self.clipboard_detect_banner)
+        cdb_lay.setContentsMargins(8, 6, 6, 6)
+        cdb_lay.setSpacing(6)
+        self.lbl_clipboard_detect = QLabel("클립보드에서 AI 응답 감지됨")
+        self.lbl_clipboard_detect.setWordWrap(True)
+        self.lbl_clipboard_detect.setStyleSheet("color: #065F46; font-size: 11px; font-weight: 700;")
+        self.btn_apply_detected_clipboard = QPushButton("바로 적용")
+        _apply_role(self.btn_apply_detected_clipboard, role="primary", obj_name="BtnApplyDetectedClipboard")
+        self.btn_apply_detected_clipboard.setFixedHeight(24)
+        self.btn_apply_detected_clipboard.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_detected_clipboard.clicked.connect(self._on_apply_detected_clipboard_clicked)
+        self.btn_dismiss_clipboard_banner = QPushButton("✕")
+        self.btn_dismiss_clipboard_banner.setFixedSize(22, 22)
+        self.btn_dismiss_clipboard_banner.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_dismiss_clipboard_banner.setStyleSheet(
+            "QPushButton { background: transparent; border: none; color: #047857; font-weight: 700; }"
+            "QPushButton:hover { color: #064E3B; }"
+        )
+        self.btn_dismiss_clipboard_banner.clicked.connect(self._dismiss_clipboard_detect_banner)
+        cdb_lay.addWidget(self.lbl_clipboard_detect, stretch=1)
+        cdb_lay.addWidget(self.btn_apply_detected_clipboard)
+        cdb_lay.addWidget(self.btn_dismiss_clipboard_banner)
+        self.clipboard_detect_banner.setVisible(False)
+        root_lay.addWidget(self.clipboard_detect_banner)
 
         # [2.3단] 미리보기 선택 인용 배지 (이모지 미사용)
         self.quote_badge_frame = QFrame(panel)
@@ -2321,8 +2433,11 @@ class AiExecutionDock(QFrame):
         # 특수 타겟용 프롬프트 복사 버튼 행 (범용 챗에서는 숨김)
         self.manual_copy_card = QFrame()
         _apply_role(self.manual_copy_card, role="subCard")
-        mc_copy_lay = QHBoxLayout(self.manual_copy_card)
-        mc_copy_lay.setContentsMargins(8, 6, 8, 6)
+        mc_outer_lay = QVBoxLayout(self.manual_copy_card)
+        mc_outer_lay.setContentsMargins(8, 6, 8, 6)
+        mc_outer_lay.setSpacing(6)
+        mc_copy_lay = QHBoxLayout()
+        mc_copy_lay.setContentsMargins(0, 0, 0, 0)
         mc_copy_lay.setSpacing(6)
 
         self.btn_manual_copy_open = QPushButton("프롬프트 복사 & 웹 열기")
@@ -2339,6 +2454,18 @@ class AiExecutionDock(QFrame):
 
         mc_copy_lay.addWidget(self.btn_manual_copy_open, stretch=1)
         mc_copy_lay.addWidget(self.btn_manual_copy_only)
+
+        self.btn_manual_clipboard_apply = QPushButton("클립보드 바로 적용")
+        _apply_role(self.btn_manual_clipboard_apply, role="secondary", obj_name="BtnDockClipboardApply")
+        self.btn_manual_clipboard_apply.setFixedHeight(30)
+        self.btn_manual_clipboard_apply.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_manual_clipboard_apply.setToolTip(
+            "클립보드의 HWPX JSON(\"operations\") 또는 Python 코드(def edit_hwpx)를 확인해 즉시 문서에 반영합니다."
+        )
+        self.btn_manual_clipboard_apply.clicked.connect(self._on_manual_clipboard_apply_clicked)
+
+        mc_outer_lay.addLayout(mc_copy_lay)
+        mc_outer_lay.addWidget(self.btn_manual_clipboard_apply)
         lay.addWidget(self.manual_copy_card)
 
         # 내부/테스트 호환용 숨김 위젯 (중간 붙여넣기 UI 제거, 하단 전송↔응답 회수로 통합)
@@ -2892,6 +3019,7 @@ class AiExecutionDock(QFrame):
                 self.reset_target_state()
 
         self._last_context = dict(ctx)
+        self._update_sidepanel_file_badge(self._last_context)
         is_general = kind == "general_chat"
         is_excel = kind == "excel_batch"
         is_hwpx = kind == "hwpx_agent"
@@ -3654,11 +3782,124 @@ class AiExecutionDock(QFrame):
         base_prompt = str(batch.get("final_prompt", "")) if batch else ""
         return self._append_quote_to_prompt(base_prompt) if base_prompt else ""
 
+    @staticmethod
+    def _hash_clipboard_text(text: str) -> str:
+        return hashlib.sha256(str(text or "").strip().encode("utf-8")).hexdigest()
+
+    def set_panel_width(self, width: int) -> None:
+        if self._panel_root is not None:
+            self._panel_root.setFixedWidth(max(self.EXPANDED_WIDTH, int(width)))
+
+    def set_sidepanel_mode_ui(self, enabled: bool) -> None:
+        self._sidepanel_mode = bool(enabled)
+        if hasattr(self, "btn_sidepanel_mode"):
+            self.btn_sidepanel_mode.blockSignals(True)
+            self.btn_sidepanel_mode.setChecked(self._sidepanel_mode)
+            self.btn_sidepanel_mode.blockSignals(False)
+        self._update_sidepanel_file_badge(self._last_context)
+
+    def set_always_on_top_ui(self, enabled: bool) -> None:
+        self._always_on_top = bool(enabled)
+        if hasattr(self, "btn_always_on_top"):
+            self.btn_always_on_top.blockSignals(True)
+            self.btn_always_on_top.setChecked(self._always_on_top)
+            self.btn_always_on_top.blockSignals(False)
+
+    def _update_sidepanel_file_badge(self, ctx: Optional[Dict[str, Any]] = None) -> None:
+        if not hasattr(self, "lbl_sidepanel_file_badge"):
+            return
+        if not self._sidepanel_mode:
+            self.lbl_sidepanel_file_badge.setVisible(False)
+            return
+        active_ctx = ctx or self._last_context or {}
+        filename = ""
+        for key in ("original_hwp_path", "hwpx_path", "excel_path", "file_path"):
+            val = str(active_ctx.get(key, "") or "").strip()
+            if val:
+                filename = Path(val).name
+                break
+        if not filename:
+            ocr_files = active_ctx.get("ocr_files") or active_ctx.get("attachment_paths") or []
+            if isinstance(ocr_files, list) and ocr_files:
+                filename = Path(str(ocr_files[0])).name
+        if filename:
+            self.lbl_sidepanel_file_badge.setText(f"편집 중: {filename}")
+        else:
+            label = str(active_ctx.get("label") or self._active_target_id or "일반 대화").strip()
+            self.lbl_sidepanel_file_badge.setText(f"대상: {label}")
+        self.lbl_sidepanel_file_badge.setVisible(True)
+
+    def on_host_window_activated(self) -> None:
+        if self.current_mode_index() != 1:
+            return
+        self.check_clipboard_for_hwpx_response(auto_apply=False)
+
+    def check_clipboard_for_hwpx_response(self, *, auto_apply: bool = False) -> bool:
+        if self.current_mode_index() != 1:
+            return False
+        cb = QApplication.clipboard()
+        if cb is None:
+            return False
+        clip_text = str(cb.text() or "")
+        detected = detect_hwpx_clipboard_payload(clip_text)
+        if detected is None:
+            return False
+
+        clip_hash = self._hash_clipboard_text(clip_text)
+        if not auto_apply and clip_hash == self._last_clipboard_payload_hash:
+            return False
+
+        self._last_clipboard_payload_hash = clip_hash
+        self._detected_clipboard_payload = detected
+        self._detected_clipboard_text = clip_text
+
+        self.txt_manual_response.blockSignals(True)
+        self.txt_manual_response.setPlainText(clip_text)
+        self.txt_manual_response.blockSignals(False)
+        self._on_manual_response_changed()
+
+        if auto_apply:
+            self._on_apply_detected_clipboard_clicked()
+            return True
+
+        if detected.get("kind") == "code_mode":
+            detail = "Python 코드 편집(def edit_hwpx)"
+        else:
+            ops_cnt = int(detected.get("ops_count", 0))
+            detail = f"HWPX JSON {ops_cnt}건"
+        self.lbl_clipboard_detect.setText(f"클립보드에서 AI 응답 감지됨 ({detail})")
+        self.btn_apply_detected_clipboard.setText("바로 적용")
+        self.clipboard_detect_banner.setVisible(True)
+        return True
+
+    def _dismiss_clipboard_detect_banner(self) -> None:
+        self.clipboard_detect_banner.setVisible(False)
+
+    def _on_manual_clipboard_apply_clicked(self) -> None:
+        if self.check_clipboard_for_hwpx_response(auto_apply=True):
+            return
+        raw_resp = self.txt_manual_response.toPlainText().strip()
+        if raw_resp and detect_hwpx_clipboard_payload(raw_resp) is not None:
+            self._on_manual_apply_and_next()
+            return
+        self.lbl_dock_progress_meta.setText(
+            "클립보드에 유효한 HWPX JSON 또는 def edit_hwpx 코드가 없습니다."
+        )
+
+    def _on_apply_detected_clipboard_clicked(self) -> None:
+        self.clipboard_detect_banner.setVisible(False)
+        if not self.txt_manual_response.toPlainText().strip() and self._detected_clipboard_text:
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.setPlainText(self._detected_clipboard_text)
+            self.txt_manual_response.blockSignals(False)
+        self._on_manual_apply_and_next()
+
     def _on_manual_copy_only(self) -> None:
         prompt_text = self._build_current_manual_prompt()
         if not prompt_text:
             QMessageBox.information(self, "프롬프트 확인", "복사할 프롬프트가 없습니다. 대상 파일과 배치를 확인해 주세요.")
             return
+        self._last_clipboard_payload_hash = self._hash_clipboard_text(prompt_text)
         QApplication.clipboard().setText(prompt_text)
         self.lbl_manual_verify.setText("프롬프트가 클립보드에 복사되었습니다 (웹 AI에 Ctrl+V 하세요).")
 
@@ -3672,6 +3913,7 @@ class AiExecutionDock(QFrame):
             QMessageBox.warning(self, "URL 확인", "직접 URL 모드에서는 접속할 웹 AI 주소를 입력해 주세요.")
             self.edit_manual_custom_url.setFocus()
             return
+        self._last_clipboard_payload_hash = self._hash_clipboard_text(prompt_text)
         QApplication.clipboard().setText(prompt_text)
         webbrowser.open(url)
         self.lbl_manual_verify.setText("프롬프트를 클립보드에 복사하고 웹 AI를 열었습니다.")
@@ -3782,6 +4024,12 @@ class AiExecutionDock(QFrame):
             return
 
         if kind in ("ocr", "hwpx_agent"):
+            if kind == "hwpx_agent":
+                detected_code = detect_hwpx_clipboard_payload(raw_resp)
+                if isinstance(detected_code, dict) and detected_code.get("kind") == "code_mode":
+                    self._manual_single_parsed = {"exec_kind": "code_mode", "code": detected_code["code"]}
+                    self.lbl_manual_verify.setText("유효한 HWPX Python 코드 확인됨 (def edit_hwpx)")
+                    return
             try:
                 parsed = extract_json_from_llm_response(raw_resp)
                 self._manual_single_parsed = parsed
@@ -3836,6 +4084,22 @@ class AiExecutionDock(QFrame):
 
         target_id = str(ctx.get("target_id", self._active_target_id))
         if ctx.get("kind") == "hwpx_agent":
+            detected_code = detect_hwpx_clipboard_payload(raw_resp)
+            if isinstance(detected_code, dict) and detected_code.get("kind") == "code_mode":
+                self.txt_manual_response.blockSignals(True)
+                self.txt_manual_response.clear()
+                self.txt_manual_response.blockSignals(False)
+                self._dispatch_result(
+                    target_id,
+                    {
+                        "target_id": target_id,
+                        "mode": "manual",
+                        "exec_kind": "code_mode",
+                        "code": detected_code["code"],
+                        "immediate": True,
+                    },
+                )
+                return
             chunks = self._ensure_hwpx_ref_chunks(ctx)
             is_stage1 = self._should_run_hwpx_stage1(ctx, chunks)
             try:

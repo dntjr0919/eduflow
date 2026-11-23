@@ -15,8 +15,10 @@ from typing import Any, Dict, List, Optional
 from PyQt6.QtCore import (
     QByteArray,
     QEasingCurve,
+    QEvent,
     QParallelAnimationGroup,
     QPropertyAnimation,
+    QRect,
     QRectF,
     QSize,
     QTimer,
@@ -128,6 +130,13 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._sidebar_collapsed = False
         self._ai_dock_expanded = False
+        self._sidepanel_mode = False
+        self._always_on_top = False
+        self._saved_pre_sidepanel_geometry: Optional[QRect] = None
+        self._saved_pre_sidepanel_maximized: bool = False
+        self._saved_pre_sidepanel_min_size: Optional[QSize] = None
+        self._saved_pre_sidepanel_ai_dock_expanded: bool = False
+        self._saved_pre_sidepanel_always_on_top: bool = False
         self._page_meta: List[Dict[str, str]] = []
         self._shortcuts: Dict[str, QShortcut] = {}
         self._notify_nav_row: int = 4
@@ -142,6 +151,8 @@ class MainWindow(QMainWindow):
         if not self._last_cfg_manual_mode:
             self.ai_dock.set_mode_index(0)
         self.ai_dock.ai_mode_changed.connect(self._update_ai_mode_badge)
+        self.ai_dock.sidepanel_mode_requested.connect(self.set_sidepanel_mode)
+        self.ai_dock.always_on_top_requested.connect(self.set_always_on_top)
         self.ai_dock.combo_pw_exec_mode.currentIndexChanged.connect(
             lambda _idx: self._update_ai_mode_badge()
         )
@@ -347,6 +358,13 @@ class MainWindow(QMainWindow):
         title_col.addWidget(self.lbl_page_title)
         title_col.addWidget(self.lbl_page_desc)
 
+        self.btn_sidepanel_mode = QPushButton("사이드패널 모드")
+        polish_widget(self.btn_sidepanel_mode, obj_name="SidepanelModeBtn")
+        self.btn_sidepanel_mode.setCheckable(True)
+        self.btn_sidepanel_mode.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_sidepanel_mode.setToolTip("화면 오른쪽 끝 420px 미니 사이드패널 모드로 전환")
+        self.btn_sidepanel_mode.clicked.connect(lambda checked: self.set_sidepanel_mode(checked))
+
         self.btn_toggle_ai_dock = QPushButton("AI 실행 패널")
         polish_widget(self.btn_toggle_ai_dock, obj_name="AiDockToggleBtn")
         self.btn_toggle_ai_dock.setCheckable(True)
@@ -355,6 +373,7 @@ class MainWindow(QMainWindow):
         self.btn_toggle_ai_dock.clicked.connect(lambda checked: self.toggle_ai_dock(checked))
 
         top_header_layout.addLayout(title_col, stretch=1)
+        top_header_layout.addWidget(self.btn_sidepanel_mode)
         top_header_layout.addWidget(self.btn_toggle_ai_dock)
 
         workspace_layout.addWidget(top_header)
@@ -608,6 +627,105 @@ class MainWindow(QMainWindow):
     def _on_ai_dock_anim_finished(self) -> None:
         if not self._ai_dock_expanded:
             self.ai_dock.hide()
+
+    # =========================================================================
+    # 미니 사이드패널 모드 (폭 420px × 전체 높이, 우측 도킹) & 항상 위에
+    # =========================================================================
+    SIDEPANEL_WIDTH = 420
+
+    def toggle_sidepanel_mode(self) -> None:
+        self.set_sidepanel_mode(not self._sidepanel_mode)
+
+    def set_sidepanel_mode(self, enabled: Optional[bool] = None) -> None:
+        target = (not self._sidepanel_mode) if enabled is None else bool(enabled)
+        if target == self._sidepanel_mode:
+            return
+        self._sidepanel_mode = target
+
+        self.btn_sidepanel_mode.blockSignals(True)
+        self.btn_sidepanel_mode.setChecked(target)
+        self.btn_sidepanel_mode.blockSignals(False)
+        self.ai_dock.set_sidepanel_mode_ui(target)
+
+        if target:
+            self._saved_pre_sidepanel_maximized = self.isMaximized()
+            self._saved_pre_sidepanel_geometry = (
+                self.normalGeometry() if self._saved_pre_sidepanel_maximized else self.geometry()
+            )
+            self._saved_pre_sidepanel_min_size = self.minimumSize()
+            self._saved_pre_sidepanel_ai_dock_expanded = self._ai_dock_expanded
+            self._saved_pre_sidepanel_always_on_top = self._always_on_top
+
+            if self._saved_pre_sidepanel_maximized:
+                self.showNormal()
+
+            self.sidebar_frame.hide()
+            self.workspace_frame.hide()
+
+            self._ai_dock_anim_group.stop()
+            self._ai_dock_expanded = True
+            self.btn_toggle_ai_dock.blockSignals(True)
+            self.btn_toggle_ai_dock.setChecked(True)
+            self.btn_toggle_ai_dock.blockSignals(False)
+
+            self.ai_dock.set_panel_width(self.SIDEPANEL_WIDTH)
+            self.ai_dock.setMinimumWidth(self.SIDEPANEL_WIDTH)
+            self.ai_dock.setMaximumWidth(self.SIDEPANEL_WIDTH)
+            self.ai_dock.show()
+            self.ai_dock.sync_from_context()
+
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            avail = screen.availableGeometry() if screen is not None else QRect(0, 0, 1280, 800)
+            target_x = avail.x() + max(0, avail.width() - self.SIDEPANEL_WIDTH)
+            self.setMinimumSize(self.SIDEPANEL_WIDTH, 420)
+            self.setGeometry(target_x, avail.y(), self.SIDEPANEL_WIDTH, avail.height())
+            return
+
+        # 미니 사이드패널 모드 해제 -> 원래 레이아웃·창 크기·위치·항상 위에 상태 복원
+        self.sidebar_frame.show()
+        self.workspace_frame.show()
+        self.ai_dock.set_panel_width(AiExecutionDock.EXPANDED_WIDTH)
+
+        if self._saved_pre_sidepanel_min_size is not None:
+            self.setMinimumSize(self._saved_pre_sidepanel_min_size)
+        else:
+            self.setMinimumSize(1040, 680)
+
+        self._ai_dock_anim_group.stop()
+        restore_expanded = bool(self._saved_pre_sidepanel_ai_dock_expanded)
+        self._ai_dock_expanded = restore_expanded
+        self.btn_toggle_ai_dock.blockSignals(True)
+        self.btn_toggle_ai_dock.setChecked(restore_expanded)
+        self.btn_toggle_ai_dock.blockSignals(False)
+        if restore_expanded:
+            self.ai_dock.setMinimumWidth(AiExecutionDock.EXPANDED_WIDTH)
+            self.ai_dock.setMaximumWidth(AiExecutionDock.EXPANDED_WIDTH)
+            self.ai_dock.show()
+        else:
+            self.ai_dock.setMinimumWidth(0)
+            self.ai_dock.setMaximumWidth(0)
+            self.ai_dock.hide()
+
+        if self._always_on_top != self._saved_pre_sidepanel_always_on_top:
+            self.set_always_on_top(self._saved_pre_sidepanel_always_on_top)
+
+        if self._saved_pre_sidepanel_geometry is not None and self._saved_pre_sidepanel_geometry.isValid():
+            self.setGeometry(self._saved_pre_sidepanel_geometry)
+        if self._saved_pre_sidepanel_maximized:
+            self.showMaximized()
+
+    def set_always_on_top(self, enabled: bool) -> None:
+        target = bool(enabled)
+        self._always_on_top = target
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, target)
+        self.show()
+        self.ai_dock.set_always_on_top_ui(target)
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowActivate:
+            if hasattr(self, "ai_dock") and self.ai_dock is not None:
+                self.ai_dock.on_host_window_activated()
 
     def switch_to_settings_tab(self) -> None:
         idx = self.stacked_widget.indexOf(self.tab_settings)
