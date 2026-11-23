@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
-from PyQt6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEasingCurve, QEvent, QFileSystemWatcher, QObject, QPropertyAnimation, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -1624,6 +1624,16 @@ class DocOcrTab(QWidget):
         self._hwpx_focus_index: int = 0
         self._hwpx_pending_ops: List[Dict[str, Any]] = []
         self._hwpx_pending_summary: str = ""
+        self._hwpx_watched_path: Optional[Path] = None
+        self._hwpx_last_disk_mtime_ns: Optional[int] = None
+        self._hwpx_internal_save_in_progress: bool = False
+        self._hwpx_reload_prompt_open: bool = False
+        self._hwpx_file_watcher = QFileSystemWatcher(self)
+        self._hwpx_file_watcher.fileChanged.connect(self._on_hwpx_watched_file_changed)
+        self._hwpx_watch_debounce = QTimer(self)
+        self._hwpx_watch_debounce.setSingleShot(True)
+        self._hwpx_watch_debounce.setInterval(350)
+        self._hwpx_watch_debounce.timeout.connect(self._on_hwpx_watch_debounce_timeout)
         self._hwpx_patch_timer = QTimer(self)
         self._hwpx_patch_timer.setInterval(260)
         self._hwpx_patch_timer.timeout.connect(self._step_hwpx_patch_timer)
@@ -1665,6 +1675,15 @@ class DocOcrTab(QWidget):
         apply_qss_role(self.btn_hwpx_open, role="primary")
         self.btn_hwpx_open.clicked.connect(self._on_hwpx_open)
 
+        self.btn_hwpx_reload = QPushButton("다시 불러오기")
+        self.btn_hwpx_reload.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_reload, role="outline")
+        self.btn_hwpx_reload.setEnabled(False)
+        self.btn_hwpx_reload.setToolTip(
+            "한글 등 외부에서 수정·저장한 디스크 파일을 다시 불러와 미리보기와 AI 컨텍스트에 반영합니다."
+        )
+        self.btn_hwpx_reload.clicked.connect(self._on_hwpx_reload_from_disk)
+
         self.btn_hwpx_create_new = QPushButton("새 HWPX 양식 만들기")
         self.btn_hwpx_create_new.setMinimumHeight(32)
         apply_qss_role(self.btn_hwpx_create_new, role="secondary")
@@ -1703,6 +1722,7 @@ class DocOcrTab(QWidget):
 
         for btn in (
             self.btn_hwpx_open,
+            self.btn_hwpx_reload,
             self.btn_hwpx_create_new,
             self.btn_hwpx_undo,
             self.btn_hwpx_save,
@@ -4294,6 +4314,7 @@ class DocOcrTab(QWidget):
         self._hwpx_focus_index = 0
         self._update_hwpx_nav_bar()
         self.btn_hwpx_undo.setEnabled(False)
+        self.btn_hwpx_reload.setEnabled(True)
         self.btn_hwpx_save.setEnabled(True)
         self.btn_hwpx_save_as.setEnabled(True)
         self.btn_hwpx_open_app.setEnabled(True)
@@ -4304,6 +4325,7 @@ class DocOcrTab(QWidget):
         )
         self.lbl_hwpx_summary_badge.setText(badge_text)
         self._render_hwpx_viewer()
+        self._sync_hwpx_file_watcher()
         self.ai_quote_selected.emit("", "")
         self.ai_target_requested.emit("hwpx_agent")
         self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
@@ -4322,6 +4344,7 @@ class DocOcrTab(QWidget):
         self._hwpx_focus_index = 0
         self._update_hwpx_nav_bar()
         self.btn_hwpx_undo.setEnabled(False)
+        self.btn_hwpx_reload.setEnabled(False)
         self.btn_hwpx_save.setEnabled(True)
         self.btn_hwpx_save_as.setEnabled(True)
         self.btn_hwpx_open_app.setEnabled(True)
@@ -4334,6 +4357,7 @@ class DocOcrTab(QWidget):
             "새 HWPX 양식 생성 모드 (.hwpx 전용): 우측 [AI 실행 패널]에서 지시사항 입력 후 실행하거나 아래 참고 파일을 첨부하세요."
         )
         self._render_hwpx_viewer()
+        self._sync_hwpx_file_watcher()
         self.ai_quote_selected.emit("", "")
         if emit_sync:
             self.ai_target_requested.emit("hwpx_agent")
@@ -4473,6 +4497,195 @@ class DocOcrTab(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, "열기 실패", f"HWPX 문서를 열지 못했습니다:\n{exc}")
+
+    @staticmethod
+    def _get_file_mtime_ns(path: Optional[Path]) -> Optional[int]:
+        if path is None:
+            return None
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _get_hwpx_watch_target(self) -> Optional[Path]:
+        if self._hwpx_doc is None:
+            return None
+        if self._hwpx_original_hwp_path is not None and not self._hwpx_is_create_mode:
+            return self._hwpx_original_hwp_path
+        if self._hwpx_doc.source_path is not None:
+            return Path(self._hwpx_doc.source_path)
+        return None
+
+    def _sync_hwpx_file_watcher(self, target_path: Optional[Path] = None) -> None:
+        existing = self._hwpx_file_watcher.files()
+        if existing:
+            self._hwpx_file_watcher.removePaths(existing)
+        watch_path = target_path if target_path is not None else self._get_hwpx_watch_target()
+        self._hwpx_watched_path = watch_path
+        if watch_path is not None and watch_path.exists():
+            self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(watch_path)
+            self._hwpx_file_watcher.addPath(str(watch_path))
+        else:
+            self._hwpx_last_disk_mtime_ns = None
+
+    def _on_hwpx_watched_file_changed(self, _path_str: str) -> None:
+        if self._hwpx_doc is None or self._hwpx_internal_save_in_progress:
+            return
+        self._hwpx_watch_debounce.start()
+
+    def _reload_hwpx_silently(self, *, raise_on_error: bool = False) -> bool:
+        if self._hwpx_doc is None or self._hwpx_doc.source_path is None:
+            return False
+        src_path = Path(self._hwpx_doc.source_path)
+        if not src_path.exists():
+            return False
+        try:
+            self._hwpx_doc = HwpxDocument.load(src_path)
+        except Exception:
+            if raise_on_error:
+                raise
+            return False
+        self._hwpx_dirty = False
+        self._hwpx_highlighted_ids = set()
+        self._hwpx_modified_ids = []
+        self._hwpx_focus_index = 0
+        self.btn_hwpx_undo.setEnabled(False)
+        self.btn_hwpx_reload.setEnabled(True)
+        self.btn_hwpx_save_answers.setEnabled(False)
+        self._update_hwpx_nav_bar()
+        self._render_hwpx_viewer()
+        self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
+        self._sync_hwpx_file_watcher()
+        return True
+
+    def _on_hwpx_watch_debounce_timeout(self) -> None:
+        if (
+            self._hwpx_doc is None
+            or self._hwpx_watched_path is None
+            or self._hwpx_internal_save_in_progress
+        ):
+            return
+        watch_path = self._hwpx_watched_path
+        # 한/글의 원자적 저장(임시파일 교체)으로 감시가 풀릴 수 있으므로 재등록
+        if watch_path.exists() and str(watch_path) not in self._hwpx_file_watcher.files():
+            self._hwpx_file_watcher.addPath(str(watch_path))
+        if not watch_path.exists():
+            return
+
+        current_mtime_ns = self._get_file_mtime_ns(watch_path)
+        if current_mtime_ns is None or current_mtime_ns == self._hwpx_last_disk_mtime_ns:
+            return
+
+        is_hwp_origin = (
+            self._hwpx_original_hwp_path is not None and not self._hwpx_is_create_mode
+        )
+        if not self._hwpx_dirty and not is_hwp_origin:
+            self._hwpx_last_disk_mtime_ns = current_mtime_ns
+            if self._reload_hwpx_silently():
+                self.lbl_hwpx_summary_badge.setStyleSheet(
+                    "background-color: #F8F9FF; color: #0F172A; border: 1px solid #E2E8F0; "
+                    "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
+                )
+                self.lbl_hwpx_summary_badge.setText(
+                    "외부(한글)에서 수정된 내용이 자동 반영되었습니다."
+                )
+            return
+
+        if self._hwpx_reload_prompt_open:
+            return
+        self._hwpx_last_disk_mtime_ns = current_mtime_ns
+        self._hwpx_reload_prompt_open = True
+        try:
+            if self._hwpx_dirty:
+                msg = (
+                    f"외부(한글 등)에서 '{watch_path.name}' 파일이 수정되었습니다.\n"
+                    "앱에서 수정 후 저장하지 않은 내용이 있습니다.\n\n"
+                    "디스크의 파일로 덮어쓰고 다시 불러올까요?"
+                )
+            else:
+                msg = (
+                    f"외부(한글 등)에서 원본 HWP 파일('{watch_path.name}')이 수정되었습니다.\n\n"
+                    "다시 변환하여 불러올까요?"
+                )
+            reply = QMessageBox.question(
+                self,
+                "외부 파일 변경 감지",
+                msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+        finally:
+            self._hwpx_reload_prompt_open = False
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        if is_hwp_origin and self._hwpx_original_hwp_path is not None:
+            self.open_hwpx_or_hwp_path(str(self._hwpx_original_hwp_path))
+        elif self._reload_hwpx_silently():
+            self.lbl_hwpx_summary_badge.setStyleSheet(
+                "background-color: #F8F9FF; color: #0F172A; border: 1px solid #E2E8F0; "
+                "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
+            )
+            self.lbl_hwpx_summary_badge.setText(
+                "외부(한글)에서 수정된 내용이 반영되었습니다."
+            )
+
+    def _on_hwpx_reload_from_disk(self) -> None:
+        if self._hwpx_doc is None:
+            return
+        is_hwp_origin = (
+            self._hwpx_original_hwp_path is not None and not self._hwpx_is_create_mode
+        )
+        target_path = (
+            self._hwpx_original_hwp_path if is_hwp_origin else self._hwpx_doc.source_path
+        )
+        if target_path is None:
+            QMessageBox.information(
+                self,
+                "안내",
+                "디스크에 저장된 파일이 없습니다. 먼저 문서를 열거나 저장해 주세요.",
+            )
+            return
+        if not Path(target_path).exists():
+            QMessageBox.warning(
+                self,
+                "다시 불러오기 실패",
+                f"디스크에서 파일을 찾을 수 없습니다:\n{target_path}",
+            )
+            return
+
+        if self._hwpx_dirty:
+            reply = QMessageBox.question(
+                self,
+                "다시 불러오기 확인",
+                "앱에서 수정 후 저장하지 않은 내용이 있습니다. 디스크의 파일로 덮어쓰고 다시 불러올까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        if is_hwp_origin and self._hwpx_original_hwp_path is not None:
+            self.open_hwpx_or_hwp_path(str(self._hwpx_original_hwp_path))
+            return
+
+        try:
+            reloaded = self._reload_hwpx_silently(raise_on_error=True)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "다시 불러오기 실패",
+                f"HWPX 문서를 다시 불러오지 못했습니다:\n{exc}",
+            )
+            return
+        if reloaded:
+            self.lbl_hwpx_summary_badge.setStyleSheet(
+                "background-color: #F8F9FF; color: #0F172A; border: 1px solid #E2E8F0; "
+                "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
+            )
+            self.lbl_hwpx_summary_badge.setText(
+                f"다시 불러오기 완료: {Path(target_path).name}"
+            )
 
     def _extract_target_id_from_cursor(self, cursor: Any) -> str:
         """QTextBrowser 선택 영역이 속한 [p_N] 또는 [tbl_N...] target_id를 추출합니다."""
@@ -4632,6 +4845,8 @@ class DocOcrTab(QWidget):
 
         self.btn_hwpx_save.setEnabled(False)
         self.btn_hwpx_save_as.setEnabled(False)
+        self._hwpx_internal_save_in_progress = True
+        self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
         self.lbl_hwpx_summary_badge.setText(
             f"HWP 포맷으로 저장 중... 한글 보안 경고창이 뜨면 [접근 허용] 또는 [모두 허용]을 클릭하세요. ({target_hwp_path.name})"
         )
@@ -4645,6 +4860,8 @@ class DocOcrTab(QWidget):
             self.btn_hwpx_save_as.setEnabled(True)
             self._hwpx_last_exported_path = Path(out_path)
             self._hwpx_dirty = False
+            self._hwpx_internal_save_in_progress = False
+            self._sync_hwpx_file_watcher()
             self.lbl_hwpx_summary_badge.setText(f"{badge_prefix}: {Path(out_path).name}")
             if open_after_save:
                 try:
@@ -4661,6 +4878,8 @@ class DocOcrTab(QWidget):
         def _on_save_hwp_error(err_msg: str) -> None:
             self.btn_hwpx_save.setEnabled(True)
             self.btn_hwpx_save_as.setEnabled(True)
+            self._hwpx_internal_save_in_progress = False
+            self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
             self.lbl_hwpx_summary_badge.setText("HWP 저장 실패: 아래 안내를 확인하세요.")
             err_lower = str(err_msg or "").lower()
             is_lock_err = any(
@@ -4724,13 +4943,20 @@ class DocOcrTab(QWidget):
             self._on_hwpx_save_as()
             return
         try:
+            self._hwpx_internal_save_in_progress = True
+            self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
             saved = self._hwpx_doc.save()
             self._hwpx_last_exported_path = saved
             self._hwpx_dirty = False
+            self.btn_hwpx_reload.setEnabled(True)
+            self._sync_hwpx_file_watcher()
             self.lbl_hwpx_summary_badge.setText(f"저장 완료 (OCF ZIP_STORED 무결성 유지): {saved.name}")
             QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
         except Exception as exc:
             self._warn_hwpx_save_or_open_error(exc, "저장 실패", "HWPX 저장 중 오류가 발생했습니다")
+        finally:
+            self._hwpx_internal_save_in_progress = False
+            self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
 
     def _on_hwpx_save_as(self) -> None:
         if self._hwpx_doc is None:
@@ -4786,13 +5012,20 @@ class DocOcrTab(QWidget):
         if dst_path.suffix.lower() != ".hwpx":
             dst_path = dst_path.with_suffix(".hwpx")
         try:
+            self._hwpx_internal_save_in_progress = True
+            self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
             saved = self._hwpx_doc.save(dst_path)
             self._hwpx_last_exported_path = saved
             self._hwpx_dirty = False
+            self.btn_hwpx_reload.setEnabled(True)
+            self._sync_hwpx_file_watcher()
             self.lbl_hwpx_summary_badge.setText(f"다른 이름으로 저장 완료 (HWPX): {saved.name}")
             QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
         except Exception as exc:
             self._warn_hwpx_save_or_open_error(exc, "저장 실패", "HWPX 저장 중 오류가 발생했습니다")
+        finally:
+            self._hwpx_internal_save_in_progress = False
+            self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
 
     def _on_hwpx_open_in_app(self) -> None:
         if self._hwpx_doc is None:
@@ -4846,9 +5079,12 @@ class DocOcrTab(QWidget):
                         return
                 else:
                     try:
+                        self._hwpx_internal_save_in_progress = True
+                        self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
                         saved = self._hwpx_doc.save()
                         self._hwpx_last_exported_path = saved
                         self._hwpx_dirty = False
+                        self._sync_hwpx_file_watcher()
                     except Exception as exc:
                         self._warn_hwpx_save_or_open_error(
                             exc,
@@ -4856,6 +5092,9 @@ class DocOcrTab(QWidget):
                             "HWPX 저장 중 오류가 발생했습니다",
                         )
                         return
+                    finally:
+                        self._hwpx_internal_save_in_progress = False
+                        self._hwpx_last_disk_mtime_ns = self._get_file_mtime_ns(self._hwpx_watched_path)
 
         target: Optional[Path] = None
         if self._hwpx_last_exported_path is not None and self._hwpx_last_exported_path.exists():
