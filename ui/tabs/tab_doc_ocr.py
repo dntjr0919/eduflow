@@ -4570,6 +4570,42 @@ class DocOcrTab(QWidget):
         self._render_hwpx_viewer()
         self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
 
+    @staticmethod
+    def _is_hwpx_file_lock_error(exc: BaseException) -> bool:
+        if isinstance(exc, PermissionError):
+            return True
+        if isinstance(exc, OSError):
+            if getattr(exc, "winerror", None) in (5, 32, 33):
+                return True
+            if getattr(exc, "errno", None) in (13, 16):
+                return True
+        msg = str(exc).lower()
+        return any(
+            tok in msg
+            for tok in (
+                "permission denied",
+                "winerror 32",
+                "다른 프로세스가 파일을 사용",
+                "다른 한글 창에서 해당 파일이 열려 있어",
+                "being used by another process",
+            )
+        )
+
+    def _warn_hwpx_save_or_open_error(
+        self,
+        exc: BaseException,
+        fallback_title: str,
+        fallback_prefix: str,
+    ) -> None:
+        if self._is_hwpx_file_lock_error(exc):
+            QMessageBox.warning(
+                self,
+                "파일 열림 안내",
+                "현재 파일이 열려 있습니다. 열려 있는 파일을 닫고 다시 실행해 주세요.",
+            )
+            return
+        QMessageBox.warning(self, fallback_title, f"{fallback_prefix}:\n{exc}")
+
     def _export_hwpx_as_hwp_async(
         self,
         target_hwp_path: Path,
@@ -4581,7 +4617,11 @@ class DocOcrTab(QWidget):
         try:
             saved_hwpx = self._hwpx_doc.save()
         except Exception as exc:
-            QMessageBox.warning(self, "저장 실패", f"임시 HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+            self._warn_hwpx_save_or_open_error(
+                exc,
+                "저장 실패",
+                "임시 HWPX 저장 중 오류가 발생했습니다",
+            )
             return
 
         if target_hwp_path.exists():
@@ -4607,7 +4647,14 @@ class DocOcrTab(QWidget):
             self._hwpx_dirty = False
             self.lbl_hwpx_summary_badge.setText(f"{badge_prefix}: {Path(out_path).name}")
             if open_after_save:
-                os.startfile(str(Path(out_path).resolve()))
+                try:
+                    os.startfile(str(Path(out_path).resolve()))
+                except Exception as exc:
+                    self._warn_hwpx_save_or_open_error(
+                        exc,
+                        "열기 실패",
+                        "한글(HWP)로 여는 중 오류가 발생했습니다",
+                    )
             else:
                 QMessageBox.information(self, "저장 완료", f"HWP 문서가 저장되었습니다:\n{out_path}")
 
@@ -4615,12 +4662,16 @@ class DocOcrTab(QWidget):
             self.btn_hwpx_save.setEnabled(True)
             self.btn_hwpx_save_as.setEnabled(True)
             self.lbl_hwpx_summary_badge.setText("HWP 저장 실패: 아래 안내를 확인하세요.")
+            err_lower = str(err_msg or "").lower()
             is_lock_err = any(
-                tok in err_msg
+                tok in err_lower
                 for tok in (
                     "다른 한글 창에서 해당 파일이 열려 있어",
-                    "PermissionError",
-                    "Permission denied",
+                    "permissionerror",
+                    "permission denied",
+                    "winerror 32",
+                    "다른 프로세스가 파일을 사용",
+                    "being used by another process",
                     "액세스",
                     "읽기 전용",
                     "쓰기 금지",
@@ -4679,7 +4730,7 @@ class DocOcrTab(QWidget):
             self.lbl_hwpx_summary_badge.setText(f"저장 완료 (OCF ZIP_STORED 무결성 유지): {saved.name}")
             QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
         except Exception as exc:
-            QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+            self._warn_hwpx_save_or_open_error(exc, "저장 실패", "HWPX 저장 중 오류가 발생했습니다")
 
     def _on_hwpx_save_as(self) -> None:
         if self._hwpx_doc is None:
@@ -4741,7 +4792,7 @@ class DocOcrTab(QWidget):
             self.lbl_hwpx_summary_badge.setText(f"다른 이름으로 저장 완료 (HWPX): {saved.name}")
             QMessageBox.information(self, "저장 완료", f"HWPX 문서가 저장되었습니다:\n{saved}")
         except Exception as exc:
-            QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+            self._warn_hwpx_save_or_open_error(exc, "저장 실패", "HWPX 저장 중 오류가 발생했습니다")
 
     def _on_hwpx_open_in_app(self) -> None:
         if self._hwpx_doc is None:
@@ -4799,7 +4850,11 @@ class DocOcrTab(QWidget):
                         self._hwpx_last_exported_path = saved
                         self._hwpx_dirty = False
                     except Exception as exc:
-                        QMessageBox.warning(self, "저장 실패", f"HWPX 저장 중 오류가 발생했습니다:\n{exc}")
+                        self._warn_hwpx_save_or_open_error(
+                            exc,
+                            "저장 실패",
+                            "HWPX 저장 중 오류가 발생했습니다",
+                        )
                         return
 
         target: Optional[Path] = None
@@ -4814,7 +4869,15 @@ class DocOcrTab(QWidget):
         if target is None:
             QMessageBox.information(self, "안내", "먼저 문서를 열거나 저장해 주세요.")
             return
-        os.startfile(str(target.resolve()))
+        try:
+            os.startfile(str(target.resolve()))
+        except Exception as exc:
+            self._warn_hwpx_save_or_open_error(
+                exc,
+                "열기 실패",
+                "한글(HWP)로 여는 중 오류가 발생했습니다",
+            )
+            return
 
     def _on_hwpx_save_answers(self) -> None:
         if self._hwpx_doc is None or not self._hwpx_doc.exam_answers:

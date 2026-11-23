@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -1427,6 +1428,109 @@ class _ModeOptionsPopover(QFrame):
         self.body_lay.setSpacing(8)
 
 
+class _ManualExtraPasteDialog(QDialog):
+    """수동 복붙 모드에서 추가 AI 응답(JSON Patch 등)을 붙여넣어 누적 적용하는 모달."""
+
+    def __init__(self, parent: Optional[QWidget] = None, target_kind: str = "hwpx_agent"):
+        super().__init__(parent)
+        self._target_kind = str(target_kind or "hwpx_agent")
+        self.setWindowTitle("추가 AI 응답 붙여넣기")
+        self.resize(540, 400)
+        self.setMinimumSize(420, 300)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        guide = (
+            "외부 AI 채팅창에서 이어서 받은 추가 JSON Patch 응답을 아래에 붙여넣어 주세요.\n"
+            "현재 문서 상태에 이어서 패치가 누적 적용됩니다."
+            if self._target_kind == "hwpx_agent"
+            else "외부 AI 채팅창에서 이어서 받은 추가 응답을 아래에 붙여넣어 주세요."
+        )
+        lbl_guide = QLabel(guide)
+        lbl_guide.setWordWrap(True)
+        lbl_guide.setStyleSheet("font-size: 12px; color: #334155;")
+        lay.addWidget(lbl_guide)
+
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+        self.btn_paste_clip = QPushButton("클립보드 붙여넣기")
+        self.btn_paste_clip.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_paste_clip.clicked.connect(self._on_paste_clipboard)
+        top_bar.addWidget(self.btn_paste_clip)
+
+        self.lbl_verify = QLabel(
+            "대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다."
+            if self._target_kind == "hwpx_agent"
+            else ""
+        )
+        self.lbl_verify.setWordWrap(True)
+        self.lbl_verify.setStyleSheet("font-size: 11px; color: #64748B;")
+        top_bar.addWidget(self.lbl_verify, stretch=1)
+        lay.addLayout(top_bar)
+
+        self.txt_response = QTextEdit()
+        self.txt_response.setPlaceholderText("여기에 AI 응답(JSON)을 붙여넣으세요...")
+        self.txt_response.textChanged.connect(self._on_text_changed)
+        lay.addWidget(self.txt_response, stretch=1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("취소")
+        btn_cancel.clicked.connect(self.reject)
+        btn_apply = QPushButton("적용")
+        _apply_role(btn_apply, role="primary")
+        btn_apply.setDefault(True)
+        btn_apply.clicked.connect(self._on_accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_apply)
+        lay.addLayout(btn_row)
+
+    def _on_paste_clipboard(self) -> None:
+        clip = QApplication.clipboard().text()
+        if clip:
+            self.txt_response.setPlainText(clip)
+
+    def _on_text_changed(self) -> None:
+        if self._target_kind != "hwpx_agent":
+            return
+        raw = self.txt_response.toPlainText().strip()
+        if not raw:
+            self.lbl_verify.setStyleSheet("font-size: 11px; color: #64748B;")
+            self.lbl_verify.setText("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
+            return
+        try:
+            parsed = extract_json_from_llm_response(raw)
+            ops = parsed.get("operations", []) if isinstance(parsed, dict) else []
+            ops_cnt = len(ops) if isinstance(ops, list) else 0
+            self.lbl_verify.setStyleSheet("font-size: 11px; color: #15803D; font-weight: 600;")
+            self.lbl_verify.setText(f"유효한 HWPX JSON Patch 확인됨 (연산 {ops_cnt}건)")
+        except Exception as exc:
+            self.lbl_verify.setStyleSheet("font-size: 11px; color: #B91C1C;")
+            self.lbl_verify.setText(f"JSON 추출 오류: {exc}")
+
+    def _on_accept(self) -> None:
+        raw = self.txt_response.toPlainText().strip()
+        if not raw:
+            QMessageBox.warning(self, "응답 확인", "붙여넣을 AI 응답 텍스트를 입력해 주세요.")
+            return
+        if self._target_kind == "hwpx_agent":
+            try:
+                extract_json_from_llm_response(raw)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "JSON 검증 오류",
+                    f"유효한 JSON Patch 응답을 추출하지 못했습니다:\n{exc}",
+                )
+                return
+        self.accept()
+
+    def response_text(self) -> str:
+        return self.txt_response.toPlainText().strip()
+
+
 class AiExecutionDock(QFrame):
     """EduFlow 우측 접이식 AI 실행 사이드바 위젯 (폭 340px)."""
 
@@ -1736,6 +1840,23 @@ class AiExecutionDock(QFrame):
         self.lbl_chat_empty.setStyleSheet("color: #94A3B8; font-size: 11px; padding: 18px 8px;")
         self.chat_timeline_lay.addWidget(self.lbl_chat_empty)
         self.chat_timeline_lay.addStretch()
+
+        self.manual_extra_paste_bar = QWidget(self.chat_timeline_widget)
+        mep_lay = QHBoxLayout(self.manual_extra_paste_bar)
+        mep_lay.setContentsMargins(0, 0, 0, 2)
+        mep_lay.setSpacing(6)
+        self.btn_manual_extra_paste = QPushButton("+ 추가 답변 붙여넣기")
+        self.btn_manual_extra_paste.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_manual_extra_paste.setMinimumHeight(26)
+        self.btn_manual_extra_paste.setStyleSheet(
+            "QPushButton { background-color: #FFFFFF; border: 1px solid #CBD5E1; "
+            "border-radius: 6px; color: #334155; font-size: 11px; font-weight: 600; padding: 3px 10px; }"
+            "QPushButton:hover { background-color: #F1F5F9; border-color: #94A3B8; color: #0F172A; }"
+        )
+        self.btn_manual_extra_paste.clicked.connect(self._on_manual_extra_paste_clicked)
+        mep_lay.addWidget(self.btn_manual_extra_paste)
+        mep_lay.addStretch()
+        self.manual_extra_paste_bar.setVisible(False)
 
         self.chat_scroll.setWidget(self.chat_timeline_widget)
         root_lay.addWidget(self.chat_scroll, stretch=1)
@@ -2504,6 +2625,7 @@ class AiExecutionDock(QFrame):
         self.body_scroll.setVisible(False)
         self._sync_batch_bar_visibility()
         self._sync_chat_send_button_state()
+        self._sync_manual_extra_paste_button()
 
     def _sync_batch_bar_visibility(self) -> None:
         """수동 복붙 모드이면서 분할 배치가 2개 이상 존재할 때만 하단 1줄 배치 바를 표시합니다."""
@@ -3674,7 +3796,7 @@ class AiExecutionDock(QFrame):
             try:
                 parsed = extract_json_from_llm_response(raw_resp)
             except Exception as exc:
-                if is_stage1:
+                if is_stage1 and not isinstance(parsed.get("operations"), list):
                     inst_txt = self.txt_hwpx_instruction.toPlainText().strip()
                     selected = fallback_select_chunks_by_keywords(
                         list(self._hwpx_ref_signature), inst_txt
@@ -3696,7 +3818,7 @@ class AiExecutionDock(QFrame):
                     return
                 QMessageBox.warning(self, "JSON 검증 오류", f"유효한 JSON Patch 응답을 추출하지 못했습니다:\n{exc}")
                 return
-            if is_stage1:
+            if is_stage1 and not isinstance(parsed.get("operations"), list):
                 try:
                     s1 = parse_stage1_selection_response(parsed)
                 except Exception:
@@ -4700,6 +4822,9 @@ class AiExecutionDock(QFrame):
 
     def _clear_timeline(self) -> None:
         self._remove_pw_inline_card()
+        if hasattr(self, "manual_extra_paste_bar"):
+            self.manual_extra_paste_bar.setVisible(False)
+            self.chat_timeline_lay.removeWidget(self.manual_extra_paste_bar)
         for card in self._message_cards:
             card.deleteLater()
         self._message_cards.clear()
@@ -4724,7 +4849,58 @@ class AiExecutionDock(QFrame):
         # 마지막 stretch 직전에 삽입
         insert_idx = max(0, self.chat_timeline_lay.count() - 1)
         self.chat_timeline_lay.insertWidget(insert_idx, card)
+        self._sync_manual_extra_paste_button()
         return card
+
+    def _sync_manual_extra_paste_button(self) -> None:
+        """수동 복붙 모드일 때만 가장 마지막 AI 응답 카드 바로 아래에 '+ 추가 답변 붙여넣기' 버튼을 표시합니다."""
+        if not hasattr(self, "manual_extra_paste_bar"):
+            return
+        is_manual = self.current_mode_index() == 1
+        last_ai_card = None
+        for card in reversed(self._message_cards):
+            if getattr(card, "role", "") == "assistant":
+                last_ai_card = card
+                break
+        if not is_manual or last_ai_card is None:
+            self.manual_extra_paste_bar.setVisible(False)
+            self.chat_timeline_lay.removeWidget(self.manual_extra_paste_bar)
+            return
+        self.chat_timeline_lay.removeWidget(self.manual_extra_paste_bar)
+        ai_idx = self.chat_timeline_lay.indexOf(last_ai_card)
+        insert_idx = ai_idx + 1 if ai_idx >= 0 else max(0, self.chat_timeline_lay.count() - 1)
+        self.chat_timeline_lay.insertWidget(insert_idx, self.manual_extra_paste_bar)
+        self.manual_extra_paste_bar.setVisible(True)
+
+    def _on_manual_extra_paste_clicked(self) -> None:
+        if self.current_mode_index() != 1:
+            return
+        ctx = self._fetch_fresh_context()
+        kind = str(ctx.get("kind", "general_chat") or "general_chat")
+        dlg = _ManualExtraPasteDialog(self, target_kind=kind)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        raw_resp = dlg.response_text()
+        if not raw_resp:
+            return
+
+        provider_label = self.manual_provider_display()
+        model_label = f"{provider_label} Web" if provider_label else "수동 입력"
+        tid = self._active_target_id or "general_chat"
+        self._handle_agent_response(
+            raw_resp,
+            exec_mode="manual",
+            model_name=model_label,
+            tool_name_default=tid,
+            allow_followup=False,
+        )
+        if tid != "general_chat":
+            self.txt_manual_response.blockSignals(True)
+            self.txt_manual_response.setPlainText(raw_resp)
+            self.txt_manual_response.blockSignals(False)
+            self._on_manual_apply_and_next()
+        self._scroll_timeline_to_bottom()
+        self.lbl_dock_progress_meta.setText("추가 수동 응답 적용 완료")
 
     def _scroll_timeline_to_bottom(self) -> None:
         sb = self.chat_scroll.verticalScrollBar()
