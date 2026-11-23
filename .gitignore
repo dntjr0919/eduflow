@@ -67,3 +67,5 @@ Google_OAuth_credentials.json
 scripts_archive/
 eduflow-db-*.json
 serviceAccountKey.json
+
+comcigan_sync_cache.json
