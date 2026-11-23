@@ -2121,6 +2121,136 @@ class FirestoreSyncService:
             self.db.add_log("WARN", "FirestoreSync", f"{label or collection_name} Batch 업서트 실패: {exc}")
             return False
 
+    def push_timetable_snapshots(
+        self,
+        snapshots: List[Dict[str, Any]],
+        cleanup_comcigan_changes: bool = True,
+        school_code: str = "",
+        comcigan_school_code: str = "",
+        school_name: str = "",
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
+        """날짜별 컴시간 최종 시간표 스냅샷을 Firestore `시간표_스냅샷` 컬렉션에 통째로 덮어쓰기(Set/Overwrite)합니다."""
+        clean_snaps = [dict(s) for s in (snapshots or []) if isinstance(s, dict) and str(s.get("remote_id") or "").strip()]
+        if not clean_snaps:
+            return True
+
+        sc = str(school_code or clean_snaps[0].get("school_code") or "").strip()
+        cc = str(comcigan_school_code or clean_snaps[0].get("comcigan_school_code") or "").strip()
+        sn = str(school_name or clean_snaps[0].get("school_name") or "").strip()
+        clean_dates = sorted({
+            str(s.get("date") or "").strip()[:10]
+            for s in clean_snaps
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(s.get("date") or "").strip()[:10])
+        })
+
+        if self.is_vercel_api_mode():
+            try:
+                api_payload: Dict[str, Any] = {
+                    "snapshots": clean_snaps,
+                    "cleanup_comcigan_changes": bool(cleanup_comcigan_changes),
+                    "cleanup_dates": clean_dates,
+                }
+                if sc:
+                    api_payload["school_code"] = sc
+                if cc:
+                    api_payload["comcigan_school_code"] = cc
+                if sn:
+                    api_payload["school_name"] = sn
+                self._post_vercel_api("sync_timetable_snapshots", api_payload)
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 시간표 스냅샷 저장 실패: {exc}")
+                return False
+
+        try:
+            fs = self._get_client()
+            col_ref = fs.collection("시간표_스냅샷")
+            total = len(clean_snaps)
+            now_iso = datetime.now().isoformat(timespec="seconds")
+            for idx, snap_doc in enumerate(clean_snaps, start=1):
+                rid = str(snap_doc.get("remote_id") or "").strip().replace("/", "_")
+                payload = dict(snap_doc)
+                payload["remote_id"] = rid
+                payload.setdefault("updated_at", now_iso)
+                # 병합(merge=True) 없이 통째로 덮어쓰기(Set/Overwrite)하여 삭제된 교시/취소된 보강이 남지 않도록 함
+                batch = fs.batch()
+                batch.set(col_ref.document(rid), payload)
+                batch.commit()
+                if progress_callback is not None:
+                    try:
+                        progress_callback(idx, total)
+                    except Exception:
+                        pass
+
+            if cleanup_comcigan_changes and clean_dates:
+                try:
+                    chg_ref = fs.collection("시간표_변동")
+                    if sc:
+                        snaps = chg_ref.where("school_code", "==", sc).stream()
+                    elif cc:
+                        snaps = chg_ref.where("comcigan_school_code", "==", cc).stream()
+                    elif sn:
+                        snaps = chg_ref.where("school_name", "==", sn).stream()
+                    else:
+                        snaps = []
+                    stale_ids: List[str] = []
+                    date_set = set(clean_dates)
+                    for doc_snap in snaps:
+                        rid = str(getattr(doc_snap, "id", "") or "").strip()
+                        if not rid:
+                            continue
+                        data = doc_snap.to_dict() or {}
+                        src = str(data.get("source") or "").strip().lower()
+                        if src not in ("comcigan", "comcigan_playwright") and not rid.startswith("tc_"):
+                            continue
+                        doc_date = str(data.get("date") or data.get("target_date") or "").strip()[:10]
+                        if not doc_date or doc_date in date_set:
+                            stale_ids.append(rid)
+                    if stale_ids:
+                        self.delete_timetable_docs("시간표_변동", stale_ids)
+                except Exception as exc:
+                    self.db.add_log("WARN", "FirestoreSync", f"레거시 컴시간 시간표_변동 정리 실패: {exc}")
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"시간표 스냅샷 저장 실패: {exc}")
+            return False
+
+    def has_timetable_snapshots(
+        self,
+        school_code: str = "",
+        comcigan_school_code: str = "",
+        school_name: str = "",
+    ) -> Optional[bool]:
+        """Firestore `시간표_스냅샷`에 해당 학교 문서가 최소 1건 이상 존재하는지 확인합니다."""
+        sc = str(school_code or "").strip()
+        cc = str(comcigan_school_code or "").strip()
+        sn = str(school_name or "").strip()
+        if self.is_vercel_api_mode():
+            try:
+                res = self._post_vercel_api(
+                    "check_timetable_exists",
+                    {"school_code": sc, "comcigan_school_code": cc, "school_name": sn, "collection": "시간표_스냅샷"},
+                )
+                return bool(res.get("exists"))
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 시간표 스냅샷 존재 확인 실패: {exc}")
+                return None
+        try:
+            fs = self._get_client()
+            col_ref = fs.collection("시간표_스냅샷")
+            for field, val in (("school_code", sc), ("comcigan_school_code", cc), ("school_name", sn)):
+                if val:
+                    for _ in col_ref.where(field, "==", val).limit(1).stream():
+                        return True
+            if not (sc or cc or sn):
+                for _ in col_ref.limit(1).stream():
+                    return True
+            return False
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"시간표 스냅샷 존재 확인 실패: {exc}")
+            return None
+
     def upsert_timetable_base(
         self,
         rows: List[Dict[str, Any]],

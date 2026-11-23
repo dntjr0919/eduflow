@@ -249,20 +249,7 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             ],
         }
         fake_sync = MagicMock()
-        fake_sync.fetch_sheet_rows.return_value = [
-            {
-                "remote_id": "tb_c_1_3_월_1",
-                "entry_type": "class",
-                "grade": "1",
-                "class_no": "3",
-                "day_of_week": "월",
-                "period": "1",
-                "subject": "학급기본수학",
-                "teacher_name": "이담임",
-            }
-        ]
-        fake_sync.upsert_timetable_base.return_value = True
-        fake_sync.push_timetable_changes.return_value = False
+        fake_sync.push_timetable_snapshots.return_value = False
 
         res = sync_comcigan_from_web(
             url="http://comci.net:4082/st",
@@ -272,13 +259,15 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             cache_path=self.tmp_path / "prefs_cache.json",
         )
         self.assertFalse(res["ok"])
-        self.assertEqual(res["base_pushed"], 1)
-        self.assertEqual(res["changes_pushed"], 0)
-        self.assertIn("시간표_변동 Push 실패", res["error"])
-        self.assertNotIn("시간표_기본 Upsert 실패", res["error"])
-        pushed_changes = fake_sync.push_timetable_changes.call_args.args[0]
-        self.assertEqual(pushed_changes[0]["original_subject"], "학급기본수학")
-        self.assertEqual(pushed_changes[0]["original_teacher"], "이담임")
+        self.assertEqual(res["snapshots_pushed"], 0)
+        self.assertIn("시간표_스냅샷 Push 실패", res["error"])
+        pushed_snaps = fake_sync.push_timetable_snapshots.call_args.args[0]
+        self.assertEqual(len(pushed_snaps), 1)
+        self.assertEqual(pushed_snaps[0]["date"], "2026-11-16")
+        slot_1 = pushed_snaps[0]["classes"]["1-3"]["1"]
+        self.assertEqual(slot_1["subject"], "자습")
+        self.assertEqual(slot_1["teacher_name"], "")
+        self.assertTrue(slot_1["is_changed"])
 
     def test_extract_grade_class_variants_and_chunked_sync_with_progress(self) -> None:
         from services.comcigan_playwright_fetcher import _extract_grade_class
@@ -310,16 +299,12 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         fake_fetcher = MagicMock()
         fake_fetcher.fetch.return_value = {
             "ok": True,
-            "base_rows": [{"remote_id": "tb_c_1_5_월_1"}],
-            "change_rows": [{"remote_id": "tc_20261116_1_5_1"}],
+            "base_rows": [{"remote_id": "tb_c_1_5_월_1", "grade": "1", "class_no": "5", "day_of_week": "월", "period": "1", "subject": "국어"}],
+            "change_rows": [{"remote_id": "tc_20261116_1_5_1", "date": "2026-11-16", "grade": "1", "class_no": "5", "period": "1", "changed_subject": "수학"}],
         }
         fake_sync = MagicMock()
-        fake_sync.fetch_sheet_rows.return_value = []
-        fake_sync.upsert_timetable_base.side_effect = (
-            lambda r, progress_callback=None: (progress_callback(1, 2), progress_callback(2, 2), True)[-1]
-        )
-        fake_sync.push_timetable_changes.side_effect = (
-            lambda r, progress_callback=None: (progress_callback(1, 1), True)[-1]
+        fake_sync.push_timetable_snapshots.side_effect = (
+            lambda snaps, progress_callback=None, **kwargs: (progress_callback(1, 2), progress_callback(2, 2), True)[-1]
         )
 
         res = sync_comcigan_from_web(
@@ -334,8 +319,8 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         )
         self.assertTrue(res["ok"])
         fake_fetcher.fetch.assert_called_once()
-        self.assertTrue(any("1/2 배치" in m for _, m in progress_msgs))
-        self.assertTrue(any("동기화 완료" in m for _, m in progress_msgs))
+        self.assertTrue(any("1/2일" in m for _, m in progress_msgs))
+        self.assertTrue(any("스냅샷 동기화 완료" in m for _, m in progress_msgs))
 
     def test_gas_template_uses_bulk_upsert_for_timetable(self) -> None:
         gs_path = Path("docs/apps_script_template.gs")
@@ -378,6 +363,17 @@ class TestMobileIntegrationWorker(unittest.TestCase):
           </table>
         </body></html>
         """
+        html_extra_added = """
+        <html><body>
+          <table>
+            <caption>1학년 5반 시간표</caption>
+            <tr><th>교시</th><th>월</th><th>화</th></tr>
+            <tr><td>1</td><td class="내용">국어<br>(김교사)</td><td class="내용"></td></tr>
+            <tr><td>3</td><td class="내용"></td><td class="내용">수학<br>(박교사)</td></tr>
+            <tr><td>7</td><td class="내용 변경">정보<br>(유교사)</td><td class="내용"></td></tr>
+          </table>
+        </body></html>
+        """
         current_html = {"val": html_initial}
 
         class _GridStubFetcher:
@@ -398,27 +394,18 @@ class TestMobileIntegrationWorker(unittest.TestCase):
                     "teacher_base_count": 0,
                 }
 
-        stored_base: dict = {}
-        stored_chg: dict = {}
+        stored_snaps: dict = {}
+        push_calls: list = []
 
         class _MemSyncService:
-            def has_timetable_base_docs(self, **kwargs):
-                return len(stored_base) > 0
+            def has_timetable_snapshots(self, **kwargs):
+                return len(stored_snaps) > 0
 
-            def upsert_timetable_base(self, rows, **kwargs):
-                for r in rows:
-                    stored_base[r["remote_id"]] = dict(r)
-                return True
-
-            def push_timetable_changes(self, rows, **kwargs):
-                for r in rows:
-                    stored_chg[r["remote_id"]] = dict(r)
-                return True
-
-            def delete_timetable_docs(self, col_name, ids):
-                target = stored_base if col_name == "시간표_기본" else stored_chg
-                for rid in ids:
-                    target.pop(rid, None)
+            def push_timetable_snapshots(self, snapshots, **kwargs):
+                push_calls.append(len(snapshots))
+                for s in snapshots:
+                    # 통째로 덮어쓰기(Set/Overwrite)
+                    stored_snaps[s["remote_id"]] = dict(s)
                 return True
 
             def update_teacher_comcigan_code(self, *args, **kwargs):
@@ -427,7 +414,7 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         mem_svc = _MemSyncService()
         cache_file = self.tmp_path / "comcigan_grid_cache.json"
 
-        # Step 1: 초기 동기화
+        # Step 1: 초기 동기화 (월/화 2일분 스냅샷 저장)
         r1 = sync_comcigan_from_web(
             url="http://comci.net:4082/st",
             target_date="2026-11-16",
@@ -438,11 +425,11 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             cache_path=cache_file,
         )
         self.assertTrue(r1["ok"])
-        self.assertEqual(r1["base_pushed"], 3)
-        self.assertEqual(r1["changes_pushed"], 0)
-        self.assertIn("tb_c_1_5_월_3", stored_base)
+        self.assertEqual(r1["snapshots_pushed"], 2)
+        self.assertIn("snap_8140246_20261116", stored_snaps)
+        self.assertEqual(stored_snaps["snap_8140246_20261116"]["classes"]["1-5"]["3"]["subject"], "자율")
 
-        # Step 2: 3교시 '자율'이 하이라이트 없는 빈 셀("")로 삭제됨 -> changed_subject="" 변동 생성, 기본시간표 유지
+        # Step 2: 3교시 '자율'이 공강("")으로 삭제됨 -> 월요일 스냅샷만 통째 교체, 3교시 빈 슬롯 반영
         current_html["val"] = html_deleted
         r2 = sync_comcigan_from_web(
             url="http://comci.net:4082/st",
@@ -455,15 +442,11 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         )
         self.assertTrue(r2["ok"])
         self.assertFalse(r2["skipped"])
-        self.assertEqual(r2["base_pushed"], 0)
-        self.assertEqual(r2["base_deleted"], 0)
-        self.assertEqual(r2["changes_pushed"], 1)
-        self.assertIn("tb_c_1_5_월_3", stored_base)
-        self.assertIn("tc_20261116_1_5_3", stored_chg)
-        self.assertEqual(stored_chg["tc_20261116_1_5_3"]["changed_subject"], "")
-        self.assertEqual(stored_chg["tc_20261116_1_5_3"]["original_subject"], "자율")
+        self.assertEqual(r2["snapshots_pushed"], 1)  # 화요일은 해시 동일하므로 월요일 1일분만 덮어씀
+        self.assertEqual(stored_snaps["snap_8140246_20261116"]["classes"]["1-5"]["3"]["subject"], "")
 
-        # Step 3: 동일 빈 셀 상태로 재실행 -> 스냅샷 스킵
+        # Step 3: 동일 빈 셀 상태로 재실행 -> 로컬 캐시 해시 스킵 (Firestore 쓰기 0건)
+        prev_push_count = len(push_calls)
         r3 = sync_comcigan_from_web(
             url="http://comci.net:4082/st",
             target_date="2026-11-16",
@@ -475,11 +458,11 @@ class TestMobileIntegrationWorker(unittest.TestCase):
         )
         self.assertTrue(r3["ok"])
         self.assertTrue(r3["skipped"])
-        self.assertEqual(r3["changes_pushed"], 0)
-        self.assertEqual(r3["base_pushed"], 0)
+        self.assertEqual(r3["snapshots_pushed"], 0)
+        self.assertEqual(len(push_calls), prev_push_count)
 
-        # Step 4: 3교시 '자율' 원상복귀 -> 시간표_변동 레코드 자동 삭제
-        current_html["val"] = html_initial
+        # Step 4: 7교시 보강 추가 -> 스냅샷에 is_changed=True로 반영
+        current_html["val"] = html_extra_added
         r4 = sync_comcigan_from_web(
             url="http://comci.net:4082/st",
             target_date="2026-11-16",
@@ -490,10 +473,23 @@ class TestMobileIntegrationWorker(unittest.TestCase):
             cache_path=cache_file,
         )
         self.assertTrue(r4["ok"])
-        self.assertFalse(r4["skipped"])
-        self.assertEqual(r4["changes_deleted"], 1)
-        self.assertEqual(r4["base_pushed"], 0)
-        self.assertNotIn("tc_20261116_1_5_3", stored_chg)
+        self.assertEqual(stored_snaps["snap_8140246_20261116"]["classes"]["1-5"]["7"]["subject"], "정보")
+        self.assertTrue(stored_snaps["snap_8140246_20261116"]["classes"]["1-5"]["7"]["is_changed"])
+
+        # Step 5: 7교시 보강 취소 -> 스냅샷 통째 덮어쓰기로 7교시 즉시 제거됨
+        current_html["val"] = html_deleted
+        r5 = sync_comcigan_from_web(
+            url="http://comci.net:4082/st",
+            target_date="2026-11-16",
+            target_grade="1",
+            target_class="5",
+            sync_service=mem_svc,
+            fetcher=_GridStubFetcher(),
+            cache_path=cache_file,
+        )
+        self.assertTrue(r5["ok"])
+        self.assertEqual(stored_snaps["snap_8140246_20261116"]["classes"]["1-5"]["7"]["subject"], "")
+        self.assertFalse(stored_snaps["snap_8140246_20261116"]["classes"]["1-5"]["7"]["is_changed"])
 
 
 if __name__ == "__main__":

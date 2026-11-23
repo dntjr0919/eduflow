@@ -128,6 +128,235 @@ def push_comcigan_changes(
     return {"ok": ok, "pushed": len(rows) if ok else 0, "rows": rows}
 
 
+def _normalize_snapshot_subject(raw_subject: Any) -> Tuple[str, bool]:
+    """스냅샷 슬롯의 과목명을 정규화하고 공강/삭제 표현 여부를 반환합니다."""
+    subj = str(raw_subject or "").strip()
+    if subj in ("수업없음(휴업/공강)", "수업없음", "공강", "휴강"):
+        return "", True
+    return subj, False
+
+
+def build_daily_timetable_snapshots(
+    grid_slots: Optional[Dict[str, Dict[str, Any]]] = None,
+    base_rows: Optional[List[Dict[str, Any]]] = None,
+    change_rows: Optional[List[Dict[str, Any]]] = None,
+    target_date: str = "",
+    school_code: str = "",
+    comcigan_school_code: str = "",
+    school_name: str = "",
+    max_periods: int = 8,
+) -> List[Dict[str, Any]]:
+    """
+    컴시간 파싱 결과(grid_slots 우선, 없을 경우 base_rows+change_rows)를
+    날짜별 최종 스냅샷 문서 목록(`시간표_스냅샷` 스키마)으로 변환합니다.
+    """
+    from services.timetable_manual_service import normalize_teacher_name
+
+    weekday_ko = ("월", "화", "수", "목", "금", "토", "일")
+    eff_date = str(target_date or datetime.now().strftime("%Y-%m-%d")).strip()[:10]
+    raw_school_key = str(school_code or comcigan_school_code or school_name or "default").strip()
+    school_key = re.sub(r"[^0-9A-Za-z_-]", "_", raw_school_key) or "default"
+
+    def _day_from_date(d_str: str) -> str:
+        try:
+            return weekday_ko[datetime.strptime(d_str, "%Y-%m-%d").weekday()]
+        except ValueError:
+            return ""
+
+    # date -> {"classes": {class_key: {p_str: slot}}, "teachers": {teacher_name: {p_str: slot}}, "day_of_week": str}
+    by_date: Dict[str, Dict[str, Any]] = {}
+
+    def _ensure_date_bucket(d_str: str, day_hint: str = "") -> Dict[str, Any]:
+        bucket = by_date.get(d_str)
+        if bucket is None:
+            bucket = {
+                "day_of_week": str(day_hint or _day_from_date(d_str)).strip(),
+                "classes": {},
+                "teachers": {},
+            }
+            by_date[d_str] = bucket
+        elif not bucket["day_of_week"] and day_hint:
+            bucket["day_of_week"] = str(day_hint).strip()
+        return bucket
+
+    def _ensure_class_periods(bucket: Dict[str, Any], class_key: str) -> Dict[str, Dict[str, Any]]:
+        cls_map = bucket["classes"].setdefault(class_key, {})
+        for p in range(1, max_periods + 1):
+            p_str = str(p)
+            if p_str not in cls_map:
+                cls_map[p_str] = {
+                    "period": p,
+                    "subject": "",
+                    "teacher_name": "",
+                    "is_changed": False,
+                }
+        return cls_map
+
+    def _ensure_teacher_periods(bucket: Dict[str, Any], t_name: str) -> Dict[str, Dict[str, Any]]:
+        t_map = bucket["teachers"].setdefault(t_name, {})
+        for p in range(1, max_periods + 1):
+            p_str = str(p)
+            if p_str not in t_map:
+                t_map[p_str] = {
+                    "period": p,
+                    "grade": "",
+                    "class_no": "",
+                    "subject": "",
+                    "teacher_name": t_name,
+                    "is_changed": False,
+                }
+        return t_map
+
+    slots_dict = dict(grid_slots or {})
+    if slots_dict:
+        for slot in slots_dict.values():
+            if not isinstance(slot, dict):
+                continue
+            d_str = str(slot.get("date") or eff_date).strip()[:10]
+            if not d_str:
+                continue
+            p_raw = str(slot.get("period") or "").strip()
+            try:
+                p_num = int(re.sub(r"[^0-9]", "", p_raw))
+            except ValueError:
+                continue
+            if p_num < 1 or p_num > 12:
+                continue
+            p_str = str(p_num)
+            day_name = str(slot.get("day_of_week") or _day_from_date(d_str)).strip()
+            bucket = _ensure_date_bucket(d_str, day_name)
+            e_type = str(slot.get("entry_type") or "").strip().lower()
+            subj, was_empty_marker = _normalize_snapshot_subject(slot.get("subject"))
+            is_changed = bool(slot.get("is_changed")) or was_empty_marker
+            t_norm = normalize_teacher_name(slot.get("teacher_name") or slot.get("teacher") or "")
+            g_str = str(slot.get("grade") or "").strip()
+            c_str = str(slot.get("class_no") or "").strip()
+
+            if e_type == "teacher":
+                if not t_norm:
+                    continue
+                t_map = _ensure_teacher_periods(bucket, t_norm)
+                t_map[p_str] = {
+                    "period": p_num,
+                    "grade": g_str if subj else "",
+                    "class_no": c_str if subj else "",
+                    "subject": subj,
+                    "teacher_name": t_norm,
+                    "is_changed": is_changed,
+                }
+            else:
+                if not g_str or not c_str:
+                    continue
+                class_key = f"{g_str}-{c_str}"
+                cls_map = _ensure_class_periods(bucket, class_key)
+                cls_map[p_str] = {
+                    "period": p_num,
+                    "subject": subj,
+                    "teacher_name": t_norm if subj else "",
+                    "is_changed": is_changed,
+                }
+    else:
+        # Fallback: grid_slots가 없는 레거시/모의 fetcher용
+        target_day = _day_from_date(eff_date)
+        for b in (base_rows or []):
+            if not isinstance(b, dict):
+                continue
+            d_val = str(b.get("day_of_week") or "").strip()
+            if target_day and d_val and not d_val.startswith(target_day):
+                continue
+            d_str = str(b.get("date") or eff_date).strip()[:10]
+            p_raw = str(b.get("period") or "").strip()
+            try:
+                p_num = int(re.sub(r"[^0-9]", "", p_raw))
+            except ValueError:
+                continue
+            p_str = str(p_num)
+            bucket = _ensure_date_bucket(d_str, d_val or target_day)
+            e_type = str(b.get("entry_type") or "").strip().lower()
+            subj, was_empty_marker = _normalize_snapshot_subject(b.get("subject"))
+            t_norm = normalize_teacher_name(b.get("teacher_name") or b.get("teacher") or "")
+            g_str = str(b.get("grade") or "").strip()
+            c_str = str(b.get("class_no") or "").strip()
+            if e_type == "teacher" and t_norm:
+                t_map = _ensure_teacher_periods(bucket, t_norm)
+                t_map[p_str] = {
+                    "period": p_num,
+                    "grade": g_str if subj else "",
+                    "class_no": c_str if subj else "",
+                    "subject": subj,
+                    "teacher_name": t_norm,
+                    "is_changed": was_empty_marker,
+                }
+            elif g_str and c_str:
+                cls_map = _ensure_class_periods(bucket, f"{g_str}-{c_str}")
+                cls_map[p_str] = {
+                    "period": p_num,
+                    "subject": subj,
+                    "teacher_name": t_norm if subj else "",
+                    "is_changed": was_empty_marker,
+                }
+        for c in (change_rows or []):
+            if not isinstance(c, dict):
+                continue
+            d_str = str(c.get("date") or c.get("target_date") or eff_date).strip()[:10]
+            p_raw = str(c.get("period") or "").strip()
+            try:
+                p_num = int(re.sub(r"[^0-9]", "", p_raw))
+            except ValueError:
+                continue
+            p_str = str(p_num)
+            bucket = _ensure_date_bucket(d_str)
+            subj, _ = _normalize_snapshot_subject(c.get("changed_subject"))
+            t_norm = normalize_teacher_name(c.get("changed_teacher") or c.get("original_teacher") or "")
+            g_str = str(c.get("grade") or "").strip()
+            c_str = str(c.get("class_no") or "").strip()
+            if g_str and c_str:
+                cls_map = _ensure_class_periods(bucket, f"{g_str}-{c_str}")
+                cls_map[p_str] = {
+                    "period": p_num,
+                    "subject": subj,
+                    "teacher_name": t_norm if subj else "",
+                    "is_changed": True,
+                }
+            if t_norm:
+                t_map = _ensure_teacher_periods(bucket, t_norm)
+                t_map[p_str] = {
+                    "period": p_num,
+                    "grade": g_str if subj else "",
+                    "class_no": c_str if subj else "",
+                    "subject": subj,
+                    "teacher_name": t_norm,
+                    "is_changed": True,
+                }
+
+    snapshots: List[Dict[str, Any]] = []
+    for d_str in sorted(by_date.keys()):
+        bucket = by_date[d_str]
+        doc_id = f"snap_{school_key}_{d_str.replace('-', '')}"
+        date_hash = hashlib.sha256(
+            json.dumps(
+                {"classes": bucket["classes"], "teachers": bucket["teachers"]},
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        snapshots.append(
+            {
+                "remote_id": doc_id,
+                "date": d_str,
+                "day_of_week": bucket["day_of_week"] or _day_from_date(d_str),
+                "school_code": str(school_code or "").strip(),
+                "comcigan_school_code": str(comcigan_school_code or "").strip(),
+                "school_name": str(school_name or "").strip(),
+                "source": "comcigan",
+                "snapshot_hash": date_hash,
+                "classes": bucket["classes"],
+                "teachers": bucket["teachers"],
+            }
+        )
+    return snapshots
+
+
 def compute_comcigan_snapshot_hash(
     base_rows: List[Dict[str, Any]],
     change_rows: List[Dict[str, Any]],
@@ -522,8 +751,21 @@ def sync_comcigan_from_web(
 
     cls_cnt = int(fetched.get("class_base_count", len(base_rows)) or 0)
     tch_cnt = int(fetched.get("teacher_base_count", 0) or 0)
+    snapshots = build_daily_timetable_snapshots(
+        grid_slots=grid_slots,
+        base_rows=base_rows,
+        change_rows=change_rows,
+        target_date=eff_date,
+        school_code=eff_neis_code,
+        comcigan_school_code=eff_comcigan_code,
+        school_name=eff_school_name,
+    )
     snap_hash = compute_comcigan_snapshot_hash(base_rows, change_rows, grid_slots)
-    raw_snap_hash = snap_hash
+    curr_date_hashes: Dict[str, str] = {
+        str(s["date"]): str(s["snapshot_hash"])
+        for s in snapshots
+        if isinstance(s, dict) and s.get("date")
+    }
 
     resolved_cache_path = Path(cache_path) if cache_path is not None else _default_comcigan_cache_path()
     cache_key = f"{eff_neis_code or eff_comcigan_code or 'default'}|{eff_teacher}|{scope}|{target_grade}|{target_class}"
@@ -531,9 +773,10 @@ def sync_comcigan_from_web(
     svc = sync_service or FirestoreSyncService()
 
     def _is_remote_empty() -> bool:
-        if not hasattr(svc, "has_timetable_base_docs"):
+        checker = getattr(svc, "has_timetable_snapshots", None) or getattr(svc, "has_timetable_base_docs", None)
+        if checker is None:
             return False
-        exists = svc.has_timetable_base_docs(
+        exists = checker(
             school_code=eff_neis_code,
             comcigan_school_code=eff_comcigan_code,
             school_name=eff_school_name,
@@ -541,11 +784,13 @@ def sync_comcigan_from_web(
         return exists is False
 
     effective_prev_hash = "" if force_full else (prev_snapshot_hash or str(prev_cache.get("snapshot_hash") or ""))
+    remote_was_empty = False
     if not force_full and (skip_if_unchanged or use_local_cache) and effective_prev_hash and snap_hash == effective_prev_hash:
         if _is_remote_empty():
-            _LOGGER.info("Firestore 시간표_기본 문서가 0건으로 감지되어 로컬 캐시를 무효화하고 전체 재동기화합니다.")
+            _LOGGER.info("Firestore 시간표_스냅샷 문서가 0건으로 감지되어 로컬 캐시를 무효화하고 전체 재동기화합니다.")
             prev_cache = {}
             effective_prev_hash = ""
+            remote_was_empty = True
         else:
             _report(100, "변경된 시간표가 없어 동기화를 건너뛰었습니다 (0건 반영)")
             return {
@@ -561,6 +806,8 @@ def sync_comcigan_from_web(
                 "class_base_count": cls_cnt,
                 "teacher_base_count": tch_cnt,
                 "change_count": len(change_rows),
+                "snapshot_count": 0,
+                "snapshots_pushed": 0,
                 "base_pushed": 0,
                 "changes_pushed": 0,
                 "base_deleted": 0,
@@ -568,116 +815,21 @@ def sync_comcigan_from_web(
                 "error": "",
             }
 
-    cached_base_rows = list((prev_cache.get("base_rows") or {}).values())
-    has_empty_grid_slots = any(
-        isinstance(s, dict) and not str(s.get("subject") or "").strip()
-        for s in grid_slots.values()
-    )
-    needs_orig_lookup = any(
-        str(c.get("original_subject") or "").strip() == "(기존수업)"
-        for c in change_rows
-    )
-    if not cached_base_rows and (needs_orig_lookup or has_empty_grid_slots) and sync_service is not None:
-        try:
-            cached_base_rows = sync_service.fetch_sheet_rows("시간표_기본") or []
-        except Exception:
-            cached_base_rows = []
+    prev_date_hashes: Dict[str, str] = dict(prev_cache.get("date_hashes") or {})
+    if force_full or not use_local_cache or not prev_date_hashes or remote_was_empty:
+        snapshots_to_push = list(snapshots)
+    else:
+        snapshots_to_push = [
+            s for s in snapshots
+            if prev_date_hashes.get(str(s.get("date") or "")) != str(s.get("snapshot_hash") or "")
+        ]
 
-    if grid_slots and cached_base_rows:
-        base_rows, change_rows = reconcile_grid_with_base(
-            grid_slots=grid_slots,
-            base_rows=base_rows,
-            change_rows=change_rows,
-            prev_base_rows=cached_base_rows,
-            school_code=eff_neis_code,
-            comcigan_school_code=eff_comcigan_code,
-            school_name=eff_school_name,
-        )
-
-    # 시간표_기본과 대조해 '(기존수업)' 대신 실제 원래 과목/교사명을 로컬 캐시 기준으로 보완 (Firestore 전체 읽기 제거)
-    if change_rows:
-        _report(78, "로컬 기본 시간표와 변동 과목 매칭 중...")
-        class_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
-        fallback_lookup: Dict[Tuple[str, str, str, str], Tuple[str, str]] = {}
-        teacher_lookup: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
-        for b in cached_base_rows + list(base_rows):
-            if not isinstance(b, dict):
-                continue
-            g_val = str(b.get("grade") or "").strip()
-            c_val = str(b.get("class_no") or "").strip()
-            d_val = str(b.get("day_of_week") or "").strip()
-            p_val = str(b.get("period") or "").strip()
-            subj = str(b.get("subject") or "").strip()
-            tchr = str(b.get("teacher_name") or b.get("teacher") or "").strip()
-            if not subj or not d_val or not p_val:
-                continue
-            e_type = str(b.get("entry_type") or "").strip().lower()
-            key = (g_val, c_val, d_val, p_val)
-            if g_val and c_val:
-                if e_type in ("", "class"):
-                    class_lookup[key] = (subj, tchr)
-                else:
-                    fallback_lookup[key] = (subj, tchr)
-            if tchr:
-                t_key = (tchr, d_val, p_val)
-                if e_type == "teacher" or t_key not in teacher_lookup:
-                    teacher_lookup[t_key] = (subj, tchr)
-
-        weekday_ko = ("월", "화", "수", "목", "금", "토", "일")
-        for chg in change_rows:
-            orig_s = str(chg.get("original_subject") or "").strip()
-            if orig_s and orig_s != "(기존수업)":
-                continue
-            d_str = str(chg.get("date") or chg.get("target_date") or "").strip()
-            try:
-                day_name = weekday_ko[datetime.strptime(d_str, "%Y-%m-%d").weekday()]
-            except ValueError:
-                day_name = ""
-            p_val = str(chg.get("period") or "").strip()
-            key = (
-                str(chg.get("grade") or "").strip(),
-                str(chg.get("class_no") or "").strip(),
-                day_name,
-                p_val,
-            )
-            matched = class_lookup.get(key) or fallback_lookup.get(key)
-            if not matched:
-                chg_tchr = str(chg.get("original_teacher") or chg.get("changed_teacher") or "").strip()
-                if chg_tchr and day_name and p_val:
-                    matched = teacher_lookup.get((chg_tchr, day_name, p_val))
-            if matched:
-                chg["original_subject"] = matched[0]
-                if not chg.get("original_teacher"):
-                    chg["original_teacher"] = matched[1]
-
-    snap_hash = raw_snap_hash
-    delta = (
-        compute_timetable_delta(prev_cache, base_rows, change_rows)
-        if (use_local_cache and not force_full)
-        else {
-            "base_delta": base_rows,
-            "change_delta": change_rows,
-            "deleted_base_ids": [],
-            "deleted_change_ids": [],
-            "curr_base_hashes": {_row_remote_id("tb", r, i): _compute_row_hash(r) for i, r in enumerate(base_rows) if isinstance(r, dict)},
-            "curr_chg_hashes": {_row_remote_id("tc", r, i): _compute_row_hash(r) for i, r in enumerate(change_rows) if isinstance(r, dict)},
-            "curr_base_map": {_row_remote_id("tb", r, i): r for i, r in enumerate(base_rows) if isinstance(r, dict)},
-        }
-    )
-    base_delta: List[Dict[str, Any]] = delta["base_delta"]
-    change_delta: List[Dict[str, Any]] = delta["change_delta"]
-    deleted_base_ids: List[str] = delta["deleted_base_ids"]
-    deleted_change_ids: List[str] = delta["deleted_change_ids"]
-
-    if not force_full and use_local_cache and not base_delta and not change_delta and not deleted_base_ids and not deleted_change_ids:
+    if not force_full and use_local_cache and not snapshots_to_push:
         if _is_remote_empty():
-            _LOGGER.info("Firestore 시간표_기본 문서가 0건으로 감지되어 전체 재동기화합니다.")
-            base_delta = list(base_rows)
-            change_delta = list(change_rows)
-            deleted_base_ids = []
-            deleted_change_ids = []
+            _LOGGER.info("Firestore 시간표_스냅샷 문서가 0건으로 감지되어 전체 재동기화합니다.")
+            snapshots_to_push = list(snapshots)
         else:
-            _report(100, "변경된 항목이 없어 동기화를 건너뛰었습니다 (0건 반영)")
+            _report(100, "변경된 날짜 스냅샷이 없어 동기화를 건너뛰었습니다 (0건 반영)")
             return {
                 "ok": True,
                 "skipped": True,
@@ -691,6 +843,8 @@ def sync_comcigan_from_web(
                 "class_base_count": cls_cnt,
                 "teacher_base_count": tch_cnt,
                 "change_count": len(change_rows),
+                "snapshot_count": 0,
+                "snapshots_pushed": 0,
                 "base_pushed": 0,
                 "changes_pushed": 0,
                 "base_deleted": 0,
@@ -701,67 +855,31 @@ def sync_comcigan_from_web(
     if eff_comcigan_code and eff_teacher_id and (force_full or str(prev_cache.get("comcigan_school_code") or "") != eff_comcigan_code):
         svc.update_teacher_comcigan_code(eff_teacher_id, eff_comcigan_code)
 
-    if base_delta:
-        _report(82, f"Firestore 기본 시간표 변경분 반영 중 ({len(base_delta)}건)...")
+    if snapshots_to_push:
+        _report(85, f"Firestore 날짜별 시간표 스냅샷 덮어쓰기 중 ({len(snapshots_to_push)}일분)...")
         if progress_callback is not None:
-            base_ok = svc.upsert_timetable_base(
-                base_delta,
+            ok = svc.push_timetable_snapshots(
+                snapshots_to_push,
+                cleanup_comcigan_changes=True,
+                school_code=eff_neis_code,
+                comcigan_school_code=eff_comcigan_code,
+                school_name=eff_school_name,
                 progress_callback=lambda b_idx, b_tot: _report(
-                    82 + int(10 * b_idx / max(1, b_tot)),
-                    f"Firestore 기본 시간표 변경분 반영 중 ({b_idx}/{b_tot} 배치)",
+                    85 + int(14 * b_idx / max(1, b_tot)),
+                    f"Firestore 날짜별 시간표 스냅샷 덮어쓰기 중 ({b_idx}/{b_tot}일)",
                 ),
             )
         else:
-            base_ok = svc.upsert_timetable_base(base_delta)
-    else:
-        base_ok = True
-
-    if base_ok and deleted_base_ids and hasattr(svc, "delete_timetable_docs"):
-        base_ok = svc.delete_timetable_docs("시간표_기본", deleted_base_ids)
-
-    reconcile_dates_set = {eff_date} if eff_date else set()
-    for r in change_rows:
-        if isinstance(r, dict):
-            d = str(r.get("date") or r.get("target_date") or "").strip()[:10]
-            if d:
-                reconcile_dates_set.add(d)
-    for slot in (grid_slots or {}).values():
-        if isinstance(slot, dict):
-            d = str(slot.get("date") or "").strip()[:10]
-            if d:
-                reconcile_dates_set.add(d)
-    reconcile_dates = sorted(reconcile_dates_set)
-    keep_change_ids = list((delta.get("curr_chg_hashes") or {}).keys())
-
-    should_reconcile_changes = bool(change_delta) or bool(deleted_change_ids) or force_full or not prev_cache
-    if should_reconcile_changes:
-        _report(93, f"Firestore 시간표 변동 변경분 반영 중 ({len(change_delta)}건)...")
-        reconcile_kwargs: Dict[str, Any] = {
-            "reconcile_changes": True,
-            "reconcile_dates": reconcile_dates,
-            "keep_remote_ids": keep_change_ids,
-            "school_code": eff_neis_code,
-            "comcigan_school_code": eff_comcigan_code,
-            "school_name": eff_school_name,
-        }
-        if progress_callback is not None:
-            chg_ok = svc.push_timetable_changes(
-                change_delta,
-                progress_callback=lambda b_idx, b_tot: _report(
-                    93 + int(6 * b_idx / max(1, b_tot)),
-                    f"Firestore 시간표 변동 변경분 반영 중 ({b_idx}/{b_tot} 배치)",
-                ),
-                **reconcile_kwargs,
+            ok = svc.push_timetable_snapshots(
+                snapshots_to_push,
+                cleanup_comcigan_changes=True,
+                school_code=eff_neis_code,
+                comcigan_school_code=eff_comcigan_code,
+                school_name=eff_school_name,
             )
-        else:
-            chg_ok = svc.push_timetable_changes(change_delta, **reconcile_kwargs)
     else:
-        chg_ok = True
+        ok = True
 
-    if chg_ok and deleted_change_ids and not should_reconcile_changes and hasattr(svc, "delete_timetable_docs"):
-        chg_ok = svc.delete_timetable_docs("시간표_변동", deleted_change_ids)
-
-    ok = base_ok and chg_ok
     if ok:
         if use_local_cache:
             _save_comcigan_cache(
@@ -769,20 +887,13 @@ def sync_comcigan_from_web(
                 cache_key,
                 {
                     "snapshot_hash": snap_hash,
+                    "date_hashes": curr_date_hashes,
                     "comcigan_school_code": eff_comcigan_code,
-                    "base_hashes": delta["curr_base_hashes"],
-                    "change_hashes": delta["curr_chg_hashes"],
-                    "base_rows": delta["curr_base_map"],
                 },
             )
-        _report(100, f"동기화 완료 (기본 +{len(base_delta)}건, 변동 +{len(change_delta)}건)")
+        _report(100, f"스냅샷 동기화 완료 ({len(snapshots_to_push)}일분 통째 반영)")
 
-    failed_steps: List[str] = []
-    if not base_ok:
-        failed_steps.append(f"시간표_기본 Upsert 실패 ({len(base_delta)}건)")
-    if not chg_ok:
-        failed_steps.append(f"시간표_변동 Push 실패 ({len(change_delta)}건)")
-    error_msg = ", ".join(failed_steps)
+    error_msg = "" if ok else f"시간표_스냅샷 Push 실패 ({len(snapshots_to_push)}건)"
     if error_msg:
         _LOGGER.warning("컴시간 Firestore 동기화 실패: %s", error_msg)
 
@@ -799,10 +910,12 @@ def sync_comcigan_from_web(
         "class_base_count": cls_cnt,
         "teacher_base_count": tch_cnt,
         "change_count": len(change_rows),
-        "base_pushed": len(base_delta) if base_ok else 0,
-        "changes_pushed": len(change_delta) if chg_ok else 0,
-        "base_deleted": len(deleted_base_ids) if base_ok else 0,
-        "changes_deleted": len(deleted_change_ids) if chg_ok else 0,
+        "snapshot_count": len(snapshots_to_push),
+        "snapshots_pushed": len(snapshots_to_push) if ok else 0,
+        "base_pushed": 0,
+        "changes_pushed": 0,
+        "base_deleted": 0,
+        "changes_deleted": 0,
         "error": error_msg,
     }
 

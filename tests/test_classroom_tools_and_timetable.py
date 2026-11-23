@@ -341,10 +341,10 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         self.assertEqual(res["school_code"], "7010001")
         self.assertEqual(res["comcigan_school_code"], "31234")
         self.assertEqual(self.fake_fs.cols["계정_교사"]["유우석"]["comcigan_school_code"], "31234")
-        saved_tt = self.fake_fs.cols["시간표_기본"]["tb_t_유우석_화_3"]
-        self.assertEqual(saved_tt["school_code"], "7010001")
-        self.assertEqual(saved_tt["comcigan_school_code"], "31234")
-        self.assertEqual(saved_tt["teacher_name"], "유우석")
+        saved_snap = self.fake_fs.cols["시간표_스냅샷"]["snap_7010001_20261117"]
+        self.assertEqual(saved_snap["school_code"], "7010001")
+        self.assertEqual(saved_snap["comcigan_school_code"], "31234")
+        self.assertEqual(saved_snap["teachers"]["유우석"]["3"]["teacher_name"], "유우석")
 
     def test_hybrid_backend_vercel_api_fallback(self) -> None:
         from unittest.mock import patch
@@ -473,11 +473,8 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             )
             self.assertTrue(res1["ok"])
             self.assertFalse(res1["skipped"])
-            self.assertEqual(res1["base_pushed"], 3)
-            self.assertEqual(res1["changes_pushed"], 1)
+            self.assertEqual(res1["snapshots_pushed"], 1)
             self.assertEqual(read_calls["count"], 0)
-            self.assertEqual(len(pushed_base_batches), 1)
-            self.assertEqual(len(pushed_chg_batches), 1)
 
             # 2차 동기화 (동일 데이터): 0건 반영, 전송 스킵
             res2 = sync_comcigan_from_web(
@@ -492,12 +489,9 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             self.assertTrue(res2["ok"])
             self.assertTrue(res2["skipped"])
             self.assertFalse(res2["changed"])
-            self.assertEqual(res2["base_pushed"], 0)
-            self.assertEqual(res2["changes_pushed"], 0)
-            self.assertEqual(len(pushed_base_batches), 1)
-            self.assertEqual(len(pushed_chg_batches), 1)
+            self.assertEqual(res2["snapshots_pushed"], 0)
 
-            # 3차 동기화 (1개 교시만 변경): 정확히 1건만 전송
+            # 3차 동기화 (1개 교시만 변경): 해당 날짜 스냅샷 통째 덮어쓰기
             state["rows"][1]["subject"] = "물리학Ⅰ"
             res3 = sync_comcigan_from_web(
                 url="http://comci.net:4082/st",
@@ -511,18 +505,15 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             self.assertTrue(res3["ok"])
             self.assertFalse(res3["skipped"])
             self.assertTrue(res3["changed"])
-            self.assertEqual(res3["base_pushed"], 1)
-            self.assertEqual(res3["changes_pushed"], 0)
-            self.assertEqual(len(pushed_base_batches), 2)
-            self.assertEqual(len(pushed_base_batches[1]), 1)
-            self.assertEqual(pushed_base_batches[1][0]["remote_id"], "tb_2")
-            self.assertEqual(pushed_base_batches[1][0]["subject"], "물리학Ⅰ")
-            self.assertEqual(len(pushed_chg_batches), 1)
+            self.assertEqual(res3["snapshots_pushed"], 1)
+            self.assertEqual(
+                self.fake_fs.cols["시간표_스냅샷"]["snap_7010001_20261117"]["classes"]["2-4"]["2"]["subject"],
+                "물리학Ⅰ",
+            )
             self.assertEqual(read_calls["count"], 0)
 
-            # 4차 동기화 (로컬 캐시는 있지만 Firestore 시간표_기본이 0건으로 초기화된 상황): 자동 전체 재동기화
-            self.fake_fs.cols["시간표_기본"].clear()
-            self.fake_fs.cols["시간표_변동"].clear()
+            # 4차 동기화 (로컬 캐시는 있지만 Firestore 시간표_스냅샷이 0건으로 초기화된 상황): 자동 전체 재동기화
+            self.fake_fs.cols["시간표_스냅샷"].clear()
             res4 = sync_comcigan_from_web(
                 url="http://comci.net:4082/st",
                 school_code="31234",
@@ -534,12 +525,10 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             )
             self.assertTrue(res4["ok"])
             self.assertFalse(res4["skipped"])
-            self.assertEqual(res4["base_pushed"], 3)
-            self.assertEqual(res4["changes_pushed"], 1)
-            self.assertEqual(len(self.fake_fs.cols["시간표_기본"]), 3)
-            self.assertEqual(len(self.fake_fs.cols["시간표_변동"]), 1)
+            self.assertEqual(res4["snapshots_pushed"], 1)
+            self.assertEqual(len(self.fake_fs.cols["시간표_스냅샷"]), 1)
 
-            # 5차 동기화 (force_full=True 강제 재동기화): 캐시 무시하고 전체 3+1건 덮어쓰기
+            # 5차 동기화 (force_full=True 강제 재동기화): 캐시 무시하고 스냅샷 덮어쓰기
             res5 = sync_comcigan_from_web(
                 url="http://comci.net:4082/st",
                 school_code="31234",
@@ -552,8 +541,7 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             )
             self.assertTrue(res5["ok"])
             self.assertFalse(res5["skipped"])
-            self.assertEqual(res5["base_pushed"], 3)
-            self.assertEqual(res5["changes_pushed"], 1)
+            self.assertEqual(res5["snapshots_pushed"], 1)
 
     def test_vercel_api_headers_and_timeout_and_async_roster_button_restore(self) -> None:
         import time
