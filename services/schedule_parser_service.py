@@ -667,7 +667,18 @@ def export_schedules_to_xlsx(
         r_label = REMINDER_LABELS.get(r_type, "알림 없음")
         memo = str(sch.get("memo", "") or "").strip()
 
-        ws.append([s_date, e_date, title, cat, s_time, all_day_str, r_label, memo])
+        ws.append(
+            [
+                escape_spreadsheet_formula(s_date),
+                escape_spreadsheet_formula(e_date),
+                escape_spreadsheet_formula(title),
+                escape_spreadsheet_formula(cat),
+                escape_spreadsheet_formula(s_time),
+                escape_spreadsheet_formula(all_day_str),
+                escape_spreadsheet_formula(r_label),
+                escape_spreadsheet_formula(memo),
+            ]
+        )
         exported += 1
 
     if exported == 0 and include_sample_when_empty:
@@ -767,48 +778,217 @@ def normalize_ai_date_str(raw_val: Any, today: Optional[date] = None) -> str:
     return s_date
 
 
+def is_calendar_query_intent(text: str) -> bool:
+    """
+    사용자 입력이 일정·할일 '등록/추출'이 아니라 기존 일정 '조회/요약/빈 시간 확인' 질문인지 판별합니다.
+    """
+    s = str(text or "").strip()
+    if not s or len(s) > 220:
+        return False
+    # JSON 직접 입력이나 등록/추가 명령어가 명확히 포함된 경우 등록으로 간주
+    if s.startswith("{") or s.startswith("[") or "```" in s:
+        return False
+    reg_keywords = ("등록", "추가해", "넣어", "저장해", "기입", "메모해", "일괄")
+    if any(kw in s for kw in reg_keywords):
+        return False
+    query_keywords = (
+        "요약",
+        "알려",
+        "조회",
+        "확인",
+        "뭐 있",
+        "무슨 일정",
+        "어떤 일정",
+        "빈 시간",
+        "비어",
+        "비었",
+        "일정 있",
+        "할일 있",
+        "할 일 있",
+        "스케줄",
+        "보여",
+        "몇 시",
+        "언제야",
+        "언제인가",
+    )
+    if s.endswith("?") or any(kw in s for kw in query_keywords):
+        return True
+    return False
+
+
+def try_parse_direct_calendar_json(
+    raw_text: str,
+    today: Optional[date] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    사용자가 입력창에 유효한 일정·할일 JSON(배열/객체 또는 ```json 코드블록)을 직접 붙여넣은 경우
+    AI 호출 없이 즉시 parse_calendar_ai_response()로 파싱해 반환합니다. 유효하지 않으면 None.
+    """
+    s = str(raw_text or "").strip()
+    if not s:
+        return None
+    looks_like_json = (
+        s.startswith("{")
+        or s.startswith("[")
+        or "```json" in s.lower()
+        or ("```" in s and ("{" in s or "[" in s))
+    )
+    if not looks_like_json:
+        return None
+    try:
+        parsed = parse_calendar_ai_response(s, today=today)
+    except Exception:
+        return None
+    if not parsed.get("schedules") and not parsed.get("todos"):
+        return None
+    return parsed
+
+
 def build_calendar_ai_prompt(
     user_input: str,
     today: Optional[date] = None,
+    schedule_context: str = "",
 ) -> Tuple[str, str]:
     """
-    자연어 일정 요청 또는 공문·안내문 텍스트에서 일정(schedules)과 할일(todos)을
-    구조화된 JSON으로 추출하기 위한 (system_prompt, user_prompt) 튜플을 생성합니다.
+    자연어 일정 요청·공문/공지 복붙 또는 내 일정 질문에 대응하기 위한
+    (system_prompt, user_prompt) 튜플을 생성합니다.
     """
     ref = today or date.today()
     wd_names = ("월", "화", "수", "목", "금", "토", "일")
     today_label = f"{ref.isoformat()} ({wd_names[ref.weekday()]}요일)"
     categories_str = ", ".join(VALID_SCHEDULE_CATEGORIES)
+    ctx_clean = str(schedule_context or "").strip()
+    is_query = is_calendar_query_intent(user_input) and bool(ctx_clean)
+
+    if is_query:
+        system_prompt = (
+            "당신은 한국 학교 교사의 캘린더·할일 비서입니다.\n"
+            f"- 기준 오늘 날짜: {today_label} (YYYY-MM-DD: {ref.isoformat()})\n"
+            "- 아래 제공된 [내 캘린더·할일 현황]을 바탕으로 사용자의 질문(일정 요약, 빈 시간 확인, 마감 할일 조회 등)에 "
+            "한국어로 간결하고 정확하게 답변하세요.\n"
+            "- 조회/질문 응답이므로 JSON이 아닌 읽기 쉬운 일반 텍스트(불릿·시간순 정리)로 답변하세요."
+        )
+        user_prompt = (
+            f"[기준 날짜: {today_label}]\n\n"
+            f"--- [내 캘린더·할일 현황] ---\n{ctx_clean}\n\n"
+            f"--- [사용자 질문] ---\n{str(user_input or '').strip()}"
+        )
+        return system_prompt, user_prompt
 
     system_prompt = (
         "당신은 한국 학교 교사의 학사일정 및 업무 할일(To-Do) 정리 비서입니다.\n"
         f"- 기준 오늘 날짜: {today_label} (YYYY-MM-DD: {ref.isoformat()})\n"
-        "- 사용자가 입력한 자연어 요청이나 공문·가정통신문·안내문에서 '일정(schedules)'과 '할일(todos)'을 정확히 추출하세요.\n"
-        f"- 허용 카테고리(category): {categories_str} (반드시 이 4가지 중 하나만 사용)\n"
-        "- 허용 우선순위(priority): 높음, 보통, 낮음 (반드시 이 3가지 중 하나만 사용)\n"
+        "- 사용자가 입력한 자연어 요청이나 긴 공지글·회의록·공문·가정통신문에서 '일정(schedule)'과 '할일(todo)'을 모두 빠짐없이 추출하세요.\n"
+        "- 시간·장소가 정해진 행사/회의/수업/출장은 schedule, 기한까지 처리해야 할 업무/제출/준비는 todo로 분류하세요.\n"
+        "- 상대 날짜('내일', '모레', '이번 주 금요일', '다음 주 월요일')는 반드시 기준 오늘 날짜를 바탕으로 YYYY-MM-DD 형식으로 계산하세요.\n"
+        f"- 허용 카테고리(category): {categories_str} (반드시 이 4가지 중 하나만 사용, 기본: '학사일정')\n"
+        "- 허용 우선순위(priority): 높음, 보통, 낮음 (반드시 이 3가지 중 하나만 사용, 기본: '보통')\n"
         "- 허용 알림(reminder): none, 10m, 1h, morning_9am 중 하나 (명시되지 않으면 \"none\")\n"
-        "- 날짜는 '내일', '다음 주 월요일' 같은 상대 표현도 기준 오늘 날짜를 바탕으로 반드시 YYYY-MM-DD 형식으로 변환하세요.\n"
-        "- 시간(start_time)이 명시되지 않은 종일 일정은 all_day=true, start_time=\"\" 로 설정하세요.\n"
-        "- 반드시 설명이나 서문 없이 아래 스키마를 따르는 단일 ```json ... ``` 코드블록으로만 응답하세요.\n\n"
+        "- 시간(start_time)은 24시간제 HH:MM 형식이며, 시간이 없는 종일 일정은 all_day=true, start_time=\"\" 로 설정하세요.\n"
+        "- 반드시 설명이나 서문 없이 아래 스키마 중 하나를 따르는 단일 ```json ... ``` 코드블록(또는 순수 JSON)으로만 응답하세요.\n\n"
         "```json\n"
         "{\n"
         '  "summary": "추출 요약",\n'
         '  "schedules": [\n'
-        '    {"title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "start_time": "HH:MM", "all_day": true, "category": "학사일정", "reminder": "1h", "memo": "..."}\n'
+        '    {"item_type": "schedule", "title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", "start_time": "HH:MM", "all_day": true, "category": "학사일정", "reminder": "none", "memo": "..."}\n'
         "  ],\n"
         '  "todos": [\n'
-        '    {"title": "...", "due_date": "YYYY-MM-DD", "priority": "보통", "memo": "..."}\n'
+        '    {"item_type": "todo", "title": "...", "due_date": "YYYY-MM-DD", "priority": "보통", "memo": "..."}\n'
         "  ]\n"
         "}\n"
         "```"
     )
 
+    ctx_block = (
+        f"\n\n--- [참고: 내 캘린더·할일 현황] ---\n{ctx_clean}"
+        if ctx_clean
+        else ""
+    )
     user_prompt = (
         f"[기준 날짜: {today_label}]\n"
-        "아래 내용에서 캘린더 일정(schedules)과 할일(todos)을 추출하여 단일 ```json ... ``` 블록으로 응답해 주세요.\n\n"
-        f"{str(user_input or '').strip()}"
+        "아래 내용에서 캘린더 일정(schedule)과 할일(todo)을 추출하여 단일 ```json ... ``` 블록으로 응답해 주세요.\n\n"
+        f"{str(user_input or '').strip()}{ctx_block}"
     )
     return system_prompt, user_prompt
+
+
+ALLOWED_CALENDAR_AI_KEYS = frozenset(
+    {
+        "item_type",
+        "type",
+        "title",
+        "summary",
+        "task",
+        "start_date",
+        "end_date",
+        "due_date",
+        "start_time",
+        "all_day",
+        "category",
+        "priority",
+        "reminder",
+        "reminder_type",
+        "memo",
+        "description",
+    }
+)
+MAX_CALENDAR_TITLE_LEN = 200
+MAX_CALENDAR_MEMO_LEN = 1000
+MAX_CALENDAR_SUMMARY_LEN = 500
+MAX_CALENDAR_AI_BATCH_ITEMS = 500
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_SCRIPT_BLOCK_RE = re.compile(r"<script\b[^>]*>[\s\S]*?</script>", re.IGNORECASE)
+_STYLE_BLOCK_RE = re.compile(r"<style\b[^>]*>[\s\S]*?</style>", re.IGNORECASE)
+_EVENT_ATTR_RE = re.compile(
+    r"\bon[a-z]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)", re.IGNORECASE
+)
+_DANGEROUS_URI_RE = re.compile(
+    r"(?:javascript|vbscript|data\s*:\s*text/html)\s*:", re.IGNORECASE
+)
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def sanitize_schedule_text(raw_val: Any, max_len: int = MAX_CALENDAR_TITLE_LEN) -> str:
+    """
+    외부 AI/JSON 입력 문자열에서 제어문자, <script>/<style> 블록, 인라인 이벤트(onerror= 등),
+    위험 URI 스킴, HTML 태그를 제거하고 최대 길이(max_len)로 제한합니다.
+    """
+    if raw_val is None or isinstance(raw_val, (dict, list, tuple, set)):
+        return ""
+    s = str(raw_val)
+    s = _CONTROL_CHAR_RE.sub("", s)
+    s = _SCRIPT_BLOCK_RE.sub("", s)
+    s = _STYLE_BLOCK_RE.sub("", s)
+    s = _EVENT_ATTR_RE.sub("", s)
+    s = _DANGEROUS_URI_RE.sub("", s)
+    s = _HTML_TAG_RE.sub("", s)
+    s = s.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if max_len > 0 and len(s) > max_len:
+        s = s[:max_len].rstrip()
+    return s
+
+
+def escape_spreadsheet_formula(val: Any) -> str:
+    """
+    Excel/CSV 내보내기 시 수식 인젝션(Formula Injection)을 방지하기 위해
+    '=', '+', '-', '@', '\\t', '\\r'로 시작하는 문자열 앞에 작은따옴표(')를 붙입니다.
+    """
+    s = str(val if val is not None else "")
+    stripped = s.lstrip(" \t\r\n")
+    if stripped and stripped[0] in ("=", "+", "-", "@", "\t", "\r"):
+        return "'" + s
+    return s
+
+
+def _is_valid_iso_date(date_str: str) -> bool:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date_str or "")):
+        return False
+    try:
+        date.fromisoformat(date_str)
+        return True
+    except ValueError:
+        return False
 
 
 def parse_calendar_ai_response(
@@ -817,6 +997,7 @@ def parse_calendar_ai_response(
 ) -> Dict[str, Any]:
     """
     AI 응답(마크다운 ```json 블록, JSON 배열 또는 일반 JSON/dict)을 파싱하여
+    화이트리스트 스키마 검증·새니타이징·길이/건수 제한을 거친
     정규화된 {"summary": str, "schedules": [...], "todos": [...]} 딕셔너리를 반환합니다.
     """
     ref = today or date.today()
@@ -833,7 +1014,7 @@ def parse_calendar_ai_response(
     if not isinstance(parsed, dict):
         raise ValueError("AI 응답이 JSON 객체 또는 배열 형식이 아닙니다.")
 
-    summary = str(parsed.get("summary") or "").strip()
+    summary = sanitize_schedule_text(parsed.get("summary"), max_len=MAX_CALENDAR_SUMMARY_LEN)
     raw_schedules = parsed.get("schedules")
     if not isinstance(raw_schedules, list):
         # extract_json_from_llm_response()가 최상위 JSON 배열을 {"items": [...]}로 감싸는 경우 지원
@@ -848,22 +1029,72 @@ def parse_calendar_ai_response(
         raw_todos = []
 
     norm_schedules: List[Dict[str, Any]] = []
-    for item in raw_schedules:
-        if not isinstance(item, dict):
+    norm_todos: List[Dict[str, Any]] = []
+
+    def _whitelist_item(raw_item: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw_item, dict):
+            return None
+        return {k: v for k, v in raw_item.items() if k in ALLOWED_CALENDAR_AI_KEYS}
+
+    def _total_count() -> int:
+        return len(norm_schedules) + len(norm_todos)
+
+    def _append_todo_item(item: Dict[str, Any]) -> None:
+        if _total_count() >= MAX_CALENDAR_AI_BATCH_ITEMS:
+            return
+        title = sanitize_schedule_text(
+            item.get("title") or item.get("task") or item.get("summary"),
+            max_len=MAX_CALENDAR_TITLE_LEN,
+        )
+        if not title:
+            return
+        raw_due = item.get("due_date") or item.get("end_date") or item.get("start_date")
+        due_date = normalize_ai_date_str(raw_due, today=ref)
+        if due_date and not _is_valid_iso_date(due_date):
+            due_date = ""
+        priority = normalize_todo_priority(item.get("priority"))
+        memo = sanitize_schedule_text(
+            item.get("memo") or item.get("description"),
+            max_len=MAX_CALENDAR_MEMO_LEN,
+        )
+        norm_todos.append(
+            {
+                "title": title,
+                "due_date": due_date,
+                "priority": priority,
+                "memo": memo,
+            }
+        )
+
+    for raw_item in raw_schedules:
+        if _total_count() >= MAX_CALENDAR_AI_BATCH_ITEMS:
+            break
+        item = _whitelist_item(raw_item)
+        if item is None:
             continue
-        title = str(item.get("title") or item.get("summary") or "").strip()
+        item_type_raw = str(item.get("item_type") or item.get("type") or "schedule").strip().lower()
+        item_type = item_type_raw if item_type_raw in ("schedule", "todo") else "schedule"
+        if item_type == "todo":
+            _append_todo_item(item)
+            continue
+        title = sanitize_schedule_text(
+            item.get("title") or item.get("summary"),
+            max_len=MAX_CALENDAR_TITLE_LEN,
+        )
         if not title:
             continue
 
         s_date = normalize_ai_date_str(item.get("start_date"), today=ref)
-        if not s_date:
+        if not _is_valid_iso_date(s_date):
             s_date = ref.isoformat()
-        e_date = normalize_ai_date_str(item.get("end_date"), today=ref) or s_date
-        if e_date < s_date:
+        e_date = normalize_ai_date_str(item.get("end_date"), today=ref)
+        if not _is_valid_iso_date(e_date) or e_date < s_date:
             e_date = s_date
 
         all_day_raw = item.get("all_day")
         s_time = normalize_time_str(item.get("start_time"))
+        if not re.fullmatch(r"\d{2}:\d{2}", s_time):
+            s_time = ""
         if all_day_raw is True or (isinstance(all_day_raw, str) and all_day_raw.strip().lower() in ("true", "1", "y", "예")):
             all_day = True
             s_time = ""
@@ -873,8 +1104,13 @@ def parse_calendar_ai_response(
             all_day = False
 
         cat = infer_schedule_category(title, str(item.get("category") or ""))
+        if cat not in VALID_SCHEDULE_CATEGORIES:
+            cat = "학사일정"
         reminder = normalize_reminder_type(item.get("reminder") or item.get("reminder_type") or "none")
-        memo = str(item.get("memo") or item.get("description") or "").strip()
+        memo = sanitize_schedule_text(
+            item.get("memo") or item.get("description"),
+            max_len=MAX_CALENDAR_MEMO_LEN,
+        )
 
         norm_schedules.append(
             {
@@ -889,24 +1125,13 @@ def parse_calendar_ai_response(
             }
         )
 
-    norm_todos: List[Dict[str, Any]] = []
-    for item in raw_todos:
-        if not isinstance(item, dict):
+    for raw_item in raw_todos:
+        if _total_count() >= MAX_CALENDAR_AI_BATCH_ITEMS:
+            break
+        item = _whitelist_item(raw_item)
+        if item is None:
             continue
-        title = str(item.get("title") or item.get("task") or "").strip()
-        if not title:
-            continue
-        due_date = normalize_ai_date_str(item.get("due_date"), today=ref)
-        priority = normalize_todo_priority(item.get("priority"))
-        memo = str(item.get("memo") or item.get("description") or "").strip()
-        norm_todos.append(
-            {
-                "title": title,
-                "due_date": due_date,
-                "priority": priority,
-                "memo": memo,
-            }
-        )
+        _append_todo_item(item)
 
     return {
         "summary": summary,
@@ -915,19 +1140,53 @@ def parse_calendar_ai_response(
     }
 
 
+def format_hwpx_schedule_text(doc_or_path: Any) -> str:
+    """
+    HWPX AI 문서 에이전트의 DOM 맵 추출 로직(`extract_hwpx_dom_map`)을 재사용하여
+    문단([p_...])과 표([tbl_...])의 행/열 경계(` | `)가 보존된 텍스트를 생성합니다.
+    """
+    from services.hwpx_agent_service import extract_hwpx_dom_map
+
+    dom_map = extract_hwpx_dom_map(doc_or_path)
+    lines: List[str] = []
+    for blk in dom_map.get("blocks") or []:
+        if not isinstance(blk, dict):
+            continue
+        blk_id = str(blk.get("id") or "").strip()
+        if blk.get("type") == "table":
+            if blk_id:
+                lines.append(f"[{blk_id}]")
+            for row in blk.get("rows") or []:
+                row_txt = " | ".join(
+                    str((c.get("text", "") if isinstance(c, dict) else c) or "")
+                    .replace("\n", " / ")
+                    .strip()
+                    for c in row
+                )
+                if row_txt.strip(" |"):
+                    lines.append(row_txt)
+        else:
+            txt = str(blk.get("text", "")).strip()
+            if txt:
+                lines.append(f"[{blk_id}] {txt}" if blk_id else txt)
+    return "\n".join(lines).strip()
+
+
 def extract_schedule_text_from_document(
     file_path: str | Path, max_chars: int = 24000
 ) -> Tuple[str, bool]:
     """
     HWP, HWPX, PDF 학사일정 문서에서 표(행/셀)와 본문 텍스트를 로컬로 1차 추출합니다.
+    - .hwp 파일은 HWPX AI 문서 에이전트와 동일한 한컴 COM 변환(`convert_hwp_to_hwpx`) +
+      DOM 표/문단 추출(`format_hwpx_schedule_text`)을 우선 사용하고, 불가 시 olefile로 폴백합니다.
     반환값: (extracted_text, is_scanned_pdf)
     """
     import tempfile
 
+    from services.hwpx_agent_service import convert_hwp_to_hwpx
     from services.multi_doc_extractor_service import (
         HAS_OLEFILE,
         PDF_MIN_CHARS_PER_PAGE,
-        _convert_hwp_via_com,
         _extract_hwp_text_olefile,
         _extract_pdf_text_layers,
         extract_raw_text_preview,
@@ -956,31 +1215,45 @@ def extract_schedule_text_from_document(
             txt = txt[:max_chars] + "\n... (이하 생략)"
         return txt, False
 
-    extracted = ""
-    if ext == ".hwpx":
-        parsed = parse_hwpx_content(p)
-        extracted = str(parsed.get("raw_text") or "").strip()
-        if not extracted and parsed.get("tables"):
+    def _extract_from_hwpx_path(hwpx_p: Path) -> str:
+        try:
+            dom_txt = format_hwpx_schedule_text(hwpx_p)
+            if dom_txt:
+                return dom_txt
+        except Exception:
+            pass
+        parsed = parse_hwpx_content(hwpx_p)
+        txt = str(parsed.get("raw_text") or "").strip()
+        if not txt and parsed.get("tables"):
             lines = [
                 " | ".join(str(c or "").strip() for c in row)
                 for tbl in parsed["tables"]
                 for row in tbl
             ]
-            extracted = "\n".join(ln for ln in lines if ln).strip()
+            txt = "\n".join(ln for ln in lines if ln).strip()
+        return txt
+
+    extracted = ""
+    if ext == ".hwpx":
+        extracted = _extract_from_hwpx_path(p)
     else:
-        if HAS_OLEFILE:
+        # 1순위: HWP -> 임시 HWPX 변환 후 문단/표([p_...], [tbl_...]) 구조 추출
+        try:
+            with tempfile.TemporaryDirectory(prefix="eduflow_hwp_sched_") as tmp_dir:
+                temp_hwpx = Path(tmp_dir) / f"{p.stem}.hwpx"
+                conv = convert_hwp_to_hwpx(p, temp_hwpx)
+                if conv and conv.exists():
+                    extracted = _extract_from_hwpx_path(conv)
+        except Exception:
+            extracted = ""
+
+        # 2순위(폴백): 한컴 COM 변환이 불가한 환경에서는 olefile로 추출
+        if not extracted and HAS_OLEFILE:
             try:
                 extracted = str(_extract_hwp_text_olefile(p) or "").strip()
             except Exception:
                 extracted = ""
-        if not extracted:
-            try:
-                with tempfile.TemporaryDirectory(prefix="eduflow_hwp_") as tmp_dir:
-                    conv = _convert_hwp_via_com(p, Path(tmp_dir))
-                    if conv and conv.exists():
-                        extracted = str(parse_hwpx_content(conv).get("raw_text") or "").strip()
-            except Exception:
-                pass
+
         if not extracted:
             preview = extract_raw_text_preview(p, max_chars=max_chars)
             if preview and not preview.startswith("("):
@@ -1020,12 +1293,15 @@ def build_hwp_schedule_ai_prompt(
         f"{src_line}"
         f"기준 연도/날짜: {ref.isoformat()}\n"
         "아래 학사일정 문서(표 및 본문)에서 모든 학사일정을 추출하여 "
-        "반드시 아래 형식의 JSON 배열로만 응답해 주세요.\n"
-        '- 형식: [{"title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", '
+        "반드시 아래 형식의 순수 JSON 배열(또는 단일 ```json 코드블록)로만 응답해 주세요.\n"
+        '- 출력 스키마: [{"title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", '
         '"category": "학사일정", "memo": "..."}]\n'
         "- category는 '학사일정', '수행평가', '업무', '개인' 중 하나로 분류하세요 (기본: '학사일정').\n"
-        "- 날짜 범위(예: 5.1~5.3, 3월 4일~6일)는 start_date와 end_date에 YYYY-MM-DD 형식으로 채우고, "
-        "단일 날짜는 start_date와 end_date를 동일하게 설정하세요.\n\n"
+        "- [지침 1 - 변경/수정 문서 처리] 문서에 '변경 전'과 '변경 후' 표나 항목이 함께 있으면 '변경 전' 일정은 제외하고 최종 확정/'변경 후' 일정만 추출하세요.\n"
+        "- [지침 2 - 학년도·연도 전환 처리] 2학기 학사일정 표처럼 8~12월 뒤에 1월 또는 2월이 나오면 기준 연도의 다음 해(기준 연도 + 1)로 계산해 YYYY-MM-DD를 채우세요. (문서에 명시된 학년도가 있으면 해당 학년도 기준 적용)\n"
+        "- [지침 3 - 다중 일정 및 기간 분리] 한 셀에 여러 일정이 쉼표(,)나 가운뎃점(·) 등으로 묶여 있으면 각각 별도의 JSON 객체로 분리하고, '6일-8일' 또는 '5.1~5.3' 같은 기간은 start_date와 end_date로 정확히 나누세요. (단일 날짜는 start_date와 end_date를 동일하게 설정)\n"
+        "- [지침 4 - 세부 정보 보존] '모의수능(3)', '전국연합(인천-1,2)' 등 대상 학년이나 부가 설명은 title 또는 memo에 누락 없이 반영하세요.\n"
+        "- [지침 5 - 순수 JSON만 출력] 인사말·설명 문구·요약 해설 없이 순수 JSON 배열(또는 ```json ... ``` 코드블록)만 출력하세요.\n\n"
         "--- [추출된 학사일정 원문] ---\n"
         f"{str(extracted_text or '').strip()}"
     )

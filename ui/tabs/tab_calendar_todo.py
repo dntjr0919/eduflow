@@ -1097,10 +1097,25 @@ class CalendarTodoTab(QWidget):
 
         if item_type == "schedule":
             if action == "delete" and item_id:
-                self.db.delete_schedule(int(item_id))
+                target_id = int(item_id)
+                prev_sch = next(
+                    (s for s in (self.db.get_schedules() or []) if int(s.get("id") or 0) == target_id),
+                    None,
+                )
+                prev_rid = str((prev_sch or {}).get("remote_id") or "").strip()
+                self.db.delete_schedule(target_id)
+                if prev_rid:
+                    self._delete_remote_schedule_async(prev_rid)
             elif action == "save":
                 if item_id:
-                    self.db.update_schedule(int(item_id), **data)
+                    target_id = int(item_id)
+                    self.db.update_schedule(target_id, **data)
+                    updated_sch = next(
+                        (s for s in (self.db.get_schedules() or []) if int(s.get("id") or 0) == target_id),
+                        None,
+                    )
+                    if updated_sch:
+                        self._push_schedules_async([updated_sch])
                 else:
                     new_id = self.db.add_schedule(**data, is_read=1)
                     if new_id == 0:
@@ -1109,6 +1124,12 @@ class CalendarTodoTab(QWidget):
                             "중복 일정 건너뜀",
                             "동일한 일정(제목·날짜·시간)이 이미 등록되어 있어 건너뛰었습니다.",
                         )
+                    else:
+                        new_sch = next(
+                            (s for s in (self.db.get_schedules() or []) if int(s.get("id") or 0) == int(new_id)),
+                            None,
+                        )
+                        self._push_schedules_async([new_sch] if new_sch else [dict(data)])
             self.refresh_calendar()
         elif item_type == "todo":
             if action == "delete" and item_id:
@@ -1478,10 +1499,45 @@ class CalendarTodoTab(QWidget):
         def _push(_worker: FunctionWorker) -> bool:
             return self.sync_service.upsert_schedules(schedules)
 
+        def _on_done(ok: bool) -> None:
+            if not ok:
+                self.db.add_log("WARN", "FirestoreSync", "일정 Firebase 업로드가 실패했습니다.")
+
+        def _on_err(err: str) -> None:
+            first = str(err or "").splitlines()[0] if err else "알 수 없는 오류"
+            self.db.add_log("WARN", "FirestoreSync", f"일정 Firebase 업로드 오류: {first}")
+
         worker = FunctionWorker("Cloud Firestore 학사일정 일괄 동기화", _push)
         self.task_runner.start_worker(
             worker=worker,
             task_key="calendar_bulk_push_schedules",
+            on_result=_on_done,
+            on_error=_on_err,
+        )
+
+    def _delete_remote_schedule_async(self, remote_id: str) -> None:
+        rid = str(remote_id or "").strip()
+        if not rid:
+            return
+
+        def _del(_worker: FunctionWorker) -> Dict[str, Any]:
+            return self.sync_service.delete_collection_rows("Schedules", [rid])
+
+        def _on_done(res: Dict[str, Any]) -> None:
+            if not isinstance(res, dict) or not res.get("ok"):
+                err = (res or {}).get("error", "삭제 실패") if isinstance(res, dict) else "삭제 실패"
+                self.db.add_log("WARN", "FirestoreSync", f"원격 일정 삭제 실패 ({rid}): {err}")
+
+        def _on_err(err: str) -> None:
+            first = str(err or "").splitlines()[0] if err else "알 수 없는 오류"
+            self.db.add_log("WARN", "FirestoreSync", f"원격 일정 삭제 오류 ({rid}): {first}")
+
+        worker = FunctionWorker("Cloud Firestore 일정 삭제", _del)
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key="calendar_remote_delete_schedule",
+            on_result=_on_done,
+            on_error=_on_err,
         )
 
     def _on_bulk_import_clicked(self) -> None:
@@ -1591,21 +1647,91 @@ class CalendarTodoTab(QWidget):
         )
 
     # =========================================================================
-    # 우측 AiExecutionDock 연동 (자연어/공문 → 일정·할일 JSON 추출)
+    # 우측 AiExecutionDock 연동 (자연어/공문 → 일정·할일 JSON 추출 & 조회)
     # =========================================================================
+    def _build_local_schedule_context_text(self) -> str:
+        """로컬 DB의 최근/예정 일정과 미완료 할일을 AI 조회 컨텍스트 문자열로 요약합니다."""
+        today = date.today()
+        win_start = (today - timedelta(days=7)).isoformat()
+        win_end = (today + timedelta(days=30)).isoformat()
+        lines: List[str] = []
+        try:
+            all_sch = self.db.get_schedules() or []
+            rel_sch = [
+                s for s in all_sch
+                if str(s.get("end_date") or s.get("start_date") or "") >= win_start
+                and str(s.get("start_date") or "") <= win_end
+            ]
+            rel_sch.sort(key=lambda x: (str(x.get("start_date") or ""), str(x.get("start_time") or "")))
+            if rel_sch:
+                lines.append("[등록된 일정 (최근 7일~향후 30일)]")
+                for s in rel_sch[:60]:
+                    sd = str(s.get("start_date") or "")
+                    ed = str(s.get("end_date") or sd)
+                    d_str = sd if sd == ed else f"{sd}~{ed}"
+                    t_str = f" {s['start_time']}" if s.get("start_time") else " (종일)"
+                    cat = str(s.get("category") or "학사일정")
+                    memo = f" - {s['memo']}" if s.get("memo") else ""
+                    lines.append(f"- {d_str}{t_str} | [{cat}] {s.get('title', '')}{memo}")
+            else:
+                lines.append("[등록된 일정] 최근 7일~향후 30일 내 일정 없음")
+        except Exception:
+            pass
+
+        try:
+            todos = self.db.get_todos() or []
+            pending_todos = [t for t in todos if not t.get("is_done") and not t.get("completed")]
+            if pending_todos:
+                lines.append("\n[미완료 할일(To-Do)]")
+                for t in pending_todos[:40]:
+                    due = str(t.get("due_date") or "기한 없음")
+                    prio = str(t.get("priority") or "normal")
+                    lines.append(f"- (마감: {due}, 우선순위: {prio}) {t.get('title', '')}")
+        except Exception:
+            pass
+        return "\n".join(lines).strip()
+
     def get_ai_context(self) -> Dict[str, Any]:
         ctx: Dict[str, Any] = {
             "target_id": "calendar_todo",
             "kind": "calendar_todo",
             "task_label": "일정·할일 자동 추출",
             "selected_date": self._selected_date_str,
+            "schedule_context": self._build_local_schedule_context_text(),
         }
         if self._pending_ai_attachment_paths:
             ctx["attachment_paths"] = list(self._pending_ai_attachment_paths)
         return ctx
 
+    def _save_calendar_and_todo_items(
+        self,
+        schedules: List[Dict[str, Any]],
+        todos: List[Dict[str, Any]],
+    ) -> Tuple[int, int, int]:
+        added_sch = self.db.bulk_add_schedules(schedules, is_read=1) if schedules else 0
+        if schedules:
+            self._push_schedules_async(schedules)
+        skipped_sch = max(0, len(schedules) - added_sch)
+        added_todo = 0
+        for td in todos:
+            self.db.add_todo(
+                title=td["title"],
+                due_date=td.get("due_date", ""),
+                priority=td.get("priority", "normal"),
+                memo=td.get("memo", ""),
+                is_read=1,
+            )
+            added_todo += 1
+        self.refresh_all()
+        self.unread_changed.emit()
+        return added_sch, added_todo, skipped_sch
+
     def apply_ai_dock_result(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
+            return
+        if payload.get("is_query_answer"):
+            self._pending_ai_source_name = ""
+            self._pending_ai_attachment_paths = []
             return
         parsed_cal = payload.get("parsed_calendar")
         if not isinstance(parsed_cal, dict):
@@ -1638,12 +1764,45 @@ class CalendarTodoTab(QWidget):
             )
             return
 
-        src_label = self._pending_ai_source_name or "AI 자동 추출"
+        src_label = self._pending_ai_source_name or ""
         self._pending_ai_source_name = ""
         self._pending_ai_attachment_paths = []
+
+        # 1~2건 단건 자연어/직접 입력은 가벼운 확인 후 바로 등록
+        total_count = len(schedules) + len(todos)
+        if 1 <= total_count <= 2 and not src_label:
+            preview_lines: List[str] = []
+            for s in schedules:
+                d_str = s.get("start_date", "")
+                if s.get("end_date") and s.get("end_date") != d_str:
+                    d_str = f"{d_str}~{s['end_date']}"
+                t_str = f" {s['start_time']}" if s.get("start_time") else " (종일)"
+                preview_lines.append(
+                    f"• [일정/{s.get('category', '학사일정')}] {d_str}{t_str} — {s.get('title', '')}"
+                )
+            for td in todos:
+                due = td.get("due_date") or "기한 없음"
+                preview_lines.append(f"• [할일] 마감 {due} — {td.get('title', '')}")
+
+            reply = QMessageBox.question(
+                self,
+                "일정·할일 바로 등록",
+                "아래 항목을 바로 등록할까요?\n\n" + "\n".join(preview_lines),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            added_sch, added_todo, skipped_sch = self._save_calendar_and_todo_items(schedules, todos)
+            done_msg = f"일정 {added_sch}건, 할일 {added_todo}건이 바로 등록되었습니다."
+            if skipped_sch > 0:
+                done_msg += f"\n(동일 일정 중복 {skipped_sch}건 건너뜀)"
+            QMessageBox.information(self, "등록 완료", done_msg)
+            return
+
         dlg = ScheduleImportPreviewDialog(
             parsed_items=schedules,
-            file_name=src_label,
+            file_name=src_label or "AI 자동 추출",
             parent=self,
             parsed_todos=todos,
             summary=summary,
@@ -1653,23 +1812,7 @@ class CalendarTodoTab(QWidget):
 
         sel_schedules = dlg.get_selected_schedules()
         sel_todos = dlg.get_selected_todos()
-        added_sch = self.db.bulk_add_schedules(sel_schedules, is_read=1) if sel_schedules else 0
-        if sel_schedules:
-            self._push_schedules_async(sel_schedules)
-        skipped_sch = max(0, len(sel_schedules) - added_sch)
-        added_todo = 0
-        for td in sel_todos:
-            self.db.add_todo(
-                title=td["title"],
-                due_date=td.get("due_date", ""),
-                priority=td.get("priority", "normal"),
-                memo=td.get("memo", ""),
-                is_read=1,
-            )
-            added_todo += 1
-
-        self.refresh_all()
-        self.unread_changed.emit()
+        added_sch, added_todo, skipped_sch = self._save_calendar_and_todo_items(sel_schedules, sel_todos)
         done_msg = f"선택하신 일정 {added_sch}건, 할일 {added_todo}건이 등록되었습니다."
         if skipped_sch > 0:
             done_msg += f"\n(동일 일정 중복 {skipped_sch}건 건너뜀)"
@@ -1711,7 +1854,9 @@ class CalendarTodoTab(QWidget):
                 self,
                 "Firebase 클라우드 동기화 완료",
                 (
-                    f"일정 +{res.get('schedules_added', 0)}건 · "
+                    f"업로드(Push): 일정 {res.get('schedules_pushed', 0)}건 · "
+                    f"할일 {res.get('todos_pushed', 0)}건\n"
+                    f"수신(Pull): 일정 +{res.get('schedules_added', 0)}건 · "
                     f"할일 +{res.get('todos_added', 0)}건 · "
                     f"예약작업 +{res.get('mobile_tasks_added', 0)}건 · "
                     f"외부 알림 +{res.get('notifications_added', 0)}건 반영됨\n"

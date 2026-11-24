@@ -762,6 +762,8 @@ class DbManagerTab(QWidget):
         )
 
     def export_visible_to_csv(self, output_path: str) -> int:
+        from services.schedule_parser_service import escape_spreadsheet_formula
+
         written = 0
         with open(output_path, "w", encoding="utf-8-sig", newline="") as fp:
             writer = csv.writer(fp)
@@ -772,7 +774,8 @@ class DbManagerTab(QWidget):
                 row_vals: List[str] = []
                 for col_idx in range(self.table.columnCount()):
                     item = self.table.item(row_idx, col_idx)
-                    row_vals.append(item.text() if item is not None else "")
+                    raw_cell = item.text() if item is not None else ""
+                    row_vals.append(escape_spreadsheet_formula(raw_cell))
                 writer.writerow(row_vals)
                 written += 1
         return written

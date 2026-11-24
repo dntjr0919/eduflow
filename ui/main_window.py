@@ -861,10 +861,21 @@ class MainWindow(QMainWindow):
         self.ai_dock.txt_calendar_instruction.setPlainText(prompt_text)
         if not self._ai_dock_expanded:
             self.toggle_ai_dock(True)
-        if self.ai_dock.current_mode_index() == 1:
+        mode_idx = self.ai_dock.current_mode_index()
+        if mode_idx == 0:
+            self.ai_dock._on_api_start_clicked()
+        elif mode_idx == 1:
             self.ai_dock.prepare_manual_prompt_for_target("calendar_todo")
-        elif self.ai_dock.current_mode_index() == 2:
+        elif mode_idx == 2:
             self.ai_dock._on_pw_start_clicked()
+
+    def _on_hwpx_schedule_extract_requested(self, extracted_text: str, file_name: str) -> None:
+        from services.schedule_parser_service import build_hwp_schedule_ai_prompt
+
+        prompt_text = build_hwp_schedule_ai_prompt(extracted_text, file_name=file_name)
+        self.tab_calendar._pending_ai_source_name = file_name
+        self.tab_calendar._pending_ai_attachment_paths = []
+        self._on_calendar_hwp_ai_requested(prompt_text, file_name)
 
     def _on_app_focus_changed(self, _old: Optional[QWidget], new: Optional[QWidget]) -> None:
         if new is None:
@@ -1047,6 +1058,9 @@ class MainWindow(QMainWindow):
         self.tab_doc_ocr.ai_target_requested.connect(self._on_central_ai_target_requested)
         self.tab_doc_ocr.ai_context_changed.connect(self.ai_dock.sync_from_context)
         self.tab_doc_ocr.ai_quote_selected.connect(self.ai_dock.set_quoted_selection)
+        self.tab_doc_ocr.hwpx_schedule_extract_requested.connect(
+            self._on_hwpx_schedule_extract_requested
+        )
         self.tab_classroom.ai_target_requested.connect(self._on_central_ai_target_requested)
         self.tab_classroom.ai_context_changed.connect(self.ai_dock.sync_from_context)
         self.tab_classroom.schoolbell_login_required.connect(

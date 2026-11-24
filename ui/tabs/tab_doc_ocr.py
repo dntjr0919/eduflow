@@ -913,6 +913,7 @@ class DocOcrTab(QWidget):
     ai_target_requested = pyqtSignal(str)
     ai_quote_selected = pyqtSignal(str, str)
     ai_context_changed = pyqtSignal(dict)
+    hwpx_schedule_extract_requested = pyqtSignal(str, str)
 
     TASK_ANALYZE = "doc_tab_analyze_submissions"
     TASK_RENAME = "doc_tab_standard_rename"
@@ -1720,6 +1721,15 @@ class DocOcrTab(QWidget):
         self.btn_hwpx_save_answers.setEnabled(False)
         self.btn_hwpx_save_answers.clicked.connect(self._on_hwpx_save_answers)
 
+        self.btn_hwpx_send_to_calendar = QPushButton("학사일정 AI 추출")
+        self.btn_hwpx_send_to_calendar.setMinimumHeight(32)
+        apply_qss_role(self.btn_hwpx_send_to_calendar, role="outline", obj_name="BtnHwpxSendToCalendar")
+        self.btn_hwpx_send_to_calendar.setEnabled(False)
+        self.btn_hwpx_send_to_calendar.setToolTip(
+            "현재 열린 HWP/HWPX 문서의 표·본문 텍스트를 캘린더 & 할일 AI 추출 패널로 보냅니다."
+        )
+        self.btn_hwpx_send_to_calendar.clicked.connect(self._on_hwpx_send_to_calendar)
+
         for btn in (
             self.btn_hwpx_open,
             self.btn_hwpx_reload,
@@ -1729,6 +1739,7 @@ class DocOcrTab(QWidget):
             self.btn_hwpx_save_as,
             self.btn_hwpx_open_app,
             self.btn_hwpx_save_answers,
+            self.btn_hwpx_send_to_calendar,
         ):
             toolbar.addWidget(btn)
         toolbar.addStretch(1)
@@ -4319,6 +4330,7 @@ class DocOcrTab(QWidget):
         self.btn_hwpx_save_as.setEnabled(True)
         self.btn_hwpx_open_app.setEnabled(True)
         self.btn_hwpx_save_answers.setEnabled(False)
+        self.btn_hwpx_send_to_calendar.setEnabled(True)
         self.lbl_hwpx_summary_badge.setStyleSheet(
             "background-color: #F8F9FF; color: #0F172A; border: 1px solid #E2E8F0; "
             "border-left: 4px solid #2563EB; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
@@ -4349,6 +4361,7 @@ class DocOcrTab(QWidget):
         self.btn_hwpx_save_as.setEnabled(True)
         self.btn_hwpx_open_app.setEnabled(True)
         self.btn_hwpx_save_answers.setEnabled(False)
+        self.btn_hwpx_send_to_calendar.setEnabled(True)
         self.lbl_hwpx_summary_badge.setStyleSheet(
             "background-color: #EEF2FF; color: #1E3A8A; border: 1px solid #C7D2FE; "
             "border-left: 4px solid #4F46E5; border-radius: 6px; padding: 8px 10px; font-weight: 600;"
@@ -4435,6 +4448,28 @@ class DocOcrTab(QWidget):
             self.ai_context_changed.emit(self.get_ai_context("hwpx_agent"))
             return "hwpx_agent", f"수업자료 파일을 HWPX AI 에이전트 참고 문서로 등록했습니다: {p.name}"
         return "", ""
+
+    def _on_hwpx_send_to_calendar(self) -> None:
+        if self._hwpx_doc is None:
+            QMessageBox.information(self, "문서 없음", "먼저 HWP 또는 HWPX 문서를 열어 주세요.")
+            return
+        from services.schedule_parser_service import format_hwpx_schedule_text
+
+        extracted_text = format_hwpx_schedule_text(self._hwpx_doc)
+        if not extracted_text:
+            QMessageBox.information(
+                self,
+                "추출할 내용 없음",
+                "현재 문서에서 학사일정 추출용 본문·표 텍스트를 찾지 못했습니다.",
+            )
+            return
+        if self._hwpx_original_hwp_path is not None:
+            file_name = self._hwpx_original_hwp_path.name
+        elif self._hwpx_doc.source_path is not None:
+            file_name = Path(self._hwpx_doc.source_path).name
+        else:
+            file_name = "document.hwpx"
+        self.hwpx_schedule_extract_requested.emit(extracted_text, file_name)
 
     def _on_hwpx_open(self) -> None:
         fpath, _ = QFileDialog.getOpenFileName(

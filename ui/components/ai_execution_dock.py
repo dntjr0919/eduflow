@@ -116,7 +116,9 @@ from services.record_generator_service import (
 )
 from services.schedule_parser_service import (
     build_calendar_ai_prompt,
+    is_calendar_query_intent,
     parse_calendar_ai_response,
+    try_parse_direct_calendar_json,
 )
 from services.class_notice_digest_service import parse_notice_digest_ai_response
 from services.web_gemini_auto_worker import (
@@ -873,23 +875,43 @@ class _DockApiHwpxAgentWorker(BaseWorker):
 
 
 class _DockApiCalendarTodoWorker(BaseWorker):
-    """캘린더 & 할일 자연어/공문 텍스트에서 구조화된 일정·할일 JSON을 추출하는 API 워커."""
+    """캘린더 & 할일 자연어/공문 텍스트 추출 또는 내 일정 질의응답을 처리하는 API 워커."""
 
-    def __init__(self, instruction: str):
+    def __init__(self, instruction: str, schedule_context: str = ""):
         super().__init__(task_name="캘린더 & 할일 AI 추출 (API)")
         self.instruction = instruction
+        self.schedule_context = schedule_context
 
     def execute(self) -> Dict[str, Any]:
-        self.emit_progress(25, "일정·할일 추출 프롬프트 전송 중...")
-        sys_p, usr_p = build_calendar_ai_prompt(self.instruction)
+        is_query = is_calendar_query_intent(self.instruction)
+        self.emit_progress(
+            25,
+            "내 일정 조회 응답 생성 중..." if is_query else "일정·할일 추출 프롬프트 전송 중...",
+        )
+        sys_p, usr_p = build_calendar_ai_prompt(
+            self.instruction,
+            schedule_context=self.schedule_context,
+        )
         client = MultiLlmClient()
         raw_reply = client.generate(prompt=usr_p, system_prompt=sys_p)
+        if is_query:
+            parsed_try = try_parse_direct_calendar_json(raw_reply)
+            if parsed_try is None:
+                self.emit_progress(100, "일정 조회 답변 완료")
+                return {
+                    "target_id": "calendar_todo",
+                    "mode": "api",
+                    "is_query_answer": True,
+                    "raw_response": raw_reply,
+                    "parsed_calendar": {"summary": "", "schedules": [], "todos": []},
+                }
         self.emit_progress(80, "추출된 JSON 정규화 중...")
         parsed_cal = parse_calendar_ai_response(raw_reply)
         self.emit_progress(100, "일정·할일 JSON 추출 완료")
         return {
             "target_id": "calendar_todo",
             "mode": "api",
+            "is_query_answer": False,
             "raw_response": raw_reply,
             "parsed_calendar": parsed_cal,
         }
@@ -1570,6 +1592,371 @@ class _ManualExtraPasteDialog(QDialog):
 
     def response_text(self) -> str:
         return self.txt_response.toPlainText().strip()
+
+
+# =============================================================================
+# 3모드 공통 타깃 실행 어댑터 규격 및 레지스트리
+# -----------------------------------------------------------------------------
+# 새 AI 기능을 추가할 때는 TargetExecutionAdapter를 상속한 어댑터를 정의하고
+# _DEFAULT_TARGET_ADAPTERS에 target_id로 등록하면 API / 수동 복붙 / Playwright
+# 3모드 공통 파이프라인(_execute_target_pipeline)이 자동으로 동작합니다.
+# (배치 분할의 agg_step2, 다중 턴/코드모드의 hwpx_agent, 도구 루프의 general_chat은
+#  전용 전략으로 분리 유지됩니다.)
+# =============================================================================
+class TargetExecutionAdapter:
+    """단일·첨부 기반 AI 타깃을 API/수동 복붙/Playwright 3모드 공통 파이프라인에 연결하는 어댑터."""
+
+    target_id: str = ""
+    empty_prompt_warning: str = "실행할 입력이나 대상 내용을 먼저 확인해 주세요."
+
+    def build_prompt(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> str:
+        raise NotImplementedError
+
+    def get_attachments(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> List[str]:
+        raw = ctx.get("attachment_paths") or []
+        return [str(p).strip() for p in raw if str(p).strip()]
+
+    def pre_execute_hook(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], mode_idx: int
+    ) -> bool:
+        """실행 전 가로채기 훅. True를 반환하면 AI 호출을 생략하고 종료합니다."""
+        return False
+
+    def create_api_worker(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], info: Dict[str, Any]
+    ) -> BaseWorker:
+        raise NotImplementedError
+
+    def parse_manual_or_pw_result(
+        self,
+        dock: "AiExecutionDock",
+        raw_text: str,
+        ctx: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def format_manual_verify_text(self, parsed_payload: Dict[str, Any]) -> str:
+        return "유효한 AI 응답 확인됨"
+
+    def post_api_result_hook(
+        self,
+        dock: "AiExecutionDock",
+        res: Dict[str, Any],
+        ctx: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> str:
+        return "API 실행 완료"
+
+    def on_pw_started_hook(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> None:
+        pass
+
+
+class _ClassNoticeDigestAdapter(TargetExecutionAdapter):
+    target_id = "class_notice_digest"
+    empty_prompt_warning = (
+        "중앙 '4. 학급 공지·긴급 알림' 탭에서 카톡 대화 또는 요약할 공지를 먼저 입력·선택해 주세요."
+    )
+
+    def build_prompt(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> str:
+        sys_p = str(ctx.get("system_prompt") or "").strip()
+        user_p = str(ctx.get("user_prompt") or "").strip()
+        if not user_p:
+            return ""
+        user_p = dock._append_quote_to_prompt(user_p)
+        return f"[System 지시문]\n{sys_p}\n\n{user_p}" if sys_p else user_p
+
+    def get_attachments(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> List[str]:
+        return []
+
+    def create_api_worker(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], info: Dict[str, Any]
+    ) -> BaseWorker:
+        usr_p = str(ctx.get("user_prompt") or "").strip()
+        if not usr_p:
+            raise ValueError(self.empty_prompt_warning)
+        return _DockApiClassNoticeDigestWorker(
+            system_prompt=str(ctx.get("system_prompt") or "").strip(),
+            user_prompt=dock._append_quote_to_prompt(usr_p),
+            source_label=str(ctx.get("source_label") or "카카오톡 대화"),
+            source_type=str(ctx.get("source_type") or "kakao"),
+            digest_action=str(ctx.get("digest_action") or "kakao_digest"),
+            review_card_id=str(ctx.get("review_card_id") or ""),
+        )
+
+    def parse_manual_or_pw_result(
+        self,
+        dock: "AiExecutionDock",
+        raw_text: str,
+        ctx: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        src_label = str(ctx.get("source_label") or "카카오톡 대화")
+        items = parse_notice_digest_ai_response(raw_text, default_source_label=src_label)
+        if not items:
+            raise ValueError("추출된 공지사항이 없습니다.")
+        return {
+            "items": items,
+            "source_label": src_label,
+            "source_type": str(ctx.get("source_type") or "kakao"),
+            "digest_action": str(ctx.get("digest_action") or "kakao_digest"),
+            "review_card_id": str(ctx.get("review_card_id") or ""),
+            "raw_response": raw_text,
+        }
+
+    def format_manual_verify_text(self, parsed_payload: Dict[str, Any]) -> str:
+        cnt = len(parsed_payload.get("items") or [])
+        return f"유효한 공지 JSON 확인됨 ({cnt}건)"
+
+    def post_api_result_hook(
+        self,
+        dock: "AiExecutionDock",
+        res: Dict[str, Any],
+        ctx: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> str:
+        n_cnt = len(res.get("items") or [])
+        return f"API 공지 요약 완료 · {n_cnt}건"
+
+
+class _CalendarTodoAdapter(TargetExecutionAdapter):
+    target_id = "calendar_todo"
+    empty_prompt_warning = "상단 입력창에 일정 요청이나 공문·안내문 텍스트를 입력해 주세요."
+
+    def pre_execute_hook(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], mode_idx: int
+    ) -> bool:
+        inst = dock.txt_calendar_instruction.toPlainText().strip()
+        if not inst:
+            QMessageBox.information(dock, "입력 확인", self.empty_prompt_warning)
+            dock.txt_calendar_instruction.setFocus()
+            return True
+        if dock._try_handle_direct_calendar_json(inst):
+            return True
+        return False
+
+    def build_prompt(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> str:
+        inst = dock.txt_calendar_instruction.toPlainText().strip()
+        if not inst:
+            return ""
+        sys_p, user_p = build_calendar_ai_prompt(
+            dock._append_quote_to_prompt(inst),
+            schedule_context=str(ctx.get("schedule_context") or ""),
+        )
+        return f"[System 지시문]\n{sys_p}\n\n{user_p}"
+
+    def create_api_worker(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], info: Dict[str, Any]
+    ) -> BaseWorker:
+        inst = dock.txt_calendar_instruction.toPlainText().strip()
+        return _DockApiCalendarTodoWorker(
+            instruction=dock._append_quote_to_prompt(inst),
+            schedule_context=str(ctx.get("schedule_context") or ""),
+        )
+
+    def parse_manual_or_pw_result(
+        self,
+        dock: "AiExecutionDock",
+        raw_text: str,
+        ctx: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        inst = dock.txt_calendar_instruction.toPlainText().strip()
+        try:
+            parsed_cal = parse_calendar_ai_response(raw_text)
+        except Exception:
+            if is_calendar_query_intent(inst) and raw_text.strip():
+                return {"is_query_answer": True, "raw_response": raw_text}
+            raise
+        s_cnt = len(parsed_cal.get("schedules") or [])
+        t_cnt = len(parsed_cal.get("todos") or [])
+        if s_cnt == 0 and t_cnt == 0:
+            if is_calendar_query_intent(inst) and raw_text.strip():
+                return {"is_query_answer": True, "raw_response": raw_text}
+            raise ValueError("추출된 일정이나 할일이 없습니다.")
+        return {"parsed_calendar": parsed_cal, "raw_response": raw_text}
+
+    def format_manual_verify_text(self, parsed_payload: Dict[str, Any]) -> str:
+        if parsed_payload.get("is_query_answer"):
+            return "일정 조회/요약 일반 텍스트 응답 확인됨 (적용 시 채팅창에 표시)"
+        p_cal = parsed_payload.get("parsed_calendar") or {}
+        s_cnt = len(p_cal.get("schedules") or [])
+        t_cnt = len(p_cal.get("todos") or [])
+        return f"유효한 일정·할일 JSON 확인됨 (일정 {s_cnt}건, 할일 {t_cnt}건)"
+
+    def post_api_result_hook(
+        self,
+        dock: "AiExecutionDock",
+        res: Dict[str, Any],
+        ctx: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> str:
+        model_label = str(info.get("model") or info.get("provider") or "API")
+        if res.get("is_query_answer"):
+            reply_txt = str(res.get("raw_response") or "").strip()
+            if reply_txt:
+                dock._append_chat_message(
+                    role="assistant",
+                    content=reply_txt,
+                    exec_mode="api",
+                    model_name=model_label,
+                    tool_name="calendar_todo",
+                )
+            return "API 일정 조회 답변 완료"
+        p_cal = res.get("parsed_calendar") or {}
+        s_cnt = len(p_cal.get("schedules") or [])
+        t_cnt = len(p_cal.get("todos") or [])
+        dock._append_chat_message(
+            role="assistant",
+            content=f"일정 {s_cnt}건, 할일 {t_cnt}건을 추출했습니다.",
+            exec_mode="api",
+            model_name=model_label,
+            tool_name="calendar_todo",
+        )
+        return f"API 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건"
+
+    def on_pw_started_hook(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> None:
+        dock._append_chat_message(
+            role="assistant",
+            content="🌐 Playwright 브라우저 자동화를 시작했습니다. 웹 AI에 프롬프트를 전송하고 응답을 회수하는 중입니다...",
+            exec_mode="playwright",
+            tool_name="calendar_todo",
+        )
+
+
+class _NoticeOcrAdapter(TargetExecutionAdapter):
+    target_id = "notice_ocr"
+    empty_prompt_warning = "가정통신문 파일 또는 본문을 먼저 입력해 주세요."
+
+    def build_prompt(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> str:
+        notice_prompt = str(ctx.get("ocr_prompt", "") or "").strip()
+        return dock._append_quote_to_prompt(notice_prompt) if notice_prompt else ""
+
+    def get_attachments(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> List[str]:
+        raw_atts = ctx.get("attachment_paths")
+        if raw_atts is None:
+            raw_atts = ctx.get("ocr_files") or []
+        return [str(p).strip() for p in (raw_atts or []) if str(p).strip()]
+
+    def create_api_worker(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], info: Dict[str, Any]
+    ) -> BaseWorker:
+        files = ctx.get("ocr_files") or []
+        if not files:
+            raise ValueError("API 보정을 실행할 가정통신문 파일을 먼저 선택해 주세요.")
+        return _DockApiOcrWorker(
+            file_paths=files,
+            prompt_guide=dock._append_quote_to_prompt(str(ctx.get("ocr_prompt", ""))),
+        )
+
+    def parse_manual_or_pw_result(
+        self,
+        dock: "AiExecutionDock",
+        raw_text: str,
+        ctx: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        parsed = extract_json_from_llm_response(raw_text)
+        return {
+            "parsed_json": parsed,
+            "raw_response": raw_text,
+            "formatted_text": raw_text,
+        }
+
+    def format_manual_verify_text(self, parsed_payload: Dict[str, Any]) -> str:
+        parsed = parsed_payload.get("parsed_json")
+        keys = ", ".join(list(parsed.keys())[:4]) if isinstance(parsed, dict) else ""
+        return f"JSON 검증 성공 (추출 키: {keys})"
+
+    def post_api_result_hook(
+        self,
+        dock: "AiExecutionDock",
+        res: Dict[str, Any],
+        ctx: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> str:
+        return f"API OCR 완료 ({res.get('count', 0)}개 파일)"
+
+
+class _OcrAdapter(TargetExecutionAdapter):
+    target_id = "ocr"
+    empty_prompt_warning = "중앙 탭에서 문서 파일 또는 텍스트를 먼저 확인해 주세요."
+
+    def build_prompt(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> str:
+        from ui.tabs.tab_doc_ocr import extract_local_text_from_files
+
+        files = ctx.get("ocr_files") or []
+        raw_text = (
+            extract_local_text_from_files(files)
+            if files
+            else str(ctx.get("ocr_current_text", ""))
+        )
+        sys_p, user_p = build_structured_prompt(
+            task_key="ocr_correction",
+            raw_content=raw_text,
+            custom_instruction=dock._append_quote_to_prompt(str(ctx.get("ocr_prompt", ""))),
+        )
+        return f"[System 지시문]\n{sys_p}\n\n{user_p}"
+
+    def get_attachments(self, dock: "AiExecutionDock", ctx: Dict[str, Any]) -> List[str]:
+        raw_atts = ctx.get("attachment_paths")
+        if raw_atts is None:
+            raw_atts = ctx.get("ocr_files") or []
+        return [str(p).strip() for p in (raw_atts or []) if str(p).strip()]
+
+    def create_api_worker(
+        self, dock: "AiExecutionDock", ctx: Dict[str, Any], info: Dict[str, Any]
+    ) -> BaseWorker:
+        files = ctx.get("ocr_files") or []
+        if not files:
+            raise ValueError("API 보정을 실행할 문서/이미지 파일을 중앙 탭에서 먼저 추가해 주세요.")
+        return _DockApiOcrWorker(
+            file_paths=files,
+            prompt_guide=dock._append_quote_to_prompt(str(ctx.get("ocr_prompt", ""))),
+        )
+
+    def parse_manual_or_pw_result(
+        self,
+        dock: "AiExecutionDock",
+        raw_text: str,
+        ctx: Dict[str, Any],
+        *,
+        mode: str,
+    ) -> Dict[str, Any]:
+        parsed = extract_json_from_llm_response(raw_text)
+        return {
+            "parsed_json": parsed,
+            "raw_response": raw_text,
+            "formatted_text": str(parsed.get("corrected_text") or raw_text)
+            if isinstance(parsed, dict)
+            else raw_text,
+        }
+
+    def format_manual_verify_text(self, parsed_payload: Dict[str, Any]) -> str:
+        parsed = parsed_payload.get("parsed_json")
+        keys = ", ".join(list(parsed.keys())[:4]) if isinstance(parsed, dict) else ""
+        return f"JSON 검증 성공 (추출 키: {keys})"
+
+    def post_api_result_hook(
+        self,
+        dock: "AiExecutionDock",
+        res: Dict[str, Any],
+        ctx: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> str:
+        return f"API OCR 완료 ({res.get('count', 0)}개 파일)"
+
+
+_DEFAULT_TARGET_ADAPTERS: Dict[str, TargetExecutionAdapter] = {
+    "class_notice_digest": _ClassNoticeDigestAdapter(),
+    "calendar_todo": _CalendarTodoAdapter(),
+    "notice_ocr": _NoticeOcrAdapter(),
+    "ocr": _OcrAdapter(),
+}
 
 
 def detect_hwpx_clipboard_payload(raw_text: str) -> Optional[Dict[str, Any]]:
@@ -3142,20 +3529,190 @@ class AiExecutionDock(QFrame):
         self.btn_api_stop.setVisible(busy)
         self._sync_body_scroll_visibility()
 
+    def _get_target_adapter(
+        self, target_id: Optional[str] = None
+    ) -> Optional[TargetExecutionAdapter]:
+        tid = str(target_id or self._active_target_id or "").strip()
+        return _DEFAULT_TARGET_ADAPTERS.get(tid)
+
+    def _execute_target_pipeline(self, mode_idx: int) -> bool:
+        """
+        TargetExecutionAdapter가 등록된 타깃에 대해 API(0) / 수동 복붙(1) / Playwright(2)
+        3모드 공통 파이프라인을 실행합니다. 어댑터가 없는 특수 타깃은 False를 반환합니다.
+        """
+        ctx = self._fetch_fresh_context()
+        if not ctx and self._active_target_id:
+            ctx = {"target_id": self._active_target_id, "kind": self._active_target_id}
+        if not ctx:
+            return False
+        target_id = str(ctx.get("target_id") or self._active_target_id or "").strip()
+        adapter = self._get_target_adapter(target_id)
+        if adapter is None:
+            return False
+
+        if adapter.pre_execute_hook(self, ctx, mode_idx):
+            return True
+
+        if mode_idx == 0:
+            if self._is_api_running:
+                return True
+            info = get_active_ai_info()
+            if not info.get("has_key", False):
+                err_msg = (
+                    f"현재 선택된 AI 공급자({info.get('provider_display')})의 API Key가 등록되어 있지 않습니다."
+                )
+                self.lbl_dock_progress_meta.setText(f"API 실행 불가: {err_msg}")
+                self._append_chat_message(
+                    role="assistant",
+                    content=f"⚠️ {err_msg}\n환경설정 탭에서 API Key를 등록해 주세요.",
+                    exec_mode="api",
+                    tool_name=target_id,
+                )
+                reply = QMessageBox.warning(
+                    self,
+                    "API Key 필요",
+                    f"{err_msg}\n환경설정 탭으로 이동하여 API Key를 등록하시겠습니까?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.go_to_settings_requested.emit()
+                return True
+
+            try:
+                worker = adapter.create_api_worker(self, ctx, info)
+            except Exception as exc:
+                QMessageBox.information(self, "입력 확인", str(exc))
+                return True
+
+            worker.signals.progress.connect(self._on_dock_worker_progress)
+            self._set_api_busy(True)
+            self.progress_dock.setValue(0)
+            self.lbl_dock_progress_meta.setText("API 작업 시작 중...")
+
+            def _on_res(res: Dict[str, Any]) -> None:
+                self._dispatch_result(target_id, res)
+                self.sync_from_context(self._fetch_fresh_context(target_id))
+                meta_msg = adapter.post_api_result_hook(self, res, ctx, info)
+                if meta_msg:
+                    self.lbl_dock_progress_meta.setText(meta_msg)
+
+            def _on_err(err: str) -> None:
+                first = (err or "").strip().split("\n")[0]
+                self.lbl_dock_progress_meta.setText(f"오류: {first}")
+                self._append_chat_message(
+                    role="assistant",
+                    content=f"⚠️ API 실행 오류: {first}",
+                    exec_mode="api",
+                    tool_name=target_id,
+                )
+                QMessageBox.critical(self, "API 실행 오류", first)
+
+            self.task_runner.start_worker(
+                worker=worker,
+                task_key=self.TASK_DOCK_API,
+                on_result=_on_res,
+                on_error=_on_err,
+                on_finished=lambda: self._set_api_busy(False),
+            )
+            return True
+
+        if mode_idx == 1:
+            prompt_text = adapter.build_prompt(self, ctx)
+            if not prompt_text:
+                QMessageBox.information(self, "프롬프트 확인", adapter.empty_prompt_warning)
+                return True
+            att_paths = [Path(p) for p in adapter.get_attachments(self, ctx) if Path(p).is_file()]
+            self._notify_manual_attachments(target_id, att_paths)
+            self._copy_and_open_manual_web(prompt_text)
+            return True
+
+        # mode_idx == 2 (Playwright 자동)
+        if self._active_pw_worker is not None:
+            return True
+        custom_url = ""
+        if self._pw_provider == "custom":
+            custom_url = normalize_web_url(self.edit_pw_custom_url.text())
+            if not custom_url:
+                QMessageBox.warning(self, "URL 확인", "직접 URL 모드에서는 접속할 웹 AI 주소를 입력해 주세요.")
+                self.edit_pw_custom_url.setFocus()
+                return True
+
+        prompt_text = adapter.build_prompt(self, ctx)
+        if not prompt_text:
+            QMessageBox.warning(self, "입력 확인", adapter.empty_prompt_warning)
+            return True
+
+        exec_mode = str(self.combo_pw_exec_mode.currentData() or "auto")
+        keep_login = bool(self.chk_pw_keep_login.isChecked())
+        use_temp_chat = bool(self.chk_pw_temp_chat.isChecked())
+        attachment_paths = adapter.get_attachments(self, ctx)
+        task_label = str(ctx.get("task_label") or target_id).strip()
+
+        worker = WebGeminiAutoWorker(
+            excel_path=None,
+            single_prompt=prompt_text,
+            attachment_paths=attachment_paths,
+            provider=self._pw_provider,
+            custom_url=custom_url,
+            execution_mode=exec_mode,
+            require_login=False,
+            keep_login_session=keep_login,
+            use_temp_chat=use_temp_chat,
+            headless=False,
+            task_label=task_label,
+        )
+        worker.signals.progress.connect(self._on_dock_worker_progress)
+        worker.waiting_for_login.connect(self._on_pw_waiting_for_login)
+        worker.waiting_for_semi_auto_collect.connect(self._on_pw_waiting_for_collect)
+        worker.waiting_for_element_click.connect(self._on_pw_waiting_for_click)
+        worker.batch_completed.connect(
+            lambda payload, tid=target_id: self._on_pw_batch_completed(tid, payload)
+        )
+
+        self._active_pw_worker = worker
+        self._pw_single_batches_applied = False
+        self._set_pw_running_state(True)
+        self.progress_dock.setValue(0)
+        self.lbl_dock_progress_meta.setText(f"[{task_label}] Playwright 브라우저 실행 중...")
+        adapter.on_pw_started_hook(self, ctx)
+
+        self.task_runner.start_worker(
+            worker=worker,
+            task_key=self.TASK_DOCK_PLAYWRIGHT,
+            on_result=lambda res, tid=target_id: self._on_pw_finished_result(tid, res),
+            on_error=self._on_pw_error,
+            on_finished=self._on_pw_finished,
+        )
+        return True
+
     def _on_api_start_clicked(self) -> None:
+        if self._execute_target_pipeline(0):
+            return
         if self._is_api_running:
             return
         ctx = self._fetch_fresh_context()
+        if not ctx and self._active_target_id:
+            ctx = {"target_id": self._active_target_id, "kind": self._active_target_id}
         if not ctx:
             return
 
         info = get_active_ai_info()
         if not info.get("has_key", False):
+            err_msg = (
+                f"현재 선택된 AI 공급자({info.get('provider_display')})의 API Key가 등록되어 있지 않습니다."
+            )
+            self.lbl_dock_progress_meta.setText(f"API 실행 불가: {err_msg}")
+            self._append_chat_message(
+                role="assistant",
+                content=f"⚠️ {err_msg}\n환경설정 탭에서 API Key를 등록해 주세요.",
+                exec_mode="api",
+                tool_name=str(ctx.get("target_id") or self._active_target_id or "general_chat"),
+            )
             reply = QMessageBox.warning(
                 self,
                 "API Key 필요",
-                f"현재 선택된 AI 공급자({info.get('provider_display')})의 API Key가 등록되어 있지 않습니다.\n"
-                "환경설정 탭으로 이동하여 API Key를 등록하시겠습니까?",
+                f"{err_msg}\n환경설정 탭으로 이동하여 API Key를 등록하시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
             )
@@ -3215,8 +3772,11 @@ class AiExecutionDock(QFrame):
                 )
                 self.txt_calendar_instruction.setFocus()
                 return
+            if self._try_handle_direct_calendar_json(inst):
+                return
             worker = _DockApiCalendarTodoWorker(
                 instruction=self._append_quote_to_prompt(inst),
+                schedule_context=str(ctx.get("schedule_context") or ""),
             )
         elif kind == "class_notice_digest":
             sys_p = str(ctx.get("system_prompt") or "").strip()
@@ -3293,12 +3853,32 @@ class AiExecutionDock(QFrame):
             if kind == "ocr":
                 self.lbl_dock_progress_meta.setText(f"API OCR 완료 ({res.get('count', 0)}개 파일)")
             elif kind == "calendar_todo":
-                p_cal = res.get("parsed_calendar") or {}
-                s_cnt = len(p_cal.get("schedules") or [])
-                t_cnt = len(p_cal.get("todos") or [])
-                self.lbl_dock_progress_meta.setText(
-                    f"API 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건"
-                )
+                if res.get("is_query_answer"):
+                    reply_txt = str(res.get("raw_response") or "").strip()
+                    if reply_txt:
+                        self._append_chat_message(
+                            role="assistant",
+                            content=reply_txt,
+                            exec_mode="api",
+                            model_name=str(info.get("model") or info.get("provider") or "API"),
+                            tool_name=target_id,
+                        )
+                    self.lbl_dock_progress_meta.setText("API 일정 조회 답변 완료")
+                else:
+                    p_cal = res.get("parsed_calendar") or {}
+                    s_cnt = len(p_cal.get("schedules") or [])
+                    t_cnt = len(p_cal.get("todos") or [])
+                    summary_msg = f"일정 {s_cnt}건, 할일 {t_cnt}건을 추출했습니다."
+                    self._append_chat_message(
+                        role="assistant",
+                        content=summary_msg,
+                        exec_mode="api",
+                        model_name=str(info.get("model") or info.get("provider") or "API"),
+                        tool_name=target_id,
+                    )
+                    self.lbl_dock_progress_meta.setText(
+                        f"API 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건"
+                    )
             elif kind == "class_notice_digest":
                 n_cnt = len(res.get("items") or [])
                 self.lbl_dock_progress_meta.setText(f"API 공지 요약 완료 · {n_cnt}건")
@@ -3318,6 +3898,12 @@ class AiExecutionDock(QFrame):
         def _on_err(err: str) -> None:
             first = (err or "").strip().split("\n")[0]
             self.lbl_dock_progress_meta.setText(f"오류: {first}")
+            self._append_chat_message(
+                role="assistant",
+                content=f"⚠️ API 실행 오류: {first}",
+                exec_mode="api",
+                tool_name=target_id,
+            )
             QMessageBox.critical(self, "API 실행 오류", first)
 
         self.task_runner.start_worker(
@@ -3742,36 +4328,9 @@ class AiExecutionDock(QFrame):
                 current_dom_map=dom_map if isinstance(dom_map, dict) else None,
             )
             return f"{sys_p}\n\n{usr_p}"
-        if kind == "calendar_todo" or self._active_target_id == "calendar_todo":
-            inst = self.txt_calendar_instruction.toPlainText().strip()
-            if not inst:
-                return ""
-            sys_p, user_p = build_calendar_ai_prompt(self._append_quote_to_prompt(inst))
-            return f"[System 지시문]\n{sys_p}\n\n{user_p}"
-        if kind == "class_notice_digest" or self._active_target_id == "class_notice_digest":
-            sys_p = str(ctx.get("system_prompt") or "").strip()
-            user_p = str(ctx.get("user_prompt") or "").strip()
-            if not user_p:
-                return ""
-            user_p = self._append_quote_to_prompt(user_p)
-            return f"[System 지시문]\n{sys_p}\n\n{user_p}" if sys_p else user_p
-        if kind == "ocr":
-            if self._active_target_id == "notice_ocr" or ctx.get("target_id") == "notice_ocr":
-                notice_prompt = str(ctx.get("ocr_prompt", "") or "").strip()
-                if not notice_prompt:
-                    return ""
-                return self._append_quote_to_prompt(notice_prompt)
-
-            from ui.tabs.tab_doc_ocr import extract_local_text_from_files
-
-            files = ctx.get("ocr_files") or []
-            raw_text = extract_local_text_from_files(files) if files else str(ctx.get("ocr_current_text", ""))
-            sys_p, user_p = build_structured_prompt(
-                task_key="ocr_correction",
-                raw_content=raw_text,
-                custom_instruction=self._append_quote_to_prompt(str(ctx.get("ocr_prompt", ""))),
-            )
-            return f"[System 지시문]\n{sys_p}\n\n{user_p}"
+        adapter = self._get_target_adapter(str(ctx.get("target_id") or self._active_target_id))
+        if adapter is not None:
+            return adapter.build_prompt(self, ctx)
 
         # 실행 시점 최신 컨텍스트로 배치 재계산 (현재 선택된 batch_index 최대한 유지)
         prev_idx = max(0, self.combo_manual_batch.currentIndex())
@@ -3998,32 +4557,19 @@ class AiExecutionDock(QFrame):
             self.lbl_manual_verify.setText("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
             return
 
-        if kind == "calendar_todo":
+        adapter = self._get_target_adapter(str(ctx.get("target_id") or self._active_target_id))
+        if adapter is not None:
             try:
-                parsed_cal = parse_calendar_ai_response(raw_resp)
-                self._manual_single_parsed = parsed_cal
-                s_cnt = len(parsed_cal.get("schedules") or [])
-                t_cnt = len(parsed_cal.get("todos") or [])
-                self.lbl_manual_verify.setText(
-                    f"유효한 일정·할일 JSON 확인됨 (일정 {s_cnt}건, 할일 {t_cnt}건)"
-                )
+                parsed_payload = adapter.parse_manual_or_pw_result(self, raw_resp, ctx, mode="manual")
+                self._manual_single_parsed = parsed_payload
+                if isinstance(parsed_payload.get("items"), list):
+                    self._manual_parsed_items = parsed_payload["items"]
+                self.lbl_manual_verify.setText(adapter.format_manual_verify_text(parsed_payload))
             except Exception as exc:
                 self._manual_single_parsed = {}
-                self.lbl_manual_verify.setText(f"JSON 추출 오류: {exc}")
-            return
-
-        if kind == "class_notice_digest":
-            try:
-                src_label = str(ctx.get("source_label") or "카카오톡 대화")
-                items = parse_notice_digest_ai_response(raw_resp, default_source_label=src_label)
-                self._manual_parsed_items = items
-                self.lbl_manual_verify.setText(f"유효한 공지 JSON 확인됨 ({len(items)}건)")
-            except Exception as exc:
                 self._manual_parsed_items = []
                 self.lbl_manual_verify.setText(f"JSON 추출 오류: {exc}")
             return
-
-        if kind in ("ocr", "hwpx_agent"):
             if kind == "hwpx_agent":
                 detected_code = detect_hwpx_clipboard_payload(raw_resp)
                 if isinstance(detected_code, dict) and detected_code.get("kind") == "code_mode":
@@ -4226,79 +4772,37 @@ class AiExecutionDock(QFrame):
                 self.lbl_dock_progress_meta.setText("수동 Patch 반영 완료")
                 self.progress_dock.setValue(100)
             return
-        if ctx.get("kind") == "calendar_todo":
+        adapter = self._get_target_adapter(target_id)
+        if adapter is not None:
             try:
-                parsed_cal = parse_calendar_ai_response(raw_resp)
+                parsed_payload = adapter.parse_manual_or_pw_result(
+                    self, raw_resp, ctx, mode="manual"
+                )
             except Exception as exc:
-                QMessageBox.warning(self, "JSON 검증 오류", f"유효한 일정·할일 JSON 응답을 추출하지 못했습니다:\n{exc}")
-                return
-            s_cnt = len(parsed_cal.get("schedules") or [])
-            t_cnt = len(parsed_cal.get("todos") or [])
-            if s_cnt == 0 and t_cnt == 0:
-                QMessageBox.information(self, "추출 결과 없음", "추출된 일정이나 할일이 없습니다.")
+                QMessageBox.warning(
+                    self,
+                    "JSON 검증 오류",
+                    f"유효한 응답을 추출하지 못했습니다:\n{exc}",
+                )
                 return
             self.txt_manual_response.blockSignals(True)
             self.txt_manual_response.clear()
             self.txt_manual_response.blockSignals(False)
+            if parsed_payload.get("is_query_answer"):
+                self._append_chat_message(
+                    role="assistant",
+                    content=str(parsed_payload.get("raw_response") or raw_resp),
+                    exec_mode="manual",
+                    model_name="Manual Web",
+                    tool_name=target_id,
+                )
             self._dispatch_result(
                 target_id,
-                {
-                    "target_id": target_id,
-                    "mode": "manual",
-                    "raw_response": raw_resp,
-                    "parsed_calendar": parsed_cal,
-                },
+                {"target_id": target_id, "mode": "manual", **parsed_payload},
             )
-            self.lbl_manual_verify.setText(f"일정 {s_cnt}건, 할일 {t_cnt}건 확인창으로 전달됨")
-            self.lbl_dock_progress_meta.setText(f"수동 추출 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건")
-            self.progress_dock.setValue(100)
-            return
-        if ctx.get("kind") == "class_notice_digest":
-            src_label = str(ctx.get("source_label") or "카카오톡 대화")
-            try:
-                items = parse_notice_digest_ai_response(raw_resp, default_source_label=src_label)
-            except Exception as exc:
-                QMessageBox.warning(self, "JSON 검증 오류", f"유효한 공지 JSON 응답을 추출하지 못했습니다:\n{exc}")
-                return
-            if not items:
-                QMessageBox.information(self, "추출 결과 없음", "추출된 공지사항이 없습니다.")
-                return
-            self.txt_manual_response.blockSignals(True)
-            self.txt_manual_response.clear()
-            self.txt_manual_response.blockSignals(False)
-            self._dispatch_result(
-                target_id,
-                {
-                    "target_id": target_id,
-                    "mode": "manual",
-                    "raw_response": raw_resp,
-                    "items": items,
-                    "source_label": src_label,
-                    "source_type": str(ctx.get("source_type") or "kakao"),
-                    "digest_action": str(ctx.get("digest_action") or "kakao_digest"),
-                    "review_card_id": str(ctx.get("review_card_id") or ""),
-                },
-            )
-            self.lbl_manual_verify.setText(f"공지 {len(items)}건 검수 목록에 반영됨")
-            self.lbl_dock_progress_meta.setText(f"수동 추출 완료 · 공지 {len(items)}건")
-            self.progress_dock.setValue(100)
-            return
-        if ctx.get("kind") == "ocr":
-            try:
-                parsed = extract_json_from_llm_response(raw_resp)
-                formatted = format_parsed_json_to_readable_text(parsed)
-            except Exception as exc:
-                QMessageBox.warning(self, "JSON 검증 오류", f"유효한 JSON 응답을 추출하지 못했습니다:\n{exc}")
-                return
-            self.txt_manual_response.blockSignals(True)
-            self.txt_manual_response.clear()
-            self.txt_manual_response.blockSignals(False)
-            self._dispatch_result(
-                target_id,
-                {"target_id": target_id, "mode": "manual", "formatted_text": formatted, "parsed_json": parsed},
-            )
-            self.lbl_manual_verify.setText("OCR 결과가 중앙 편집창에 반영되었습니다.")
-            self.lbl_dock_progress_meta.setText("수동 OCR 반영 완료")
+            verify_msg = adapter.format_manual_verify_text(parsed_payload)
+            self.lbl_manual_verify.setText(verify_msg)
+            self.lbl_dock_progress_meta.setText(verify_msg)
             self.progress_dock.setValue(100)
             return
 
@@ -4460,9 +4964,13 @@ class AiExecutionDock(QFrame):
         self._sync_body_scroll_visibility()
 
     def _on_pw_start_clicked(self) -> None:
+        if self._execute_target_pipeline(2):
+            return
         if self._active_pw_worker is not None:
             return
         ctx = self._fetch_fresh_context()
+        if not ctx and self._active_target_id:
+            ctx = {"target_id": self._active_target_id, "kind": self._active_target_id}
         if not ctx:
             return
 
@@ -4615,6 +5123,8 @@ class AiExecutionDock(QFrame):
                 )
                 self.txt_calendar_instruction.setFocus()
                 return
+            if self._try_handle_direct_calendar_json(inst):
+                return
             prompt_text = self._build_current_manual_prompt()
             worker = WebGeminiAutoWorker(
                 excel_path=None,
@@ -4709,6 +5219,13 @@ class AiExecutionDock(QFrame):
             if kind in ("ocr", "hwpx_agent", "calendar_todo", "class_notice_digest")
             else "Playwright 브라우저 실행 중..."
         )
+        if kind == "calendar_todo":
+            self._append_chat_message(
+                role="assistant",
+                content="🌐 Playwright 브라우저 자동화를 시작했습니다. 웹 AI에 프롬프트를 전송하고 응답을 회수하는 중입니다...",
+                exec_mode="playwright",
+                tool_name=target_id,
+            )
 
         self.task_runner.start_worker(
             worker=worker,
@@ -4952,10 +5469,31 @@ class AiExecutionDock(QFrame):
             self._pw_inline_card.lbl_status.setText("Playwright 작업 중지 요청됨...")  # type: ignore[attr-defined]
         self.lbl_dock_progress_meta.setText("Playwright 작업 중지 요청됨...")
 
+    def _enrich_pw_payload_with_adapter(
+        self, target_id: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        enriched = {"target_id": target_id, "mode": "playwright", **payload}
+        adapter = self._get_target_adapter(target_id)
+        if adapter is None:
+            return enriched
+        raw_txt = str(enriched.get("raw_response") or enriched.get("formatted_text") or "").strip()
+        if not raw_txt:
+            return enriched
+        ctx = self._fetch_fresh_context(target_id)
+        try:
+            parsed_extra = adapter.parse_manual_or_pw_result(
+                self, raw_txt, ctx, mode="playwright"
+            )
+            enriched.update(parsed_extra)
+        except Exception:
+            pass
+        return enriched
+
     def _on_pw_batch_completed(self, target_id: str, payload: Dict[str, Any]) -> None:
         if payload.get("is_single_prompt"):
             self._pw_single_batches_applied = True
-        self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **payload})
+        enriched = self._enrich_pw_payload_with_adapter(target_id, payload)
+        self._dispatch_result(target_id, enriched)
         self.sync_from_context(self._fetch_fresh_context(target_id))
 
     def _on_pw_finished_result(self, target_id: str, res: Dict[str, Any]) -> None:
@@ -5010,7 +5548,8 @@ class AiExecutionDock(QFrame):
                 return
 
         if not self._pw_single_batches_applied:
-            self._dispatch_result(target_id, {"target_id": target_id, "mode": "playwright", **res})
+            pw_payload = self._enrich_pw_payload_with_adapter(target_id, res)
+            self._dispatch_result(target_id, pw_payload)
         self._pw_single_batches_applied = False
         reply_txt = str(res.get("raw_response", "") or res.get("summary", "") or "").strip()
         if reply_txt:
@@ -5027,6 +5566,12 @@ class AiExecutionDock(QFrame):
     def _on_pw_error(self, err: str) -> None:
         first = (err or "").strip().split("\n")[0]
         self._set_progress_meta_alert(f"오류: {first}", alert=False)
+        self._append_chat_message(
+            role="assistant",
+            content=f"⚠️ Playwright 실행 오류: {first}",
+            exec_mode="playwright",
+            tool_name=self._active_target_id or "general_chat",
+        )
         QMessageBox.critical(self, "Playwright 실행 오류", first)
 
     def _on_pw_finished(self) -> None:
@@ -5612,6 +6157,10 @@ class AiExecutionDock(QFrame):
         self._manual_waiting_collect = True
         self.btn_chat_send.setText("응답 회수")
         self.btn_chat_send.setToolTip("입력창 또는 클립보드의 웹 AI 응답을 회수하여 등록합니다.")
+        self.txt_chat_input.setPlaceholderText(
+            "웹 AI 응답(JSON 또는 답변)을 여기에 붙여넣고 [응답 회수]를 누르세요.\n"
+            "(응답을 복사한 상태라면 입력창이 비어 있어도 [응답 회수]로 자동 회수됩니다.)"
+        )
         self.btn_chat_cancel_collect.setVisible(True)
 
     def _cancel_manual_collect_waiting(self) -> None:
@@ -5619,6 +6168,7 @@ class AiExecutionDock(QFrame):
         self.btn_chat_send.setText("전송")
         self.btn_chat_send.setToolTip("")
         self.btn_chat_cancel_collect.setVisible(False)
+        self._sync_chat_send_button_state()
 
     def _on_manual_collect_from_chat(self) -> None:
         input_txt = self.txt_chat_input.toPlainText().strip()
@@ -5656,6 +6206,39 @@ class AiExecutionDock(QFrame):
             self._on_manual_apply_and_next()
         self.lbl_dock_progress_meta.setText("수동 응답 회수 완료")
 
+    def _try_handle_direct_calendar_json(self, raw_text: str, *, from_chat: bool = False) -> bool:
+        """
+        사용자가 입력창에 유효한 일정·할일 JSON(배열/객체 또는 ```json 코드블록)을 직접 붙여넣은 경우
+        AI API/Playwright를 호출하지 않고 즉시 파싱해 CalendarTodoTab으로 전달합니다.
+        """
+        parsed_cal = try_parse_direct_calendar_json(raw_text)
+        if parsed_cal is None:
+            return False
+        s_cnt = len(parsed_cal.get("schedules") or [])
+        t_cnt = len(parsed_cal.get("todos") or [])
+        if from_chat:
+            self._append_chat_message(
+                role="assistant",
+                content=f"입력하신 JSON을 직접 파싱했습니다 (일정 {s_cnt}건, 할일 {t_cnt}건). 등록 확인 창으로 전달합니다.",
+                exec_mode="direct_json",
+                model_name="JSON 직접 입력",
+                tool_name="calendar_todo",
+            )
+        self._dispatch_result(
+            "calendar_todo",
+            {
+                "target_id": "calendar_todo",
+                "mode": "direct_json",
+                "raw_response": raw_text,
+                "parsed_calendar": parsed_cal,
+            },
+        )
+        self.lbl_dock_progress_meta.setText(
+            f"JSON 직접 입력 파싱 완료 · 일정 {s_cnt}건, 할일 {t_cnt}건"
+        )
+        self.progress_dock.setValue(100)
+        return True
+
     def _on_chat_send_clicked(self) -> None:
         if self._pw_waiting_collect:
             self._on_pw_collect_next_clicked()
@@ -5688,7 +6271,8 @@ class AiExecutionDock(QFrame):
             else:
                 self.txt_hwpx_instruction.setPlainText(raw_text)
         elif tid == "calendar_todo":
-            self.txt_calendar_instruction.setPlainText(raw_text)
+            if raw_text:
+                self.txt_calendar_instruction.setPlainText(raw_text)
 
         self._chat_extra_instruction = raw_text
         self._chat_extra_attachments = list(attachments)
@@ -5710,6 +6294,12 @@ class AiExecutionDock(QFrame):
         )
 
         if tid != "general_chat":
+            if tid == "calendar_todo":
+                direct_src = raw_text or self.txt_calendar_instruction.toPlainText().strip()
+                if self._try_handle_direct_calendar_json(direct_src, from_chat=True):
+                    return
+            if self._execute_target_pipeline(mode_idx):
+                return
             if mode_idx == 0:
                 self._on_api_start_clicked()
             elif mode_idx == 1:
@@ -5798,6 +6388,12 @@ class AiExecutionDock(QFrame):
         def _on_err(err: str) -> None:
             first = (err or "").strip().split("\n")[0]
             self.lbl_dock_progress_meta.setText(f"오류: {first}")
+            self._append_chat_message(
+                role="assistant",
+                content=f"⚠️ API 실행 오류: {first}",
+                exec_mode="api",
+                tool_name=target_id,
+            )
             QMessageBox.critical(self, "API 실행 오류", first)
 
         self.task_runner.start_worker(

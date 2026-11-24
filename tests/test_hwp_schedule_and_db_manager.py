@@ -498,6 +498,466 @@ class TestHwpScheduleAndDbManager(unittest.TestCase):
 
         self.assertEqual(len(captured_workers), 4)
 
+    def test_hwp_com_conversion_priority_and_olefile_fallback(self) -> None:
+        from unittest.mock import patch
+        from services.schedule_parser_service import extract_schedule_text_from_document
+
+        fake_hwp = self.tmp_path / "academic_2026_2.hwp"
+        fake_hwp.write_bytes(b"dummy hwp bytes")
+        sample_hwpx = self.tmp_path / "converted_sample.hwpx"
+        _make_sample_hwpx(sample_hwpx)
+
+        def _fake_convert(_src, out_hwpx):
+            out_hwpx.write_bytes(sample_hwpx.read_bytes())
+            return out_hwpx
+
+        with patch("services.hwpx_agent_service.convert_hwp_to_hwpx", side_effect=_fake_convert) as mock_conv, patch(
+            "services.multi_doc_extractor_service._extract_hwp_text_olefile",
+            return_value="OLE_FALLBACK_SHOULD_NOT_BE_USED",
+        ) as mock_ole:
+            extracted, is_scanned = extract_schedule_text_from_document(fake_hwp)
+
+        self.assertFalse(is_scanned)
+        mock_conv.assert_called_once()
+        mock_ole.assert_not_called()
+        self.assertIn("[p_0]", extracted)
+        self.assertIn("[tbl_", extracted)
+        self.assertIn("2026-03-02 | 시업식 및 입학식 | 강당 09:00", extracted)
+
+        # COM 변환 실패 시 olefile 폴백 동작 확인
+        with patch("services.hwpx_agent_service.convert_hwp_to_hwpx", side_effect=RuntimeError("COM unavailable")), patch(
+            "services.multi_doc_extractor_service.HAS_OLEFILE", True
+        ), patch(
+            "services.multi_doc_extractor_service._extract_hwp_text_olefile",
+            return_value="폴백 추출 텍스트",
+        ):
+            fb_text, fb_scanned = extract_schedule_text_from_document(fake_hwp)
+        self.assertFalse(fb_scanned)
+        self.assertEqual(fb_text, "폴백 추출 텍스트")
+
+    def test_enhanced_hwp_prompt_and_complex_json_preview_dialog(self) -> None:
+        prompt = build_hwp_schedule_ai_prompt(
+            "[tbl_0]\n9월 | 모의수능(3), 전국연합(인천-1,2)\n1월 | 6일-8일 겨울방학 캠프",
+            file_name="2026_2학기_학사일정_변경후.hwp",
+            today=date(2026, 8, 20),
+        )
+        self.assertIn("변경 전", prompt)
+        self.assertIn("변경 후", prompt)
+        self.assertIn("기준 연도 + 1", prompt)
+        self.assertIn("모의수능(3)", prompt)
+        self.assertIn("순수 JSON 배열", prompt)
+
+        complex_ai_json = """```json
+        [
+          {"title": "모의수능(3)", "start_date": "2026-09-03", "end_date": "2026-09-03", "category": "학사일정", "memo": "3학년"},
+          {"title": "전국연합(인천-1,2)", "start_date": "2026-09-03", "end_date": "2026-09-03", "category": "학사일정", "memo": "1,2학년"},
+          {"title": "겨울방학 캠프", "start_date": "2027-01-06", "end_date": "2027-01-08", "category": "학사일정", "memo": "연도 전환"}
+        ]
+        ```"""
+        parsed = parse_calendar_ai_response(complex_ai_json, today=date(2026, 8, 20))
+        self.assertEqual(len(parsed["schedules"]), 3)
+        self.assertEqual(parsed["schedules"][0]["title"], "모의수능(3)")
+        self.assertEqual(parsed["schedules"][1]["title"], "전국연합(인천-1,2)")
+        self.assertEqual(parsed["schedules"][2]["start_date"], "2027-01-06")
+        self.assertEqual(parsed["schedules"][2]["end_date"], "2027-01-08")
+
+        dlg = ScheduleImportPreviewDialog(
+            parsed_items=parsed["schedules"],
+            file_name="2026_2학기_학사일정_변경후.hwp",
+        )
+        self.assertEqual(dlg.table.rowCount(), 3)
+        selected = dlg.get_selected_schedules()
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[2]["start_date"], "2027-01-06")
+
+    def test_calendar_ai_dock_natural_language_direct_json_and_query(self) -> None:
+        from unittest.mock import patch
+        from services.schedule_parser_service import (
+            build_calendar_ai_prompt,
+            is_calendar_query_intent,
+            try_parse_direct_calendar_json,
+        )
+
+        ref = date(2026, 11, 24)  # 화요일
+        # 1) 자연어 프롬프트 날짜/요일 주입 & 조회 분기
+        sys_p, usr_p = build_calendar_ai_prompt("내일 오전 10시 회의 등록", today=ref)
+        self.assertIn("2026-11-24 (화요일)", sys_p)
+        self.assertIn("item_type", sys_p)
+        self.assertFalse(is_calendar_query_intent("내일 오전 10시 회의 등록"))
+        self.assertTrue(is_calendar_query_intent("이번 주 일정 요약해줘"))
+        self.assertTrue(is_calendar_query_intent("내일 빈 시간 알려줘"))
+
+        q_sys, q_usr = build_calendar_ai_prompt(
+            "이번 주 일정 요약해줘",
+            today=ref,
+            schedule_context="[등록된 일정]\n- 2026-11-25 10:00 | [업무] 교무회의",
+        )
+        self.assertIn("일반 텍스트", q_sys)
+        self.assertIn("교무회의", q_usr)
+
+        # 2) item_type ("schedule" | "todo") 분기 파싱 및 직접 JSON 감지
+        direct_raw = """```json
+        [
+          {"item_type": "schedule", "title": "교무회의", "start_date": "내일", "start_time": "10:00", "category": "업무", "memo": "회의실"},
+          {"item_type": "todo", "title": "공문 제출", "start_date": "이번 주 금요일", "priority": "높음", "memo": "나이스"}
+        ]
+        ```"""
+        parsed_direct = try_parse_direct_calendar_json(direct_raw, today=ref)
+        self.assertIsNotNone(parsed_direct)
+        assert parsed_direct is not None
+        self.assertEqual(len(parsed_direct["schedules"]), 1)
+        self.assertEqual(len(parsed_direct["todos"]), 1)
+        self.assertEqual(parsed_direct["schedules"][0]["start_date"], "2026-11-25")
+        self.assertEqual(parsed_direct["schedules"][0]["start_time"], "10:00")
+        self.assertEqual(parsed_direct["todos"][0]["due_date"], "2026-11-27")
+        self.assertEqual(parsed_direct["todos"][0]["priority"], "high")
+
+        # 3) CalendarTodoTab 1~2건 단건 바로 등록 vs 조회성 응답 무시
+        tab = CalendarTodoTab(
+            task_runner=self.task_runner,
+            db=self.db,
+            config=self.config,
+            start_timer=False,
+        )
+        # 조회성 응답은 다이얼로그/경고 없이 무시
+        tab.apply_ai_dock_result({"is_query_answer": True, "raw_response": "이번 주 일정은 없습니다."})
+
+        # 1~2건 단건 바로 등록
+        with patch(
+            "ui.tabs.tab_calendar_todo.QMessageBox.question",
+            return_value=16384,  # QMessageBox.StandardButton.Yes
+        ), patch("ui.tabs.tab_calendar_todo.QMessageBox.information"):
+            tab.apply_ai_dock_result({"parsed_calendar": parsed_direct})
+
+        self.assertEqual(len(self.db.get_schedules()), 1)
+        self.assertEqual(len(self.db.get_todos()), 1)
+
+    def test_security_schema_whitelist_xss_limits_and_formula_injection(self) -> None:
+        import csv
+        import openpyxl
+        from services.schedule_parser_service import (
+            MAX_CALENDAR_AI_BATCH_ITEMS,
+            MAX_CALENDAR_MEMO_LEN,
+            MAX_CALENDAR_TITLE_LEN,
+            escape_spreadsheet_formula,
+            export_schedules_to_xlsx,
+            try_parse_direct_calendar_json,
+        )
+
+        ref = date(2026, 11, 24)
+        # 1) XSS, 제어문자, 알 수 없는 키, 잘못된 날짜/시간, 초대용량 문자열 검증
+        malicious_payload = {
+            "summary": "<script>alert(1)</script>요약\x00텍스트",
+            "unknown_top_key": "drop table",
+            "schedules": [
+                {
+                    "item_type": "invalid_type",
+                    "title": '<img src=x onerror="alert(1)"><b>교무회의</b>\x07 ' + ("가" * 300),
+                    "start_date": "2026-02-30",  # 존재하지 않는 날짜 -> 오늘 폴백
+                    "end_date": "1999-01-01",    # 시작일보다 앞선 종료일 -> 시작일로 보정
+                    "start_time": "99:99",       # 잘못된 시간 -> ""
+                    "category": "악성카테고리",
+                    "memo": "javascript:alert(1) <script>evil()</script>메모 " + ("나" * 1200),
+                    "__proto__": {"polluted": True},
+                    "evil_exec": "__import__('os').system('calc')",
+                }
+            ],
+            "todos": [
+                {
+                    "title": "<svg onload=alert(1)>공문 제출</svg>",
+                    "due_date": "not-a-date",
+                    "priority": "urgent_unknown",
+                    "extra_field": "ignored",
+                }
+            ],
+        }
+        parsed = parse_calendar_ai_response(malicious_payload, today=ref)
+        self.assertEqual(parsed["summary"], "요약텍스트")
+        self.assertEqual(len(parsed["schedules"]), 1)
+        sch = parsed["schedules"][0]
+        self.assertNotIn("<script>", sch["title"])
+        self.assertNotIn("onerror", sch["title"].lower())
+        self.assertNotIn("\x07", sch["title"])
+        self.assertLessEqual(len(sch["title"]), MAX_CALENDAR_TITLE_LEN)
+        self.assertEqual(sch["start_date"], "2026-11-24")
+        self.assertEqual(sch["end_date"], "2026-11-24")
+        self.assertEqual(sch["start_time"], "")
+        self.assertTrue(sch["all_day"])
+        self.assertEqual(sch["category"], "업무")  # '교무회의' 기반 안전 분류
+        self.assertNotIn("<script>", sch["memo"])
+        self.assertNotIn("javascript:", sch["memo"].lower())
+        self.assertLessEqual(len(sch["memo"]), MAX_CALENDAR_MEMO_LEN)
+        self.assertNotIn("__proto__", sch)
+        self.assertNotIn("evil_exec", sch)
+
+        td = parsed["todos"][0]
+        self.assertEqual(td["title"], "공문 제출")
+        self.assertEqual(td["due_date"], "")
+        self.assertEqual(td["priority"], "normal")
+        self.assertNotIn("extra_field", td)
+
+        # 2) 일괄 등록 최대 500건 제한
+        oversized = [
+            {"title": f"일정 {i}", "start_date": "2026-11-24"}
+            for i in range(MAX_CALENDAR_AI_BATCH_ITEMS + 50)
+        ]
+        parsed_cap = parse_calendar_ai_response(oversized, today=ref)
+        self.assertEqual(len(parsed_cap["schedules"]), MAX_CALENDAR_AI_BATCH_ITEMS)
+
+        # 3) 비정상 JSON / 코드 인젝션 시도 거부
+        self.assertIsNone(try_parse_direct_calendar_json("{'bad_json': __import__('os')}"))
+        with self.assertRaises(ValueError):
+            parse_calendar_ai_response("not a valid json at all")
+
+        # 4) Excel(.xlsx) 수식 인젝션 방어
+        self.assertEqual(escape_spreadsheet_formula("=CMD|'/C calc'!A0"), "'=CMD|'/C calc'!A0")
+        self.assertEqual(escape_spreadsheet_formula("+1+1"), "'+1+1")
+        self.assertEqual(escape_spreadsheet_formula("-2+3"), "'-2+3")
+        self.assertEqual(escape_spreadsheet_formula("@SUM(A1:A2)"), "'@SUM(A1:A2)")
+        self.assertEqual(escape_spreadsheet_formula("정상 일정"), "정상 일정")
+
+        xlsx_out = self.tmp_path / "formula_safe.xlsx"
+        export_schedules_to_xlsx(
+            [
+                {
+                    "start_date": "2026-11-24",
+                    "end_date": "2026-11-24",
+                    "title": "=HYPERLINK(\"http://evil\",\"클릭\")",
+                    "category": "학사일정",
+                    "memo": "@SUM(1,2)",
+                }
+            ],
+            xlsx_out,
+        )
+        wb = openpyxl.load_workbook(xlsx_out)
+        ws = wb.active
+        self.assertEqual(ws.cell(row=2, column=3).value, "'=HYPERLINK(\"http://evil\",\"클릭\")")
+        self.assertEqual(ws.cell(row=2, column=8).value, "'@SUM(1,2)")
+
+    def test_ai_dock_calendar_todo_all_three_modes_execution(self) -> None:
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QApplication
+        from ui.components.ai_execution_dock import AiExecutionDock
+
+        dispatched = []
+
+        class _CaptureRunner:
+            def __init__(self) -> None:
+                self.started = []
+
+            def is_running(self, _key: str) -> bool:
+                return False
+
+            def start_worker(self, worker, task_key="", on_result=None, on_error=None, on_finished=None, **_kw):
+                self.started.append((task_key, worker, on_result, on_error, on_finished))
+
+            def stop_task(self, *_a, **_kw) -> None:
+                pass
+
+        runner = _CaptureRunner()
+        dock = AiExecutionDock(task_runner=runner, db=self.db)
+        try:
+            dock.register_target(
+                target_id="calendar_todo",
+                label="캘린더 & 할일",
+                context_getter=lambda: {
+                    "target_id": "calendar_todo",
+                    "kind": "calendar_todo",
+                    "task_label": "일정·할일 자동 추출",
+                    "schedule_context": "[등록된 일정] 없음",
+                },
+                on_result=lambda payload: dispatched.append(payload),
+            )
+            dock.set_target("calendar_todo", force=True)
+
+            # 1) API 모드: 키 미등록 시 상태 라벨/채팅에 원인 가시화, 키 등록 시 실제 워커 시작
+            dock._on_mode_segment_clicked(0)
+            dock.txt_chat_input.setPlainText("내일 오전 10시 회의 등록")
+            with patch(
+                "ui.components.ai_execution_dock.get_active_ai_info",
+                return_value={"has_key": False, "provider_display": "Gemini"},
+            ), patch("ui.components.ai_execution_dock.QMessageBox.warning", return_value=65536):
+                dock._on_chat_send_clicked()
+            self.assertIn("API Key", dock.lbl_dock_progress_meta.text())
+            self.assertEqual(len(runner.started), 0)
+
+            dock.txt_chat_input.setPlainText("내일 오전 10시 회의 등록")
+            with patch(
+                "ui.components.ai_execution_dock.get_active_ai_info",
+                return_value={"has_key": True, "provider": "gemini", "model": "gemini-2.5-flash", "provider_display": "Gemini"},
+            ):
+                dock._on_chat_send_clicked()
+            self.assertEqual(len(runner.started), 1)
+            self.assertEqual(runner.started[0][0], dock.TASK_DOCK_API)
+            if callable(runner.started[0][4]):
+                runner.started[0][4]()
+
+            # 외부 요청(txt_calendar_instruction 사전 입력 후 빈 채팅창에서 전송) 시 기존 지시문 보존 확인
+            dock.txt_calendar_instruction.setPlainText("기존 HWP 학사일정 추출 프롬프트")
+            dock.txt_chat_input.clear()
+            with patch(
+                "ui.components.ai_execution_dock.get_active_ai_info",
+                return_value={"has_key": True, "provider": "gemini", "model": "gemini-2.5-flash", "provider_display": "Gemini"},
+            ):
+                dock._on_chat_send_clicked()
+            self.assertEqual(len(runner.started), 2)
+            self.assertEqual(dock.txt_calendar_instruction.toPlainText(), "기존 HWP 학사일정 추출 프롬프트")
+
+            # 2) 수동 복붙 모드: 프롬프트 클립보드 복사 + 응답 회수 대기 전환 + 응답 붙여넣기 시 결과 전달
+            dock._on_mode_segment_clicked(1)
+            dock.txt_chat_input.setPlainText("모레 오후 2시 학부모 상담 등록")
+            with patch("ui.components.ai_execution_dock.webbrowser.open") as mock_open:
+                dock._on_chat_send_clicked()
+            mock_open.assert_called_once()
+            self.assertTrue(dock._manual_waiting_collect)
+            self.assertEqual(dock.btn_chat_send.text(), "응답 회수")
+            self.assertIn("모레 오후 2시 학부모 상담 등록", QApplication.clipboard().text())
+
+            dock.txt_chat_input.setPlainText(
+                '[{"item_type": "schedule", "title": "학부모 상담", "start_date": "2026-11-26", "start_time": "14:00"}]'
+            )
+            dock._on_chat_send_clicked()
+            self.assertFalse(dock._manual_waiting_collect)
+            self.assertEqual(len(dispatched), 1)
+            self.assertEqual(dispatched[0]["parsed_calendar"]["schedules"][0]["title"], "학부모 상담")
+
+            # 3) Playwright 자동 모드: 실제 Playwright 워커 시작 확인
+            dock._on_mode_segment_clicked(2)
+            dock.txt_chat_input.setPlainText("다음 주 월요일 출장 등록")
+            dock._on_chat_send_clicked()
+            self.assertEqual(len(runner.started), 3)
+            self.assertEqual(runner.started[2][0], dock.TASK_DOCK_PLAYWRIGHT)
+            self.assertIsNotNone(dock._active_pw_worker)
+        finally:
+            dock.shutdown_workers()
+            dock.close()
+            dock.deleteLater()
+            app = QApplication.instance()
+            if app is not None:
+                app.processEvents()
+
+    def test_calendar_manual_crud_push_and_bidirectional_sync(self) -> None:
+        from unittest.mock import MagicMock, patch
+        from services.firestore_sync_service import FirestoreSyncService
+
+        store = {"Schedules": {}, "Tasks": {}, "Notifications": {}}
+        fs_mock = _FakeFirestoreClient(store)
+        sync_svc = FirestoreSyncService(db=self.db, config=self.config)
+
+        class _InlineTaskRunner:
+            def is_running(self, _key: str) -> bool:
+                return False
+
+            def start_worker(self, worker, task_key="", on_result=None, on_error=None, on_finished=None, **_kw):
+                res = worker.execute()
+                if on_result is not None:
+                    on_result(res)
+                if on_finished is not None:
+                    on_finished()
+
+        with patch.object(
+            self.config,
+            "get_section",
+            return_value={
+                "teacher_id": "t_01",
+                "school_code": "7530001",
+                "school_name": "테스트고",
+            },
+        ), patch.object(sync_svc, "_get_client", return_value=fs_mock):
+            tab = CalendarTodoTab(
+                task_runner=_InlineTaskRunner(),
+                db=self.db,
+                config=self.config,
+                start_timer=False,
+            )
+            tab.sync_service = sync_svc
+
+            # 1) 수동 일정 추가 -> 즉시 Firestore Schedules에 school_code 포함 업로드 + 로컬 remote_id 역기록
+            tab._apply_dialog_result(
+                {
+                    "action": "save",
+                    "item_type": "schedule",
+                    "id": None,
+                    "data": {
+                        "title": "수동 교무회의",
+                        "category": "업무",
+                        "start_date": "2026-11-25",
+                        "end_date": "2026-11-25",
+                        "start_time": "15:00",
+                        "reminder_type": "10m",
+                        "memo": "본관 2층",
+                    },
+                }
+            )
+            self.assertEqual(len(store["Schedules"]), 1)
+            pushed_doc = next(iter(store["Schedules"].values()))
+            self.assertEqual(pushed_doc["title"], "수동 교무회의")
+            self.assertEqual(pushed_doc["school_code"], "7530001")
+            self.assertEqual(pushed_doc["teacher_id"], "t_01")
+
+            local_sch = self.db.get_schedules()[0]
+            self.assertEqual(local_sch["remote_id"], pushed_doc["remote_id"])
+
+            # 2) 수동 일정 수정 -> 동일 remote_id 문서 업데이트
+            tab._apply_dialog_result(
+                {
+                    "action": "save",
+                    "item_type": "schedule",
+                    "id": local_sch["id"],
+                    "data": {
+                        "title": "수동 교무회의(변경)",
+                        "category": "업무",
+                        "start_date": "2026-11-25",
+                        "end_date": "2026-11-25",
+                        "start_time": "16:00",
+                        "reminder_type": "10m",
+                        "memo": "대회의실",
+                    },
+                }
+            )
+            self.assertEqual(len(store["Schedules"]), 1)
+            self.assertEqual(
+                store["Schedules"][local_sch["remote_id"]]["title"],
+                "수동 교무회의(변경)",
+            )
+
+            # 3) 수동 일정 삭제 -> Firestore Schedules 문서도 삭제
+            tab._apply_dialog_result(
+                {
+                    "action": "delete",
+                    "item_type": "schedule",
+                    "id": local_sch["id"],
+                    "data": {},
+                }
+            )
+            self.assertEqual(len(store["Schedules"]), 0)
+
+            # 4) 로컬에만 있는 일정/할일 + 원격에만 있는 일정이 섞여 있을 때 sync_all() 양방향 Push + Pull 검증
+            self.db.add_schedule(
+                title="로컬 전용 학사일정",
+                category="학사일정",
+                start_date="2026-11-28",
+                end_date="2026-11-28",
+                is_read=1,
+            )
+            self.db.add_todo(title="로컬 전용 할일", due_date="2026-11-29", priority="high", is_read=1)
+            store["Schedules"]["remote_only_1"] = {
+                "remote_id": "remote_only_1",
+                "title": "원격 학사일정",
+                "category": "학사일정",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-01",
+                "school_code": "7530001",
+            }
+            with patch("ui.tabs.tab_calendar_todo.QMessageBox.information") as mock_info:
+                tab.sync_with_google_sheets(interactive=True)
+            mock_info.assert_called_once()
+            popup_text = mock_info.call_args[0][2]
+            self.assertIn("업로드(Push): 일정 1건 · 할일 1건", popup_text)
+            self.assertIn("수신(Pull): 일정 +1건", popup_text)
+            self.assertEqual(len(store["Schedules"]), 2)
+            self.assertEqual(len(store["Tasks"]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

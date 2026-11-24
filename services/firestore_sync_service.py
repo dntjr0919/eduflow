@@ -1841,6 +1841,7 @@ class FirestoreSyncService:
 
     def sync_all(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         try:
+            push_summary = self.push_local_schedules_and_todos()
             schedules = self.fetch_collection_rows("Schedules")
             tasks = self.fetch_collection_rows("Tasks")
             notifications = self.fetch_collection_rows("Notifications")
@@ -1852,14 +1853,15 @@ class FirestoreSyncService:
                 "server_time": _now_str(),
             }
             summary = self.sync_from_payload(payload)
+            summary["schedules_pushed"] = int(push_summary.get("schedules_pushed", 0))
+            summary["todos_pushed"] = int(push_summary.get("todos_pushed", 0))
             self.db.add_log(
                 "INFO",
                 "FirestoreSync",
                 (
-                    f"동기화 완료: 일정 +{summary['schedules_added']}, "
-                    f"할일 +{summary['todos_added']}, "
-                    f"모바일 예약 +{summary['mobile_tasks_added']}, "
-                    f"외부 알림 +{summary['notifications_added']}"
+                    f"양방향 동기화 완료: Push(일정 {summary['schedules_pushed']}, 할일 {summary['todos_pushed']}) / "
+                    f"Pull(일정 +{summary['schedules_added']}, 할일 +{summary['todos_added']}, "
+                    f"모바일 예약 +{summary['mobile_tasks_added']}, 외부 알림 +{summary['notifications_added']})"
                 ),
             )
             return summary
@@ -2913,11 +2915,177 @@ class FirestoreSyncService:
             return False
 
 
+    def _get_schedule_tenant_meta(self) -> Dict[str, str]:
+        tp = self.config.get_section("teacher_profile") or {}
+        sc = str(tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+        sn = str(tp.get("school_name") or "").strip()
+        tid = str(tp.get("teacher_id") or tp.get("login_id") or "").strip()
+        return {"school_code": sc, "school_name": sn, "teacher_id": tid}
+
+    @staticmethod
+    def _build_deterministic_schedule_remote_id(row: Dict[str, Any]) -> str:
+        existing = str(row.get("remote_id") or "").strip()
+        if existing:
+            return existing.replace("/", "_")
+        key_str = "|".join(
+            [
+                str(row.get("title") or "").strip(),
+                str(row.get("start_date") or "").strip(),
+                str(row.get("end_date") or row.get("start_date") or "").strip(),
+                str(row.get("start_time") or "").strip(),
+            ]
+        )
+        digest = hashlib.sha1(key_str.encode("utf-8")).hexdigest()[:16]
+        return f"sch_{digest}"
+
+    def _bind_local_schedule_remote_ids(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        try:
+            with self.db._lock:
+                conn = self.db._get_connection()
+                try:
+                    cur = conn.cursor()
+                    for r in rows:
+                        rid = str(r.get("remote_id") or "").strip()
+                        if not rid:
+                            continue
+                        local_id = r.get("id")
+                        if local_id is not None:
+                            cur.execute(
+                                "UPDATE schedules SET remote_id = ? WHERE id = ? AND (remote_id IS NULL OR remote_id = '')",
+                                (rid, int(local_id)),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                UPDATE schedules SET remote_id = ?
+                                WHERE (remote_id IS NULL OR remote_id = '')
+                                  AND title = ? AND start_date = ? AND end_date = ? AND start_time = ?
+                                """,
+                                (
+                                    rid,
+                                    str(r.get("title") or "").strip(),
+                                    str(r.get("start_date") or "").strip(),
+                                    str(r.get("end_date") or r.get("start_date") or "").strip(),
+                                    str(r.get("start_time") or "").strip(),
+                                ),
+                            )
+                    conn.commit()
+                finally:
+                    conn.close()
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"로컬 일정 remote_id 역기록 실패: {exc}")
+
     def upsert_schedules(self, rows: List[Dict[str, Any]]) -> bool:
-        """일정(Schedules) 목록을 Firestore에 일괄 Upsert합니다."""
+        """일정(Schedules) 목록을 테넌트 필드(school_code 등) 포함해 Firestore에 일괄 Upsert합니다."""
         if not rows:
             return False
-        return self._batch_upsert("Schedules", rows, label="학사일정 일괄 등록")
+        tenant = self._get_schedule_tenant_meta()
+        now_ts = _now_str()
+        enriched: List[Dict[str, Any]] = []
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            title = str(item.get("title") or "").strip()
+            s_date = str(item.get("start_date") or "").strip()
+            if not title or not s_date:
+                continue
+            e_date = str(item.get("end_date") or "").strip() or s_date
+            rid = self._build_deterministic_schedule_remote_id(item)
+            item["remote_id"] = rid
+            item["title"] = title
+            item["start_date"] = s_date
+            item["end_date"] = e_date
+            item["start_time"] = str(item.get("start_time") or "").strip()
+            item["category"] = str(item.get("category") or "학사일정").strip() or "학사일정"
+            item["reminder_type"] = str(item.get("reminder_type") or "none").strip() or "none"
+            item["memo"] = str(item.get("memo") or "").strip()
+            if tenant["school_code"] and not str(item.get("school_code") or "").strip():
+                item["school_code"] = tenant["school_code"]
+            if tenant["school_name"] and not str(item.get("school_name") or "").strip():
+                item["school_name"] = tenant["school_name"]
+            if tenant["teacher_id"] and not str(item.get("teacher_id") or "").strip():
+                item["teacher_id"] = tenant["teacher_id"]
+            if not str(item.get("updated_at") or "").strip():
+                item["updated_at"] = now_ts
+            item.pop("id", None)
+            enriched.append(item)
+
+        if not enriched:
+            return False
+        ok = self._batch_upsert("Schedules", enriched, label="학사일정 일괄 등록")
+        if ok:
+            # 원본 rows에 있던 local id 매핑 포함해 로컬 remote_id 역기록
+            bind_targets: List[Dict[str, Any]] = []
+            for raw, enr in zip(rows, enriched):
+                if isinstance(raw, dict):
+                    merged = dict(enr)
+                    if raw.get("id") is not None:
+                        merged["id"] = raw.get("id")
+                    bind_targets.append(merged)
+            self._bind_local_schedule_remote_ids(bind_targets)
+        return ok
+
+    def push_local_schedules_and_todos(self) -> Dict[str, int]:
+        """로컬 SQLite에만 존재(remote_id 미할당)하는 일정과 할일을 Firestore로 Push합니다."""
+        schedules_pushed = 0
+        todos_pushed = 0
+        tenant = self._get_schedule_tenant_meta()
+
+        local_schedules = self.db.get_schedules() or []
+        unsynced_sch = [
+            dict(s) for s in local_schedules if not str(s.get("remote_id") or "").strip()
+        ]
+        if unsynced_sch and self.upsert_schedules(unsynced_sch):
+            schedules_pushed = len(unsynced_sch)
+
+        local_todos = self.db.get_todos() or []
+        unsynced_todos = [
+            dict(t) for t in local_todos if not str(t.get("remote_id") or "").strip()
+        ]
+        if unsynced_todos:
+            now_ts = _now_str()
+            task_rows: List[Dict[str, Any]] = []
+            for td in unsynced_todos:
+                key_str = f"{td.get('title', '')}|{td.get('due_date', '')}|{td.get('id', '')}"
+                rid = f"todo_{hashlib.sha1(key_str.encode('utf-8')).hexdigest()[:16]}"
+                row: Dict[str, Any] = {
+                    "remote_id": rid,
+                    "title": str(td.get("title") or "").strip(),
+                    "task_type": "todo",
+                    "is_mobile_task": False,
+                    "due_date": str(td.get("due_date") or "").strip(),
+                    "priority": str(td.get("priority") or "normal").strip(),
+                    "is_done": bool(td.get("is_done")),
+                    "memo": str(td.get("memo") or "").strip(),
+                    "updated_at": str(td.get("updated_at") or now_ts),
+                }
+                if tenant["school_code"]:
+                    row["school_code"] = tenant["school_code"]
+                if tenant["teacher_id"]:
+                    row["teacher_id"] = tenant["teacher_id"]
+                task_rows.append(row)
+            if self._batch_upsert("Tasks", task_rows, label="할일 동기화"):
+                todos_pushed = len(task_rows)
+                try:
+                    with self.db._lock:
+                        conn = self.db._get_connection()
+                        try:
+                            cur = conn.cursor()
+                            for td, trow in zip(unsynced_todos, task_rows):
+                                cur.execute(
+                                    "UPDATE todos SET remote_id = ? WHERE id = ? AND (remote_id IS NULL OR remote_id = '')",
+                                    (trow["remote_id"], int(td["id"])),
+                                )
+                            conn.commit()
+                        finally:
+                            conn.close()
+                except Exception:
+                    pass
+
+        return {"schedules_pushed": schedules_pushed, "todos_pushed": todos_pushed}
 
     @staticmethod
     def _sanitize_doc_for_cache(doc_id: str, raw_data: Dict[str, Any]) -> Dict[str, Any]:
