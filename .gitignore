@@ -69,3 +69,5 @@ eduflow-db-*.json
 serviceAccountKey.json
 
 comcigan_sync_cache.json
+
+*.log
