@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -821,22 +822,41 @@ def try_parse_direct_calendar_json(
     today: Optional[date] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    사용자가 입력창에 유효한 일정·할일 JSON(배열/객체 또는 ```json 코드블록)을 직접 붙여넣은 경우
-    AI 호출 없이 즉시 parse_calendar_ai_response()로 파싱해 반환합니다. 유효하지 않으면 None.
+    사용자가 입력창에 순수 JSON 객체/배열 또는 단일 ```json ... ``` 코드블록 전체를 직접 붙여넣은 경우에만
+    AI 호출 없이 즉시 parse_calendar_ai_response()로 파싱해 반환합니다.
+    (긴 프롬프트 지시문이나 문서 원문 중간에 포함된 스키마 예시는 절대 가로채지 않습니다.)
     """
     s = str(raw_text or "").strip()
     if not s:
         return None
-    looks_like_json = (
-        s.startswith("{")
-        or s.startswith("[")
-        or "```json" in s.lower()
-        or ("```" in s and ("{" in s or "[" in s))
-    )
-    if not looks_like_json:
+    if "--- [추출된 학사일정 원문] ---" in s or s.startswith("[원본 파일:"):
         return None
+
+    candidate = ""
+    m_block = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", s, re.IGNORECASE)
+    if m_block:
+        candidate = m_block.group(1).strip()
+    elif (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        candidate = s
+    else:
+        return None
+
+    if not candidate or not (
+        (candidate.startswith("{") and candidate.endswith("}"))
+        or (candidate.startswith("[") and candidate.endswith("]"))
+    ):
+        return None
+
     try:
-        parsed = parse_calendar_ai_response(s, today=today)
+        loaded = json.loads(candidate)
+    except Exception:
+        return None
+
+    if not isinstance(loaded, (dict, list)):
+        return None
+
+    try:
+        parsed = parse_calendar_ai_response(loaded, today=today)
     except Exception:
         return None
     if not parsed.get("schedules") and not parsed.get("todos"):
@@ -981,6 +1001,22 @@ def escape_spreadsheet_formula(val: Any) -> str:
     return s
 
 
+_DUMMY_SCHEDULE_TITLES = frozenset(
+    {"...", "…", "일정명", "할일", "제목", "예시", "sample", "example"}
+)
+
+
+def _is_dummy_schedule_title(title: str) -> bool:
+    t = str(title or "").strip()
+    if not t:
+        return True
+    if t.lower() in _DUMMY_SCHEDULE_TITLES:
+        return True
+    if re.fullmatch(r"[.\u2026·\-_\s]+", t):
+        return True
+    return False
+
+
 def _is_valid_iso_date(date_str: str) -> bool:
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date_str or "")):
         return False
@@ -1046,7 +1082,7 @@ def parse_calendar_ai_response(
             item.get("title") or item.get("task") or item.get("summary"),
             max_len=MAX_CALENDAR_TITLE_LEN,
         )
-        if not title:
+        if _is_dummy_schedule_title(title):
             return
         raw_due = item.get("due_date") or item.get("end_date") or item.get("start_date")
         due_date = normalize_ai_date_str(raw_due, today=ref)
@@ -1081,7 +1117,7 @@ def parse_calendar_ai_response(
             item.get("title") or item.get("summary"),
             max_len=MAX_CALENDAR_TITLE_LEN,
         )
-        if not title:
+        if _is_dummy_schedule_title(title):
             continue
 
         s_date = normalize_ai_date_str(item.get("start_date"), today=ref)
@@ -1294,8 +1330,8 @@ def build_hwp_schedule_ai_prompt(
         f"기준 연도/날짜: {ref.isoformat()}\n"
         "아래 학사일정 문서(표 및 본문)에서 모든 학사일정을 추출하여 "
         "반드시 아래 형식의 순수 JSON 배열(또는 단일 ```json 코드블록)로만 응답해 주세요.\n"
-        '- 출력 스키마: [{"title": "...", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", '
-        '"category": "학사일정", "memo": "..."}]\n'
+        '- 출력 스키마: [{"title": "<일정명>", "start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD", '
+        '"category": "학사일정", "memo": "<대상 학년·장소 등 부가 메모>"}]\n'
         "- category는 '학사일정', '수행평가', '업무', '개인' 중 하나로 분류하세요 (기본: '학사일정').\n"
         "- [지침 1 - 변경/수정 문서 처리] 문서에 '변경 전'과 '변경 후' 표나 항목이 함께 있으면 '변경 전' 일정은 제외하고 최종 확정/'변경 후' 일정만 추출하세요.\n"
         "- [지침 2 - 학년도·연도 전환 처리] 2학기 학사일정 표처럼 8~12월 뒤에 1월 또는 2월이 나오면 기준 연도의 다음 해(기준 연도 + 1)로 계산해 YYYY-MM-DD를 채우세요. (문서에 명시된 학년도가 있으면 해당 학년도 기준 적용)\n"
