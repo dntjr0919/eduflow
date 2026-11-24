@@ -31,9 +31,19 @@ from PyQt6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    QUrl,
     pyqtSignal,
 )
-from PyQt6.QtGui import QCursor, QFontMetrics, QIcon, QKeyEvent, QPainter, QPixmap, QTextLayout
+from PyQt6.QtGui import (
+    QCursor,
+    QDesktopServices,
+    QFontMetrics,
+    QIcon,
+    QKeyEvent,
+    QPainter,
+    QPixmap,
+    QTextLayout,
+)
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication,
@@ -1556,12 +1566,25 @@ class _ManualExtraPasteDialog(QDialog):
             self.txt_response.setPlainText(clip)
 
     def _on_text_changed(self) -> None:
-        if self._target_kind != "hwpx_agent":
+        if self._target_kind not in ("hwpx_agent", "calendar_todo"):
             return
         raw = self.txt_response.toPlainText().strip()
         if not raw:
             self.lbl_verify.setStyleSheet("font-size: 11px; color: #64748B;")
             self.lbl_verify.setText("대기 중: JSON 응답을 붙여넣으면 자동 검증됩니다.")
+            return
+        if self._target_kind == "calendar_todo":
+            try:
+                parsed_cal = parse_calendar_ai_response(raw)
+                s_cnt = len(parsed_cal.get("schedules") or [])
+                t_cnt = len(parsed_cal.get("todos") or [])
+                self.lbl_verify.setStyleSheet("font-size: 11px; color: #15803D; font-weight: 600;")
+                self.lbl_verify.setText(
+                    f"유효한 일정·할일 JSON 확인됨 (일정 {s_cnt}건, 할일 {t_cnt}건)"
+                )
+            except Exception as exc:
+                self.lbl_verify.setStyleSheet("font-size: 11px; color: #B91C1C;")
+                self.lbl_verify.setText(f"JSON 추출 오류: {exc}")
             return
         try:
             parsed = extract_json_from_llm_response(raw)
@@ -1578,7 +1601,17 @@ class _ManualExtraPasteDialog(QDialog):
         if not raw:
             QMessageBox.warning(self, "응답 확인", "붙여넣을 AI 응답 텍스트를 입력해 주세요.")
             return
-        if self._target_kind == "hwpx_agent":
+        if self._target_kind == "calendar_todo":
+            try:
+                parse_calendar_ai_response(raw)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "JSON 검증 오류",
+                    f"유효한 일정·할일 JSON 응답을 추출하지 못했습니다:\n{exc}",
+                )
+                return
+        elif self._target_kind == "hwpx_agent":
             try:
                 extract_json_from_llm_response(raw)
             except Exception as exc:
@@ -1733,7 +1766,10 @@ class _CalendarTodoAdapter(TargetExecutionAdapter):
             QMessageBox.information(dock, "입력 확인", self.empty_prompt_warning)
             dock.txt_calendar_instruction.setFocus()
             return True
-        if dock._try_handle_direct_calendar_json(inst):
+        is_system_doc_prompt = (
+            inst.startswith("[원본 파일:") or "--- [추출된 학사일정 원문] ---" in inst
+        )
+        if not is_system_doc_prompt and dock._try_handle_direct_calendar_json(inst):
             return True
         return False
 
@@ -2390,6 +2426,17 @@ class AiExecutionDock(QFrame):
         )
         self.btn_manual_extra_paste.clicked.connect(self._on_manual_extra_paste_clicked)
         mep_lay.addWidget(self.btn_manual_extra_paste)
+
+        self.btn_manual_open_web = QPushButton("🌐 웹 AI 열기")
+        self.btn_manual_open_web.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_manual_open_web.setMinimumHeight(26)
+        self.btn_manual_open_web.setStyleSheet(
+            "QPushButton { background-color: #EFF6FF; border: 1px solid #93C5FD; "
+            "border-radius: 6px; color: #1D4ED8; font-size: 11px; font-weight: 600; padding: 3px 10px; }"
+            "QPushButton:hover { background-color: #DBEAFE; border-color: #60A5FA; color: #1E3A8A; }"
+        )
+        self.btn_manual_open_web.clicked.connect(self._on_manual_open_web_clicked)
+        mep_lay.addWidget(self.btn_manual_open_web)
         mep_lay.addStretch()
         self.manual_extra_paste_bar.setVisible(False)
 
@@ -3276,8 +3323,11 @@ class AiExecutionDock(QFrame):
             ctx = meta["context_getter"]()
             if isinstance(ctx, dict):
                 return ctx
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                self.db.add_log("WARN", "AiDock", f"컨텍스트 조회 실패 ({tid}): {exc}")
+            except Exception:
+                pass
         return {}
 
     def _apply_target_visibility(
@@ -3544,6 +3594,7 @@ class AiExecutionDock(QFrame):
         if not ctx and self._active_target_id:
             ctx = {"target_id": self._active_target_id, "kind": self._active_target_id}
         if not ctx:
+            self.lbl_dock_progress_meta.setText("실행 불가: 활성 타깃 컨텍스트가 없습니다.")
             return False
         target_id = str(ctx.get("target_id") or self._active_target_id or "").strip()
         adapter = self._get_target_adapter(target_id)
@@ -3620,6 +3671,13 @@ class AiExecutionDock(QFrame):
         if mode_idx == 1:
             prompt_text = adapter.build_prompt(self, ctx)
             if not prompt_text:
+                self.lbl_dock_progress_meta.setText(f"수동 복붙 중단: {adapter.empty_prompt_warning}")
+                self._append_chat_message(
+                    role="assistant",
+                    content=f"⚠️ 수동 복붙 중단: {adapter.empty_prompt_warning}",
+                    exec_mode="manual",
+                    tool_name=target_id,
+                )
                 QMessageBox.information(self, "프롬프트 확인", adapter.empty_prompt_warning)
                 return True
             att_paths = [Path(p) for p in adapter.get_attachments(self, ctx) if Path(p).is_file()]
@@ -4474,8 +4532,12 @@ class AiExecutionDock(QFrame):
             return
         self._last_clipboard_payload_hash = self._hash_clipboard_text(prompt_text)
         QApplication.clipboard().setText(prompt_text)
-        webbrowser.open(url)
-        self.lbl_manual_verify.setText("프롬프트를 클립보드에 복사하고 웹 AI를 열었습니다.")
+        opened = self._open_external_web_url(url)
+        self.lbl_manual_verify.setText(
+            f"프롬프트 복사 완료 · 웹 브라우저 열기: {url}"
+            if opened
+            else f"프롬프트 복사 완료 · 웹 브라우저 열기 실패 ({url})"
+        )
 
     def _extract_context_attachment_paths(self, ctx: Optional[Dict[str, Any]] = None) -> List[Path]:
         """컨텍스트에서 실제 존재하는 첨부파일 경로 목록을 중복 없이 추출합니다."""
@@ -5716,15 +5778,17 @@ class AiExecutionDock(QFrame):
             if getattr(card, "role", "") == "assistant":
                 last_ai_card = card
                 break
-        if not is_manual or last_ai_card is None:
+        if not is_manual or (last_ai_card is None and not self._manual_waiting_collect):
             self.manual_extra_paste_bar.setVisible(False)
             self.chat_timeline_lay.removeWidget(self.manual_extra_paste_bar)
             return
         self.chat_timeline_lay.removeWidget(self.manual_extra_paste_bar)
-        ai_idx = self.chat_timeline_lay.indexOf(last_ai_card)
+        ai_idx = self.chat_timeline_lay.indexOf(last_ai_card) if last_ai_card is not None else -1
         insert_idx = ai_idx + 1 if ai_idx >= 0 else max(0, self.chat_timeline_lay.count() - 1)
         self.chat_timeline_lay.insertWidget(insert_idx, self.manual_extra_paste_bar)
         self.manual_extra_paste_bar.setVisible(True)
+        if self._manual_waiting_collect:
+            QTimer.singleShot(0, self._scroll_timeline_to_bottom)
 
     def _on_manual_extra_paste_clicked(self) -> None:
         if self.current_mode_index() != 1:
@@ -6093,6 +6157,31 @@ class AiExecutionDock(QFrame):
             )
         self._append_action_approval_card(t_name, t_label, args)
 
+    @staticmethod
+    def _open_external_web_url(url: str) -> bool:
+        """
+        Windows 등에서 기본 웹 브라우저(크롬 등) 새 탭이 확실히 열리도록
+        QDesktopServices.openUrl -> os.startfile -> webbrowser.open_new_tab 순으로 시도합니다.
+        """
+        target_url = str(url or "").strip()
+        if not target_url:
+            return False
+        try:
+            if QDesktopServices.openUrl(QUrl(target_url)):
+                return True
+        except Exception:
+            pass
+        if sys.platform == "win32" and hasattr(os, "startfile"):
+            try:
+                os.startfile(target_url)  # type: ignore[attr-defined]
+                return True
+            except Exception:
+                pass
+        try:
+            return bool(webbrowser.open_new_tab(target_url))
+        except Exception:
+            return False
+
     def _copy_and_open_manual_web(self, prompt_text: str) -> None:
         QApplication.clipboard().setText(prompt_text)
         self._enter_manual_collect_waiting(prompt_text)
@@ -6109,10 +6198,15 @@ class AiExecutionDock(QFrame):
                 "프롬프트가 복사되었습니다. 웹 AI 주소를 입력하거나 붙여넣기 후 [응답 회수]를 눌러주세요."
             )
             return
-        webbrowser.open(url)
-        self.lbl_dock_progress_meta.setText(
-            "프롬프트가 복사되었습니다. 열린 웹 AI 창에 붙여넣기(Ctrl+V)한 뒤, 답변을 복사해 [응답 회수]를 눌러주세요."
-        )
+        opened = self._open_external_web_url(url)
+        if opened:
+            self.lbl_dock_progress_meta.setText(
+                f"프롬프트 복사 완료 · 웹 브라우저 열기: {url} (Ctrl+V 후 응답을 복사해 [응답 회수] 또는 [+ 추가 답변 붙여넣기])"
+            )
+        else:
+            self.lbl_dock_progress_meta.setText(
+                f"프롬프트 복사 완료 · 웹 브라우저 열기 실패 ({url}) — 브라우저에서 직접 열어 붙여넣기 해주세요."
+            )
 
     def _notify_manual_attachments(self, target_id: str, att_paths: List[Path]) -> None:
         """수동 복붙 모드에서 첨부파일 안내를 타임라인에 표시하고 탐색기를 엽니다."""
@@ -6133,12 +6227,38 @@ class AiExecutionDock(QFrame):
         except Exception:
             pass
 
+    def _on_manual_open_web_clicked(self) -> None:
+        provider_key = str(self.combo_web_provider.currentData() or self._manual_provider or "gemini")
+        url = self._resolve_target_web_url(provider_key, self.edit_chat_custom_url)
+        if not url:
+            QMessageBox.information(
+                self,
+                "URL 확인",
+                "직접 URL 모드에서는 접속할 웹 AI 주소를 입력해 주세요.",
+            )
+            self.edit_chat_custom_url.setFocus()
+            return
+        opened = self._open_external_web_url(url)
+        self.lbl_dock_progress_meta.setText(
+            f"웹 브라우저 열기: {url}"
+            if opened
+            else f"웹 브라우저 열기 실패 ({url}) — 브라우저에서 직접 열어 주세요."
+        )
+
     def prepare_manual_prompt_for_target(self, target_id: str) -> str:
         """지정 타겟의 수동 복붙용 프롬프트를 패널 타임라인·클립보드에 띄우고 웹 AI 창을 열어 응답 회수 대기로 전환합니다."""
         self.set_target(target_id, force=True)
         ctx = self._fetch_fresh_context()
         prompt_text = self._build_current_manual_prompt()
         if not prompt_text:
+            msg = "수동 복붙 중단: 생성된 프롬프트가 비어 있습니다. 지시사항이나 문서를 확인해 주세요."
+            self.lbl_dock_progress_meta.setText(msg)
+            self._append_chat_message(
+                role="assistant",
+                content=f"⚠️ {msg}",
+                exec_mode="manual",
+                tool_name=target_id,
+            )
             return ""
         att_paths = self._extract_context_attachment_paths(ctx)
         self._append_chat_message(
@@ -6162,6 +6282,7 @@ class AiExecutionDock(QFrame):
             "(응답을 복사한 상태라면 입력창이 비어 있어도 [응답 회수]로 자동 회수됩니다.)"
         )
         self.btn_chat_cancel_collect.setVisible(True)
+        self._sync_manual_extra_paste_button()
 
     def _cancel_manual_collect_waiting(self) -> None:
         self._manual_waiting_collect = False
@@ -6169,6 +6290,7 @@ class AiExecutionDock(QFrame):
         self.btn_chat_send.setToolTip("")
         self.btn_chat_cancel_collect.setVisible(False)
         self._sync_chat_send_button_state()
+        self._sync_manual_extra_paste_button()
 
     def _on_manual_collect_from_chat(self) -> None:
         input_txt = self.txt_chat_input.toPlainText().strip()
@@ -6294,9 +6416,8 @@ class AiExecutionDock(QFrame):
         )
 
         if tid != "general_chat":
-            if tid == "calendar_todo":
-                direct_src = raw_text or self.txt_calendar_instruction.toPlainText().strip()
-                if self._try_handle_direct_calendar_json(direct_src, from_chat=True):
+            if tid == "calendar_todo" and raw_text:
+                if self._try_handle_direct_calendar_json(raw_text, from_chat=True):
                     return
             if self._execute_target_pipeline(mode_idx):
                 return

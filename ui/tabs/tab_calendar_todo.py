@@ -1696,7 +1696,7 @@ class CalendarTodoTab(QWidget):
             "target_id": "calendar_todo",
             "kind": "calendar_todo",
             "task_label": "일정·할일 자동 추출",
-            "selected_date": self._selected_date_str,
+            "selected_date": str(getattr(self, "_selected_date", "") or ""),
             "schedule_context": self._build_local_schedule_context_text(),
         }
         if self._pending_ai_attachment_paths:

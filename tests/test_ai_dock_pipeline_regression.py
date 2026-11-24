@@ -48,9 +48,12 @@ class TestAiDockPipelineRegression(unittest.TestCase):
         self.dock = AiExecutionDock(task_runner=self.runner, db=self.db)
         self.dispatched = []
 
-        wb_patch = patch("ui.components.ai_execution_dock.webbrowser.open", return_value=True)
+        wb_patch = patch("ui.components.ai_execution_dock.webbrowser.open_new_tab", return_value=True)
+        qt_open_patch = patch("ui.components.ai_execution_dock.QDesktopServices.openUrl", return_value=True)
         self.mock_web_open = wb_patch.start()
+        self.mock_qt_open = qt_open_patch.start()
         self.addCleanup(wb_patch.stop)
+        self.addCleanup(qt_open_patch.stop)
 
     def tearDown(self) -> None:
         try:
@@ -323,6 +326,161 @@ class TestAiDockPipelineRegression(unittest.TestCase):
         self.dock._on_manual_apply_and_next()
         self.assertEqual(self.dispatched[-1][0], "hwpx_agent")
         self.assertEqual(self.dispatched[-1][1].get("exec_kind"), "code_mode")
+
+    def test_7_hwp_schedule_prompt_not_hijacked_by_direct_json_in_all_3_modes(self) -> None:
+        from datetime import date
+        from services.schedule_parser_service import (
+            build_hwp_schedule_ai_prompt,
+            parse_calendar_ai_response,
+            try_parse_direct_calendar_json,
+        )
+
+        hwp_prompt = build_hwp_schedule_ai_prompt(
+            "[tbl_0]\n9월 | 모의수능(3), 전국연합(인천-1,2)\n1월 | 6일-8일 겨울방학 캠프",
+            file_name="2026학년도 2학기 학사일정 변경(안).hwp",
+            today=date(2026, 8, 20),
+        )
+        # 프롬프트 내 스키마 예시가 "..." 더미 값을 쓰지 않고, direct JSON으로 오인되지 않아야 함
+        self.assertNotIn('"title": "..."', hwp_prompt)
+        self.assertIsNone(try_parse_direct_calendar_json(hwp_prompt))
+
+        # 더미 title("...") 방어 검증
+        dummy_parsed = parse_calendar_ai_response(
+            [{"title": "...", "start_date": "2026-09-01", "memo": "..."}],
+            today=date(2026, 8, 20),
+        )
+        self.assertEqual(len(dummy_parsed["schedules"]), 0)
+
+        self._register_std_target(
+            "calendar_todo",
+            {
+                "target_id": "calendar_todo",
+                "kind": "calendar_todo",
+                "task_label": "일정·할일 자동 추출",
+                "schedule_context": "",
+            },
+        )
+        self.dock.set_target("calendar_todo", force=True)
+        self.dock.txt_calendar_instruction.setPlainText(hwp_prompt)
+
+        # 1) API 모드: 스킵되지 않고 실제 API 워커 시작
+        self.dock._on_mode_segment_clicked(0)
+        with patch(
+            "ui.components.ai_execution_dock.get_active_ai_info",
+            return_value={"has_key": True, "provider": "gemini", "model": "gemini-2.5-flash"},
+        ):
+            self.dock._on_api_start_clicked()
+        self.assertEqual(len(self.dispatched), 0)
+        self.assertEqual(len(self.runner.started), 1)
+        self.assertEqual(self.runner.started[0][0], self.dock.TASK_DOCK_API)
+        if callable(self.runner.started[0][4]):
+            self.runner.started[0][4]()
+
+        # 2) 수동 복붙 모드: dock.show() 상태에서 프롬프트 복사 + 실제 URL 오픈 + 추가 붙여넣기 바 isVisible() 확인
+        self.dock.setMinimumWidth(340)
+        self.dock.setMaximumWidth(340)
+        self.dock.show()
+        self.dock._on_mode_segment_clicked(1)
+        self.dock.prepare_manual_prompt_for_target("calendar_todo")
+        self.app.processEvents()
+        self.assertEqual(len(self.dispatched), 0)
+        self.mock_qt_open.assert_called()
+        opened_qurl = self.mock_qt_open.call_args[0][0]
+        self.assertEqual(opened_qurl.toString(), "https://gemini.google.com/app")
+        self.assertIn("https://gemini.google.com/app", self.dock.lbl_dock_progress_meta.text())
+        self.assertTrue(self.dock._manual_waiting_collect)
+        self.assertTrue(self.dock.manual_extra_paste_bar.isVisible())
+        self.assertTrue(self.dock.manual_extra_paste_bar.isVisibleTo(self.dock))
+        self.assertTrue(self.dock.btn_manual_extra_paste.isVisible())
+        self.assertIn("2026학년도 2학기 학사일정 변경(안).hwp", self.dock._last_manual_prompt)
+
+        # 채팅 입력창 전송(btn_chat_send.click) 경로에서도 동일하게 웹 오픈 + 바 표시 확인
+        self.dock._cancel_manual_collect_waiting()
+        self.mock_qt_open.reset_mock()
+        self.dock.txt_chat_input.setPlainText("내일 오전 10시 교무회의")
+        self.dock.btn_chat_send.click()
+        self.app.processEvents()
+        self.mock_qt_open.assert_called_once()
+        self.assertEqual(self.mock_qt_open.call_args[0][0].toString(), "https://gemini.google.com/app")
+        self.assertTrue(self.dock.manual_extra_paste_bar.isVisible())
+        self.assertTrue(self.dock.manual_extra_paste_bar.isVisibleTo(self.dock))
+
+        # QDesktopServices.openUrl 실패 시 os.startfile / webbrowser.open_new_tab 폴백 확인
+        self.dock._cancel_manual_collect_waiting()
+        with patch("ui.components.ai_execution_dock.QDesktopServices.openUrl", return_value=False), patch(
+            "ui.components.ai_execution_dock.os.startfile", side_effect=OSError("no handler")
+        ), patch("ui.components.ai_execution_dock.webbrowser.open_new_tab", return_value=True) as mock_wb_tab:
+            self.dock.prepare_manual_prompt_for_target("calendar_todo")
+        mock_wb_tab.assert_called_once_with("https://gemini.google.com/app")
+
+        # _ManualExtraPasteDialog의 calendar_todo 실시간 JSON 검증 확인
+        from ui.components.ai_execution_dock import _ManualExtraPasteDialog
+
+        paste_dlg = _ManualExtraPasteDialog(self.dock, target_kind="calendar_todo")
+        paste_dlg.txt_response.setPlainText(
+            '[{"title": "모의수능(3)", "start_date": "2026-09-03", "end_date": "2026-09-03"}]'
+        )
+        self.assertIn("일정 1건", paste_dlg.lbl_verify.text())
+        paste_dlg.close()
+        self.dock._cancel_manual_collect_waiting()
+
+        # 3) Playwright 자동 모드: 스킵되지 않고 실제 Playwright 워커 시작
+        self.dock._on_mode_segment_clicked(2)
+        self.dock._on_pw_start_clicked()
+        self.assertEqual(len(self.dispatched), 0)
+        self.assertEqual(len(self.runner.started), 2)
+        self.assertEqual(self.runner.started[1][0], self.dock.TASK_DOCK_PLAYWRIGHT)
+        self.assertIsNotNone(self.dock._active_pw_worker)
+
+    def test_8_e2e_import_hwp_schedule_to_manual_browser_open(self) -> None:
+        from core.config_manager import ConfigManager
+        from ui.tabs.tab_calendar_todo import CalendarTodoTab
+        from tests.test_hwp_schedule_and_db_manager import _make_sample_hwpx
+
+        hwpx_path = self.tmp_path / "2026_schedule.hwpx"
+        _make_sample_hwpx(hwpx_path)
+
+        cfg = ConfigManager(str(self.tmp_path / "config.json"))
+        tab = CalendarTodoTab(
+            task_runner=self.runner,
+            db=self.db,
+            config=cfg,
+            start_timer=False,
+        )
+        self.dock.register_target(
+            target_id="calendar_todo",
+            label="캘린더 & 할일",
+            context_getter=tab.get_ai_context,
+            on_result=tab.apply_ai_dock_result,
+        )
+
+        def _handle_hwp_ai_req(prompt_text: str, _file_name: str = "") -> None:
+            self.dock.set_target("calendar_todo", force=True)
+            self.dock.txt_calendar_instruction.setPlainText(prompt_text)
+            if self.dock.current_mode_index() == 1:
+                self.dock.prepare_manual_prompt_for_target("calendar_todo")
+
+        tab.ai_hwp_schedule_requested.connect(_handle_hwp_ai_req)
+
+        self.dock.setMinimumWidth(340)
+        self.dock.setMaximumWidth(340)
+        self.dock.show()
+        self.dock._on_mode_segment_clicked(1)
+        self.mock_qt_open.reset_mock()
+
+        tab.import_hwp_schedule_file(str(hwpx_path))
+        self.app.processEvents()
+
+        self.mock_qt_open.assert_called_once()
+        self.assertEqual(
+            self.mock_qt_open.call_args[0][0].toString(),
+            "https://gemini.google.com/app",
+        )
+        self.assertIn("웹 브라우저 열기: https://gemini.google.com/app", self.dock.lbl_dock_progress_meta.text())
+        self.assertTrue(self.dock.manual_extra_paste_bar.isVisible())
+        self.assertTrue(self.dock.btn_manual_open_web.isVisible())
+        tab.close()
+        tab.deleteLater()
 
 
 if __name__ == "__main__":
