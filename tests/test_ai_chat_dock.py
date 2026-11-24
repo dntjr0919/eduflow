@@ -27,7 +27,7 @@ class TestAiChatDatabaseAndDock(unittest.TestCase):
         self.db_path = Path(self.tmp_dir.name) / "test_chat.db"
         self.db = DatabaseManager(str(self.db_path))
         self._tracked_docks = []
-        wb_patcher = patch("ui.components.ai_execution_dock.webbrowser.open", return_value=True)
+        wb_patcher = patch("ui.components.ai_execution_dock.AiExecutionDock._open_external_web_url", return_value=True)
         self.mock_webbrowser_open = wb_patcher.start()
         self.addCleanup(wb_patcher.stop)
 
@@ -918,7 +918,7 @@ class TestAiChatDatabaseAndDock(unittest.TestCase):
 
         self.mock_webbrowser_open.assert_called_once_with(PROVIDER_CONFIGS["chatgpt"]["url"])
         self.assertEqual(dock.btn_chat_send.text(), "응답 회수")
-        self.assertIn("열린 웹 AI 창에 붙여넣기(Ctrl+V)", dock.lbl_dock_progress_meta.text())
+        self.assertIn("웹 브라우저 열기:", dock.lbl_dock_progress_meta.text())
         dock.btn_chat_cancel_collect.click()
 
         # 2) 특수 타겟(calendar_todo) + Claude 선택 시에도 Claude URL 자동 오픈

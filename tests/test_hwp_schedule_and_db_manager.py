@@ -806,7 +806,9 @@ class TestHwpScheduleAndDbManager(unittest.TestCase):
             # 2) 수동 복붙 모드: 프롬프트 클립보드 복사 + 응답 회수 대기 전환 + 응답 붙여넣기 시 결과 전달
             dock._on_mode_segment_clicked(1)
             dock.txt_chat_input.setPlainText("모레 오후 2시 학부모 상담 등록")
-            with patch("ui.components.ai_execution_dock.webbrowser.open") as mock_open:
+            with patch(
+                "ui.components.ai_execution_dock.QDesktopServices.openUrl", return_value=True
+            ) as mock_open:
                 dock._on_chat_send_clicked()
             mock_open.assert_called_once()
             self.assertTrue(dock._manual_waiting_collect)
