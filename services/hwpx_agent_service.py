@@ -6,6 +6,7 @@ HWPX AI 문서 에이전트 XML 분석·패치 엔진 (services/hwpx_agent_servi
 - 아래첨자(_{...}), 위첨자(^{...}), 수식($$...$$) 자동 변환 및 실행 취소(Undo) 스냅샷 스택 지원
 """
 
+from collections import Counter
 import ctypes
 from contextlib import contextmanager
 import html
@@ -341,17 +342,24 @@ def _ensure_script_char_pr(
     except Exception:
         target_height = base_height
     base_bold = _find_child(base_node, "bold") is not None
-    base_color = str(base_node.get("textColor", "#000000"))
+    base_ul = _char_pr_has_underline(base_node)
+    base_sig = _char_pr_signature(
+        base_node, ignore_children={"subscript", "superscript", "bold", "underline"}
+    )
     other_script = "superscript" if script_type == "subscript" else "subscript"
 
-    # 동일 속성의 기존 첨자 charPr 재사용 (비표준 속성 미사용)
+    # 글꼴(fontRef) 및 모든 기타 서식 시그니처가 완전히 일치할 때만 기존 첨자 charPr 재사용
     for ch in all_char_prs:
         if (
             _find_child(ch, script_type) is not None
             and _find_child(ch, other_script) is None
             and (_find_child(ch, "bold") is not None) == base_bold
+            and _char_pr_has_underline(ch) == base_ul
             and str(ch.get("height", "1000")) == target_height
-            and str(ch.get("textColor", "#000000")) == base_color
+            and _char_pr_signature(
+                ch, ignore_children={"subscript", "superscript", "bold", "underline"}
+            )
+            == base_sig
         ):
             return str(ch.get("id"))
 
@@ -441,6 +449,41 @@ def _char_pr_has_underline(char_pr_node: Any) -> bool:
     return ul is not None and str(ul.get("type", "NONE")).strip().upper() != "NONE"
 
 
+def _char_pr_signature(
+    char_pr_node: Any,
+    *,
+    ignore_children: Optional[Set[str]] = None,
+) -> Tuple[Any, ...]:
+    """
+    charPr 노드의 글꼴(fontRef 전체 속성), 장평(ratio), 자간(spacing),
+    기울임/취소선/음영/테두리 등 모든 서식 속성을 정규화한 비교용 시그니처를 반환합니다.
+    """
+    ignored = ignore_children or set()
+    attr_items: List[Tuple[str, str]] = []
+    has_text_color = False
+    for k, v in char_pr_node.attrib.items():
+        if k in ("id", "height") or k.startswith("_eduflow_"):
+            continue
+        if k == "textColor":
+            has_text_color = True
+        attr_items.append((str(k), str(v)))
+    if not has_text_color:
+        attr_items.append(("textColor", "#000000"))
+    attr_items.sort()
+
+    child_items: List[Tuple[str, Tuple[Tuple[str, str], ...], str]] = []
+    for ch in char_pr_node:
+        tag = _local_tag(ch)
+        if tag in ignored:
+            continue
+        ch_attrs = tuple(sorted((str(k), str(v)) for k, v in ch.attrib.items()))
+        ch_text = (ch.text or "").strip()
+        child_items.append((tag, ch_attrs, ch_text))
+    child_items.sort()
+
+    return (tuple(attr_items), tuple(child_items))
+
+
 def _ensure_styled_char_pr(
     doc: HwpxDocument,
     base_char_pr_id: str = "0",
@@ -496,6 +539,9 @@ def _ensure_styled_char_pr(
         return resolved_base_id
 
     base_color = str(base_node.get("textColor", "#000000"))
+    base_sig = _char_pr_signature(
+        base_node, ignore_children={"subscript", "superscript", "bold", "underline"}
+    )
     for ch in all_char_prs:
         if (
             _find_child(ch, "subscript") is None
@@ -503,7 +549,10 @@ def _ensure_styled_char_pr(
             and (_find_child(ch, "bold") is not None) == target_bold
             and _char_pr_has_underline(ch) == target_ul
             and str(ch.get("height", "1000")) == target_height
-            and str(ch.get("textColor", "#000000")) == base_color
+            and _char_pr_signature(
+                ch, ignore_children={"subscript", "superscript", "bold", "underline"}
+            )
+            == base_sig
         ):
             return str(ch.get("id"))
 
@@ -553,16 +602,58 @@ def _ensure_styled_char_pr(
     return new_id
 
 
-def _para_margin_sig(para_node: Any) -> Tuple[str, str]:
+def _para_margin_sig(para_node: Any) -> Tuple[Tuple[str, Tuple[Tuple[str, str], ...]], ...]:
     margin_el = _find_child(para_node, "margin")
     if margin_el is None:
-        return ("0", "0")
-    intent_el = _find_child(margin_el, "intent")
-    left_el = _find_child(margin_el, "left")
-    return (
-        str(intent_el.get("value", "0")) if intent_el is not None else "0",
-        str(left_el.get("value", "0")) if left_el is not None else "0",
+        return ()
+    items: List[Tuple[str, Tuple[Tuple[str, str], ...]]] = []
+    for ch in margin_el:
+        items.append((_local_tag(ch), tuple(sorted((str(k), str(v)) for k, v in ch.attrib.items()))))
+    items.sort()
+    return tuple(items)
+
+
+def _para_pr_signature(para_node: Any) -> Tuple[Any, ...]:
+    """
+    paraPr 노드의 tabPrIDRef, lineSpacing, 전체 margin, border, heading,
+    breakSetting(pageBreak 제외) 등 모든 문단 서식 속성을 정규화한 시그니처를 반환합니다.
+    """
+    attr_items = tuple(
+        sorted(
+            (str(k), str(v))
+            for k, v in para_node.attrib.items()
+            if k != "id" and not k.startswith("_eduflow_")
+        )
     )
+    align_el = _find_child(para_node, "align")
+    align_vert = str(align_el.get("vertical", "BASELINE")) if align_el is not None else "BASELINE"
+
+    break_el = _find_child(para_node, "breakSetting")
+    break_attrs = (
+        tuple(
+            sorted(
+                (str(k), str(v))
+                for k, v in break_el.attrib.items()
+                if k != "pageBreak"
+            )
+        )
+        if break_el is not None
+        else ()
+    )
+
+    margin_sig = _para_margin_sig(para_node)
+
+    other_children: List[Tuple[str, Tuple[Tuple[str, str], ...], str]] = []
+    for ch in para_node:
+        tag = _local_tag(ch)
+        if tag in ("align", "breakSetting", "margin"):
+            continue
+        ch_attrs = tuple(sorted((str(k), str(v)) for k, v in ch.attrib.items()))
+        ch_text = (ch.text or "").strip()
+        other_children.append((tag, ch_attrs, ch_text))
+    other_children.sort()
+
+    return (attr_items, align_vert, break_attrs, margin_sig, tuple(other_children))
 
 
 def _ensure_styled_para_pr(
@@ -606,8 +697,7 @@ def _ensure_styled_para_pr(
     base_align = str(existing_align_el.get("horizontal", "")).upper() if existing_align_el is not None else ""
     existing_break_el = _find_child(base_node, "breakSetting")
     base_pb = (existing_break_el.get("pageBreak") == "1") if existing_break_el is not None else False
-    base_keep_next = (existing_break_el.get("keepWithNext") == "1") if existing_break_el is not None else False
-    base_margin = _para_margin_sig(base_node)
+    base_sig = _para_pr_signature(base_node)
 
     target_align = align_norm or base_align
     target_pb = bool(page_break) if page_break is not None else base_pb
@@ -620,12 +710,10 @@ def _ensure_styled_para_pr(
         pr_al = str(al_el.get("horizontal", "")).upper() if al_el is not None else ""
         br_el = _find_child(pr, "breakSetting")
         pr_pb = (br_el.get("pageBreak") == "1") if br_el is not None else False
-        pr_kn = (br_el.get("keepWithNext") == "1") if br_el is not None else False
         if (
             pr_al == target_align
             and pr_pb == target_pb
-            and pr_kn == base_keep_next
-            and _para_margin_sig(pr) == base_margin
+            and _para_pr_signature(pr) == base_sig
         ):
             return str(pr.get("id"))
 
@@ -1462,7 +1550,7 @@ def _replace_text_in_paragraph(
 def _get_header_style_maps(
     doc: HwpxDocument,
 ) -> Tuple[Dict[str, str], Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    """header.xml에서 script_map, char_style_map(bold/font_size_pt), para_style_map(align/page_break)을 읽습니다."""
+    """header.xml에서 fontfaces, script_map, char_style_map, para_style_map을 읽습니다."""
     script_map: Dict[str, str] = {}
     char_style_map: Dict[str, Dict[str, Any]] = {}
     para_style_map: Dict[str, Dict[str, Any]] = {}
@@ -1471,6 +1559,20 @@ def _get_header_style_maps(
         return script_map, char_style_map, para_style_map
     try:
         root = _parse_xml(doc.entries[header_name])
+        font_map: Dict[str, Dict[str, str]] = {}
+        for node in root.iter():
+            if _local_tag(node) == "fontface":
+                lang = str(node.get("lang", "")).strip().upper()
+                if not lang:
+                    continue
+                lang_fonts = font_map.setdefault(lang, {})
+                for f_node in node:
+                    if _local_tag(f_node) == "font":
+                        fid = str(f_node.get("id", ""))
+                        face = str(f_node.get("face", "")).strip()
+                        if fid and face:
+                            lang_fonts[fid] = face
+
         for node in root.iter():
             tag = _local_tag(node)
             if tag == "charPr":
@@ -1480,6 +1582,8 @@ def _get_header_style_maps(
                 elif _find_child(node, "superscript") is not None:
                     script_map[cid] = "sup"
                 is_bold = _find_child(node, "bold") is not None
+                is_italic = _find_child(node, "italic") is not None
+                is_ul = _char_pr_has_underline(node)
                 font_pt: Optional[float] = None
                 raw_h = node.get("height")
                 if raw_h is not None:
@@ -1487,7 +1591,24 @@ def _get_header_style_maps(
                         font_pt = round(int(raw_h) / 100.0, 2)
                     except (TypeError, ValueError):
                         font_pt = None
-                char_style_map[cid] = {"bold": is_bold, "font_size_pt": font_pt}
+                text_color = str(node.get("textColor", "#000000"))
+                font_ref = _find_child(node, "fontRef")
+                font_hangul = ""
+                font_latin = ""
+                if font_ref is not None:
+                    h_id = str(font_ref.get("hangul", ""))
+                    l_id = str(font_ref.get("latin", ""))
+                    font_hangul = font_map.get("HANGUL", {}).get(h_id, "")
+                    font_latin = font_map.get("LATIN", {}).get(l_id, "")
+                char_style_map[cid] = {
+                    "bold": is_bold,
+                    "italic": is_italic,
+                    "underline": is_ul,
+                    "font_size_pt": font_pt,
+                    "color": text_color,
+                    "font_hangul": font_hangul,
+                    "font_latin": font_latin,
+                }
             elif tag == "paraPr":
                 pid = str(node.get("id", ""))
                 align_el = _find_child(node, "align")
@@ -1498,7 +1619,41 @@ def _get_header_style_maps(
                 )
                 break_el = _find_child(node, "breakSetting")
                 is_pb = bool(break_el is not None and break_el.get("pageBreak") == "1")
-                para_style_map[pid] = {"align": align_val, "page_break": is_pb}
+
+                line_spacing = ""
+                ls_el = _find_child(node, "lineSpacing")
+                if ls_el is not None:
+                    ls_type = str(ls_el.get("type", "")).strip().upper()
+                    ls_val = str(ls_el.get("value", "")).strip()
+                    if ls_type == "PERCENT" and ls_val:
+                        line_spacing = f"{ls_val}%"
+                    elif ls_val:
+                        line_spacing = f"{ls_val}({ls_type})" if ls_type else ls_val
+
+                indent_pt = 0.0
+                left_margin_pt = 0.0
+                margin_el = _find_child(node, "margin")
+                if margin_el is not None:
+                    intent_el = _find_child(margin_el, "intent")
+                    if intent_el is not None:
+                        try:
+                            indent_pt = round(int(intent_el.get("value", "0")) / 100.0, 2)
+                        except (TypeError, ValueError):
+                            indent_pt = 0.0
+                    left_el = _find_child(margin_el, "left")
+                    if left_el is not None:
+                        try:
+                            left_margin_pt = round(int(left_el.get("value", "0")) / 100.0, 2)
+                        except (TypeError, ValueError):
+                            left_margin_pt = 0.0
+
+                para_style_map[pid] = {
+                    "align": align_val,
+                    "page_break": is_pb,
+                    "line_spacing": line_spacing,
+                    "indent_pt": indent_pt,
+                    "left_margin_pt": left_margin_pt,
+                }
     except Exception:
         pass
     return script_map, char_style_map, para_style_map
@@ -1545,11 +1700,37 @@ def _collect_dom_from_roots(
                                 continue
                             cid = f"{tid}_r{r_idx}_c{c_idx}"
                             id_map[cid] = (sec_name, tr, tc)
-                            cell_lines: List[str] = []
-                            for sub in tc.iter():
-                                if _local_tag(sub) == "p":
-                                    cell_lines.append(_extract_paragraph_plain_text(sub))
-                            row_cells.append({"id": cid, "text": "\n".join(cell_lines).strip()})
+                            cell_ps = [sub for sub in tc.iter() if _local_tag(sub) == "p"]
+                            cell_lines: List[str] = [
+                                _extract_paragraph_plain_text(sub) for sub in cell_ps
+                            ]
+                            cell_para_prs = [str(sub.get("paraPrIDRef", "0") or "0") for sub in cell_ps]
+                            cell_char_prs: List[str] = []
+                            for sub in cell_ps:
+                                for ch in sub:
+                                    if _is_replaceable_run(ch):
+                                        cell_char_prs.append(str(ch.get("charPrIDRef", "0") or "0"))
+
+                            cell_info: Dict[str, Any] = {
+                                "id": cid,
+                                "text": "\n".join(cell_lines).strip(),
+                            }
+                            if len(cell_ps) > 1:
+                                cell_info["para_count"] = len(cell_ps)
+                            if cell_para_prs:
+                                uniq_p = list(dict.fromkeys(cell_para_prs))
+                                if len(uniq_p) == 1:
+                                    cell_info["paraPr"] = uniq_p[0]
+                                else:
+                                    cell_info["paraPrs"] = cell_para_prs
+                            if cell_char_prs:
+                                uniq_c = list(dict.fromkeys(cell_char_prs))
+                                if len(uniq_c) == 1:
+                                    cell_info["charPr"] = uniq_c[0]
+                                else:
+                                    cell_info["mixed_styles"] = True
+                                    cell_info["charPrs"] = uniq_c
+                            row_cells.append(cell_info)
                             c_idx += 1
                         rows_data.append(row_cells)
                         r_idx += 1
@@ -1562,15 +1743,26 @@ def _collect_dom_from_roots(
                         pid = f"p_{p_counter}"
                         p_counter += 1
                         id_map[pid] = (sec_name, parent, child)
-                        para_id_ref = str(child.get("paraPrIDRef", ""))
+                        para_id_ref = str(child.get("paraPrIDRef", "") or "0")
                         is_pb = (child.get("pageBreak") == "1") or bool(
                             p_style_map.get(para_id_ref, {}).get("page_break")
                         )
+                        run_entries: List[Dict[str, str]] = []
+                        for ch in child:
+                            if _is_replaceable_run(ch):
+                                r_txt = _extract_run_text(ch)
+                                r_cid = str(ch.get("charPrIDRef", "0") or "0")
+                                run_entries.append({"t": r_txt, "charPr": r_cid})
                         blk_info: Dict[str, Any] = {
                             "id": pid,
                             "type": "paragraph",
+                            "paraPr": para_id_ref,
                             "text": _extract_paragraph_plain_text(child),
                         }
+                        if len(run_entries) >= 2 or len({r["charPr"] for r in run_entries}) > 1:
+                            blk_info["runs"] = run_entries
+                        elif len(run_entries) == 1:
+                            blk_info["charPr"] = run_entries[0]["charPr"]
                         if is_pb:
                             blk_info["page_break"] = True
                         blocks.append(blk_info)
@@ -1606,21 +1798,100 @@ def _find_dom_id_for_element(section_roots: Dict[str, Any], target_elem: Any) ->
 
 
 def extract_hwpx_dom_map(doc_or_path: HwpxDocument | Path | str) -> Dict[str, Any]:
-    """AI 프롬프트에 전달할 경량 문서 구조 JSON 맵을 생성합니다."""
+    """AI 프롬프트에 전달할 경량 문서 구조 JSON 맵(참조된 스타일 사전 포함)을 생성합니다."""
     doc = (
         doc_or_path
         if isinstance(doc_or_path, HwpxDocument)
         else HwpxDocument.load(doc_or_path)
     )
-    _, blocks, _ = _collect_section_dom(doc)
+    script_map, char_style_map, para_style_map = _get_header_style_maps(doc)
+    section_roots: Dict[str, Any] = {}
+    for sec_name in doc.section_names():
+        section_roots[sec_name] = _parse_xml(doc.entries[sec_name])
+    _, blocks = _collect_dom_from_roots(section_roots, para_style_map=para_style_map)
+
+    used_char_ids: Set[str] = set()
+    used_para_ids: Set[str] = set()
+    for blk in blocks:
+        if blk.get("type") == "paragraph":
+            if blk.get("paraPr"):
+                used_para_ids.add(str(blk["paraPr"]))
+            if blk.get("charPr"):
+                used_char_ids.add(str(blk["charPr"]))
+            for r in blk.get("runs") or []:
+                if isinstance(r, dict) and r.get("charPr"):
+                    used_char_ids.add(str(r["charPr"]))
+        elif blk.get("type") == "table":
+            for row in blk.get("rows") or []:
+                for cell in row:
+                    if not isinstance(cell, dict):
+                        continue
+                    if cell.get("paraPr"):
+                        used_para_ids.add(str(cell["paraPr"]))
+                    for pid in cell.get("paraPrs") or []:
+                        used_para_ids.add(str(pid))
+                    if cell.get("charPr"):
+                        used_char_ids.add(str(cell["charPr"]))
+                    for cid in cell.get("charPrs") or []:
+                        used_char_ids.add(str(cid))
+
+    def _id_sort_key(val: str) -> Tuple[int, str]:
+        return (int(val) if val.isdigit() else 999999, val)
+
+    char_catalog: Dict[str, Dict[str, Any]] = {}
+    for cid in sorted(used_char_ids, key=_id_sort_key):
+        cinfo = char_style_map.get(cid)
+        if not cinfo:
+            continue
+        c_entry: Dict[str, Any] = {}
+        if cinfo.get("font_hangul"):
+            c_entry["font"] = cinfo["font_hangul"]
+        if cinfo.get("font_latin") and cinfo.get("font_latin") != cinfo.get("font_hangul"):
+            c_entry["font_latin"] = cinfo["font_latin"]
+        if cinfo.get("font_size_pt") is not None:
+            c_entry["size_pt"] = cinfo["font_size_pt"]
+        if cinfo.get("color") and cinfo["color"] != "#000000":
+            c_entry["color"] = cinfo["color"]
+        if cinfo.get("bold"):
+            c_entry["bold"] = True
+        if cinfo.get("italic"):
+            c_entry["italic"] = True
+        if cinfo.get("underline"):
+            c_entry["underline"] = True
+        if script_map.get(cid):
+            c_entry["script"] = script_map[cid]
+        char_catalog[cid] = c_entry
+
+    para_catalog: Dict[str, Dict[str, Any]] = {}
+    for pid in sorted(used_para_ids, key=_id_sort_key):
+        pinfo = para_style_map.get(pid)
+        if not pinfo:
+            continue
+        p_entry: Dict[str, Any] = {}
+        if pinfo.get("align"):
+            p_entry["align"] = pinfo["align"]
+        if pinfo.get("line_spacing"):
+            p_entry["line_spacing"] = pinfo["line_spacing"]
+        if pinfo.get("indent_pt"):
+            p_entry["indent_pt"] = pinfo["indent_pt"]
+        if pinfo.get("left_margin_pt"):
+            p_entry["left_margin_pt"] = pinfo["left_margin_pt"]
+        if pinfo.get("page_break"):
+            p_entry["page_break"] = True
+        para_catalog[pid] = p_entry
+
     return {
         "file_name": doc.source_path.name if doc.source_path else "document.hwpx",
         "block_count": len(blocks),
+        "styles": {
+            "charPr": char_catalog,
+            "paraPr": para_catalog,
+        },
         "blocks": blocks,
     }
 
 
-def _compact_dom_map_for_prompt(dom_map: Dict[str, Any], max_chars: int = 45000) -> str:
+def _compact_dom_map_for_prompt(dom_map: Dict[str, Any], max_chars: int = 150000) -> str:
     """dom_map을 JSON 문자열로 직렬화하되 max_chars 초과 시 유효한 JSON 형태를 유지하며 경량화합니다."""
     dom_json = json.dumps(dom_map, ensure_ascii=False, separators=(",", ":"))
     if len(dom_json) <= max_chars:
@@ -1631,7 +1902,7 @@ def _compact_dom_map_for_prompt(dom_map: Dict[str, Any], max_chars: int = 45000)
     if not isinstance(blocks, list):
         return json.dumps({"truncated": True}, ensure_ascii=False, separators=(",", ":"))
 
-    # 1단계: 연속된 빈 문단 축약
+    # 1단계: 연속된 빈 문단 축약 (실제 문항 블록 보존 최우선)
     collapsed: List[Dict[str, Any]] = []
     empty_run_start: Optional[Dict[str, Any]] = None
     empty_run_cnt = 0
@@ -1667,7 +1938,15 @@ def _compact_dom_map_for_prompt(dom_map: Dict[str, Any], max_chars: int = 45000)
     if len(dom_json) <= max_chars:
         return dom_json
 
-    # 2단계: 긴 텍스트/표 셀 요약
+    # 2단계: runs 배열 제거 (styles 및 전체 블록 텍스트는 유지)
+    for b in compact["blocks"]:
+        if isinstance(b, dict) and "runs" in b:
+            b.pop("runs", None)
+    dom_json = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+    if len(dom_json) <= max_chars:
+        return dom_json
+
+    # 3단계: 긴 텍스트/표 셀 요약 (styles와 핵심 텍스트는 보존)
     for b in compact["blocks"]:
         if not isinstance(b, dict):
             continue
@@ -1721,31 +2000,39 @@ def build_hwpx_agent_prompt(dom_map: Dict[str, Any], user_instruction: str) -> T
     system_prompt = (
         "당신은 대한민국 교직 실무용 HWPX 문서 편집 AI 에이전트입니다.\n"
         "문서 전체를 다시 쓰지 말고, 반드시 아래 JSON Patch 스키마에 맞는 ```json ... ``` 블록만 출력하세요.\n"
+        "DOM 맵 구조 안내:\n"
+        "- `styles.charPr` / `styles.paraPr`: 현재 문서 블록에서 실제로 참조 중인 글자 서식(글꼴, 크기, 색상, 굵게, 밑줄, 기울임 등)과 문단 서식(정렬, 줄간격, 들여쓰기 등) 사전입니다.\n"
+        "- 각 `paragraph` 블록에는 `paraPr` ID가 포함되며, 문단 내 서식이 섞였거나 여러 run으로 나뉜 경우 `runs`: `[{\"t\":\"...\", \"charPr\":\"...\"}, ...]` 배열이 함께 제공됩니다.\n"
+        "- 표 셀(`tbl_..._r0_c0`)에는 셀 내 문단의 `paraPr`/`paraPrs`, `para_count`, `mixed_styles` 요약이 포함됩니다.\n"
         "사용 가능한 op 목록:\n"
         "1. replace_text: {\"op\":\"replace_text\", \"target_id\":\"p_0\"|\"tbl_0_r0_c0\"|\"ALL\", \"old_text\":\"...\", \"new_text\":\"...\"}\n"
         "2. set_paragraph_text: {\"op\":\"set_paragraph_text\", \"target_id\":\"p_0\", \"new_text\":\"...\"}\n"
-        "3. insert_paragraph_after: {\"op\":\"insert_paragraph_after\", \"target_id\":\"p_0\", \"text\":\"...\"}\n"
-        "4. delete_paragraph: {\"op\":\"delete_paragraph\", \"target_id\":\"p_0\"}\n"
-        "5. update_cell: {\"op\":\"update_cell\", \"target_id\":\"tbl_0_r0_c1\", \"new_text\":\"...\"}\n"
-        "6. add_table_row: {\"op\":\"add_table_row\", \"target_id\":\"tbl_0\", \"after_row\":0, \"cells\":[\"...\"]}\n"
-        "7. set_paragraph_indent: {\"op\":\"set_paragraph_indent\", \"target_id\":\"p_0\", \"indent_pt\":-12, \"left_margin_pt\":12}\n"
-        "8. update_table_layout: {\"op\":\"update_table_layout\", \"target_id\":\"tbl_0\", \"left_indent_pt\":10, \"col_widths_ratio\":[1,3]}\n"
-        "9. insert_exam_question: {\"op\":\"insert_exam_question\", \"target_id\":\"p_0\", \"number\":1, \"score\":\"3.2점\", \"question\":\"...\", \"bogi\":[\"ㄱ. ...\"], \"choices\":[\"① ...\"], \"answer\":\"③\", \"explanation\":\"...\"}\n"
-        "10. append_paragraph: {\"op\":\"append_paragraph\", \"text\":\"...\", \"bold\":false, \"font_size_pt\":10.0, \"align\":\"LEFT\"|\"CENTER\"|\"RIGHT\"}\n"
-        "11. append_table: {\"op\":\"append_table\", \"headers\":[\"항목\",\"내용\"], \"rows\":[[\"...\",\"...\"]], \"col_widths_ratio\":[1,3]}\n"
-        "12. insert_table_after: {\"op\":\"insert_table_after\", \"target_id\":\"p_0\", \"headers\":[\"항목\",\"내용\"], \"rows\":[[\"...\",\"...\"]], \"col_widths_ratio\":[1,3]}\n"
-        "13. page_break: {\"op\":\"page_break\"}\n"
-        "14. clone_block: {\"op\":\"clone_block\", \"source_id\":\"tbl_5\", \"after_id\":\"p_12\"}\n"
-        "15. delete_block: {\"op\":\"delete_block\", \"target_id\":\"p_5\"|\"tbl_2\"}\n"
+        "3. set_paragraph_runs: {\"op\":\"set_paragraph_runs\", \"target_id\":\"p_0\", \"paraPr\":\"5\", \"runs\":[{\"t\":\"제목 \", \"charPr\":\"7\"}, {\"t\":\"본문\", \"charPr\":\"0\"}]}\n"
+        "4. insert_paragraph_after: {\"op\":\"insert_paragraph_after\", \"target_id\":\"p_0\", \"text\":\"...\"}\n"
+        "5. delete_paragraph: {\"op\":\"delete_paragraph\", \"target_id\":\"p_0\"}\n"
+        "6. update_cell: {\"op\":\"update_cell\", \"target_id\":\"tbl_0_r0_c1\", \"new_text\":\"...\"}\n"
+        "7. add_table_row: {\"op\":\"add_table_row\", \"target_id\":\"tbl_0\", \"after_row\":0, \"cells\":[\"...\"]}\n"
+        "8. set_paragraph_indent: {\"op\":\"set_paragraph_indent\", \"target_id\":\"p_0\", \"indent_pt\":-12, \"left_margin_pt\":12}\n"
+        "9. update_table_layout: {\"op\":\"update_table_layout\", \"target_id\":\"tbl_0\", \"left_indent_pt\":10, \"col_widths_ratio\":[1,3]}\n"
+        "10. insert_exam_question: {\"op\":\"insert_exam_question\", \"target_id\":\"p_0\", \"number\":1, \"score\":\"3.2점\", \"question\":\"...\", \"bogi\":[\"ㄱ. ...\"], \"choices\":[\"① ...\"], \"answer\":\"③\", \"explanation\":\"...\"}\n"
+        "11. append_paragraph: {\"op\":\"append_paragraph\", \"text\":\"...\", \"bold\":false, \"font_size_pt\":10.0, \"align\":\"LEFT\"|\"CENTER\"|\"RIGHT\"}\n"
+        "12. append_table: {\"op\":\"append_table\", \"headers\":[\"항목\",\"내용\"], \"rows\":[[\"...\",\"...\"]], \"col_widths_ratio\":[1,3]}\n"
+        "13. insert_table_after: {\"op\":\"insert_table_after\", \"target_id\":\"p_0\", \"headers\":[\"항목\",\"내용\"], \"rows\":[[\"...\",\"...\"]], \"col_widths_ratio\":[1,3]}\n"
+        "14. page_break: {\"op\":\"page_break\"}\n"
+        "15. clone_block: {\"op\":\"clone_block\", \"source_id\":\"tbl_5\", \"after_id\":\"p_12\"}\n"
+        "16. delete_block: {\"op\":\"delete_block\", \"target_id\":\"p_5\"|\"tbl_2\"}\n"
+        "17. reorder_blocks: {\"op\":\"reorder_blocks\", \"groups\":[[\"p_5\",\"p_6\",\"tbl_1\"],[\"p_2\",\"p_3\"]]}\n"
         "핵심 규칙:\n"
+        "- 기존 문단이나 표 셀의 일부 문구만 수정할 때는 기존 글꼴·색상·부분 강조 서식이 훼손되지 않도록 반드시 `replace_text`를 최우선으로 사용하세요.\n"
+        "- 문단 전체 내용을 새로 바꾸되 문단 내 부분 강조(예: 제목만 굵게, 특정 단어만 다른 색상/글꼴)를 유지하거나 지정해야 할 때는 `set_paragraph_text` 대신 `runs`와 `styles` 사전을 참고하여 `set_paragraph_runs`를 사용하세요(`paraPr` 생략 시 기존 문단 `paraPrIDRef` 유지).\n"
+        "- 표 셀(tbl_...)도 일부 문구만 수정할 때는 `replace_text`를 우선 사용하고, 셀 전체 줄 구조를 새로 교체할 때만 `update_cell`을 사용하세요.\n"
         "- 기존 서식에 `<보기>` 상자나 선택지 표(예: 3x3 상자, ①~⑤ 표)가 이미 있는 문서에 문항을 추가할 때는 `insert_exam_question` 대신 `clone_block`으로 기존 문항/표 서식을 복제한 뒤 `set_paragraph_text`/`update_cell`로 내용만 채우는 방식을 우선 사용하세요.\n"
         "- replace_text를 사용할 때 old_text는 DOM 맵에 있는 원문(공백, 중괄호 {}, $$...$$ 포함)을 임의로 고치지 말고 단 한 글자도 바꾸지 않은 채 그대로 복사하세요.\n"
-        "- 표 셀(tbl_...) 내부의 수식($$...$$)이나 여러 줄 텍스트를 수정할 때는 replace_text 대신 update_cell을 우선 사용해도 됩니다.\n"
         "- new_text에는 지시사항에 맞게 실제로 수정된 최종 텍스트/수식을 반드시 반영하세요(원문 그대로 반환 금지).\n"
         "- 화학식/첨자/수식은 H_{2}O, Fe^{3+}, $$x^2 + y^2 = r^2$$, $$rm {CH}_{3}COOH(it {aq})$$처럼 "
         "한글 수식 문법(rm, it 뒤 공백 유지, 다문자 피연산자는 중괄호 {}로 감싸기, 백슬래시 금지)을 사용하세요."
     )
-    dom_json = _compact_dom_map_for_prompt(dom_map, max_chars=45000)
+    dom_json = _compact_dom_map_for_prompt(dom_map, max_chars=150000)
 
     user_prompt = (
         f"### [교사 수정 지시사항]\n{user_instruction.strip()}\n\n"
@@ -1777,7 +2064,10 @@ def build_hwpx_code_mode_prompt(dom_map: Dict[str, Any], user_instruction: str) 
         "4. 2단 편집 및 문항 서식 안내:\n"
         "   - `<보기>` 표나 `①~⑤` 선택지 표가 기존 문서에 있으면 그 표를 감싼 `<hp:p>`(또는 `helpers['wrap_table_in_paragraph'](tbl_clone)`)를 복제해 고정 2단 폭과 테두리 서식을 그대로 유지하세요.\n"
         "   - 새 너비 계산이 필요하면 `helpers['compute_content_width']()`로 현재 문서의 실제 1단 너비를 조회하세요.\n"
-        "5. 사용 가능한 `helpers` 목록:\n"
+        "5. 문항 순서 재배치/역순 배치 규칙:\n"
+        "   - 문항 순서를 바꿀 때는 `deepcopy`+삭제를 남발하지 말고, `sec_root`의 기존 최상위 `<hp:p>` 요소들을 문항 단위 그룹으로 묶어 기존 XML 노드의 순서만 `sec_root.remove(...)` 후 `sec_root.insert(...)`로 재배치하세요. 이렇게 해야 그림(`<hp:pic>`), 수식(`<hp:equation>`), 표(`<hp:tbl>`), 서식이 100% 보존됩니다.\n"
+        "   - 단, 첫 문단의 `<hp:secPr>`/`<hp:ctrl>`과 시험지 상단 머리글·구분 제목(\"서답형\" 등)은 고정 위치에 유지하세요.\n"
+        "6. 사용 가능한 `helpers` 목록:\n"
         "   - `helpers['collect_dom_ids']()` -> `dict` (`id_map[dom_id] = (sec_name, parent_elem, target_elem)`)\n"
         "   - `helpers['set_paragraph_rich_text'](p_elem, text, base_char_pr_id=None)` (**굵게**, __밑줄__, **__굵게+밑줄__**, _{...}, ^{...}, $$...$$ 지원)\n"
         "   - `helpers['extract_paragraph_plain_text'](p_elem)` -> `str`\n"
@@ -1787,7 +2077,7 @@ def build_hwpx_code_mode_prompt(dom_map: Dict[str, Any], user_instruction: str) 
         "   - `helpers['wrap_table_in_paragraph'](tbl_elem)` -> `<hp:p>`\n"
         "   - `helpers['local_tag'](elem)` / `helpers['find_child'](parent, tag_name)` / `helpers['HP_NS']`\n"
     )
-    dom_json = _compact_dom_map_for_prompt(dom_map, max_chars=45000)
+    dom_json = _compact_dom_map_for_prompt(dom_map, max_chars=150000)
     user_prompt = (
         f"### [교사 복합 편집 지시사항]\n{user_instruction.strip()}\n\n"
         f"### [출력 형식 - 필수 준수]\n"
@@ -1807,6 +2097,11 @@ _CODE_MODE_COMPLEX_PATTERNS = (
     r"보기.*상자.*복제",
     r"선택지\s*표",
     r"레이아웃\s*재구성",
+    r"역순",
+    r"재배치",
+    r"순서\s*변경",
+    r"문항.*이동",
+    r"셔플",
     r"Python\s*코드\s*모드",
     r"code_mode",
 )
@@ -2241,6 +2536,37 @@ def _resolve_block_insertion_target(
     return parent, idx, base_pid
 
 
+def _infer_default_style_ids(
+    doc: HwpxDocument,
+    section_roots: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """현재 문서 본문에서 가장 많이 쓰인 최빈 (charPrIDRef, paraPrIDRef)를 추론합니다."""
+    roots = section_roots
+    if roots is None:
+        roots = {sec_name: _parse_xml(doc.entries[sec_name]) for sec_name in doc.section_names()}
+
+    char_counter: Counter[str] = Counter()
+    para_counter: Counter[str] = Counter()
+    for root in roots.values():
+        for p_el in root.iter():
+            if _local_tag(p_el) != "p":
+                continue
+            if _is_empty_secpr_placeholder(p_el):
+                continue
+            pid = str(p_el.get("paraPrIDRef", "")).strip()
+            if pid:
+                para_counter[pid] += 1
+            for ch in p_el:
+                if _local_tag(ch) == "run" and not _run_has_sec_pr_or_ctrl(ch):
+                    cid = str(ch.get("charPrIDRef", "")).strip()
+                    if cid:
+                        char_counter[cid] += 1
+
+    default_char = char_counter.most_common(1)[0][0] if char_counter else "0"
+    default_para = para_counter.most_common(1)[0][0] if para_counter else "0"
+    return default_char, default_para
+
+
 def _build_table_element(
     doc: HwpxDocument,
     op_data: Dict[str, Any],
@@ -2289,9 +2615,10 @@ def _build_table_element(
     else:
         col_widths = [total_w // col_cnt] * col_cnt
 
+    default_char_id, default_para_id = _infer_default_style_ids(doc, section_roots)
     border_fill_id = _ensure_table_border_fill_id(doc)
-    hdr_char_pr_id = _ensure_styled_char_pr(doc, "0", bold=True) if has_headers else "0"
-    hdr_para_pr_id = _ensure_styled_para_pr(doc, "0", align="CENTER") if has_headers else "0"
+    hdr_char_pr_id = _ensure_styled_char_pr(doc, default_char_id, bold=True) if has_headers else default_char_id
+    hdr_para_pr_id = _ensure_styled_para_pr(doc, default_para_id, align="CENTER") if has_headers else default_para_id
 
     tbl_id = _next_section_object_id(section_roots, id_counter)
     total_h = max(2000, row_cnt * 2000)
@@ -2356,8 +2683,8 @@ def _build_table_element(
     for r_idx, row_vals in enumerate(normalized_rows):
         tr = ET.SubElement(tbl, _qname(HP_NS, "tr"))
         is_hdr_row = has_headers and r_idx == 0
-        cell_para_id = hdr_para_pr_id if is_hdr_row else "0"
-        cell_char_id = hdr_char_pr_id if is_hdr_row else "0"
+        cell_para_id = hdr_para_pr_id if is_hdr_row else default_para_id
+        cell_char_id = hdr_char_pr_id if is_hdr_row else default_char_id
 
         for c_idx, cell_text in enumerate(row_vals):
             tc = ET.SubElement(
@@ -2516,6 +2843,49 @@ def apply_single_hwpx_operation(
                 )
                 touched_ids.append(target_id)
 
+    elif op == "set_paragraph_runs":
+        if target_id in id_map:
+            _, _, elem = id_map[target_id]
+            if _local_tag(elem) == "p":
+                raw_para_pr = op_data.get("paraPr")
+                if raw_para_pr is not None and str(raw_para_pr).strip() != "":
+                    elem.set("paraPrIDRef", str(raw_para_pr).strip())
+
+                # secPr/ctrl 컨트롤 run은 반드시 보존하고, 일반 본문 run / linesegarray만 제거
+                for ch in list(elem):
+                    tag = _local_tag(ch)
+                    if tag == "linesegarray":
+                        elem.remove(ch)
+                    elif tag == "run":
+                        if _run_has_sec_pr_or_ctrl(ch):
+                            for sub in list(ch):
+                                if _local_tag(sub) not in ("secPr", "ctrl"):
+                                    ch.remove(sub)
+                        else:
+                            elem.remove(ch)
+
+                default_char_id, _ = _infer_default_style_ids(doc, section_roots)
+                runs_data = op_data.get("runs")
+                if isinstance(runs_data, list) and runs_data:
+                    for run_spec in runs_data:
+                        if isinstance(run_spec, dict):
+                            r_text = str(run_spec.get("t", ""))
+                            r_cid = str(run_spec.get("charPr") or default_char_id).strip() or default_char_id
+                        else:
+                            r_text = str(run_spec)
+                            r_cid = default_char_id
+                        for run_el in _build_rich_runs(
+                            doc,
+                            r_text,
+                            base_char_pr_id=r_cid,
+                            section_roots=section_roots,
+                            id_counter=counter,
+                        ):
+                            elem.append(run_el)
+                else:
+                    elem.append(_make_plain_run(default_char_id, ""))
+                touched_ids.append(target_id)
+
     elif op == "insert_paragraph_after":
         if target_id in id_map:
             _, raw_parent, elem = id_map[target_id]
@@ -2605,6 +2975,80 @@ def apply_single_hwpx_operation(
                     container.remove(block_elem)
             touched_ids.append(target_id)
 
+    elif op == "reorder_blocks":
+        raw_groups = op_data.get("groups")
+        if isinstance(raw_groups, list) and raw_groups:
+            ordered_blocks: List[Any] = []
+            seen_blocks: Set[int] = set()
+            target_container: Optional[Any] = None
+            resolved_ids: List[str] = []
+
+            for grp in raw_groups:
+                grp_ids = grp if isinstance(grp, list) else [grp]
+                for gid_raw in grp_ids:
+                    gid = str(gid_raw).strip()
+                    if gid not in id_map:
+                        continue
+                    _, raw_parent, elem = id_map[gid]
+                    if _local_tag(elem) == "tbl":
+                        container, block_elem = _find_enclosing_block_container(
+                            section_roots, raw_parent, elem
+                        )
+                    else:
+                        container, block_elem = _find_enclosing_block_container(
+                            section_roots, raw_parent, elem
+                        )
+                    if target_container is None:
+                        target_container = container
+                    if container is not target_container:
+                        continue
+                    if id(block_elem) not in seen_blocks:
+                        seen_blocks.add(id(block_elem))
+                        ordered_blocks.append(block_elem)
+                    resolved_ids.append(gid)
+
+            if target_container is not None and len(ordered_blocks) >= 2:
+                children = list(target_container)
+                slot_indices = sorted(
+                    children.index(b) for b in ordered_blocks if b in children
+                )
+                if len(slot_indices) == len(ordered_blocks):
+                    # 첫 문단의 <hp:secPr>/<hp:ctrl> 보호: index 0 문단이 이동될 경우 컨트롤 run을 새 index 0 문단에 유지
+                    orig_first = children[0] if children else None
+                    extracted_sec_runs: List[Any] = []
+                    if (
+                        orig_first is not None
+                        and _local_tag(orig_first) == "p"
+                        and orig_first in ordered_blocks
+                        and ordered_blocks[0] is not orig_first
+                    ):
+                        for ch in list(orig_first):
+                            if _local_tag(ch) == "run" and _run_has_sec_pr_or_ctrl(ch):
+                                sec_only_run = ET.Element(
+                                    _qname(HP_NS, "run"), dict(ch.attrib)
+                                )
+                                for sub in list(ch):
+                                    if _local_tag(sub) in ("secPr", "ctrl"):
+                                        sec_only_run.append(deepcopy(sub))
+                                        ch.remove(sub)
+                                if len(list(ch)) == 0:
+                                    orig_first.remove(ch)
+                                if len(list(sec_only_run)) > 0:
+                                    extracted_sec_runs.append(sec_only_run)
+
+                    for b in ordered_blocks:
+                        target_container.remove(b)
+                    for idx, b in zip(slot_indices, ordered_blocks):
+                        target_container.insert(idx, b)
+
+                    if extracted_sec_runs:
+                        new_first = list(target_container)[0]
+                        if _local_tag(new_first) == "p":
+                            for offset, sr in enumerate(extracted_sec_runs):
+                                new_first.insert(offset, sr)
+
+                    touched_ids.extend(resolved_ids)
+
     elif op == "delete_paragraph":
         if target_id in id_map:
             _, parent, elem = id_map[target_id]
@@ -2630,20 +3074,38 @@ def apply_single_hwpx_operation(
             lines = new_text.split("\n") if new_text else [""]
             sub_list = _find_child_or(tc, "subList", tc)
             existing_ps = [ch for ch in sub_list if _local_tag(ch) == "p"]
-            template_p = (
-                deepcopy(existing_ps[0])
-                if existing_ps
-                else ET.Element(_qname(HP_NS, "p"), {"paraPrIDRef": "0"})
-            )
+            template_ps = [deepcopy(p) for p in existing_ps]
+            default_char_id, default_para_id = _infer_default_style_ids(doc, section_roots)
             for p_old in existing_ps:
                 sub_list.remove(p_old)
-            for ln in lines:
-                new_p = deepcopy(template_p)
-                _strip_sec_pr_and_ctrl(new_p)
-                new_p.set("id", _next_section_object_id(section_roots, counter))
-                _set_paragraph_rich_text(
-                    doc, new_p, ln, section_roots=section_roots, id_counter=counter
-                )
+            for i, ln in enumerate(lines):
+                if template_ps:
+                    new_p = deepcopy(template_ps[min(i, len(template_ps) - 1)])
+                    _strip_sec_pr_and_ctrl(new_p)
+                    new_p.set("id", _next_section_object_id(section_roots, counter))
+                    _set_paragraph_rich_text(
+                        doc, new_p, ln, section_roots=section_roots, id_counter=counter
+                    )
+                else:
+                    new_p = ET.Element(
+                        _qname(HP_NS, "p"),
+                        {
+                            "id": _next_section_object_id(section_roots, counter),
+                            "paraPrIDRef": default_para_id,
+                            "styleIDRef": "0",
+                            "pageBreak": "0",
+                            "columnBreak": "0",
+                            "merged": "0",
+                        },
+                    )
+                    _set_paragraph_rich_text(
+                        doc,
+                        new_p,
+                        ln,
+                        section_roots=section_roots,
+                        id_counter=counter,
+                        base_char_pr_id=default_char_id,
+                    )
                 sub_list.append(new_p)
             touched_ids.append(target_id)
 
@@ -2781,8 +3243,9 @@ def apply_single_hwpx_operation(
                     pass
             align_opt = str(op_data.get("align", "")).strip() or None
 
-            char_pr_id = _ensure_styled_char_pr(doc, "0", bold=bold_opt, font_size_pt=size_opt)
-            para_pr_id = _ensure_styled_para_pr(doc, "0", align=align_opt)
+            default_char_id, default_para_id = _infer_default_style_ids(doc, section_roots)
+            char_pr_id = _ensure_styled_char_pr(doc, default_char_id, bold=bold_opt, font_size_pt=size_opt)
+            para_pr_id = _ensure_styled_para_pr(doc, default_para_id, align=align_opt)
 
             placeholder = _consume_initial_secpr_placeholder(sec_root)
             if placeholder is not None:
@@ -2822,16 +3285,28 @@ def apply_single_hwpx_operation(
         sec_info = _get_target_section_root(doc, section_roots)
         if sec_info is not None:
             _, sec_root = sec_info
+            default_char_id, default_para_id = _infer_default_style_ids(doc, section_roots)
             new_tbl = _build_table_element(
                 doc, op_data, section_roots=section_roots, id_counter=counter
             )
             placeholder = _consume_initial_secpr_placeholder(sec_root)
             if placeholder is not None:
                 _wrap_table_in_paragraph(
-                    new_tbl, section_roots, counter, target_p=placeholder
+                    new_tbl,
+                    section_roots,
+                    counter,
+                    para_pr_id=default_para_id,
+                    char_pr_id=default_char_id,
+                    target_p=placeholder,
                 )
             else:
-                tbl_p = _wrap_table_in_paragraph(new_tbl, section_roots, counter)
+                tbl_p = _wrap_table_in_paragraph(
+                    new_tbl,
+                    section_roots,
+                    counter,
+                    para_pr_id=default_para_id,
+                    char_pr_id=default_char_id,
+                )
                 sec_root.append(tbl_p)
             new_id = _find_dom_id_for_element(section_roots, new_tbl)
             if new_id:

@@ -85,6 +85,7 @@ PROVIDER_CONFIGS: Dict[str, Dict[str, str]] = {
         "done_action": 'button[data-testid="copy-turn-action-button"], button[aria-label*="복사"], button[aria-label*="Copy"]',
         "send": (
             'button[data-testid="send-button"], '
+            'button[data-testid="composer-submit-button"], '
             'button#composer-submit-button, '
             'button[aria-label*="프롬프트 보내기"], '
             'button[aria-label*="메시지 보내기"], '
@@ -1275,6 +1276,7 @@ class WebGeminiAutoWorker(BaseWorker):
             except Exception:
                 copied = False
 
+        injected = False
         if copied:
             try:
                 page.keyboard.press("Control+A")
@@ -1292,48 +1294,63 @@ class WebGeminiAutoWorker(BaseWorker):
                 stripped_len = len(current_text.strip())
                 prompt_len = len(prompt_text.strip())
                 if stripped_len >= 10 or (prompt_len < 10 and stripped_len >= max(1, prompt_len)):
-                    return
+                    injected = True
             except Exception:
                 pass
 
         # 2순위: fill() 시도
-        try:
-            input_loc.fill(prompt_text)
-            time.sleep(0.15)
-            current_text = self._read_input_box_text(input_loc)
-            if len(current_text.strip()) > 0:
-                return
-        except Exception:
-            pass
+        if not injected:
+            try:
+                input_loc.fill(prompt_text)
+                time.sleep(0.15)
+                current_text = self._read_input_box_text(input_loc)
+                if len(current_text.strip()) > 0:
+                    injected = True
+            except Exception:
+                pass
 
         # 3순위: keyboard.insert_text() 폴백
-        try:
-            input_loc.click()
-            page.keyboard.insert_text(prompt_text)
-            time.sleep(0.15)
-            current_text = self._read_input_box_text(input_loc)
-            if len(current_text.strip()) > 0:
-                return
-        except Exception:
-            pass
+        if not injected:
+            try:
+                input_loc.click()
+                page.keyboard.insert_text(prompt_text)
+                time.sleep(0.15)
+                current_text = self._read_input_box_text(input_loc)
+                if len(current_text.strip()) > 0:
+                    injected = True
+            except Exception:
+                pass
 
         # 최종 JS 폴백
-        try:
-            input_loc.evaluate(
-                """(el, text) => {
-                    el.focus();
-                    if (el.isContentEditable) {
-                        el.textContent = text;
-                        el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
-                    } else {
-                        el.value = text;
-                        el.dispatchEvent(new Event('input', { bubbles: true }));
-                    }
-                }""",
-                prompt_text,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"프롬프트 입력창에 텍스트를 삽입하지 못했습니다: {exc}") from exc
+        if not injected:
+            try:
+                input_loc.evaluate(
+                    """(el, text) => {
+                        el.focus();
+                        if (el.isContentEditable) {
+                            el.textContent = text;
+                            el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text }));
+                        } else {
+                            el.value = text;
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                    }""",
+                    prompt_text,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"프롬프트 입력창에 텍스트를 삽입하지 못했습니다: {exc}") from exc
+
+        # ChatGPT React/ProseMirror 입력창 상태 갱신 유도 (긴 텍스트 붙여넣기 후 input 이벤트 확실히 트리거)
+        if self.provider == "chatgpt":
+            try:
+                time.sleep(0.25)
+                input_loc.focus()
+                page.keyboard.press("Space")
+                time.sleep(0.05)
+                page.keyboard.press("Backspace")
+                time.sleep(0.15)
+            except Exception:
+                pass
 
     def _is_submission_started(
         self,
@@ -1391,37 +1408,56 @@ class WebGeminiAutoWorker(BaseWorker):
                     return False
                 time.sleep(0.2)
 
-        # 1) 입력창 포커스 유지 상태에서 Enter 전송 및 최대 1.2초 검증
-        time.sleep(0.25)
-        try:
-            input_loc.focus()
-        except Exception:
-            pass
-        try:
-            input_loc.press("Enter")
-        except Exception:
-            pass
-        if _poll_started(1.2):
-            return
-
-        # 2) send_sel 매칭 모든 버튼 순회하며 visible & enabled 버튼 클릭 + 최대 2초 재확인
-        clicked_btn = False
-        try:
-            btns = page.locator(send_sel)
-            cnt = int(btns.count())
-            for idx in range(cnt):
-                cand = btns.nth(idx)
+        def _try_click_send_button(wait_timeout_sec: float = 0.0) -> bool:
+            deadline = time.time() + max(0.0, wait_timeout_sec)
+            while True:
+                if self.is_stop_requested():
+                    return False
                 try:
-                    if cand.is_visible() and cand.is_enabled():
-                        cand.click()
-                        clicked_btn = True
-                        break
+                    btns = page.locator(send_sel)
+                    cnt = int(btns.count())
+                    for idx in range(cnt):
+                        cand = btns.nth(idx)
+                        try:
+                            if cand.is_visible() and cand.is_enabled():
+                                cand.click()
+                                return True
+                        except Exception:
+                            continue
                 except Exception:
-                    continue
-        except Exception:
-            pass
-        if clicked_btn and _poll_started(2.0):
-            return
+                    pass
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.2)
+
+        if self.provider == "chatgpt":
+            # ChatGPT: 전송 버튼(visible & enabled) 최대 10초 대기 후 클릭 -> 실패 시 Enter 폴백
+            if _try_click_send_button(wait_timeout_sec=10.0) and _poll_started(2.5):
+                return
+            try:
+                input_loc.focus()
+                input_loc.press("Enter")
+            except Exception:
+                pass
+            if _poll_started(2.0):
+                return
+        else:
+            # 1) 입력창 포커스 유지 상태에서 Enter 전송 및 최대 1.2초 검증
+            time.sleep(0.25)
+            try:
+                input_loc.focus()
+            except Exception:
+                pass
+            try:
+                input_loc.press("Enter")
+            except Exception:
+                pass
+            if _poll_started(1.2):
+                return
+
+            # 2) send_sel 매칭 모든 버튼 순회하며 visible & enabled 버튼 클릭 + 최대 2초 재확인
+            if _try_click_send_button(wait_timeout_sec=0.0) and _poll_started(2.0):
+                return
 
         # 3) Ctrl+Enter 및 JS form.requestSubmit() 폴백 1회 시도
         try:
