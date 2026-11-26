@@ -1568,6 +1568,7 @@ class ClassroomToolsTab(QWidget):
     ai_context_changed = pyqtSignal()
     schoolbell_login_required = pyqtSignal(object, str)
     schoolbell_login_cleared = pyqtSignal(str)
+    teacher_auth_changed = pyqtSignal()
 
     def __init__(self, task_runner: TaskRunner, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -1614,11 +1615,56 @@ class ClassroomToolsTab(QWidget):
         self.restore_saved_teacher_session()
         self._refresh_roster_dependent_views()
 
+    def _local_homeroom_matches_logged_in_teacher(
+        self,
+        hr_group: Optional[Dict[str, Any]],
+        students: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """로그인한 교사의 학년·반과 로컬 SQLite 담임 명렬표의 학년·반이 일치하는지 확인합니다."""
+        if not self._logged_in_teacher:
+            return True
+        def _to_int(val: Any) -> Optional[int]:
+            if val is None or isinstance(val, bool):
+                return None
+            try:
+                s = str(val).strip()
+                return int(float(s)) if s else None
+            except (ValueError, TypeError):
+                return None
+
+        meta = self._teacher_meta()
+        t_grade = _to_int(meta.get("grade"))
+        t_class = _to_int(meta.get("class_no"))
+        if t_grade is None or t_class is None:
+            return True
+
+        saw_class_info = False
+        for stu in (students or []):
+            if not isinstance(stu, dict):
+                continue
+            sg = _to_int(stu.get("grade"))
+            sc = _to_int(stu.get("class_no"))
+            if sg is not None or sc is not None:
+                saw_class_info = True
+                if sg != t_grade or sc != t_class:
+                    return False
+
+        if isinstance(hr_group, dict):
+            label = f"{hr_group.get('group_name', '')} {hr_group.get('extra_info', '')}".strip()
+            m = re.search(r"(\d+)\s*학년\s*(\d+)\s*반", label) or re.search(r"(\d+)\s*-\s*(\d+)", label)
+            if m:
+                saw_class_info = True
+                if int(m.group(1)) != t_grade or int(m.group(2)) != t_class:
+                    return False
+
+        return saw_class_info
+
     def _get_active_roster(self) -> List[Tuple[str, str]]:
         if self._firebase_roster:
             return list(self._firebase_roster)
+        hr_group = self.db.get_active_homeroom_group()
         students = self.db.get_active_homeroom_students()
-        if students:
+        if students and self._local_homeroom_matches_logged_in_teacher(hr_group, students):
             return [(str(s["student_id"]), str(s["name"])) for s in students]
         return []
 
@@ -2684,6 +2730,7 @@ class ClassroomToolsTab(QWidget):
             if hasattr(self, "spin_notice_target_class") and c is not None:
                 self.spin_notice_target_class.setValue(int(c))
             self._start_pc_agent_timers(send_immediate=trigger_heartbeat)
+        self.teacher_auth_changed.emit()
 
     def _start_pc_agent_timers(self, send_immediate: bool = True) -> None:
         if not self._logged_in_teacher:
@@ -3094,6 +3141,52 @@ class ClassroomToolsTab(QWidget):
             self.refresh_firebase_roster(sync_service=sync_service, silent=True)
         return True
 
+    def sync_teacher_profile_from_config(self) -> None:
+        """config의 teacher_profile 변경 사항을 현재 탭의 로그인/학반 상태에 반영합니다."""
+        if getattr(self, "_syncing_profile_from_cfg", False):
+            return
+        self._syncing_profile_from_cfg = True
+        try:
+            tp_sec = dict(self.config.get_section("teacher_profile") or {})
+            if not tp_sec.get("session_logged_in"):
+                if self._logged_in_teacher is not None:
+                    self._logged_in_teacher = None
+                    self._firebase_roster = []
+                    self._apply_teacher_auth_state(trigger_heartbeat=False)
+                    self._refresh_roster_dependent_views()
+                return
+
+            tid = str(tp_sec.get("teacher_id") or tp_sec.get("login_id") or tp_sec.get("name") or "").strip()
+            if not tid:
+                return
+            sc = str(tp_sec.get("school_code") or tp_sec.get("neis_school_code") or "").strip()
+            new_teacher = {
+                "teacher_id": tid,
+                "login_id": str(tp_sec.get("login_id") or tid).strip(),
+                "name": str(tp_sec.get("name") or tid).strip(),
+                "school_code": sc,
+                "neis_school_code": sc,
+                "school_name": str(tp_sec.get("school_name") or "").strip(),
+                "grade": int(tp_sec["grade"]) if str(tp_sec.get("grade") or "").isdigit() else None,
+                "class_no": int(tp_sec["class_no"]) if str(tp_sec.get("class_no") or "").isdigit() else None,
+                "is_admin": bool(tp_sec.get("is_admin") is True),
+            }
+            if self._logged_in_teacher != new_teacher:
+                prev = self._logged_in_teacher or {}
+                scope_changed = (
+                    prev.get("teacher_id") != new_teacher["teacher_id"]
+                    or prev.get("school_code") != new_teacher["school_code"]
+                    or prev.get("grade") != new_teacher["grade"]
+                    or prev.get("class_no") != new_teacher["class_no"]
+                )
+                self._logged_in_teacher = new_teacher
+                if scope_changed:
+                    self._firebase_roster = []
+                self._apply_teacher_auth_state(trigger_heartbeat=False)
+                self._refresh_roster_dependent_views()
+        finally:
+            self._syncing_profile_from_cfg = False
+
     def refresh_firebase_roster(
         self,
         sync_service: Optional[FirestoreSyncService] = None,
@@ -3221,7 +3314,20 @@ class ClassroomToolsTab(QWidget):
             hr_group = self.db.get_active_homeroom_group()
             homeroom_students = self.db.get_active_homeroom_students()
 
-            if hr_group and homeroom_students:
+            if self._logged_in_teacher and not self._local_homeroom_matches_logged_in_teacher(
+                hr_group, homeroom_students
+            ):
+                label = self._current_homeroom_label()
+                local_name = str((hr_group or {}).get("group_name") or "타 학반").strip()
+                self.lbl_roster_status_badge.setText(
+                    f"연동 명렬표: [Firebase] {label} (0명)"
+                )
+                apply_qss_role(self.lbl_roster_status_badge, role="badgeWarning")
+                self.lbl_roster_status_badge.setToolTip(
+                    f"로그인한 교사({label})와 로컬 SQLite 담임 명렬표({local_name})의 학반이 달라 "
+                    "타 학반 명렬표 자동 폴백을 차단했습니다. (로컬 데이터는 보존됩니다)"
+                )
+            elif hr_group and homeroom_students:
                 self.lbl_roster_status_badge.setText(
                     f"연동 명렬표: [담임 학급] {hr_group['group_name']} ({len(homeroom_students)}명)"
                 )
@@ -4067,7 +4173,47 @@ class ClassroomToolsTab(QWidget):
             "is_published": bool(is_published),
         }
 
+    def _has_primary_drive_config(self) -> bool:
+        api = self.config.get_section("api_and_integrations") or {}
+        drive_priority = str(api.get("drive_priority") or "workspace").strip().lower()
+        if drive_priority == "personal":
+            personal_gas_url = str(
+                api.get("personal_gas_url") or api.get("google_apps_script_url") or ""
+            ).strip()
+            return bool(personal_gas_url)
+        ws_folder_id = str(api.get("workspace_drive_folder_id") or "").strip()
+        return bool(ws_folder_id)
+
     def _on_publish_mobile_notice(self) -> None:
+        requires_reply = bool(
+            hasattr(self, "chk_notice_requires_reply") and self.chk_notice_requires_reply.isChecked()
+        )
+        sig_mode = (
+            str(
+                self.combo_notice_signature_mode.currentData()
+                or ("parent" if requires_reply else "none")
+            ).strip().lower()
+            if hasattr(self, "combo_notice_signature_mode")
+            else ("parent" if requires_reply else "none")
+        )
+        if not requires_reply:
+            sig_mode = "none"
+        elif sig_mode == "none":
+            sig_mode = "parent"
+
+        if sig_mode != "none" and not self._has_primary_drive_config():
+            reply = QMessageBox.question(
+                self,
+                "Google Drive 서명 저장 설정 확인",
+                "Google Drive 서명 저장 설정(공유 드라이브 폴더 ID 또는 개인 GAS URL)이 되어 있지 않아 "
+                "학생·학부모 서명 제출 및 가정통신문 사본 서명 인쇄 기능이 작동하지 않을 수 있습니다. "
+                "환경설정에서 먼저 설정해 주세요. 그래도 게시하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         self._save_mobile_notice(is_published=True)
 
     def _save_mobile_notice(self, *, is_published: bool) -> None:
@@ -5436,18 +5582,24 @@ class ClassroomToolsTab(QWidget):
         self._on_export_absence_document()
 
     def _get_ordered_duty_students(self) -> List[Dict[str, Any]]:
-        students = self.db.get_active_homeroom_students()
         out: List[Dict[str, Any]] = []
-        if students:
-            for idx, s in enumerate(students, start=1):
-                sid = str(s.get("student_id", "")).strip()
-                name = str(s.get("name", "")).strip()
-                num = _infer_student_number(s.get("number"), sid, idx)
-                out.append({"number": num, "student_id": sid, "name": name})
-        elif self._firebase_roster:
+        if self._logged_in_teacher and self._firebase_roster:
             for idx, (sid, name) in enumerate(self._firebase_roster, start=1):
                 num = _infer_student_number(None, sid, idx)
                 out.append({"number": num, "student_id": sid, "name": name})
+        else:
+            hr_group = self.db.get_active_homeroom_group()
+            students = self.db.get_active_homeroom_students()
+            if students and self._local_homeroom_matches_logged_in_teacher(hr_group, students):
+                for idx, s in enumerate(students, start=1):
+                    sid = str(s.get("student_id", "")).strip()
+                    name = str(s.get("name", "")).strip()
+                    num = _infer_student_number(s.get("number"), sid, idx)
+                    out.append({"number": num, "student_id": sid, "name": name})
+            elif self._firebase_roster:
+                for idx, (sid, name) in enumerate(self._firebase_roster, start=1):
+                    num = _infer_student_number(None, sid, idx)
+                    out.append({"number": num, "student_id": sid, "name": name})
         out.sort(key=lambda item: (int(item["number"]), str(item["student_id"])))
         return out
 

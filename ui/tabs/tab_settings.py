@@ -785,6 +785,23 @@ class SettingsTab(QWidget):
             "https://script.google.com/macros/s/.../exec (Apps Script 웹 앱 URL)"
         )
 
+        self.combo_drive_priority = QComboBox()
+        configure_input_widget(self.combo_drive_priority)
+        self.combo_drive_priority.addItem("Workspace 공유 드라이브", "workspace")
+        self.combo_drive_priority.addItem("개인 Google 계정 (GAS 웹 앱)", "personal")
+
+        self.edit_workspace_drive_folder_id = QLineEdit()
+        configure_input_widget(self.edit_workspace_drive_folder_id)
+        self.edit_workspace_drive_folder_id.setPlaceholderText(
+            "Google Workspace 공유 드라이브 폴더 ID (모바일 서명·첨부파일 업로드)"
+        )
+
+        self.edit_personal_drive_folder_id = QLineEdit()
+        configure_input_widget(self.edit_personal_drive_folder_id)
+        self.edit_personal_drive_folder_id.setPlaceholderText(
+            "선택 사항: 개인 Google Drive 폴더 ID (미입력 시 기본 폴더 사용)"
+        )
+
         self.edit_gas_api_secret = QLineEdit()
         configure_input_widget(self.edit_gas_api_secret)
         self.edit_gas_api_secret.setEchoMode(QLineEdit.EchoMode.Password)
@@ -927,7 +944,10 @@ class SettingsTab(QWidget):
         ext_form.addRow("Firebase 연결 모드:", self.lbl_firebase_backend_mode)
         ext_form.addRow("연동 서버 URL (Vercel):", self.edit_vercel_api_url)
         ext_form.addRow("Firebase 서비스 계정 키 JSON:", cred_container)
+        ext_form.addRow("모바일 Drive 저장 1순위:", self.combo_drive_priority)
+        ext_form.addRow("Workspace 공유 드라이브 폴더 ID:", self.edit_workspace_drive_folder_id)
         ext_form.addRow("가정통신문 PDF Drive 업로드 URL (Apps Script):", self.edit_apps_script_url)
+        ext_form.addRow("개인 Drive 폴더 ID (선택):", self.edit_personal_drive_folder_id)
         self.edit_gcal_cred_path = QLineEdit()
         configure_input_widget(self.edit_gcal_cred_path)
         self.edit_gcal_cred_path.setPlaceholderText("Google Calendar/Tasks OAuth credentials.json 경로")
@@ -1759,6 +1779,11 @@ class SettingsTab(QWidget):
             self.edit_vercel_api_url.setText(api.get("vercel_api_url", DEFAULT_VERCEL_API_URL) or DEFAULT_VERCEL_API_URL)
             self.edit_sheet_url.setText(api.get("google_sheet_url", ""))
             self.edit_apps_script_url.setText(api.get("google_apps_script_url", ""))
+            drive_priority = str(api.get("drive_priority", "workspace") or "workspace").strip().lower()
+            dp_idx = self.combo_drive_priority.findData(drive_priority)
+            self.combo_drive_priority.setCurrentIndex(dp_idx if dp_idx >= 0 else 0)
+            self.edit_workspace_drive_folder_id.setText(str(api.get("workspace_drive_folder_id", "") or ""))
+            self.edit_personal_drive_folder_id.setText(str(api.get("personal_drive_folder_id", "") or ""))
             self.edit_gas_api_secret.setText(api.get("gas_api_secret", ""))
             self.chk_sync_on_startup.setChecked(bool(api.get("sync_on_startup", True)))
             self.spin_sheet_interval.setValue(
@@ -1835,6 +1860,9 @@ class SettingsTab(QWidget):
                 "vercel_api_url": self.edit_vercel_api_url.text().strip() or DEFAULT_VERCEL_API_URL,
                 "google_sheet_url": self.edit_sheet_url.text().strip(),
                 "google_apps_script_url": self.edit_apps_script_url.text().strip(),
+                "drive_priority": str(self.combo_drive_priority.currentData() or "workspace").strip().lower(),
+                "workspace_drive_folder_id": self.edit_workspace_drive_folder_id.text().strip(),
+                "personal_drive_folder_id": self.edit_personal_drive_folder_id.text().strip(),
                 "gas_api_secret": self.edit_gas_api_secret.text().strip(),
                 "sync_on_startup": self.chk_sync_on_startup.isChecked(),
                 "google_sheet_poll_interval_sec": self.spin_sheet_interval.value(),
@@ -1863,6 +1891,7 @@ class SettingsTab(QWidget):
                 "class_no": self.spin_teacher_class.value(),
                 "neis_office_code": self.edit_neis_office_code.text().strip(),
                 "neis_school_code": self.edit_neis_school_code.text().strip(),
+                "school_code": self.edit_neis_school_code.text().strip(),
             },
             auto_save=False,
         )
@@ -1877,6 +1906,36 @@ class SettingsTab(QWidget):
 
     def save_ui_to_settings(self) -> None:
         self._persist_settings_silently()
+        tid = self.edit_teacher_id.text().strip() if hasattr(self, "edit_teacher_id") else ""
+        if tid:
+            drive_priority = str(self.combo_drive_priority.currentData() or "workspace").strip().lower()
+            ws_folder_id = self.edit_workspace_drive_folder_id.text().strip()
+            personal_gas_url = self.edit_apps_script_url.text().strip()
+            personal_folder_id = self.edit_personal_drive_folder_id.text().strip()
+            sync_ok = False
+            sync_err = ""
+            try:
+                svc = FirestoreSyncService(db=self.db, config=self.config)
+                sync_ok = bool(
+                    svc.save_teacher_drive_settings(
+                        teacher_id=tid,
+                        drive_priority=drive_priority,
+                        workspace_drive_folder_id=ws_folder_id,
+                        personal_gas_url=personal_gas_url,
+                        personal_drive_folder_id=personal_folder_id,
+                    )
+                )
+            except Exception as exc:
+                sync_ok = False
+                sync_err = str(exc)
+            if not sync_ok:
+                detail = f"\n(사유: {sync_err})" if sync_err else ""
+                QMessageBox.warning(
+                    self,
+                    "교사 Drive 설정 동기화 실패",
+                    f"로컬 config.json에는 저장되었으나, 교사 계정({tid})의 계정_교사 문서 동기화에 실패했습니다.{detail}",
+                )
+                return
         QMessageBox.information(self, "저장 완료", "환경설정이 config.json에 안전하게 저장되었습니다.")
 
     def _on_provision_homeroom_accounts(self) -> None:
@@ -2136,6 +2195,16 @@ class SettingsTab(QWidget):
                 self.spin_teacher_class.setValue(int(profile["class_no"]))
             self.edit_neis_office_code.setText(str(profile.get("neis_office_code") or ""))
             self.edit_neis_school_code.setText(str(profile.get("neis_school_code") or ""))
+            if profile.get("drive_priority"):
+                dp_idx = self.combo_drive_priority.findData(str(profile["drive_priority"]).strip().lower())
+                if dp_idx >= 0:
+                    self.combo_drive_priority.setCurrentIndex(dp_idx)
+            if "workspace_drive_folder_id" in profile:
+                self.edit_workspace_drive_folder_id.setText(str(profile.get("workspace_drive_folder_id") or ""))
+            if "personal_gas_url" in profile:
+                self.edit_apps_script_url.setText(str(profile.get("personal_gas_url") or ""))
+            if "personal_drive_folder_id" in profile:
+                self.edit_personal_drive_folder_id.setText(str(profile.get("personal_drive_folder_id") or ""))
             self._persist_settings_silently()
             QMessageBox.information(self, "교사 프로필 불러오기", f"'{tid}' 교사 프로필을 불러왔습니다.")
 
@@ -2184,6 +2253,35 @@ class SettingsTab(QWidget):
             on_result=_on_result,
             on_error=lambda err: QMessageBox.warning(self, "교사 프로필 저장 오류", str(err or "").splitlines()[0]),
         )
+
+    def refresh_teacher_profile_from_config(self) -> None:
+        """config의 teacher_profile 변경(다른 탭에서 로그인/로그아웃 등)을 설정 UI에 반영합니다."""
+        if getattr(self, "_loading_ui", False):
+            return
+        tp_sec = self.config.get_section("teacher_profile") or {}
+        self._loading_ui = True
+        try:
+            tid = str(tp_sec.get("teacher_id") or "").strip()
+            tname = str(tp_sec.get("name") or "").strip()
+            sname = str(tp_sec.get("school_name") or "").strip()
+            sc = str(tp_sec.get("neis_school_code") or tp_sec.get("school_code") or "").strip()
+            oc = str(tp_sec.get("neis_office_code") or "").strip()
+            if self.edit_teacher_id.text().strip() != tid:
+                self.edit_teacher_id.setText(tid)
+            if self.edit_teacher_name.text().strip() != tname:
+                self.edit_teacher_name.setText(tname)
+            if self.edit_school_name.text().strip() != sname:
+                self.edit_school_name.setText(sname)
+            if tp_sec.get("grade") and int(tp_sec["grade"]) != self.spin_teacher_grade.value():
+                self.spin_teacher_grade.setValue(int(tp_sec["grade"]))
+            if tp_sec.get("class_no") and int(tp_sec["class_no"]) != self.spin_teacher_class.value():
+                self.spin_teacher_class.setValue(int(tp_sec["class_no"]))
+            if self.edit_neis_office_code.text().strip() != oc:
+                self.edit_neis_office_code.setText(oc)
+            if self.edit_neis_school_code.text().strip() != sc:
+                self.edit_neis_school_code.setText(sc)
+        finally:
+            self._loading_ui = False
 
     def _set_default_target_dir(self, folder: str) -> None:
         if not folder:

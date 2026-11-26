@@ -480,6 +480,46 @@ class FirestoreSyncService:
             self.db.add_log("WARN", "FirestoreSync", f"컴시간 학교코드 저장 실패 ({tid}): {exc}")
             return False
 
+    def save_teacher_drive_settings(
+        self,
+        teacher_id: str,
+        drive_priority: str = "workspace",
+        workspace_drive_folder_id: str = "",
+        personal_gas_url: str = "",
+        personal_drive_folder_id: str = "",
+    ) -> bool:
+        """교사 문서(`계정_교사`)에 모바일 서명·첨부파일 업로드 1순위 Drive 저장소 설정을 저장합니다."""
+        tid = str(teacher_id or "").strip()
+        if not tid:
+            return False
+        priority = str(drive_priority or "workspace").strip().lower()
+        if priority not in ("workspace", "personal"):
+            priority = "workspace"
+        payload: Dict[str, Any] = {
+            "teacher_id": tid,
+            "drive_priority": priority,
+            "workspace_drive_folder_id": str(workspace_drive_folder_id or "").strip(),
+            "personal_gas_url": str(personal_gas_url or "").strip(),
+            "personal_drive_folder_id": str(personal_drive_folder_id or "").strip(),
+        }
+        if self.is_vercel_api_mode():
+            try:
+                self._post_vercel_api("update_teacher_drive_settings", payload)
+                return True
+            except Exception as exc:
+                self.db.add_log("WARN", "FirestoreSync", f"Vercel API 교사 Drive 설정 저장 실패 ({tid}): {exc}")
+                return False
+        try:
+            fs = self._get_client()
+            fs.collection("계정_교사").document(tid).set(
+                {**payload, "updated_at": _now_str()},
+                merge=True,
+            )
+            return True
+        except Exception as exc:
+            self.db.add_log("WARN", "FirestoreSync", f"교사 Drive 설정 저장 실패 ({tid}): {exc}")
+            return False
+
     @staticmethod
     def extract_birth_6digits(student: Dict[str, Any]) -> str:
         """명렬표 학생의 extra_data/필드에서 생년월일/주민번호 앞 6자리(YYMMDD)를 추출합니다."""
@@ -571,20 +611,22 @@ class FirestoreSyncService:
         col_stu = fs.collection("계정_학생")
         col_par = fs.collection("계정_학부모")
 
+        # 기존 계정 ID 집합 조회(덮어쓰기 방지 또는 재설정 대상 문서 ID 매핑)
         sc = str(school_code or "").strip()
         sn = str(school_name or "").strip()
         now = _now_str()
 
-        # 기존 계정 ID 집합 조회(덮어쓰기 방지 또는 재설정 대상 문서 ID 매핑)
         existing_stu_doc_map: Dict[str, str] = {}
-        for d in col_stu.stream():
+        stu_query = col_stu.where("school_code", "==", sc) if sc else col_stu
+        for d in stu_query.stream():
             existing_stu_doc_map[d.id] = d.id
             data = d.to_dict() or {}
             if data.get("student_id"):
                 existing_stu_doc_map.setdefault(str(data["student_id"]), d.id)
 
         existing_par_doc_map: Dict[str, str] = {}
-        for d in col_par.stream():
+        par_query = col_par.where("school_code", "==", sc) if sc else col_par
+        for d in par_query.stream():
             existing_par_doc_map[d.id] = d.id
             data = d.to_dict() or {}
             if data.get("parent_id"):
@@ -754,13 +796,21 @@ class FirestoreSyncService:
                 data = doc.to_dict() or {}
                 data["remote_id"] = doc.id
                 data["role"] = role_key
-                if sc and data.get("school_code") and str(data["school_code"]).strip() != sc:
+                doc_sc = str(data.get("school_code") or data.get("neis_school_code") or "").strip()
+                doc_sn = str(data.get("school_name") or "").strip()
+                if sc:
+                    if doc_sc:
+                        if doc_sc != sc:
+                            continue
+                    elif not (sn and doc_sn == sn):
+                        continue
+                elif sn and doc_sn and doc_sn != sn:
                     continue
-                if sn and data.get("school_name") and str(data["school_name"]).strip() != sn:
+                doc_g = _to_int_or_none(data.get("grade"))
+                doc_c = _to_int_or_none(data.get("class_no"))
+                if grade is not None and (doc_g is None or doc_g != int(grade)):
                     continue
-                if grade is not None and data.get("grade") is not None and int(data["grade"]) != int(grade):
-                    continue
-                if class_no is not None and data.get("class_no") is not None and int(data["class_no"]) != int(class_no):
+                if class_no is not None and (doc_c is None or doc_c != int(class_no)):
                     continue
                 results.append(data)
 
@@ -874,10 +924,12 @@ class FirestoreSyncService:
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `일일_출결` 컬렉션에서 해당 학급의 모바일 출결 내역(미확인·전체 날짜 포함)을 조회합니다."""
+        tenant = self._get_tenant_defaults()
         g_int = _to_int_or_none(grade)
         c_int = _to_int_or_none(class_no)
-        sc = str(school_code or "").strip()
-        sn = str(school_name or "").strip()
+        sc = str(school_code or tenant.get("school_code") or "").strip()
+        sn = str(school_name or tenant.get("school_name") or "").strip()
+        tid = str(tenant.get("teacher_id") or "").strip()
 
         if self.is_vercel_api_mode():
             res = self._post_vercel_api(
@@ -887,22 +939,36 @@ class FirestoreSyncService:
                     "class_no": c_int,
                     "school_code": sc,
                     "school_name": sn,
+                    "teacher_id": tid,
                     "include_all_dates": True,
                     "include_unconfirmed": True,
                 },
             )
-            rows = list(res.get("attendance") or [])
-            for r in rows:
-                if isinstance(r, dict) and r.get("student_id") is not None:
+            rows = []
+            for r in list(res.get("attendance") or []):
+                if not isinstance(r, dict):
+                    continue
+                if not self._doc_matches_tenant("일일_출결", r, tenant):
+                    continue
+                if r.get("student_id") is not None:
                     r["student_id"] = re.sub(r"^(\d+)\.0+$", r"\1", str(r.get("student_id") or "").strip())
+                rows.append(r)
             return rows
 
         fs = self._get_client()
         ref: Any = fs.collection("일일_출결")
+        if tid:
+            ref = ref.where("teacher_id", "==", tid)
+        elif sc:
+            ref = ref.where("school_code", "==", sc)
+        elif g_int is not None and c_int is not None:
+            ref = ref.where("grade", "==", g_int).where("class_no", "==", c_int)
         rows: List[Dict[str, Any]] = []
         for doc in ref.stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            if not self._doc_matches_tenant("일일_출결", d, tenant):
+                continue
             doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
             doc_sn = str(d.get("school_name") or "").strip()
             if sc and doc_sc and doc_sc != sc:
@@ -1461,14 +1527,28 @@ class FirestoreSyncService:
         nid = str(notice_id or "").strip()
         if not nid:
             return []
+        tenant = self._get_tenant_defaults()
         if self.is_vercel_api_mode():
-            res = self._post_vercel_api("fetch_notice_replies", {"notice_id": nid})
-            return list(res.get("replies") or [])
+            res = self._post_vercel_api(
+                "fetch_notice_replies",
+                {
+                    "notice_id": nid,
+                    "teacher_id": tenant.get("teacher_id", ""),
+                    "school_code": tenant.get("school_code", ""),
+                },
+            )
+            return [
+                r
+                for r in list(res.get("replies") or [])
+                if isinstance(r, dict) and self._doc_matches_tenant("가정통신문_회신", r, tenant)
+            ]
         fs = self._get_client()
         rows: List[Dict[str, Any]] = []
         for doc in fs.collection("가정통신문_회신").where("notice_id", "==", nid).stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            if not self._doc_matches_tenant("가정통신문_회신", d, tenant):
+                continue
             rows.append(d)
         return rows
 
@@ -1576,6 +1656,10 @@ class FirestoreSyncService:
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `Notifications` 발송 이력을 조회합니다."""
+        tenant = self._get_tenant_defaults()
+        sc = str(school_code or tenant.get("school_code") or "").strip()
+        sn = str(school_name or tenant.get("school_name") or "").strip()
+        tid = str(tenant.get("teacher_id") or "").strip()
         if self.is_vercel_api_mode():
             res = self._post_vercel_api(
                 "fetch_sent_notifications",
@@ -1583,18 +1667,24 @@ class FirestoreSyncService:
                     "grade": grade,
                     "class_no": class_no,
                     "limit": limit,
-                    "school_code": str(school_code or "").strip(),
-                    "school_name": str(school_name or "").strip(),
+                    "school_code": sc,
+                    "school_name": sn,
+                    "teacher_id": tid,
                 },
             )
-            return list(res.get("notifications") or [])
+            return [
+                r
+                for r in list(res.get("notifications") or [])
+                if isinstance(r, dict) and self._doc_matches_tenant("Notifications", r, tenant)
+            ]
         fs = self._get_client()
-        sc = str(school_code or "").strip()
-        sn = str(school_name or "").strip()
+        ref: Any = self._build_scoped_query(fs.collection("Notifications"), "Notifications", tenant)
         rows: List[Dict[str, Any]] = []
-        for doc in fs.collection("Notifications").limit(limit).stream():
+        for doc in ref.limit(limit).stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            if not self._doc_matches_tenant("Notifications", d, tenant):
+                continue
             doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
             doc_sn = str(d.get("school_name") or "").strip()
             if sc and doc_sc and doc_sc != sc:
@@ -1618,6 +1708,10 @@ class FirestoreSyncService:
         school_name: str = "",
     ) -> List[Dict[str, Any]]:
         """Firestore `1:1_상담채팅` 대화 내역을 조회합니다."""
+        tenant = self._get_tenant_defaults()
+        sc = str(school_code or tenant.get("school_code") or "").strip()
+        sn = str(school_name or tenant.get("school_name") or "").strip()
+        tid = str(tenant.get("teacher_id") or "").strip()
         if self.is_vercel_api_mode():
             res = self._post_vercel_api(
                 "fetch_chat_history",
@@ -1625,11 +1719,16 @@ class FirestoreSyncService:
                     "grade": grade,
                     "class_no": class_no,
                     "student_id": str(student_id or "").strip(),
-                    "school_code": str(school_code or "").strip(),
-                    "school_name": str(school_name or "").strip(),
+                    "school_code": sc,
+                    "school_name": sn,
+                    "teacher_id": tid,
                 },
             )
-            return list(res.get("messages") or [])
+            return [
+                r
+                for r in list(res.get("messages") or [])
+                if isinstance(r, dict) and self._doc_matches_tenant("1:1_상담채팅", r, tenant)
+            ]
         fs = self._get_client()
         ref: Any = fs.collection("1:1_상담채팅")
         sid = str(student_id or "").strip()
@@ -1637,12 +1736,14 @@ class FirestoreSyncService:
             ref = ref.where("room_id", "==", f"ROOM-{sid}")
         elif grade is not None and class_no is not None:
             ref = ref.where("grade", "==", int(grade)).where("class_no", "==", int(class_no))
-        sc = str(school_code or "").strip()
-        sn = str(school_name or "").strip()
+        else:
+            ref = self._build_scoped_query(ref, "1:1_상담채팅", tenant)
         rows: List[Dict[str, Any]] = []
         for doc in ref.stream():
             d = doc.to_dict() or {}
             d.setdefault("remote_id", doc.id)
+            if not self._doc_matches_tenant("1:1_상담채팅", d, tenant):
+                continue
             doc_sc = str(d.get("school_code") or d.get("neis_school_code") or "").strip()
             doc_sn = str(d.get("school_name") or "").strip()
             if sc and doc_sc and doc_sc != sc:
@@ -1667,10 +1768,26 @@ class FirestoreSyncService:
                 return False, f"Vercel API 연결 테스트 실패: {exc}", {}
         try:
             fs = self._get_client()
+            tenant = self._get_tenant_defaults()
             counts = {
-                "schedules": sum(1 for _ in fs.collection("Schedules").limit(500).stream()),
-                "tasks": sum(1 for _ in fs.collection("Tasks").limit(500).stream()),
-                "notifications": sum(1 for _ in fs.collection("Notifications").limit(500).stream()),
+                "schedules": sum(
+                    1
+                    for _ in self._build_scoped_query(fs.collection("Schedules"), "Schedules", tenant)
+                    .limit(500)
+                    .stream()
+                ),
+                "tasks": sum(
+                    1
+                    for _ in self._build_scoped_query(fs.collection("Tasks"), "Tasks", tenant)
+                    .limit(500)
+                    .stream()
+                ),
+                "notifications": sum(
+                    1
+                    for _ in self._build_scoped_query(fs.collection("Notifications"), "Notifications", tenant)
+                    .limit(500)
+                    .stream()
+                ),
             }
             data = {
                 "ok": True,
@@ -1692,6 +1809,7 @@ class FirestoreSyncService:
         이미 acknowledged / done 으로 기록된 remote_id는 pending으로 되돌리지 않으며
         예정된 작업 목록(pending_mobile_tasks)에서도 자동 제외됩니다.
         """
+        tenant = self._get_tenant_defaults()
         schedules_added = 0
         schedules_updated = 0
         todos_added = 0
@@ -1703,6 +1821,8 @@ class FirestoreSyncService:
         # 1. Schedules 동기화
         for raw_sch in payload.get("schedules", []) or []:
             if not isinstance(raw_sch, dict):
+                continue
+            if not self._doc_matches_tenant("Schedules", raw_sch, tenant):
                 continue
             title = str(raw_sch.get("title", "")).strip()
             if not title:
@@ -1738,6 +1858,8 @@ class FirestoreSyncService:
         # 2. Tasks 동기화 (모바일 예약 작업 vs 일반 할일)
         for raw_task in payload.get("tasks", []) or []:
             if not isinstance(raw_task, dict):
+                continue
+            if not self._doc_matches_tenant("Tasks", raw_task, tenant):
                 continue
             title = str(raw_task.get("title", "")).strip()
             if not title:
@@ -1807,6 +1929,8 @@ class FirestoreSyncService:
         for raw_noti in payload.get("notifications", []) or []:
             if not isinstance(raw_noti, dict):
                 continue
+            if not self._doc_matches_tenant("Notifications", raw_noti, tenant):
+                continue
             title = str(raw_noti.get("title", "")).strip()
             msg = str(raw_noti.get("message", "")).strip()
             if not title and not msg:
@@ -1841,17 +1965,21 @@ class FirestoreSyncService:
         }
 
     def fetch_collection_rows(self, collection_name: str, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        """지정한 Firestore 컬렉션의 문서 목록을 조회합니다."""
+        """지정한 Firestore 컬렉션의 문서 목록을 현재 교사/테넌트 범위로 격리 조회합니다."""
         col_name = str(collection_name or "").strip()
         if not col_name:
             return []
         try:
             fs = self._get_client()
+            tenant = self._get_tenant_defaults()
+            query = self._build_scoped_query(fs.collection(col_name), col_name, tenant)
             rows: List[Dict[str, Any]] = []
-            for doc in fs.collection(col_name).stream():
+            for doc in query.stream():
                 data = doc.to_dict() or {}
                 if not data.get("remote_id"):
                     data["remote_id"] = doc.id
+                if not self._doc_matches_tenant(col_name, data, tenant):
+                    continue
                 rows.append(data)
             return rows
         except Exception as exc:
@@ -2007,7 +2135,18 @@ class FirestoreSyncService:
                     {"teacher_id": tid, "school_code": sc},
                 )
                 raw_tasks = res.get("tasks") or res.get("items") or res.get("rows") or []
-                return [dict(t) for t in raw_tasks if isinstance(t, dict)]
+                filtered_api_tasks: List[Dict[str, Any]] = []
+                for t in raw_tasks:
+                    if not isinstance(t, dict):
+                        continue
+                    doc_tid = str(t.get("teacher_id") or t.get("requested_by_teacher_id") or "").strip()
+                    doc_sc = str(t.get("school_code") or t.get("neis_school_code") or "").strip()
+                    if tid and doc_tid and doc_tid != tid:
+                        continue
+                    if sc and doc_sc and doc_sc != sc:
+                        continue
+                    filtered_api_tasks.append(dict(t))
+                return filtered_api_tasks
             except Exception as exc:
                 self.db.add_log("WARN", "FirestoreSync", f"Vercel API 대기 원격 작업 조회 실패: {exc}")
                 return []
@@ -2015,9 +2154,18 @@ class FirestoreSyncService:
         try:
             fs = self._get_client()
             rows: List[Dict[str, Any]] = []
-            for doc in fs.collection("Tasks").where("exec_status", "==", "pending").stream():
+            col_ref = fs.collection("Tasks")
+            if tid:
+                query = col_ref.where("teacher_id", "==", tid)
+            elif sc:
+                query = col_ref.where("school_code", "==", sc)
+            else:
+                query = col_ref.where("exec_status", "==", "pending")
+            for doc in query.stream():
                 d = doc.to_dict() or {}
                 d.setdefault("remote_id", doc.id)
+                if str(d.get("exec_status") or "").strip().lower() != "pending":
+                    continue
                 if _is_truthy(d.get("is_done")):
                     continue
                 is_mobile_flag = d.get("is_mobile_task")
@@ -2084,7 +2232,19 @@ class FirestoreSyncService:
 
         try:
             fs = self._get_client()
-            fs.collection("Tasks").document(rid).set(update_data, merge=True)
+            doc_ref = fs.collection("Tasks").document(rid)
+            tenant = self._get_tenant_defaults()
+            if tenant.get("teacher_id") or tenant.get("school_code"):
+                try:
+                    snap = doc_ref.get()
+                    if getattr(snap, "exists", False):
+                        existing = snap.to_dict() or {}
+                        if self._is_foreign_teacher_doc("Tasks", existing, tenant):
+                            self.db.add_log("WARN", "FirestoreSync", f"타 교사 원격 작업 상태 수정 차단 ({rid})")
+                            return False
+                except Exception:
+                    pass
+            doc_ref.set(update_data, merge=True)
             return True
         except Exception as exc:
             self.db.add_log("WARN", "FirestoreSync", f"원격 작업 상태 갱신 실패 ({rid}): {exc}")
@@ -2106,6 +2266,39 @@ class FirestoreSyncService:
             is_done=is_done,
         )
 
+    _TEACHER_SCOPED_COLLECTIONS = frozenset({
+        "Schedules",
+        "Tasks",
+        "Notifications",
+        "가정통신문_목록",
+        "가정통신문_회신",
+        "학급_공지게시판",
+        "일일_출결",
+        "서류_추적",
+        "1:1_상담채팅",
+        "교과_명렬표",
+        "교과_출결",
+        "수업_진도",
+        "학급회비",
+    })
+    _HOMEROOM_CLASS_SCOPED_COLLECTIONS = frozenset({
+        "일일_출결",
+        "서류_추적",
+        "학급회비",
+        "학급_공지게시판",
+        "가정통신문_목록",
+        "1:1_상담채팅",
+    })
+    _SCHOOL_SCOPED_COLLECTIONS = frozenset({
+        "시간표_기본",
+        "시간표_변동",
+        "시간표_스냅샷",
+        "급식_식단표",
+        "계정_학생",
+        "계정_학부모",
+        "학생_안면데이터",
+    })
+
     def _get_tenant_defaults(self) -> Dict[str, Any]:
         tp = self.config.get_section("teacher_profile") or {}
         return {
@@ -2115,7 +2308,144 @@ class FirestoreSyncService:
             "teacher_name": str(tp.get("name") or tp.get("teacher_id") or "").strip(),
             "grade": _to_int_or_none(tp.get("grade")),
             "class_no": _to_int_or_none(tp.get("class_no")),
+            "is_admin": bool(tp.get("is_admin") is True),
         }
+
+    def _doc_matches_tenant(
+        self,
+        collection_name: str,
+        doc: Dict[str, Any],
+        tenant: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """문서가 현재 교사/테넌트 범위와 일치하는지 검사합니다. (teacher_id 없는 레거시 호환 유지)"""
+        if not isinstance(doc, dict):
+            return False
+        t = tenant if tenant is not None else self._get_tenant_defaults()
+        cur_tid = str(t.get("teacher_id") or "").strip()
+        cur_sc = str(t.get("school_code") or "").strip()
+        cur_sn = str(t.get("school_name") or "").strip()
+        cur_g = _to_int_or_none(t.get("grade"))
+        cur_c = _to_int_or_none(t.get("class_no"))
+
+        doc_tid = str(doc.get("teacher_id") or doc.get("requested_by_teacher_id") or "").strip()
+        doc_sc = str(doc.get("school_code") or doc.get("neis_school_code") or "").strip()
+        doc_sn = str(doc.get("school_name") or "").strip()
+
+        if collection_name in self._TEACHER_SCOPED_COLLECTIONS:
+            if cur_tid and doc_tid and doc_tid != cur_tid:
+                return False
+            if cur_sc and doc_sc and doc_sc != cur_sc:
+                return False
+            if cur_sn and doc_sn and doc_sn != cur_sn:
+                return False
+            if not doc_tid and collection_name in self._HOMEROOM_CLASS_SCOPED_COLLECTIONS:
+                doc_g = _to_int_or_none(
+                    doc.get("grade") if doc.get("grade") is not None else doc.get("target_grade")
+                )
+                doc_c = _to_int_or_none(
+                    doc.get("class_no") if doc.get("class_no") is not None else doc.get("target_class")
+                )
+                if cur_g is not None and doc_g is not None and doc_g != cur_g:
+                    return False
+                if cur_c is not None and doc_c is not None and doc_c != cur_c:
+                    return False
+            return True
+
+        if collection_name in self._SCHOOL_SCOPED_COLLECTIONS:
+            if cur_sc and doc_sc and doc_sc != cur_sc:
+                return False
+            if cur_sn and doc_sn and doc_sn != cur_sn:
+                return False
+            if collection_name == "학생_안면데이터" and cur_tid and doc_tid and doc_tid != cur_tid:
+                return False
+            return True
+
+        if collection_name == "계정_교사":
+            if cur_tid and not bool(t.get("is_admin")):
+                row_tid = str(doc.get("teacher_id") or doc.get("remote_id") or "").strip()
+                if row_tid and row_tid != cur_tid:
+                    return False
+            return True
+
+        if cur_tid and doc_tid and doc_tid != cur_tid:
+            return False
+        if cur_sc and doc_sc and doc_sc != cur_sc:
+            return False
+        return True
+
+    def _is_foreign_teacher_doc(
+        self,
+        collection_name: str,
+        doc: Dict[str, Any],
+        tenant: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """쓰기·삭제 대상 문서가 다른 교사/학교 소유인지 판별합니다."""
+        if not isinstance(doc, dict):
+            return False
+        t = tenant if tenant is not None else self._get_tenant_defaults()
+        cur_tid = str(t.get("teacher_id") or "").strip()
+        cur_sc = str(t.get("school_code") or "").strip()
+        doc_tid = str(doc.get("teacher_id") or doc.get("requested_by_teacher_id") or "").strip()
+        doc_sc = str(doc.get("school_code") or doc.get("neis_school_code") or "").strip()
+
+        if collection_name in self._TEACHER_SCOPED_COLLECTIONS:
+            if cur_tid and doc_tid and doc_tid != cur_tid:
+                return True
+            if cur_sc and doc_sc and doc_sc != cur_sc:
+                return True
+            return False
+
+        if collection_name in self._SCHOOL_SCOPED_COLLECTIONS:
+            if cur_sc and doc_sc and doc_sc != cur_sc:
+                return True
+            return False
+
+        if collection_name == "계정_교사" and cur_tid and not bool(t.get("is_admin")):
+            row_tid = str(doc.get("teacher_id") or doc.get("remote_id") or "").strip()
+            if row_tid and row_tid != cur_tid:
+                return True
+        return False
+
+    def _build_scoped_query(
+        self,
+        col_ref: Any,
+        collection_name: str,
+        tenant: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """컬렉션 성격에 맞게 단일 필드 where()로 Firestore 조회 범위를 좁힙니다."""
+        t = tenant if tenant is not None else self._get_tenant_defaults()
+        cur_tid = str(t.get("teacher_id") or "").strip()
+        cur_sc = str(t.get("school_code") or "").strip()
+
+        if collection_name == "Schedules":
+            if cur_sc:
+                return col_ref.where("school_code", "==", cur_sc)
+            if cur_tid:
+                return col_ref.where("teacher_id", "==", cur_tid)
+            return col_ref
+
+        if collection_name in self._TEACHER_SCOPED_COLLECTIONS:
+            if cur_tid:
+                return col_ref.where("teacher_id", "==", cur_tid)
+            if cur_sc:
+                return col_ref.where("school_code", "==", cur_sc)
+            return col_ref
+
+        if collection_name in self._SCHOOL_SCOPED_COLLECTIONS:
+            if cur_sc:
+                return col_ref.where("school_code", "==", cur_sc)
+            return col_ref
+
+        if collection_name == "계정_교사":
+            if cur_tid and not bool(t.get("is_admin")):
+                return col_ref.where("teacher_id", "==", cur_tid)
+            return col_ref
+
+        if cur_tid:
+            return col_ref.where("teacher_id", "==", cur_tid)
+        if cur_sc:
+            return col_ref.where("school_code", "==", cur_sc)
+        return col_ref
 
     def _enrich_tenant_doc(self, collection_name: str, doc_data: Dict[str, Any]) -> Dict[str, Any]:
         """Direct Admin 쓰기 시 테넌트 격리 필수 필드 및 Notifications 필드를 보완합니다."""
@@ -2173,6 +2503,8 @@ class FirestoreSyncService:
         try:
             fs = self._get_client()
             col_ref = fs.collection(collection_name)
+            tenant = self._get_tenant_defaults()
+            wrote_any = False
 
             for batch_idx, start in enumerate(range(0, len(rows), size), start=1):
                 if progress_callback is not None:
@@ -2182,8 +2514,16 @@ class FirestoreSyncService:
                         pass
                 chunk = rows[start : start + size]
                 batch = fs.batch()
+                chunk_count = 0
                 for offset, raw_row in enumerate(chunk):
                     if not isinstance(raw_row, dict):
+                        continue
+                    if self._is_foreign_teacher_doc(collection_name, raw_row, tenant):
+                        self.db.add_log(
+                            "WARN",
+                            "FirestoreSync",
+                            f"타 교사 문서 덮어쓰기 차단 ({collection_name}: {raw_row.get('remote_id', '')})",
+                        )
                         continue
                     doc_id = _resolve_doc_id(collection_name, raw_row, start + offset)
                     doc_data = _normalize_doc_fields(raw_row)
@@ -2192,9 +2532,12 @@ class FirestoreSyncService:
                         doc_data["updated_at"] = _now_str()
                     self._enrich_tenant_doc(collection_name, doc_data)
                     batch.set(col_ref.document(doc_id), doc_data, merge=True)
-                batch.commit()
+                    chunk_count += 1
+                if chunk_count > 0:
+                    batch.commit()
+                    wrote_any = True
 
-            return True
+            return wrote_any or bool(rows)
         except Exception as exc:
             self.db.add_log("WARN", "FirestoreSync", f"{label or collection_name} Batch 업서트 실패: {exc}")
             return False
@@ -2978,6 +3321,10 @@ class FirestoreSyncService:
         if not col_name or not isinstance(item_data, dict):
             return False
         try:
+            tenant = self._get_tenant_defaults()
+            if self._is_foreign_teacher_doc(col_name, item_data, tenant):
+                self.db.add_log("WARN", "FirestoreSync", f"타 교사 항목 Push 차단 ({col_name})")
+                return False
             fs = self._get_client()
             doc_id = _resolve_doc_id(col_name, item_data, 0)
             doc_data = _normalize_doc_fields(item_data)
@@ -3000,11 +3347,22 @@ class FirestoreSyncService:
         return {"school_code": sc, "school_name": sn, "teacher_id": tid}
 
     @staticmethod
-    def _build_deterministic_schedule_remote_id(row: Dict[str, Any]) -> str:
+    def _build_deterministic_schedule_remote_id(
+        row: Dict[str, Any],
+        teacher_id: str = "",
+        school_code: str = "",
+    ) -> str:
         existing = str(row.get("remote_id") or "").strip()
         if existing:
             return existing.replace("/", "_")
-        key_str = "|".join(
+        tid = str(row.get("teacher_id") or teacher_id or "").strip()
+        sc = str(row.get("school_code") or school_code or "").strip()
+        key_parts = []
+        if tid:
+            key_parts.append(tid)
+        if sc:
+            key_parts.append(sc)
+        key_parts.extend(
             [
                 str(row.get("title") or "").strip(),
                 str(row.get("start_date") or "").strip(),
@@ -3012,6 +3370,7 @@ class FirestoreSyncService:
                 str(row.get("start_time") or "").strip(),
             ]
         )
+        key_str = "|".join(key_parts)
         digest = hashlib.sha1(key_str.encode("utf-8")).hexdigest()[:16]
         return f"sch_{digest}"
 
@@ -3065,12 +3424,19 @@ class FirestoreSyncService:
             if not isinstance(raw, dict):
                 continue
             item = dict(raw)
+            if self._is_foreign_teacher_doc("Schedules", item, tenant):
+                self.db.add_log("WARN", "FirestoreSync", f"타 교사 일정 Upsert 차단 ({item.get('remote_id', '')})")
+                continue
             title = str(item.get("title") or "").strip()
             s_date = str(item.get("start_date") or "").strip()
             if not title or not s_date:
                 continue
             e_date = str(item.get("end_date") or "").strip() or s_date
-            rid = self._build_deterministic_schedule_remote_id(item)
+            rid = self._build_deterministic_schedule_remote_id(
+                item,
+                teacher_id=tenant.get("teacher_id", ""),
+                school_code=tenant.get("school_code", ""),
+            )
             item["remote_id"] = rid
             item["title"] = title
             item["start_date"] = s_date
@@ -3126,7 +3492,9 @@ class FirestoreSyncService:
             now_ts = _now_str()
             task_rows: List[Dict[str, Any]] = []
             for td in unsynced_todos:
-                key_str = f"{td.get('title', '')}|{td.get('due_date', '')}|{td.get('id', '')}"
+                tid_meta = str(tenant.get("teacher_id") or "").strip()
+                sc_meta = str(tenant.get("school_code") or "").strip()
+                key_str = f"{tid_meta}|{sc_meta}|{td.get('title', '')}|{td.get('due_date', '')}|{td.get('id', '')}"
                 rid = f"todo_{hashlib.sha1(key_str.encode('utf-8')).hexdigest()[:16]}"
                 row: Dict[str, Any] = {
                     "remote_id": rid,
@@ -3141,6 +3509,8 @@ class FirestoreSyncService:
                 }
                 if tenant["school_code"]:
                     row["school_code"] = tenant["school_code"]
+                if tenant["school_name"]:
+                    row["school_name"] = tenant["school_name"]
                 if tenant["teacher_id"]:
                     row["teacher_id"] = tenant["teacher_id"]
                 task_rows.append(row)
@@ -3195,15 +3565,19 @@ class FirestoreSyncService:
             return None
 
     def sync_collection_full(self, collection_name: str) -> Dict[str, Any]:
-        """선택된 컬렉션 전체 문서를 Firestore에서 다시 받아 로컬 캐시를 교체합니다."""
+        """선택된 컬렉션 문서를 현재 교사/테넌트 범위로 Firestore에서 다시 받아 로컬 캐시를 교체합니다."""
         col_name = str(collection_name or "").strip()
         if not col_name:
             return {"ok": False, "error": "컬렉션 이름이 비어 있습니다."}
         try:
             fs = self._get_client()
+            tenant = self._get_tenant_defaults()
+            query = self._build_scoped_query(fs.collection(col_name), col_name, tenant)
             rows: List[Dict[str, Any]] = []
-            for doc in fs.collection(col_name).stream():
+            for doc in query.stream():
                 data = self._sanitize_doc_for_cache(doc.id, doc.to_dict() or {})
+                if not self._doc_matches_tenant(col_name, data, tenant):
+                    continue
                 rows.append(data)
             sync_ts = _now_str()
             cached = self.db.replace_collection_cache(col_name, rows, last_sync_at=sync_ts)
@@ -3225,7 +3599,7 @@ class FirestoreSyncService:
     ) -> Dict[str, Any]:
         """
         로컬 캐시의 last_sync_at - overlap_minutes 이후 변경·추가된 문서만
-        단일 필드 쿼리로 조회해 로컬 캐시에 병합합니다.
+        단일 필드 쿼리로 조회하고 현재 교사/테넌트 범위로 필터링해 로컬 캐시에 병합합니다.
         """
         col_name = str(collection_name or "").strip()
         if not col_name:
@@ -3242,10 +3616,13 @@ class FirestoreSyncService:
 
         try:
             fs = self._get_client()
+            tenant = self._get_tenant_defaults()
             query = fs.collection(col_name).where(ts_field, ">", cutoff_str)
             delta_rows: List[Dict[str, Any]] = []
             for doc in query.stream():
                 data = self._sanitize_doc_for_cache(doc.id, doc.to_dict() or {})
+                if not self._doc_matches_tenant(col_name, data, tenant):
+                    continue
                 delta_rows.append(data)
             sync_ts = _now_str()
             merged = self.db.merge_collection_cache(
@@ -3280,6 +3657,7 @@ class FirestoreSyncService:
         try:
             fs = self._get_client()
             col_ref = fs.collection(col_name)
+            tenant = self._get_tenant_defaults()
             now_ts = _now_str()
             saved_rows: List[Dict[str, Any]] = []
             size = max(1, min(FIRESTORE_BATCH_LIMIT, 450))
@@ -3287,8 +3665,16 @@ class FirestoreSyncService:
             for start in range(0, len(rows), size):
                 chunk = rows[start : start + size]
                 batch = fs.batch()
+                chunk_count = 0
                 for offset, raw_row in enumerate(chunk):
                     if not isinstance(raw_row, dict):
+                        continue
+                    if self._is_foreign_teacher_doc(col_name, raw_row, tenant):
+                        self.db.add_log(
+                            "WARN",
+                            "FirestoreSync",
+                            f"타 교사 문서 저장 차단 ({col_name}: {raw_row.get('remote_id', '')})",
+                        )
                         continue
                     doc_id = _resolve_doc_id(col_name, raw_row, start + offset)
                     doc_data = _normalize_doc_fields(raw_row)
@@ -3299,7 +3685,9 @@ class FirestoreSyncService:
                     self._enrich_tenant_doc(col_name, doc_data)
                     batch.set(col_ref.document(doc_id), doc_data, merge=True)
                     saved_rows.append(doc_data)
-                batch.commit()
+                    chunk_count += 1
+                if chunk_count > 0:
+                    batch.commit()
 
             merged = self.db.merge_collection_cache(
                 col_name,
@@ -3320,7 +3708,7 @@ class FirestoreSyncService:
     def delete_collection_rows(
         self, collection_name: str, doc_ids: List[str]
     ) -> Dict[str, Any]:
-        """선택된 문서 ID를 Firestore에서 삭제하고 로컬 캐시에서도 제거합니다."""
+        """선택된 문서 ID를 Firestore에서 삭제하고 로컬 캐시에서도 제거합니다. (타 교사 소유 문서 삭제 차단)"""
         col_name = str(collection_name or "").strip()
         clean_ids = [str(d).strip() for d in (doc_ids or []) if str(d).strip()]
         if not col_name or not clean_ids:
@@ -3328,14 +3716,41 @@ class FirestoreSyncService:
         try:
             fs = self._get_client()
             col_ref = fs.collection(col_name)
+            tenant = self._get_tenant_defaults()
+            allowed_ids: List[str] = []
+            blocked_ids: List[str] = []
+            for doc_id in clean_ids:
+                if tenant.get("teacher_id") or tenant.get("school_code"):
+                    try:
+                        snap = col_ref.document(doc_id).get()
+                        if getattr(snap, "exists", False):
+                            existing = snap.to_dict() or {}
+                            if self._is_foreign_teacher_doc(col_name, existing, tenant):
+                                blocked_ids.append(doc_id)
+                                self.db.add_log(
+                                    "WARN",
+                                    "FirestoreSync",
+                                    f"타 교사 문서 삭제 차단 ({col_name}: {doc_id})",
+                                )
+                                continue
+                    except Exception:
+                        pass
+                allowed_ids.append(doc_id)
+
             size = max(1, min(FIRESTORE_BATCH_LIMIT, 450))
-            for start in range(0, len(clean_ids), size):
+            for start in range(0, len(allowed_ids), size):
                 batch = fs.batch()
-                for doc_id in clean_ids[start : start + size]:
+                for doc_id in allowed_ids[start : start + size]:
                     batch.delete(col_ref.document(doc_id))
                 batch.commit()
-            self.db.remove_from_collection_cache(col_name, clean_ids)
-            return {"ok": True, "collection": col_name, "deleted_count": len(clean_ids)}
+            if allowed_ids:
+                self.db.remove_from_collection_cache(col_name, allowed_ids)
+            return {
+                "ok": True,
+                "collection": col_name,
+                "deleted_count": len(allowed_ids),
+                "blocked_count": len(blocked_ids),
+            }
         except Exception as exc:
             self.db.add_log("WARN", "FirestoreSync", f"컬렉션 문서 삭제 실패 ({col_name}): {exc}")
             return {"ok": False, "collection": col_name, "error": str(exc)}

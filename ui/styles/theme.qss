@@ -185,7 +185,8 @@ QPushButton#SidebarTrayButton:hover {
     color: #F8FAFC;
 }
 
-QPushButton#SidebarAiStatusBadge {
+QPushButton#SidebarAiStatusBadge,
+QPushButton#SidebarTeacherBadge {
     background-color: #0F172A;
     color: #E2E8F0;
     border: 1px solid #1E293B;
@@ -197,7 +198,8 @@ QPushButton#SidebarAiStatusBadge {
     text-align: left;
 }
 
-QPushButton#SidebarAiStatusBadge[collapsed="true"] {
+QPushButton#SidebarAiStatusBadge[collapsed="true"],
+QPushButton#SidebarTeacherBadge[collapsed="true"] {
     padding: 0px;
     min-width: 36px;
     max-width: 36px;
@@ -206,13 +208,15 @@ QPushButton#SidebarAiStatusBadge[collapsed="true"] {
     text-align: center;
 }
 
-QPushButton#SidebarAiStatusBadge:hover {
+QPushButton#SidebarAiStatusBadge:hover,
+QPushButton#SidebarTeacherBadge:hover {
     background-color: #1E293B;
     border-color: #334155;
     color: #FFFFFF;
 }
 
-QLabel#SidebarAiStatusText {
+QLabel#SidebarAiStatusText,
+QLabel#SidebarTeacherBadgeText {
     background-color: transparent;
     color: #E2E8F0;
     font-size: 11px;

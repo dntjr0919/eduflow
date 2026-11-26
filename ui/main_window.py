@@ -165,6 +165,7 @@ class MainWindow(QMainWindow):
         self._init_shortcuts()
         self._refresh_shortcuts_from_config()
         self._update_ai_mode_badge()
+        self._update_teacher_account_badge()
 
         self._sig_config_changed.connect(self._on_config_changed)
         self.config.add_listener(lambda _: self._sig_config_changed.emit())
@@ -282,6 +283,32 @@ class MainWindow(QMainWindow):
         self.sidebar_util_layout.addWidget(self.btn_open_folder, stretch=1)
         self.sidebar_util_layout.addWidget(self.btn_hide_tray)
 
+        self.sidebar_teacher_badge = QPushButton("")
+        polish_widget(self.sidebar_teacher_badge, obj_name="SidebarTeacherBadge")
+        self.sidebar_teacher_badge.setFixedHeight(36)
+        self.sidebar_teacher_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sidebar_teacher_badge.clicked.connect(self._on_teacher_badge_clicked)
+
+        self.sidebar_teacher_badge_layout = QHBoxLayout(self.sidebar_teacher_badge)
+        self.sidebar_teacher_badge_layout.setContentsMargins(10, 0, 10, 0)
+        self.sidebar_teacher_badge_layout.setSpacing(8)
+        self.sidebar_teacher_badge_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        self.teacher_status_dot = QLabel()
+        polish_widget(self.teacher_status_dot, obj_name="SidebarTeacherStatusDot")
+        self.teacher_status_dot.setFixedSize(8, 8)
+        self.teacher_status_dot.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        self.lbl_teacher_badge = QLabel("교사: 미로그인")
+        polish_widget(self.lbl_teacher_badge, obj_name="SidebarTeacherBadgeText")
+        self.lbl_teacher_badge.setMinimumWidth(0)
+        self.lbl_teacher_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+        self.sidebar_teacher_badge_layout.addWidget(
+            self.teacher_status_dot, alignment=Qt.AlignmentFlag.AlignVCenter
+        )
+        self.sidebar_teacher_badge_layout.addWidget(self.lbl_teacher_badge, stretch=1)
+
         self.sidebar_ai_badge = QPushButton("")
         polish_widget(self.sidebar_ai_badge, obj_name="SidebarAiStatusBadge")
         self.sidebar_ai_badge.setFixedHeight(36)
@@ -312,6 +339,7 @@ class MainWindow(QMainWindow):
         self.sidebar_layout.addSpacing(8)
         self.sidebar_layout.addWidget(self.nav_section_lbl)
         self.sidebar_layout.addWidget(self.sidebar_nav, stretch=1)
+        self.sidebar_layout.addWidget(self.sidebar_teacher_badge)
         self.sidebar_layout.addWidget(self.sidebar_ai_badge)
         self.sidebar_layout.addWidget(self.sidebar_util_container)
 
@@ -500,6 +528,7 @@ class MainWindow(QMainWindow):
         collapsed_str = "true" if self._sidebar_collapsed else "false"
         self.sidebar_frame.setProperty("collapsed", collapsed_str)
         self.sidebar_nav.setProperty("collapsed", collapsed_str)
+        self.sidebar_teacher_badge.setProperty("collapsed", collapsed_str)
         self.sidebar_ai_badge.setProperty("collapsed", collapsed_str)
         self.btn_open_folder.setProperty("collapsed", collapsed_str)
         self.btn_hide_tray.setProperty("collapsed", collapsed_str)
@@ -517,6 +546,17 @@ class MainWindow(QMainWindow):
             self.brand_sub.hide()
             self.nav_section_lbl.hide()
             self.brand_logo_badge.setToolTip("사이드바 메뉴 펼치기")
+            self.lbl_teacher_badge.hide()
+            self.sidebar_teacher_badge_layout.setContentsMargins(0, 0, 0, 0)
+            self.sidebar_teacher_badge_layout.setSpacing(0)
+            self.sidebar_teacher_badge_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.sidebar_teacher_badge_layout.setAlignment(
+                self.teacher_status_dot, Qt.AlignmentFlag.AlignCenter
+            )
+            self.sidebar_teacher_badge.setFixedSize(36, 36)
+            self.sidebar_layout.setAlignment(
+                self.sidebar_teacher_badge, Qt.AlignmentFlag.AlignHCenter
+            )
             self.lbl_ai_badge.hide()
             self.sidebar_ai_badge_layout.setContentsMargins(0, 0, 0, 0)
             self.sidebar_ai_badge_layout.setSpacing(0)
@@ -552,6 +592,17 @@ class MainWindow(QMainWindow):
             self.brand_sub.show()
             self.nav_section_lbl.show()
             self.brand_logo_badge.setToolTip("사이드바 메뉴 접기")
+            self.lbl_teacher_badge.show()
+            self.sidebar_teacher_badge_layout.setContentsMargins(10, 0, 10, 0)
+            self.sidebar_teacher_badge_layout.setSpacing(8)
+            self.sidebar_teacher_badge_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+            self.sidebar_teacher_badge_layout.setAlignment(
+                self.teacher_status_dot, Qt.AlignmentFlag.AlignVCenter
+            )
+            self.sidebar_teacher_badge.setMinimumWidth(0)
+            self.sidebar_teacher_badge.setMaximumWidth(16777215)
+            self.sidebar_teacher_badge.setFixedHeight(36)
+            self.sidebar_layout.setAlignment(self.sidebar_teacher_badge, Qt.AlignmentFlag(0))
             self.lbl_ai_badge.show()
             self.sidebar_ai_badge_layout.setContentsMargins(10, 0, 10, 0)
             self.sidebar_ai_badge_layout.setSpacing(8)
@@ -583,6 +634,7 @@ class MainWindow(QMainWindow):
         for w in (
             self.sidebar_frame,
             self.sidebar_nav,
+            self.sidebar_teacher_badge,
             self.sidebar_ai_badge,
             self.btn_open_folder,
             self.btn_hide_tray,
@@ -769,6 +821,11 @@ class MainWindow(QMainWindow):
         self.ai_dock.refresh_ai_info()
         self._refresh_shortcuts_from_config()
         self._update_ai_mode_badge()
+        if hasattr(self, "tab_classroom") and hasattr(self.tab_classroom, "sync_teacher_profile_from_config"):
+            self.tab_classroom.sync_teacher_profile_from_config()
+        self._update_teacher_account_badge()
+        if hasattr(self, "tab_settings") and hasattr(self.tab_settings, "refresh_teacher_profile_from_config"):
+            self.tab_settings.refresh_teacher_profile_from_config()
         if hasattr(self, "tab_doc_ocr"):
             self.tab_doc_ocr._update_active_ai_display()
 
@@ -1069,6 +1126,8 @@ class MainWindow(QMainWindow):
             )
         )
         self.tab_classroom.schoolbell_login_cleared.connect(self.ai_dock.clear_external_login_waiting)
+        if hasattr(self.tab_classroom, "teacher_auth_changed"):
+            self.tab_classroom.teacher_auth_changed.connect(self._update_teacher_account_badge)
         self.tab_grade.ai_reference_requested.connect(self._on_grade_material_send_to_ai)
         self.ai_dock.set_target("general_chat", force=True)
 
@@ -1295,6 +1354,84 @@ class MainWindow(QMainWindow):
         self.lbl_ai_badge.setText(badge_text)
         self.sidebar_ai_badge.setToolTip(tooltip_text)
         self.lbl_ai_badge.setToolTip(tooltip_text)
+
+    def _on_teacher_badge_clicked(self) -> None:
+        tp = self.config.get_section("teacher_profile") or {}
+        tid = str(tp.get("teacher_id") or "").strip()
+        target_widget = (
+            self.tab_classroom
+            if (tid and hasattr(self, "tab_classroom"))
+            else getattr(self, "tab_settings", None)
+        )
+        if target_widget is not None:
+            idx = self.stacked_widget.indexOf(target_widget)
+            if idx >= 0:
+                self.sidebar_nav.setCurrentRow(idx)
+
+    def _update_teacher_account_badge(self) -> None:
+        if not hasattr(self, "sidebar_teacher_badge"):
+            return
+        tp = dict(self.config.get_section("teacher_profile") or {})
+        active_session = None
+        if hasattr(self, "tab_classroom"):
+            active_session = getattr(self.tab_classroom, "_logged_in_teacher", None)
+        logged_in = bool(active_session) or bool(tp.get("session_logged_in"))
+        if isinstance(active_session, dict):
+            for k in ("teacher_id", "name", "school_name", "school_code", "grade", "class_no"):
+                if active_session.get(k) not in (None, ""):
+                    tp[k] = active_session[k]
+
+        tid = str(tp.get("teacher_id") or "").strip()
+        tname = str(tp.get("name") or tid or "").strip()
+        sname = str(tp.get("school_name") or "").strip()
+        scode = str(tp.get("school_code") or tp.get("neis_school_code") or "").strip()
+        grade = tp.get("grade")
+        class_no = tp.get("class_no")
+        has_cls = grade not in (None, "") and class_no not in (None, "")
+        cls_short = f"{grade}-{class_no}" if has_cls else ""
+        cls_full = f"{grade}학년 {class_no}반" if has_cls else "담임 미지정"
+
+        if logged_in and tname:
+            dot_color = "#22C55E"
+            parts = [tname]
+            if sname:
+                parts.append(sname)
+            if cls_short:
+                parts.append(cls_short)
+            badge_text = " · ".join(parts)
+            status_desc = "로그인됨 (교사별 DB 격리 활성)"
+        elif tid or tname:
+            dot_color = "#F59E0B"
+            parts = [tname or tid]
+            if sname:
+                parts.append(sname)
+            if cls_short:
+                parts.append(cls_short)
+            badge_text = " · ".join(parts) + " (미로그인)"
+            status_desc = "프로필 설정됨 (학급 경영 도구함에서 로그인 필요)"
+        else:
+            dot_color = "#64748B"
+            badge_text = "교사 계정: 미설정"
+            status_desc = "미설정 (클릭하여 설정 또는 로그인)"
+
+        tooltip_lines = [
+            f"교사: {tname or '미설정'}" + (f" ({tid})" if tid else ""),
+            f"학교: {sname or '미설정'}" + (f" ({scode})" if scode else ""),
+            f"학급: {cls_full}",
+            f"상태: {status_desc}",
+            "클릭하여 학급 경영 도구함 / 설정으로 이동",
+        ]
+        tooltip_text = "\n".join(tooltip_lines)
+
+        self.teacher_status_dot.setStyleSheet(
+            f"background-color: {dot_color}; "
+            "border-radius: 4px; "
+            "border: none; "
+            "min-width: 8px; max-width: 8px; min-height: 8px; max-height: 8px;"
+        )
+        self.lbl_teacher_badge.setText(badge_text)
+        self.sidebar_teacher_badge.setToolTip(tooltip_text)
+        self.lbl_teacher_badge.setToolTip(tooltip_text)
 
     # =========================================================================
     # 공통 백그라운드 워커 시그널 핸들러 & 부드러운 로그 서랍 확장
