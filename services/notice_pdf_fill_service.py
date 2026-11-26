@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import re
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -89,15 +90,179 @@ def decode_signature_data_url(data_url: str) -> Optional[bytes]:
         return None
 
 
+def _is_valid_image_bytes(data: Optional[bytes]) -> bool:
+    """PNG/JPEG/GIF/WEBP/BMP 등 실제 이미지 매직 헤더 여부를 확인합니다."""
+    if not data or len(data) < 8:
+        return False
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return True
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return True
+    if data.startswith(b"BM"):
+        return True
+    return False
+
+
+def _extract_google_drive_file_id(url_or_id: str) -> str:
+    """Google Drive URL 또는 문자열에서 file_id를 추출합니다."""
+    raw = str(url_or_id or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        return raw if re.fullmatch(r"[a-zA-Z0-9_-]{10,}", raw) else ""
+    for pat in (
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"/d/([a-zA-Z0-9_-]+)",
+        r"[?&]id=([a-zA-Z0-9_-]+)",
+    ):
+        m = re.search(pat, raw)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def _download_url_bytes(url: str, timeout: float = 12.0) -> Optional[bytes]:
+    """HTTP(S) URL에서 이미지 바이트를 내려받습니다."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "EduFlow/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            if status and int(status) >= 400:
+                return None
+            data = resp.read()
+        return data if _is_valid_image_bytes(data) else None
+    except Exception:
+        return None
+
+
+def _download_drive_file_via_oauth(file_id: str) -> Optional[bytes]:
+    """연결된 Google OAuth Drive 계정을 통해 비공개 Drive 파일을 내려받습니다."""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return None
+    try:
+        from services.google_calendar_service import GoogleCalendarService
+
+        gcal = GoogleCalendarService()
+        accounts = gcal.get_connected_accounts()
+        if not accounts:
+            return None
+        for acc in accounts:
+            try:
+                drive_svc = gcal._build_service("drive", "v3", account=acc)
+                data = drive_svc.files().get_media(fileId=fid).execute()
+                if isinstance(data, (bytes, bytearray)) and _is_valid_image_bytes(bytes(data)):
+                    return bytes(data)
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def _download_drive_file_via_vercel_proxy(file_id: str, timeout: float = 15.0) -> Optional[bytes]:
+    """Vercel API 프록시를 통해 Drive 파일 바이트를 내려받습니다(지원 시)."""
+    fid = str(file_id or "").strip()
+    if not fid:
+        return None
+    try:
+        from services.firestore_sync_service import FirestoreSyncService
+
+        svc = FirestoreSyncService()
+        res = svc._post_vercel_api("download_drive_file", {"file_id": fid}, timeout=timeout)
+        if isinstance(res, dict):
+            b64_val = str(res.get("file_base64") or res.get("data_url") or "").strip()
+            if b64_val:
+                decoded = decode_signature_data_url(b64_val)
+                if _is_valid_image_bytes(decoded):
+                    return decoded
+    except Exception:
+        return None
+    return None
+
+
+def resolve_signature_image_bytes(
+    source: str,
+    *,
+    file_id: str = "",
+    cache: Optional[Dict[str, Optional[bytes]]] = None,
+    timeout: float = 12.0,
+) -> Optional[bytes]:
+    """Base64 data URL, 로컬 경로 또는 Google Drive/HTTP(S) URL에서 서명 이미지 바이트를 조회합니다."""
+    src = str(source or "").strip()
+    fid = str(file_id or "").strip()
+    if not src and not fid:
+        return None
+
+    if src and not src.startswith(("http://", "https://")):
+        decoded = decode_signature_data_url(src)
+        if decoded:
+            return decoded
+        local_p = Path(src)
+        if local_p.is_file():
+            try:
+                raw = local_p.read_bytes()
+                return raw if _is_valid_image_bytes(raw) else None
+            except Exception:
+                return None
+        return None
+
+    cache_key = src or f"drive_id:{fid}"
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
+
+    resolved_fid = fid or _extract_google_drive_file_id(src)
+    candidate_urls: List[str] = []
+    if src:
+        candidate_urls.append(src)
+    if resolved_fid:
+        for u in (
+            f"https://drive.google.com/uc?export=download&id={resolved_fid}",
+            f"https://lh3.googleusercontent.com/d/{resolved_fid}",
+        ):
+            if u not in candidate_urls:
+                candidate_urls.append(u)
+
+    result: Optional[bytes] = None
+    for cand_url in candidate_urls:
+        data = _download_url_bytes(cand_url, timeout=timeout)
+        if data:
+            result = data
+            break
+
+    if result is None and resolved_fid:
+        result = _download_drive_file_via_oauth(resolved_fid)
+    if result is None and resolved_fid:
+        result = _download_drive_file_via_vercel_proxy(resolved_fid, timeout=timeout)
+
+    if cache is not None:
+        cache[cache_key] = result
+    return result
+
+
 def _parse_answers_dict(reply: Dict[str, Any]) -> Dict[str, Any]:
-    for key in ("answers", "reply_answers", "responses", "form_data"):
+    for key in (
+        "answers",
+        "reply_answers",
+        "responses",
+        "form_data",
+        "reply_data_json",
+        "reply_data",
+    ):
         val = reply.get(key)
-        if isinstance(val, dict):
+        if isinstance(val, dict) and val:
             return val
         if isinstance(val, str) and val.strip().startswith("{"):
             try:
                 parsed = json.loads(val)
-                if isinstance(parsed, dict):
+                if isinstance(parsed, dict) and parsed:
                     return parsed
             except Exception:
                 pass
@@ -192,12 +357,86 @@ def _draw_fitted_text(
         cur_y -= line_h
 
 
+def _select_signature_candidate(
+    reply: Dict[str, Any],
+    key: str,
+    *,
+    signature_mode: Optional[str] = None,
+    student_meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """서명 필드 key와 signature_mode에 따라 (서명 소스 URL/Base64, Drive file_id)를 선택합니다."""
+    norm_key = str(key or "").strip()
+    eff_mode = str(
+        signature_mode
+        or reply.get("signature_mode")
+        or (student_meta or {}).get("signature_mode")
+        or ""
+    ).strip().lower()
+
+    if norm_key == "student_signature":
+        candidates = (
+            ("student_signature_data_url", "student_signature_file_id"),
+            ("student_signature_drive_url", "student_signature_file_id"),
+            ("signature_data_url", "signature_file_id"),
+            ("signature_drive_url", "signature_file_id"),
+        )
+        fallback_fid = str(
+            reply.get("student_signature_file_id") or reply.get("signature_file_id") or ""
+        ).strip()
+    elif norm_key == "parent_signature":
+        candidates = (
+            ("parent_signature_data_url", "signature_file_id"),
+            ("signature_drive_url", "signature_file_id"),
+            ("signature_data_url", "signature_file_id"),
+        )
+        fallback_fid = str(
+            reply.get("parent_signature_file_id") or reply.get("signature_file_id") or ""
+        ).strip()
+    else:
+        if norm_key and norm_key != "signature" and reply.get(norm_key):
+            return str(reply.get(norm_key) or "").strip(), str(
+                reply.get("signature_file_id") or ""
+            ).strip()
+        if eff_mode == "student":
+            candidates = (
+                ("student_signature_data_url", "student_signature_file_id"),
+                ("student_signature_drive_url", "student_signature_file_id"),
+                ("signature_data_url", "signature_file_id"),
+                ("signature_drive_url", "signature_file_id"),
+                ("parent_signature_data_url", "signature_file_id"),
+            )
+            fallback_fid = str(
+                reply.get("student_signature_file_id") or reply.get("signature_file_id") or ""
+            ).strip()
+        else:
+            candidates = (
+                ("parent_signature_data_url", "signature_file_id"),
+                ("signature_data_url", "signature_file_id"),
+                ("signature_drive_url", "signature_file_id"),
+                ("student_signature_data_url", "student_signature_file_id"),
+                ("student_signature_drive_url", "student_signature_file_id"),
+            )
+            fallback_fid = str(
+                reply.get("signature_file_id") or reply.get("student_signature_file_id") or ""
+            ).strip()
+
+    for url_key, fid_key in candidates:
+        raw_val = str(reply.get(url_key) or "").strip()
+        if raw_val:
+            fid_val = str(reply.get(fid_key) or fallback_fid).strip()
+            return raw_val, fid_val
+
+    return "", fallback_fid
+
+
 def _build_overlay_pdf_bytes(
     page_sizes: List[Tuple[float, float]],
     field_map: List[Dict[str, Any]],
     reply: Dict[str, Any],
     *,
     student_meta: Optional[Dict[str, Any]] = None,
+    signature_mode: Optional[str] = None,
+    signature_cache: Optional[Dict[str, Optional[bytes]]] = None,
 ) -> bytes:
     buf = io.BytesIO()
     font_name = _ensure_korean_font()
@@ -219,21 +458,17 @@ def _build_overlay_pdf_bytes(
             key = str(fld.get("key") or "").strip()
 
             if kind == "signature":
-                if key == "student_signature":
-                    raw_sig = (
-                        reply.get("student_signature_data_url")
-                        or reply.get("signature_data_url")
-                        or ""
-                    )
-                elif key == "parent_signature":
-                    raw_sig = (
-                        reply.get("parent_signature_data_url")
-                        or reply.get("signature_data_url")
-                        or ""
-                    )
-                else:
-                    raw_sig = reply.get(key) or reply.get("signature_data_url") or ""
-                sig_bytes = decode_signature_data_url(str(raw_sig or ""))
+                raw_sig, sig_file_id = _select_signature_candidate(
+                    reply,
+                    key,
+                    signature_mode=signature_mode,
+                    student_meta=student_meta,
+                )
+                sig_bytes = resolve_signature_image_bytes(
+                    raw_sig,
+                    file_id=sig_file_id,
+                    cache=signature_cache,
+                )
                 if sig_bytes:
                     try:
                         img = ImageReader(io.BytesIO(sig_bytes))
@@ -273,6 +508,8 @@ def fill_notice_pdf_for_reply(
     output_pdf_path: str | Path,
     *,
     student_meta: Optional[Dict[str, Any]] = None,
+    signature_mode: Optional[str] = None,
+    signature_cache: Optional[Dict[str, Optional[bytes]]] = None,
 ) -> Path:
     """단일 학생 회신 데이터를 원본 PDF 위에 합성하여 새 PDF 파일로 저장합니다."""
     src = Path(source_pdf_path)
@@ -289,6 +526,8 @@ def fill_notice_pdf_for_reply(
         field_map,
         reply,
         student_meta=student_meta,
+        signature_mode=signature_mode,
+        signature_cache=signature_cache,
     )
     overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
 
@@ -317,6 +556,7 @@ def batch_export_notice_pdfs(
     *,
     mode: str = "individual",
     class_meta: Optional[Dict[str, Any]] = None,
+    signature_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     학급 전체 회신 목록을 원본 PDF에 일괄 합성합니다.
@@ -331,6 +571,7 @@ def batch_export_notice_pdfs(
 
     base_meta = dict(class_meta or {})
     norm_mode = str(mode or "individual").strip().lower()
+    sig_cache: Dict[str, Optional[bytes]] = {}
 
     if norm_mode == "merged":
         writer = PdfWriter()
@@ -342,7 +583,12 @@ def batch_export_notice_pdfs(
             reader = PdfReader(str(src))
             page_sizes = [(float(p.mediabox.width), float(p.mediabox.height)) for p in reader.pages]
             overlay_bytes = _build_overlay_pdf_bytes(
-                page_sizes, field_map, rep, student_meta=s_meta
+                page_sizes,
+                field_map,
+                rep,
+                student_meta=s_meta,
+                signature_mode=signature_mode,
+                signature_cache=sig_cache,
             )
             overlay_reader = PdfReader(io.BytesIO(overlay_bytes))
             for idx, page in enumerate(reader.pages):
@@ -375,6 +621,8 @@ def batch_export_notice_pdfs(
             rep,
             out_path,
             student_meta=s_meta,
+            signature_mode=signature_mode,
+            signature_cache=sig_cache,
         )
         generated_files.append(str(out_path))
 

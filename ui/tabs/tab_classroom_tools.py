@@ -4203,7 +4203,20 @@ class ClassroomToolsTab(QWidget):
                 self.table_notice_replies.setItem(r, 1, QTableWidgetItem(str(name)))
                 self.table_notice_replies.setItem(r, 2, QTableWidgetItem("제출완료" if rep else "미제출"))
                 self.table_notice_replies.setItem(r, 3, QTableWidgetItem(str(rep.get("reply_choice", "")) if rep else "-"))
-                self.table_notice_replies.setItem(r, 4, QTableWidgetItem(str(rep.get("signature_drive_url") or rep.get("signature_url") or "") if rep else ""))
+                self.table_notice_replies.setItem(
+                    r,
+                    4,
+                    QTableWidgetItem(
+                        str(
+                            rep.get("signature_drive_url")
+                            or rep.get("student_signature_drive_url")
+                            or rep.get("signature_url")
+                            or ""
+                        )
+                        if rep
+                        else ""
+                    ),
+                )
 
         self._run_async_button_task(
             button=getattr(self, "btn_refresh_replies", None),
@@ -4314,6 +4327,11 @@ class ClassroomToolsTab(QWidget):
         meta = self._teacher_meta()
         cached_replies = list(self._last_notice_replies or [])
         field_map = list(self._notice_pdf_field_map)
+        sig_mode = (
+            str(self.combo_notice_signature_mode.currentData() or "parent").strip().lower()
+            if hasattr(self, "combo_notice_signature_mode")
+            else "parent"
+        )
 
         def _work() -> Dict[str, Any]:
             import shutil
@@ -4347,6 +4365,7 @@ class ClassroomToolsTab(QWidget):
                         "grade": meta.get("grade"),
                         "class_no": meta.get("class_no"),
                     },
+                    signature_mode=sig_mode,
                 )
             finally:
                 if temp_dir is not None:

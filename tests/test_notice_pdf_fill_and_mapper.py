@@ -15,6 +15,7 @@ from pypdf import PdfReader
 from reportlab.pdfgen import canvas
 
 from services.notice_pdf_fill_service import (
+    _parse_answers_dict,
     batch_export_notice_pdfs,
     build_pdf_vision_mapping_prompt,
     decode_signature_data_url,
@@ -113,6 +114,154 @@ class TestNoticePdfFillService(unittest.TestCase):
             self.assertEqual(res_merged["count"], 2)
             self.assertEqual(res_merged["total_pages"], 4)
             self.assertEqual(len(PdfReader(str(merged_pdf)).pages), 4)
+
+    def test_mobile_reply_schema_reply_data_json_and_drive_signature_urls(self) -> None:
+        import json
+        from unittest.mock import patch
+
+        sig_b64 = _make_sample_signature_data_url().split(",", 1)[1]
+        parent_png_bytes = base64.b64decode(sig_b64)
+        stu_img = Image.new("RGBA", (100, 35), (0, 0, 0, 0))
+        for x in range(10, 90):
+            stu_img.putpixel((x, 18), (30, 64, 175, 255))
+        stu_buf = io.BytesIO()
+        stu_img.save(stu_buf, format="PNG")
+        student_png_bytes = stu_buf.getvalue()
+
+        # 1. _parse_answers_dict supports reply_data_json and reply_data
+        self.assertEqual(
+            _parse_answers_dict({"reply_data_json": json.dumps({"consent": "Agree", "note": "확인"})}),
+            {"consent": "Agree", "note": "확인"},
+        )
+        self.assertEqual(
+            _parse_answers_dict({"answers": {}, "reply_data": {"consent": "Disagree"}}),
+            {"consent": "Disagree"},
+        )
+        self.assertEqual(
+            _parse_answers_dict({"reply_data": json.dumps({"allergy": "없음"})}),
+            {"allergy": "없음"},
+        )
+
+        # 2. Mock HTTP GET for Drive URLs + verify batch cache & signature_mode
+        download_calls: list[str] = []
+
+        class _FakeResp:
+            status = 200
+
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        def _fake_urlopen(req, timeout=12.0):  # noqa: ANN001
+            url = req.full_url if hasattr(req, "full_url") else str(req)
+            download_calls.append(url)
+            if "html_only" in url:
+                return _FakeResp(b"<html><body>Login required</body></html>")
+            if "STUDENT_FILE_ID" in url:
+                return _FakeResp(student_png_bytes)
+            return _FakeResp(parent_png_bytes)
+
+        field_map = [
+            {"id": "f1", "key": "name", "label": "이름", "kind": "text", "page": 1, "x_ratio": 0.2, "y_ratio": 0.15, "w_ratio": 0.2, "h_ratio": 0.04},
+            {"id": "f2", "key": "consent", "label": "동의", "kind": "option", "option": "Agree", "page": 1, "x_ratio": 0.28, "y_ratio": 0.18, "w_ratio": 0.04, "h_ratio": 0.03},
+            {"id": "f3", "key": "parent_signature", "label": "학부모 서명", "kind": "signature", "page": 1, "x_ratio": 0.3, "y_ratio": 0.27, "w_ratio": 0.18, "h_ratio": 0.06},
+            {"id": "f4", "key": "student_signature", "label": "학생 서명", "kind": "signature", "page": 1, "x_ratio": 0.55, "y_ratio": 0.27, "w_ratio": 0.18, "h_ratio": 0.06},
+            {"id": "f5", "key": "memo", "label": "비고", "kind": "text", "page": 1, "x_ratio": 0.2, "y_ratio": 0.4, "w_ratio": 0.4, "h_ratio": 0.05},
+        ]
+
+        shared_parent_url = "https://drive.google.com/uc?export=download&id=PARENT_FILE_ID_123"
+        student_url = "https://drive.google.com/uc?export=download&id=STUDENT_FILE_ID_456"
+        replies = [
+            {
+                "student_id": "20101",
+                "student_name": "Park_Jihun",
+                "reply_data_json": json.dumps({"consent": "Agree", "memo": "MobileReplyOK"}),
+                "signature_drive_url": shared_parent_url,
+                "signature_file_id": "PARENT_FILE_ID_123",
+                "student_signature_drive_url": student_url,
+                "student_signature_file_id": "STUDENT_FILE_ID_456",
+            },
+            {
+                "student_id": "20102",
+                "student_name": "Choi_Yuna",
+                "reply_data_json": json.dumps({"consent": "Agree", "memo": "SecondReplyOK"}),
+                "signature_drive_url": shared_parent_url,
+                "signature_file_id": "PARENT_FILE_ID_123",
+                "student_signature_drive_url": student_url,
+                "student_signature_file_id": "STUDENT_FILE_ID_456",
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as td, patch(
+            "services.notice_pdf_fill_service.urllib.request.urlopen",
+            side_effect=_fake_urlopen,
+        ):
+            src_pdf = Path(td) / "mobile_notice.pdf"
+            _make_sample_pdf(src_pdf, pages=1)
+
+            single_out = Path(td) / "mobile_single.pdf"
+            fill_notice_pdf_for_reply(src_pdf, field_map, replies[0], single_out)
+            r_single = PdfReader(str(single_out))
+            p1_txt = r_single.pages[0].extract_text() or ""
+            self.assertIn("Park_Jihun", p1_txt)
+            self.assertIn("MobileReplyOK", p1_txt)
+            self.assertGreaterEqual(len(r_single.pages[0].images), 2)
+
+            download_calls.clear()
+            merged_out = Path(td) / "mobile_merged.pdf"
+            res = batch_export_notice_pdfs(
+                src_pdf,
+                field_map,
+                replies,
+                merged_out,
+                mode="merged",
+                signature_mode="both",
+            )
+            self.assertEqual(res["count"], 2)
+            # Both replies share the same 2 URLs -> batch cache limits HTTP GETs to 2 total
+            self.assertEqual(len(download_calls), 2)
+
+            # Single generic "signature" field respects signature_mode="student"
+            generic_map = [
+                {"id": "g1", "key": "signature", "label": "서명", "kind": "signature", "page": 1, "x_ratio": 0.3, "y_ratio": 0.27, "w_ratio": 0.18, "h_ratio": 0.06},
+            ]
+            download_calls.clear()
+            stu_only_out = Path(td) / "stu_only.pdf"
+            fill_notice_pdf_for_reply(
+                src_pdf,
+                generic_map,
+                replies[0],
+                stu_only_out,
+                signature_mode="student",
+            )
+            self.assertEqual(download_calls, [student_url])
+            self.assertGreaterEqual(len(PdfReader(str(stu_only_out)).pages[0].images), 1)
+
+            # OAuth fallback when HTTP GET returns HTML instead of image bytes
+            download_calls.clear()
+            private_reply = {
+                "student_id": "20103",
+                "student_name": "Han_Minsoo",
+                "reply_data": {"memo": "OAuthFallback"},
+                "signature_drive_url": "https://drive.google.com/file/d/html_only_id_999/view",
+                "signature_file_id": "html_only_id_999",
+            }
+            oauth_out = Path(td) / "oauth_fallback.pdf"
+            with patch(
+                "services.notice_pdf_fill_service._download_drive_file_via_oauth",
+                return_value=parent_png_bytes,
+            ) as mock_oauth:
+                fill_notice_pdf_for_reply(src_pdf, generic_map, private_reply, oauth_out)
+                mock_oauth.assert_called_once_with("html_only_id_999")
+                self.assertGreaterEqual(len(PdfReader(str(oauth_out)).pages[0].images), 1)
 
 
 class TestNoticePdfMapperAndReset(unittest.TestCase):
