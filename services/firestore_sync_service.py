@@ -1522,6 +1522,245 @@ class FirestoreSyncService:
         fs.collection("가정통신문_목록").document(rid).set(payload, merge=True)
         return True, rid
 
+    @staticmethod
+    def _normalize_notice_doc(raw_doc: Dict[str, Any]) -> Dict[str, Any]:
+        doc = dict(raw_doc or {})
+        raw_schema = doc.get("reply_schema")
+        if isinstance(raw_schema, str):
+            try:
+                raw_schema = json.loads(raw_schema)
+            except Exception:
+                raw_schema = []
+        if not isinstance(raw_schema, list) or not raw_schema:
+            schema_json = str(doc.get("reply_schema_json") or "").strip()
+            if schema_json:
+                try:
+                    parsed_schema = json.loads(schema_json)
+                    if isinstance(parsed_schema, list):
+                        raw_schema = parsed_schema
+                except Exception:
+                    pass
+        if not isinstance(raw_schema, list):
+            raw_schema = []
+        doc["reply_schema"] = raw_schema
+
+        raw_pdf_map = doc.get("pdf_field_map")
+        if isinstance(raw_pdf_map, str):
+            try:
+                raw_pdf_map = json.loads(raw_pdf_map)
+            except Exception:
+                raw_pdf_map = []
+        if not isinstance(raw_pdf_map, list) or not raw_pdf_map:
+            map_json = str(doc.get("pdf_field_map_json") or "").strip()
+            if map_json:
+                try:
+                    parsed_map = json.loads(map_json)
+                    if isinstance(parsed_map, list):
+                        raw_pdf_map = parsed_map
+                except Exception:
+                    pass
+        if not isinstance(raw_pdf_map, list):
+            raw_pdf_map = []
+        doc["pdf_field_map"] = raw_pdf_map
+        return doc
+
+    def fetch_notice_detail(self, notice_id: str) -> Optional[Dict[str, Any]]:
+        """특정 가정통신문(`notice_id`)의 `가정통신문_목록` 문서를 단건 조회합니다."""
+        nid = str(notice_id or "").strip()
+        if not nid:
+            return None
+        tenant = self._get_tenant_defaults()
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "fetch_notice_detail",
+                {
+                    "notice_id": nid,
+                    "remote_id": nid,
+                    "teacher_id": tenant.get("teacher_id", ""),
+                    "school_code": tenant.get("school_code", ""),
+                },
+            )
+            doc = res.get("notice") if isinstance(res, dict) else None
+            if isinstance(doc, dict) and doc:
+                doc.setdefault("remote_id", nid)
+                if self._doc_matches_tenant("가정통신문_목록", doc, tenant):
+                    return self._normalize_notice_doc(doc)
+            return None
+        fs = self._get_client()
+        snap = fs.collection("가정통신문_목록").document(nid).get()
+        if not getattr(snap, "exists", False):
+            return None
+        d = snap.to_dict() or {}
+        d.setdefault("remote_id", getattr(snap, "id", nid) or nid)
+        if not self._doc_matches_tenant("가정통신문_목록", d, tenant):
+            return None
+        return self._normalize_notice_doc(d)
+
+    def fetch_published_notices(self, *, limit: int = 30) -> List[Dict[str, Any]]:
+        """현재 교사의 `가정통신문_목록` 게시 문서를 최신순으로 조회합니다."""
+        tenant = self._get_tenant_defaults()
+        max_items = max(1, int(limit or 30))
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api(
+                "fetch_published_notices",
+                {
+                    "teacher_id": tenant.get("teacher_id", ""),
+                    "school_code": tenant.get("school_code", ""),
+                    "grade": tenant.get("grade"),
+                    "class_no": tenant.get("class_no"),
+                    "limit": max_items,
+                },
+            )
+            rows = [
+                self._normalize_notice_doc(n)
+                for n in list(res.get("notices") or [])
+                if isinstance(n, dict) and self._doc_matches_tenant("가정통신문_목록", n, tenant)
+            ]
+            rows.sort(
+                key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""),
+                reverse=True,
+            )
+            return rows[:max_items]
+        fs = self._get_client()
+        col = fs.collection("가정통신문_목록")
+        query_ref = self._build_scoped_query(col, "가정통신문_목록", tenant)
+        rows: List[Dict[str, Any]] = []
+        for doc in query_ref.stream():
+            d = doc.to_dict() or {}
+            d.setdefault("remote_id", doc.id)
+            if not self._doc_matches_tenant("가정통신문_목록", d, tenant):
+                continue
+            rows.append(self._normalize_notice_doc(d))
+        rows.sort(
+            key=lambda x: str(x.get("updated_at") or x.get("created_at") or ""),
+            reverse=True,
+        )
+        return rows[:max_items]
+
+    def update_notice_pdf_field_map(
+        self,
+        notice_id: str,
+        pdf_field_map: List[Dict[str, Any]],
+        reply_schema: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """이미 게시된 가정통신문 문서의 `pdf_field_map`(및 선택적 `reply_schema`)을 업데이트합니다."""
+        nid = str(notice_id or "").strip()
+        if not nid:
+            return False
+        raw_map = list(pdf_field_map or [])
+        patch_data: Dict[str, Any] = {
+            "remote_id": nid,
+            "pdf_field_map": raw_map,
+            "pdf_field_map_json": json.dumps(raw_map, ensure_ascii=False),
+            "updated_at": _now_str(),
+        }
+        if reply_schema is not None:
+            raw_schema = list(reply_schema or [])
+            patch_data["reply_schema"] = raw_schema
+            patch_data["reply_schema_json"] = json.dumps(raw_schema, ensure_ascii=False)
+            patch_data["reply_fields"] = [
+                str(item.get("label") or item.get("key") or "").strip()
+                for item in raw_schema
+                if isinstance(item, dict) and str(item.get("label") or item.get("key") or "").strip()
+            ]
+            patch_data["requires_reply"] = bool(raw_schema)
+        if self.is_vercel_api_mode():
+            res = self._post_vercel_api("update_notice_pdf_field_map", patch_data)
+            return bool(res.get("ok", True)) if isinstance(res, dict) else True
+        fs = self._get_client()
+        fs.collection("가정통신문_목록").document(nid).set(patch_data, merge=True)
+        return True
+
+    def download_notice_pdf(
+        self,
+        attachment_url: str = "",
+        attachment_file_id: str = "",
+        *,
+        timeout: float = 15.0,
+    ) -> Optional[Path]:
+        """Google Drive(OAuth / 공개 URL / Vercel 프록시)에서 가정통신문 원본 PDF를 임시 파일로 내려받습니다."""
+        import base64
+        import tempfile
+        import urllib.request
+        from pathlib import Path
+        from services.notice_pdf_fill_service import _extract_google_drive_file_id
+
+        src_url = str(attachment_url or "").strip()
+        resolved_fid = str(attachment_file_id or "").strip() or _extract_google_drive_file_id(src_url)
+        if not src_url and not resolved_fid:
+            return None
+
+        def _is_pdf_bytes(data: Any) -> bool:
+            return isinstance(data, (bytes, bytearray)) and len(data) > 4 and b"%PDF" in bytes(data[:1024])
+
+        pdf_bytes: Optional[bytes] = None
+
+        # 1) 연결된 Google OAuth Drive 직접 다운로드
+        if resolved_fid:
+            try:
+                from services.google_calendar_service import GoogleCalendarService
+
+                gcal = GoogleCalendarService(db=self.db, config=self.config)
+                for acc in gcal.get_connected_accounts():
+                    try:
+                        drive_svc = gcal._build_service("drive", "v3", account=acc)
+                        raw = drive_svc.files().get_media(fileId=resolved_fid).execute()
+                        if _is_pdf_bytes(raw):
+                            pdf_bytes = bytes(raw)
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # 2) 공개 URL / Google Drive export=download URL
+        if pdf_bytes is None:
+            candidate_urls: List[str] = []
+            if resolved_fid:
+                candidate_urls.append(f"https://drive.google.com/uc?export=download&id={resolved_fid}")
+            if src_url and src_url.startswith(("http://", "https://")) and src_url not in candidate_urls:
+                candidate_urls.append(src_url)
+            for cand in candidate_urls:
+                try:
+                    req = urllib.request.Request(cand, headers={"User-Agent": "EduFlow/1.0"})
+                    with urllib.request.urlopen(req, timeout=timeout) as resp:
+                        status = getattr(resp, "status", 200)
+                        if status and int(status) >= 400:
+                            continue
+                        raw = resp.read()
+                        if _is_pdf_bytes(raw):
+                            pdf_bytes = raw
+                            break
+                except Exception:
+                    continue
+
+        # 3) Vercel API 프록시 폴백
+        if pdf_bytes is None and resolved_fid and self.get_vercel_api_url():
+            try:
+                res = self._post_vercel_api(
+                    "download_drive_file",
+                    {"file_id": resolved_fid},
+                    timeout=timeout,
+                )
+                if isinstance(res, dict):
+                    b64_val = str(res.get("file_base64") or res.get("data_url") or "").strip()
+                    if b64_val:
+                        if b64_val.startswith("data:") and "," in b64_val:
+                            b64_val = b64_val.split(",", 1)[1]
+                        decoded = base64.b64decode(b64_val)
+                        if _is_pdf_bytes(decoded):
+                            pdf_bytes = decoded
+            except Exception:
+                pass
+
+        if not pdf_bytes:
+            return None
+
+        out_dir = Path(tempfile.mkdtemp(prefix="eduflow_drive_pdf_"))
+        out_pdf = out_dir / "notice_original.pdf"
+        out_pdf.write_bytes(pdf_bytes)
+        return out_pdf
+
     def fetch_notice_replies(self, notice_id: str) -> List[Dict[str, Any]]:
         """특정 가정통신문(`notice_id`)의 회신 및 서명 내역을 조회합니다."""
         nid = str(notice_id or "").strip()

@@ -1514,10 +1514,108 @@ class TestGoogleCalendarPushAndFirebaseCleanup(unittest.TestCase):
         self.assertEqual(fake_hwp.registered, ("FilePathCheckDLL", "FilePathCheckerModule"))
         self.assertEqual(fake_hwp.saved_args[1], "PDF")
 
-        # 2) win32com 미설치/예외 시 예외 없이 None 반환 (원본 업로드 fallback 가능)
+        # 2) win32com 미설치/예외 시 예외 없이 None 반환 및 실패 사유/경고 로그 기록
         with patch("services.multi_doc_extractor_service.HAS_WIN32COM", False):
-            res_none = convert_hwp_to_pdf(hwpx_path, output_dir=out_dir)
+            with self.assertLogs("services.notice_parser_service", level="WARNING") as cm:
+                res_none = convert_hwp_to_pdf(hwpx_path, output_dir=out_dir)
         self.assertIsNone(res_none)
+        self.assertTrue(any("pywin32 미설치" in msg for msg in cm.output))
+
+    def test_convert_hwp_to_pdf_dispatchex_and_filesaveas_fallback(self) -> None:
+        from unittest.mock import patch
+        from services.notice_parser_service import convert_hwp_to_pdf_with_reason
+
+        hwpx_path = Path(self.tmp_dir.name) / "notice_fallback.hwpx"
+        hwpx_path.write_bytes(b"fake-hwpx")
+        out_dir = Path(self.tmp_dir.name) / "pdf_out_fallback"
+
+        class _FakeHSet:
+            pass
+
+        class _FakeHFileOpenSave:
+            def __init__(self):
+                self.HSet = _FakeHSet()
+                self.filename = ""
+                self.Format = ""
+
+        class _FakeHParameterSet:
+            def __init__(self):
+                self.HFileOpenSave = _FakeHFileOpenSave()
+
+        class _FakeHAction:
+            def __init__(self, pset: _FakeHParameterSet):
+                self._pset = pset
+                self.calls = []
+
+            def GetDefault(self, action_name, hset):
+                self.calls.append(("GetDefault", action_name))
+                return True
+
+            def Execute(self, action_name, hset):
+                self.calls.append(("Execute", action_name, self._pset.HFileOpenSave.Format, self._pset.HFileOpenSave.filename))
+                Path(self._pset.HFileOpenSave.filename).write_bytes(b"%PDF-1.4 filesaveas_s")
+                return True
+
+        class _FakeHwpFallback:
+            def __init__(self):
+                self.quit_called = False
+                self.HParameterSet = _FakeHParameterSet()
+                self.HAction = _FakeHAction(self.HParameterSet)
+
+            def RegisterModule(self, name, val):
+                return True
+
+            def SetMessageBoxMode(self, mode):
+                pass
+
+            def Open(self, path, fmt, arg):
+                return True
+
+            def SaveAs(self, out_path, fmt):
+                return False
+
+            def Quit(self):
+                self.quit_called = True
+
+        fake_hwp = _FakeHwpFallback()
+
+        class _FakeWin32Fallback:
+            class client:
+                @staticmethod
+                def Dispatch(prog_id):
+                    raise RuntimeError("Dispatch failed")
+
+                @staticmethod
+                def DispatchEx(prog_id):
+                    return fake_hwp
+
+        class _FakePyCom:
+            @staticmethod
+            def CoInitialize():
+                pass
+
+            @staticmethod
+            def CoUninitialize():
+                pass
+
+        with patch("services.multi_doc_extractor_service.HAS_WIN32COM", True), patch(
+            "services.multi_doc_extractor_service.win32com", _FakeWin32Fallback
+        ), patch("services.multi_doc_extractor_service.pythoncom", _FakePyCom):
+            pdf_out, reason = convert_hwp_to_pdf_with_reason(hwpx_path, output_dir=out_dir)
+
+        self.assertIsNotNone(pdf_out)
+        self.assertEqual(reason, "")
+        self.assertTrue(pdf_out.is_file())
+        self.assertEqual(pdf_out.read_bytes(), b"%PDF-1.4 filesaveas_s")
+        self.assertTrue(fake_hwp.quit_called)
+        self.assertEqual(
+            fake_hwp.HAction.calls[0],
+            ("GetDefault", "FileSaveAs_S"),
+        )
+        self.assertEqual(
+            fake_hwp.HAction.calls[1][:3],
+            ("Execute", "FileSaveAs_S", "PDF"),
+        )
 
 
 if __name__ == "__main__":

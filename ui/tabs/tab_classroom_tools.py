@@ -2282,6 +2282,21 @@ class ClassroomToolsTab(QWidget):
         self.edit_notice_fields.setVisible(False)
         c3_lay.addWidget(self.edit_notice_fields)
 
+        self._notice_picker_bar_widget = QWidget()
+        picker_bar = QHBoxLayout(self._notice_picker_bar_widget)
+        picker_bar.setContentsMargins(0, 0, 0, 0)
+        picker_bar.setSpacing(8)
+        picker_bar.addWidget(QLabel("게시한 가정통신문 선택:"))
+        self.combo_published_notices = QComboBox()
+        self.combo_published_notices.addItem("— 게시한 가정통신문 선택 —", "")
+        self.combo_published_notices.currentIndexChanged.connect(self._on_published_notice_selected)
+        self.btn_refresh_published_notices = QPushButton("목록 새로고침")
+        apply_qss_role(self.btn_refresh_published_notices, role="secondary")
+        self.btn_refresh_published_notices.clicked.connect(lambda: self._on_refresh_published_notices())
+        picker_bar.addWidget(self.combo_published_notices, stretch=1)
+        picker_bar.addWidget(self.btn_refresh_published_notices)
+        c3_lay.addWidget(self._notice_picker_bar_widget)
+
         self._notice_reply_bar_widget = QWidget()
         reply_bar = QHBoxLayout(self._notice_reply_bar_widget)
         reply_bar.setContentsMargins(0, 0, 0, 0)
@@ -3033,6 +3048,7 @@ class ClassroomToolsTab(QWidget):
             self._firebase_roster = list(res.get("roster") or [])
             self._apply_teacher_auth_state()
             self._refresh_roster_dependent_views()
+            self._on_refresh_published_notices()
             self.edit_teacher_login_pw.clear()
 
         def _on_login_error(err_msg: str) -> None:
@@ -4216,13 +4232,13 @@ class ClassroomToolsTab(QWidget):
 
         self._save_mobile_notice(is_published=True)
 
-    def _save_mobile_notice(self, *, is_published: bool) -> None:
+    def _save_mobile_notice(self, *, is_published: bool, skip_attachment: bool = False) -> None:
         title = self.edit_notice_title.text().strip()
         if not title:
             QMessageBox.warning(self, "입력 확인", "가정통신문 제목을 입력해 주세요.")
             return
         payload = self._build_notice_payload(is_published=is_published)
-        local_src_path = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
+        local_src_path = "" if skip_attachment else str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
         target_btn = (
             getattr(self, "btn_publish_mobile_notice", None)
             if is_published
@@ -4231,20 +4247,22 @@ class ClassroomToolsTab(QWidget):
 
         def _work() -> Tuple[bool, str, str, str, str]:
             import shutil
-            from services.notice_parser_service import convert_hwp_to_pdf
+            from services.notice_parser_service import convert_hwp_to_pdf_with_reason
 
             svc = FirestoreSyncService(db=self.db, config=self.config)
             uploaded_url = str(payload.get("attachment_url") or "").strip()
             uploaded_id = str(payload.get("attachment_file_id") or "").strip()
             upload_err = ""
-            if not uploaded_url and local_src_path and Path(local_src_path).is_file():
+            if not skip_attachment and not uploaded_url and local_src_path and Path(local_src_path).is_file():
                 converted_pdf: Optional[Path] = None
                 upload_target_path = local_src_path
                 try:
                     if Path(local_src_path).suffix.lower() in (".hwp", ".hwpx"):
-                        converted_pdf = convert_hwp_to_pdf(local_src_path)
-                        if converted_pdf is not None and converted_pdf.is_file():
-                            upload_target_path = str(converted_pdf)
+                        converted_pdf, conv_err = convert_hwp_to_pdf_with_reason(local_src_path)
+                        if converted_pdf is None or not converted_pdf.is_file():
+                            reason_txt = conv_err or "한컴오피스 PDF 변환에 실패했습니다."
+                            return False, "", "", "", f"PDF_CONVERT_FAILED:{reason_txt}"
+                        upload_target_path = str(converted_pdf)
 
                     up_res = svc.upload_notice_attachment(upload_target_path)
                     if up_res.get("ok") and up_res.get("attachment_url"):
@@ -4288,12 +4306,30 @@ class ClassroomToolsTab(QWidget):
             else:
                 ok, rid, uploaded_url, uploaded_id = False, "", "", ""
 
+            if str(upload_err or "").startswith("PDF_CONVERT_FAILED:"):
+                conv_reason = str(upload_err).split(":", 1)[1].strip()
+                self.lbl_notice_pdf_status.setText(f"PDF 변환 실패 — 업로드 중단 ({conv_reason})")
+                ans = QMessageBox.question(
+                    self,
+                    "PDF 변환 실패",
+                    "모바일에서 원문 PDF 보기를 위해 PDF 변환이 필요합니다. "
+                    "한컴오피스 변환에 실패했으므로 PDF로 직접 변환해 첨부하거나 다시 시도해 주세요.\n\n"
+                    f"실패 사유: {conv_reason}\n\n"
+                    "원문 PDF 첨부 없이 본문·회신 양식만 저장할까요?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Cancel,
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    self._save_mobile_notice(is_published=is_published, skip_attachment=True)
+                return
+
             if uploaded_url:
                 self.edit_notice_attachment_url.setText(uploaded_url)
                 self._selected_notice_attachment_file_id = uploaded_id
 
             if ok:
                 self.edit_active_notice_id.setText(str(rid or ""))
+                self._on_refresh_published_notices(select_notice_id=str(rid or ""))
                 warn_tail = (
                     f"\n\n※ 단, 원본 파일 Google Drive 업로드는 실패하여 본문·회신 양식만 저장되었습니다.\n(사유: {upload_err})"
                     if upload_err
@@ -4326,17 +4362,162 @@ class ClassroomToolsTab(QWidget):
             on_error=lambda err: QMessageBox.warning(self, "저장 오류", str(err or "").splitlines()[0]),
         )
 
+    def _apply_loaded_notice_doc(self, notice_doc: Dict[str, Any]) -> None:
+        """Firestore `가정통신문_목록` 문서 내용을 데스크톱 UI에 복원합니다."""
+        if not isinstance(notice_doc, dict) or not notice_doc:
+            return
+        if hasattr(self, "edit_notice_title"):
+            self.edit_notice_title.setText(str(notice_doc.get("title") or "").strip())
+        if hasattr(self, "edit_notice_due"):
+            self.edit_notice_due.setText(str(notice_doc.get("due_date") or "").strip())
+        if hasattr(self, "combo_notice_category"):
+            cat = str(notice_doc.get("category") or "가정통신문").strip() or "가정통신문"
+            idx = self.combo_notice_category.findText(cat)
+            if idx >= 0:
+                self.combo_notice_category.setCurrentIndex(idx)
+            elif self.combo_notice_category.isEditable():
+                self.combo_notice_category.setCurrentText(cat)
+        if hasattr(self, "txt_notice_content"):
+            self.txt_notice_content.setPlainText(str(notice_doc.get("content") or "").strip())
+
+        schema = notice_doc.get("reply_schema")
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except Exception:
+                schema = []
+        if not isinstance(schema, list):
+            schema = []
+        self._populate_reply_schema_table(schema)
+
+        raw_sig_mode = str(notice_doc.get("signature_mode") or "").strip().lower()
+        requires_reply = bool(notice_doc.get("requires_reply", bool(schema)))
+        if not requires_reply and not raw_sig_mode:
+            raw_sig_mode = "none"
+        target_sig_mode = raw_sig_mode or ("parent" if requires_reply else "none")
+        if hasattr(self, "combo_notice_signature_mode"):
+            self.combo_notice_signature_mode.blockSignals(True)
+            try:
+                sig_idx = self.combo_notice_signature_mode.findData(target_sig_mode)
+                if sig_idx >= 0:
+                    self.combo_notice_signature_mode.setCurrentIndex(sig_idx)
+            finally:
+                self.combo_notice_signature_mode.blockSignals(False)
+        if hasattr(self, "chk_notice_requires_reply"):
+            self.chk_notice_requires_reply.blockSignals(True)
+            try:
+                self.chk_notice_requires_reply.setChecked(requires_reply)
+            finally:
+                self.chk_notice_requires_reply.blockSignals(False)
+
+        if hasattr(self, "edit_notice_attachment_url"):
+            self.edit_notice_attachment_url.setText(str(notice_doc.get("attachment_url") or "").strip())
+        self._selected_notice_attachment_file_id = str(notice_doc.get("attachment_file_id") or "").strip()
+
+        pdf_map = notice_doc.get("pdf_field_map")
+        if isinstance(pdf_map, str):
+            try:
+                pdf_map = json.loads(pdf_map)
+            except Exception:
+                pdf_map = []
+        if not isinstance(pdf_map, list):
+            pdf_map = []
+        self._notice_pdf_field_map = list(pdf_map)
+        if hasattr(self, "lbl_notice_pdf_status"):
+            self.lbl_notice_pdf_status.setText(
+                f"게시된 통신문 불러옴 — PDF 양식 좌표 {len(self._notice_pdf_field_map)}개 · 회신 항목 {len(schema)}개 복원됨"
+            )
+
+    def _populate_published_notices_combo(
+        self,
+        notices: List[Dict[str, Any]],
+        select_notice_id: str = "",
+    ) -> None:
+        if not hasattr(self, "combo_published_notices"):
+            return
+        self.combo_published_notices.blockSignals(True)
+        try:
+            self.combo_published_notices.clear()
+            self.combo_published_notices.addItem("— 게시한 가정통신문 선택 —", "")
+            for n in list(notices or []):
+                if not isinstance(n, dict):
+                    continue
+                nid = str(n.get("remote_id") or "").strip()
+                if not nid:
+                    continue
+                title = str(n.get("title") or "(제목 없음)").strip()
+                date_part = str(
+                    n.get("due_date") or n.get("updated_at") or n.get("created_at") or ""
+                ).strip()[:10]
+                status_txt = "게시됨" if n.get("is_published", True) else "후보"
+                meta_txt = f"{date_part}/{status_txt}" if date_part else status_txt
+                self.combo_published_notices.addItem(f"[{title}] ({meta_txt})", nid)
+            if select_notice_id:
+                idx = self.combo_published_notices.findData(select_notice_id)
+                if idx >= 0:
+                    self.combo_published_notices.setCurrentIndex(idx)
+        finally:
+            self.combo_published_notices.blockSignals(False)
+
+    def _on_refresh_published_notices(self, *, select_notice_id: str = "") -> None:
+        if not hasattr(self, "combo_published_notices"):
+            return
+        target_id = str(
+            select_notice_id
+            or (self.edit_active_notice_id.text().strip() if hasattr(self, "edit_active_notice_id") else "")
+        ).strip()
+
+        def _work() -> List[Dict[str, Any]]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.fetch_published_notices(limit=30)
+
+        def _on_result(rows: Any) -> None:
+            self._populate_published_notices_combo(
+                list(rows or []),
+                select_notice_id=target_id,
+            )
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_refresh_published_notices", None),
+            loading_text="불러오는 중...",
+            task_name="게시한 가정통신문 목록 조회",
+            task_key="classroom_refresh_published_notices",
+            work_fn=_work,
+            on_result=_on_result,
+            on_error=lambda _err: None,
+        )
+
+    def _on_published_notice_selected(self, _index: int) -> None:
+        if not hasattr(self, "combo_published_notices"):
+            return
+        nid = str(self.combo_published_notices.currentData() or "").strip()
+        if not nid:
+            return
+        if hasattr(self, "edit_active_notice_id"):
+            self.edit_active_notice_id.setText(nid)
+        self._on_refresh_notice_replies()
+
     def _on_refresh_notice_replies(self) -> None:
         nid = self.edit_active_notice_id.text().strip()
         if not nid:
             QMessageBox.information(self, "조회 안내", "먼저 가정통신문 ID를 입력하거나 배포해 주세요.")
             return
 
-        def _work() -> List[Dict[str, Any]]:
+        def _work() -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
             svc = FirestoreSyncService(db=self.db, config=self.config)
-            return svc.fetch_notice_replies(nid)
+            replies = svc.fetch_notice_replies(nid)
+            notice_doc = svc.fetch_notice_detail(nid)
+            return replies, notice_doc
 
-        def _on_result(replies: Any) -> None:
+        def _on_result(res: Any) -> None:
+            if isinstance(res, tuple) and len(res) >= 2:
+                replies, notice_doc = res[0], res[1]
+            else:
+                replies, notice_doc = res, None
+
+            if isinstance(notice_doc, dict) and notice_doc:
+                self._apply_loaded_notice_doc(notice_doc)
+
             self._last_notice_replies = list(replies or [])
             rep_map = {str(r.get("student_id") or ""): r for r in self._last_notice_replies}
             roster = self._get_active_roster()
@@ -4374,15 +4555,7 @@ class ClassroomToolsTab(QWidget):
             on_error=lambda err: QMessageBox.warning(self, "회신 조회 오류", str(err or "").splitlines()[0]),
         )
 
-    def _on_open_notice_pdf_mapper(self) -> None:
-        src = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
-        if not src or not Path(src).is_file():
-            QMessageBox.information(
-                self,
-                "양식 파일 필요",
-                "먼저 PDF, HWP 또는 HWPX 가정통신문 양식 파일을 선택해 주세요.",
-            )
-            return
+    def _open_notice_pdf_mapper_with_path(self, src: str) -> None:
         from ui.dialogs.notice_pdf_mapper_dialog import NoticePdfMapperDialog
 
         schema = self._collect_reply_schema_from_table()
@@ -4407,9 +4580,45 @@ class ClassroomToolsTab(QWidget):
             self._populate_reply_schema_table(updated_schema)
             if updated_schema:
                 self.chk_notice_requires_reply.setChecked(True)
-            self.lbl_notice_pdf_status.setText(
-                f"PDF 양식 좌표 {len(self._notice_pdf_field_map)}개 · 회신 항목 {len(updated_schema)}개 동기화 완료 — 저장/게시 시 함께 반영됩니다."
+            active_nid = (
+                self.edit_active_notice_id.text().strip()
+                if hasattr(self, "edit_active_notice_id")
+                else ""
             )
+            if active_nid:
+                def _save_map_work() -> bool:
+                    svc = FirestoreSyncService(db=self.db, config=self.config)
+                    return svc.update_notice_pdf_field_map(
+                        active_nid,
+                        self._notice_pdf_field_map,
+                        reply_schema=updated_schema,
+                    )
+
+                def _save_map_done(saved: Any) -> None:
+                    if saved:
+                        self.lbl_notice_pdf_status.setText(
+                            f"PDF 양식 좌표 {len(self._notice_pdf_field_map)}개 · 회신 항목 {len(updated_schema)}개 Firestore 반영 완료 (ID: {active_nid})"
+                        )
+                    else:
+                        self.lbl_notice_pdf_status.setText(
+                            f"PDF 양식 좌표 {len(self._notice_pdf_field_map)}개 동기화됨 (Firestore 저장 실패 — 게시/저장으로 재시도 가능)"
+                        )
+
+                self._run_async_button_task(
+                    button=getattr(self, "btn_map_notice_pdf", None),
+                    loading_text="좌표 저장 중...",
+                    task_name="PDF 양식 좌표 저장",
+                    task_key="classroom_save_notice_pdf_map",
+                    work_fn=_save_map_work,
+                    on_result=_save_map_done,
+                    on_error=lambda err: QMessageBox.warning(
+                        self, "좌표 저장 오류", str(err or "").splitlines()[0]
+                    ),
+                )
+            else:
+                self.lbl_notice_pdf_status.setText(
+                    f"PDF 양식 좌표 {len(self._notice_pdf_field_map)}개 · 회신 항목 {len(updated_schema)}개 동기화 완료 — 저장/게시 시 함께 반영됩니다."
+                )
 
         dlg.accepted.connect(_on_accepted)
         dlg.setModal(False)
@@ -4418,9 +4627,52 @@ class ClassroomToolsTab(QWidget):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _on_open_notice_pdf_mapper(self) -> None:
+        src = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
+        if src and Path(src).is_file():
+            self._open_notice_pdf_mapper_with_path(src)
+            return
+
+        att_url = self.edit_notice_attachment_url.text().strip() if hasattr(self, "edit_notice_attachment_url") else ""
+        att_fid = str(getattr(self, "_selected_notice_attachment_file_id", "") or "").strip()
+        if not att_url and not att_fid:
+            QMessageBox.information(
+                self,
+                "양식 파일 필요",
+                "먼저 PDF, HWP 또는 HWPX 가정통신문 양식 파일을 선택해 주세요.",
+            )
+            return
+
+        def _dl_work() -> Optional[Path]:
+            svc = FirestoreSyncService(db=self.db, config=self.config)
+            return svc.download_notice_pdf(attachment_url=att_url, attachment_file_id=att_fid)
+
+        def _dl_done(pdf_path: Any) -> None:
+            if pdf_path is not None and Path(pdf_path).is_file():
+                self._selected_notice_pdf_path = str(pdf_path)
+                self._open_notice_pdf_mapper_with_path(str(pdf_path))
+            else:
+                QMessageBox.warning(
+                    self,
+                    "원본 PDF 다운로드 실패",
+                    "Google Drive에서 원본 PDF를 내려받지 못했습니다. 로컬 PDF/HWP 파일을 직접 선택해 주세요.",
+                )
+
+        self._run_async_button_task(
+            button=getattr(self, "btn_map_notice_pdf", None),
+            loading_text="PDF 내려받는 중...",
+            task_name="가정통신문 원본 PDF 다운로드",
+            task_key="classroom_download_notice_pdf_mapper",
+            work_fn=_dl_work,
+            on_result=_dl_done,
+            on_error=lambda err: QMessageBox.warning(self, "다운로드 오류", str(err or "").splitlines()[0]),
+        )
+
     def _on_export_filled_notice_pdfs(self) -> None:
         src = str(getattr(self, "_selected_notice_pdf_path", "") or "").strip()
-        if not src or not Path(src).is_file():
+        att_url = self.edit_notice_attachment_url.text().strip() if hasattr(self, "edit_notice_attachment_url") else ""
+        att_fid = str(getattr(self, "_selected_notice_attachment_file_id", "") or "").strip()
+        if (not src or not Path(src).is_file()) and not (att_url or att_fid):
             QMessageBox.information(
                 self,
                 "양식 파일 필요",
@@ -4481,7 +4733,7 @@ class ClassroomToolsTab(QWidget):
 
         def _work() -> Dict[str, Any]:
             import shutil
-            from services.notice_parser_service import convert_hwp_to_pdf
+            from services.notice_parser_service import convert_hwp_to_pdf_with_reason
             from services.notice_pdf_fill_service import batch_export_notice_pdfs
 
             replies = cached_replies
@@ -4492,12 +4744,23 @@ class ClassroomToolsTab(QWidget):
                 raise ValueError("출력할 제출 완료 회신 내역이 없습니다.")
 
             temp_dir: Optional[Path] = None
-            pdf_src = Path(src)
+            pdf_src = Path(src) if src else Path("")
             try:
-                if pdf_src.suffix.lower() in (".hwp", ".hwpx"):
-                    conv = convert_hwp_to_pdf(pdf_src)
+                if not src or not pdf_src.is_file():
+                    svc_dl = FirestoreSyncService(db=self.db, config=self.config)
+                    downloaded = svc_dl.download_notice_pdf(
+                        attachment_url=att_url,
+                        attachment_file_id=att_fid,
+                    )
+                    if downloaded is None or not downloaded.is_file():
+                        raise RuntimeError("Google Drive에서 원본 PDF를 내려받지 못했습니다.")
+                    temp_dir = downloaded.parent
+                    pdf_src = downloaded
+                elif pdf_src.suffix.lower() in (".hwp", ".hwpx"):
+                    conv, conv_err = convert_hwp_to_pdf_with_reason(pdf_src)
                     if conv is None or not conv.is_file():
-                        raise RuntimeError("HWP/HWPX 파일을 PDF로 변환하지 못했습니다.")
+                        detail = f" ({conv_err})" if conv_err else ""
+                        raise RuntimeError(f"HWP/HWPX 파일을 PDF로 변환하지 못했습니다.{detail}")
                     temp_dir = conv.parent
                     pdf_src = conv
 

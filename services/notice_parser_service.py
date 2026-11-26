@@ -6,11 +6,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from services.llm_client import MultiLlmClient, extract_json_from_llm_response
 from services.multi_doc_extractor_service import (
@@ -18,6 +19,8 @@ from services.multi_doc_extractor_service import (
     _extract_pdf_text_layers,
     extract_raw_text_preview,
 )
+
+logger = logging.getLogger(__name__)
 
 IMAGE_NOTICE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
@@ -510,13 +513,13 @@ def extract_notice_from_pdf(
     return parsed
 
 
-def convert_hwp_to_pdf(
+def convert_hwp_to_pdf_with_reason(
     hwp_path: str | Path,
     output_dir: Optional[str | Path] = None,
-) -> Optional[Path]:
+) -> Tuple[Optional[Path], str]:
     """
     Windows 한컴오피스 COM(HWPFrame.HwpObject)을 이용해 .hwp / .hwpx 파일을 임시 .pdf 파일로 변환합니다.
-    한글 미설치 또는 COM 오류 시 예외를 발생시키지 않고 None을 반환합니다.
+    반환값: (변환된 PDF Path 또는 None, 실패 사유 문자열 — 성공 시 빈 문자열)
     """
     import tempfile
 
@@ -529,9 +532,13 @@ def convert_hwp_to_pdf(
 
     p = Path(str(hwp_path or "").strip())
     if not p.is_file() or p.suffix.lower() not in (".hwp", ".hwpx"):
-        return None
+        reason = f"유효하지 않은 HWP/HWPX 파일입니다: {p}"
+        logger.warning("HWP→PDF 변환 건너뜀: %s", reason)
+        return None, reason
     if not HAS_WIN32COM or win32com is None or pythoncom is None:
-        return None
+        reason = "pywin32 미설치(win32com/pythoncom 모듈을 불러올 수 없음)"
+        logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+        return None, reason
 
     out_dir = (
         Path(output_dir)
@@ -544,9 +551,36 @@ def convert_hwp_to_pdf(
     hwp = None
     com_initialized = False
     try:
-        pythoncom.CoInitialize()
-        com_initialized = True
-        hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except Exception as exc:
+            reason = f"COM 초기화 실패: {exc}"
+            logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+            return None, reason
+
+        try:
+            hwp = win32com.client.Dispatch("HWPFrame.HwpObject")
+        except Exception as dispatch_exc:
+            logger.warning(
+                "HWP Dispatch('HWPFrame.HwpObject') 실패(%s) — DispatchEx 폴백 시도",
+                dispatch_exc,
+            )
+            try:
+                dispatch_ex = getattr(win32com.client, "DispatchEx", None)
+                if dispatch_ex is None:
+                    raise AttributeError("DispatchEx 미지원")
+                hwp = dispatch_ex("HWPFrame.HwpObject")
+            except Exception as dispatchex_exc:
+                reason = f"COM 객체 생성 실패(Dispatch/DispatchEx 모두 실패): {dispatchex_exc}"
+                logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+                return None, reason
+
+        if hwp is None:
+            reason = "COM 객체 생성 실패(HWPFrame.HwpObject가 None 반환)"
+            logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+            return None, reason
+
         try:
             hwp.RegisterModule("FilePathCheckDLL", "FilePathCheckerModule")
         except Exception:
@@ -557,18 +591,56 @@ def convert_hwp_to_pdf(
             pass
 
         fmt = "HWPX" if p.suffix.lower() == ".hwpx" else "HWP"
+        opened = False
+        open_exc: Optional[Exception] = None
         with _hwp_security_popup_watcher():
-            opened = hwp.Open(str(p.resolve()), fmt, "forceopen:true")
+            try:
+                opened = bool(hwp.Open(str(p.resolve()), fmt, "forceopen:true"))
+            except Exception as exc:
+                open_exc = exc
             if not opened:
-                opened = hwp.Open(str(p.resolve()), "", "forceopen:true")
+                try:
+                    opened = bool(hwp.Open(str(p.resolve()), "", "forceopen:true"))
+                except Exception as exc2:
+                    open_exc = exc2
         if not opened:
-            return None
+            detail = f": {open_exc}" if open_exc else " (Open()이 False 반환)"
+            reason = f"파일 열기 실패{detail}"
+            logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+            return None, reason
 
-        if hwp.SaveAs(str(out_pdf.resolve()), "PDF") and out_pdf.is_file() and out_pdf.stat().st_size > 0:
-            return out_pdf
-        return None
-    except Exception:
-        return None
+        out_pdf_str = str(out_pdf.resolve())
+        save_ok = False
+        save_exc: Optional[Exception] = None
+        try:
+            save_ok = bool(hwp.SaveAs(out_pdf_str, "PDF"))
+        except Exception as exc:
+            save_exc = exc
+
+        if save_ok and out_pdf.is_file() and out_pdf.stat().st_size > 0:
+            return out_pdf, ""
+
+        logger.warning(
+            "HWP SaveAs('PDF') 실패(%s) — HAction FileSaveAs_S 폴백 시도",
+            save_exc if save_exc else "False 반환 또는 출력 파일 없음",
+        )
+        try:
+            pset = hwp.HParameterSet.HFileOpenSave
+            hwp.HAction.GetDefault("FileSaveAs_S", pset.HSet)
+            pset.filename = out_pdf_str
+            pset.Format = "PDF"
+            exec_ok = bool(hwp.HAction.Execute("FileSaveAs_S", pset.HSet))
+            if exec_ok and out_pdf.is_file() and out_pdf.stat().st_size > 0:
+                return out_pdf, ""
+            reason = "PDF 저장 실패(SaveAs 및 FileSaveAs_S 모두 실패 또는 출력 파일 없음)"
+        except Exception as action_exc:
+            reason = f"PDF 저장 실패(SaveAs 실패 후 FileSaveAs_S 오류: {action_exc})"
+        logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+        return None, reason
+    except Exception as exc:
+        reason = f"HWP→PDF 변환 중 예외 발생: {exc}"
+        logger.warning("HWP→PDF 변환 실패 (%s): %s", p.name, reason)
+        return None, reason
     finally:
         if hwp is not None:
             try:
@@ -580,3 +652,15 @@ def convert_hwp_to_pdf(
                 pythoncom.CoUninitialize()
             except Exception:
                 pass
+
+
+def convert_hwp_to_pdf(
+    hwp_path: str | Path,
+    output_dir: Optional[str | Path] = None,
+) -> Optional[Path]:
+    """
+    Windows 한컴오피스 COM(HWPFrame.HwpObject)을 이용해 .hwp / .hwpx 파일을 임시 .pdf 파일로 변환합니다.
+    한글 미설치 또는 COM 오류 시 예외를 발생시키지 않고 None을 반환하며, 상세 사유는 logger.warning으로 기록합니다.
+    """
+    pdf_path, _ = convert_hwp_to_pdf_with_reason(hwp_path, output_dir=output_dir)
+    return pdf_path

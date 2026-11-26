@@ -61,7 +61,7 @@ from PyQt6.QtWidgets import (
 
 from core.base_worker import FunctionWorker
 from services.llm_client import MultiLlmClient
-from services.notice_parser_service import convert_hwp_to_pdf
+from services.notice_parser_service import convert_hwp_to_pdf_with_reason
 from services.notice_pdf_fill_service import (
     build_pdf_vision_mapping_prompt,
     parse_pdf_vision_mapping_response,
@@ -422,10 +422,12 @@ class NoticePdfMapperDialog(QDialog):
         if not p.is_file():
             raise FileNotFoundError(f"양식 파일을 찾을 수 없습니다: {p}")
         if p.suffix.lower() in (".hwp", ".hwpx"):
-            converted = convert_hwp_to_pdf(p)
+            converted, reason = convert_hwp_to_pdf_with_reason(p)
             if converted is None or not converted.is_file():
+                detail = f"\n\n(실패 사유: {reason})" if reason else ""
                 raise RuntimeError(
                     "HWP/HWPX 파일을 PDF로 변환하지 못했습니다. 한컴오피스(한글) 설치 상태를 확인하거나 PDF 파일로 변환 후 선택해 주세요."
+                    + detail
                 )
             self._temp_conv_dir = converted.parent
             return converted
