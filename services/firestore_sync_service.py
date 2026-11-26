@@ -29,6 +29,7 @@ _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_VERCEL_API_URL = "https://m.eduflow.kro.kr/api/firestore"
 DEFAULT_VERCEL_TIMEOUT = (5, 45)
+DEFAULT_VERCEL_UPLOAD_TIMEOUT = (10, 90)
 DEFAULT_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -218,7 +219,13 @@ class FirestoreSyncService:
         ).strip()
         return url or DEFAULT_VERCEL_API_URL
 
-    def _post_vercel_api(self, action: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _post_vercel_api(
+        self,
+        action: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        timeout: Any = None,
+    ) -> Dict[str, Any]:
         import requests
 
         url = self.get_vercel_api_url()
@@ -236,25 +243,18 @@ class FirestoreSyncService:
             "Accept": "application/json",
             "Content-Type": "application/json",
         }
-        is_mocked_post = getattr(requests.post, "__module__", "") != "requests.api"
-        if is_mocked_post:
-            try:
-                resp = requests.post(
-                    url,
-                    json=body,
-                    headers=headers,
-                    timeout=DEFAULT_VERCEL_TIMEOUT,
-                )
-            except TypeError:
-                resp = requests.post(url, json=body, timeout=DEFAULT_VERCEL_TIMEOUT)
-        else:
-            session = self._get_http_session()
-            resp = session.post(
-                url,
-                json=body,
-                headers=headers,
-                timeout=DEFAULT_VERCEL_TIMEOUT,
-            )
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else (DEFAULT_VERCEL_UPLOAD_TIMEOUT if action == "upload_file" else DEFAULT_VERCEL_TIMEOUT)
+        )
+        session = self._get_http_session()
+        resp = session.post(
+            url,
+            json=body,
+            headers=headers,
+            timeout=effective_timeout,
+        )
         try:
             data = resp.json()
         except ValueError as exc:
@@ -707,12 +707,10 @@ class FirestoreSyncService:
         }
 
     def is_super_admin(self, requester_id: str) -> bool:
-        """최고 관리자(유우석 또는 is_admin == True) 여부를 검증합니다."""
+        """최고 관리자(is_admin == True) 여부를 검증합니다."""
         rid = str(requester_id or "").strip()
         if not rid:
             return False
-        if rid == "유우석":
-            return True
         try:
             fs = self._get_client()
             snap = fs.collection("계정_교사").document(rid).get()
@@ -732,7 +730,7 @@ class FirestoreSyncService:
     ) -> List[Dict[str, Any]]:
         """
         담임 학급의 가입 승인 대기(status == 'pending') 학생·학부모 목록을 조회합니다.
-        최고 관리자(dntjr0919)인 경우 계정_교사의 승인 대기 신청도 함께 반환합니다.
+        최고 관리자(is_admin == True)인 경우 계정_교사의 승인 대기 신청도 함께 반환합니다.
         """
         if self.is_vercel_api_mode():
             res = self._post_vercel_api(
@@ -785,7 +783,7 @@ class FirestoreSyncService:
         role_key = str(role or "student").strip().lower()
         if role_key == "teacher":
             if not self.is_super_admin(requester_id):
-                raise PermissionError("신규 교사 가입 승인·반려는 최고 관리자(유우석)만 처리할 수 있습니다.")
+                raise PermissionError("신규 교사 가입 승인·반려는 최고 관리자(is_admin)만 처리할 수 있습니다.")
             col_name = "계정_교사"
         elif role_key == "parent":
             col_name = "계정_학부모"
@@ -987,7 +985,7 @@ class FirestoreSyncService:
         last_err = ""
         # 1) Vercel /api/firestore `upload_file` 액션 우선 호출 (Direct Admin 및 Vercel API 모드 모두 지원)
         try:
-            res = self._post_vercel_api("upload_file", req_payload)
+            res = self._post_vercel_api("upload_file", req_payload, timeout=DEFAULT_VERCEL_UPLOAD_TIMEOUT)
             file_id = str(
                 res.get("file_id")
                 or res.get("photo_file_id")
@@ -1022,7 +1020,7 @@ class FirestoreSyncService:
             try:
                 sess = self._get_http_session()
                 gas_payload = dict(req_payload, action="upload_notice_file")
-                resp = sess.post(gas_url, json=gas_payload, timeout=DEFAULT_VERCEL_TIMEOUT)
+                resp = sess.post(gas_url, json=gas_payload, timeout=DEFAULT_VERCEL_UPLOAD_TIMEOUT)
                 if resp.ok:
                     data = resp.json()
                     if isinstance(data, dict) and data.get("ok"):
@@ -1288,7 +1286,7 @@ class FirestoreSyncService:
         if gas_url:
             try:
                 sess = self._get_http_session()
-                resp = sess.post(gas_url, json=req_payload, timeout=DEFAULT_VERCEL_TIMEOUT)
+                resp = sess.post(gas_url, json=req_payload, timeout=DEFAULT_VERCEL_UPLOAD_TIMEOUT)
                 try:
                     data = resp.json()
                 except ValueError:
@@ -1321,7 +1319,7 @@ class FirestoreSyncService:
             try:
                 vercel_payload = dict(req_payload)
                 vercel_payload["action"] = "upload_file"
-                res = self._post_vercel_api("upload_file", vercel_payload)
+                res = self._post_vercel_api("upload_file", vercel_payload, timeout=DEFAULT_VERCEL_UPLOAD_TIMEOUT)
                 att_url = str(
                     res.get("attachment_url")
                     or res.get("downloadUrl")
@@ -1398,8 +1396,15 @@ class FirestoreSyncService:
             else bool(raw_schema or reply_fields)
         )
 
-        raw_sig_mode = str(notice_data.get("signature_mode") or "single").strip().lower()
-        signature_mode = "both" if raw_sig_mode == "both" else "single"
+        raw_sig_mode = str(notice_data.get("signature_mode") or "").strip().lower()
+        if raw_sig_mode in ("none", "student", "parent", "both"):
+            signature_mode = raw_sig_mode
+        elif raw_sig_mode == "single":
+            signature_mode = "parent"
+        else:
+            signature_mode = "parent" if requires_reply else "none"
+        if not requires_reply and "signature_mode" not in notice_data:
+            signature_mode = "none"
 
         raw_pdf_map = notice_data.get("pdf_field_map")
         if isinstance(raw_pdf_map, str):
@@ -1413,6 +1418,9 @@ class FirestoreSyncService:
         if not pdf_field_map_json:
             pdf_field_map_json = json.dumps(raw_pdf_map, ensure_ascii=False)
 
+        tenant = self._get_tenant_defaults()
+        resolved_grade = target_grade if target_grade is not None else tenant["grade"]
+        resolved_class = target_class if target_class is not None else tenant["class_no"]
         now_ts = _now_str()
         payload = {
             "remote_id": rid,
@@ -1429,13 +1437,14 @@ class FirestoreSyncService:
             "pdf_field_map_json": pdf_field_map_json,
             "attachment_url": str(notice_data.get("attachment_url") or "").strip(),
             "attachment_file_id": str(notice_data.get("attachment_file_id") or "").strip(),
-            "target_grade": target_grade,
-            "target_class": target_class,
-            "grade": target_grade,
-            "class_no": target_class,
-            "school_code": str(notice_data.get("school_code") or "").strip(),
-            "school_name": str(notice_data.get("school_name") or "").strip(),
-            "author_name": str(notice_data.get("author_name") or "담임교사").strip(),
+            "target_grade": resolved_grade,
+            "target_class": resolved_class,
+            "grade": resolved_grade,
+            "class_no": resolved_class,
+            "school_code": str(notice_data.get("school_code") or tenant["school_code"] or "").strip(),
+            "school_name": str(notice_data.get("school_name") or tenant["school_name"] or "").strip(),
+            "teacher_id": str(notice_data.get("teacher_id") or tenant["teacher_id"] or "").strip(),
+            "author_name": str(notice_data.get("author_name") or tenant["teacher_name"] or "담임교사").strip(),
             "is_published": is_published,
             "created_at": str(notice_data.get("created_at") or now_ts).strip(),
             "updated_at": now_ts,
@@ -1476,25 +1485,29 @@ class FirestoreSyncService:
         student_id: str = "",
         channel: str = "desktop_broadcast",
         notice_id: str = "",
+        teacher_id: str = "",
     ) -> Tuple[bool, str]:
         """Firestore `Notifications`에 학급 공지/긴급 알림을 등록합니다."""
         rid = f"noti_{int(datetime.now().timestamp() * 1000)}"
-        int_grade = _to_int_or_none(grade)
-        int_class = _to_int_or_none(class_no)
+        tenant = self._get_tenant_defaults()
+        int_grade = _to_int_or_none(grade) if grade is not None else tenant["grade"]
+        int_class = _to_int_or_none(class_no) if class_no is not None else tenant["class_no"]
         payload = {
             "remote_id": rid,
             "title": str(title or "").strip(),
             "message": str(message or "").strip(),
             "channel": str(channel or "desktop_broadcast").strip(),
-            "target_role": str(target_role or "all").strip().lower(),
-            "sender": str(sender or "담임교사").strip(),
+            "target_role": str(target_role or "all").strip().lower() or "all",
+            "sender": str(sender or tenant["teacher_name"] or "담임교사").strip(),
             "grade": int_grade,
             "class_no": int_class,
             "target_grade": int_grade,
             "target_class": int_class,
-            "school_code": str(school_code or "").strip(),
-            "school_name": str(school_name or "").strip(),
+            "school_code": str(school_code or tenant["school_code"] or "").strip(),
+            "school_name": str(school_name or tenant["school_name"] or "").strip(),
+            "teacher_id": str(teacher_id or tenant["teacher_id"] or "").strip(),
             "student_id": str(student_id or "").strip(),
+            "read_by": [],
             "is_read": False,
             "created_at": _now_str(),
             "updated_at": _now_str(),
@@ -1520,6 +1533,13 @@ class FirestoreSyncService:
         title = str(row.get("title") or "").strip()
         content = str(row.get("content") or "").strip()
         summary = str(row.get("summary") or "").strip() or content[:180].replace("\n", " ").strip()
+        tenant = self._get_tenant_defaults()
+        target_grade = _to_int_or_none(row.get("target_grade") if "target_grade" in row else row.get("grade"))
+        if target_grade is None:
+            target_grade = tenant["grade"]
+        target_class = _to_int_or_none(row.get("target_class") if "target_class" in row else row.get("class_no"))
+        if target_class is None:
+            target_class = tenant["class_no"]
         payload: Dict[str, Any] = {
             "remote_id": rid,
             "title": title,
@@ -1528,11 +1548,14 @@ class FirestoreSyncService:
             "source_type": src_type,
             "source_label": str(row.get("source_label") or "").strip(),
             "source_url": str(row.get("source_url") or "").strip(),
-            "target_grade": _to_int_or_none(row.get("target_grade") if "target_grade" in row else row.get("grade")),
-            "target_class": _to_int_or_none(row.get("target_class") if "target_class" in row else row.get("class_no")),
-            "school_code": str(row.get("school_code") or "").strip(),
-            "school_name": str(row.get("school_name") or "").strip(),
-            "author_name": str(row.get("author_name") or "담임교사").strip(),
+            "grade": target_grade,
+            "class_no": target_class,
+            "target_grade": target_grade,
+            "target_class": target_class,
+            "school_code": str(row.get("school_code") or tenant["school_code"] or "").strip(),
+            "school_name": str(row.get("school_name") or tenant["school_name"] or "").strip(),
+            "teacher_id": str(row.get("teacher_id") or tenant["teacher_id"] or "").strip(),
+            "author_name": str(row.get("author_name") or tenant["teacher_name"] or "담임교사").strip(),
             "is_pinned": _is_truthy(row.get("is_pinned")),
             "published_at": str(row.get("published_at") or "").strip() or now_str,
             "updated_at": str(row.get("updated_at") or "").strip() or now_str,
@@ -2083,6 +2106,58 @@ class FirestoreSyncService:
             is_done=is_done,
         )
 
+    def _get_tenant_defaults(self) -> Dict[str, Any]:
+        tp = self.config.get_section("teacher_profile") or {}
+        return {
+            "school_code": str(tp.get("school_code") or tp.get("neis_school_code") or "").strip(),
+            "school_name": str(tp.get("school_name") or "").strip(),
+            "teacher_id": str(tp.get("teacher_id") or tp.get("login_id") or "").strip(),
+            "teacher_name": str(tp.get("name") or tp.get("teacher_id") or "").strip(),
+            "grade": _to_int_or_none(tp.get("grade")),
+            "class_no": _to_int_or_none(tp.get("class_no")),
+        }
+
+    def _enrich_tenant_doc(self, collection_name: str, doc_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Direct Admin 쓰기 시 테넌트 격리 필수 필드 및 Notifications 필드를 보완합니다."""
+        tenant = self._get_tenant_defaults()
+        if tenant["school_code"] and not str(doc_data.get("school_code") or "").strip():
+            doc_data["school_code"] = tenant["school_code"]
+        if tenant["school_name"] and not str(doc_data.get("school_name") or "").strip():
+            doc_data["school_name"] = tenant["school_name"]
+        if tenant["teacher_id"] and not str(doc_data.get("teacher_id") or "").strip():
+            doc_data["teacher_id"] = tenant["teacher_id"]
+
+        homeroom_scoped = collection_name in (
+            "Schedules",
+            "Tasks",
+            "Notifications",
+            "일일_출결",
+            "서류_추적",
+            "학급회비",
+            "수업_진도",
+            "교과_출결",
+            "가정통신문_목록",
+            "학급_공지게시판",
+        )
+        if homeroom_scoped:
+            if doc_data.get("grade") is None and tenant["grade"] is not None:
+                doc_data["grade"] = tenant["grade"]
+            if doc_data.get("class_no") is None and tenant["class_no"] is not None:
+                doc_data["class_no"] = tenant["class_no"]
+
+        if collection_name == "Notifications":
+            if not str(doc_data.get("target_role") or "").strip():
+                doc_data["target_role"] = "all"
+            if not isinstance(doc_data.get("read_by"), list):
+                doc_data["read_by"] = []
+            if "student_id" not in doc_data or doc_data.get("student_id") is None:
+                doc_data["student_id"] = ""
+            if doc_data.get("target_grade") is None and doc_data.get("grade") is not None:
+                doc_data["target_grade"] = doc_data["grade"]
+            if doc_data.get("target_class") is None and doc_data.get("class_no") is not None:
+                doc_data["target_class"] = doc_data["class_no"]
+        return doc_data
+
     def _batch_upsert(
         self,
         collection_name: str,
@@ -2115,6 +2190,7 @@ class FirestoreSyncService:
                     doc_data["remote_id"] = doc_id
                     if not doc_data.get("updated_at"):
                         doc_data["updated_at"] = _now_str()
+                    self._enrich_tenant_doc(collection_name, doc_data)
                     batch.set(col_ref.document(doc_id), doc_data, merge=True)
                 batch.commit()
 
@@ -2908,6 +2984,7 @@ class FirestoreSyncService:
             doc_data["remote_id"] = doc_id
             if not doc_data.get("updated_at"):
                 doc_data["updated_at"] = _now_str()
+            self._enrich_tenant_doc(col_name, doc_data)
             fs.collection(col_name).document(doc_id).set(doc_data, merge=True)
             return True
         except Exception as exc:
@@ -3219,6 +3296,7 @@ class FirestoreSyncService:
                     doc_data["updated_at"] = now_ts
                     if not str(doc_data.get("created_at") or "").strip():
                         doc_data["created_at"] = now_ts
+                    self._enrich_tenant_doc(col_name, doc_data)
                     batch.set(col_ref.document(doc_id), doc_data, merge=True)
                     saved_rows.append(doc_data)
                 batch.commit()

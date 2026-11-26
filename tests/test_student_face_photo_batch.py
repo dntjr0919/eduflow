@@ -217,7 +217,7 @@ class TestStudentFacePhotoBatch(unittest.TestCase):
             return resp
 
         sample_data_url = "data:image/jpeg;base64," + base64.b64encode(b"fake_jpeg").decode("ascii")
-        with patch("requests.post", side_effect=_fake_post):
+        with patch("requests.Session.post", side_effect=_fake_post):
             ok = svc.upsert_student_face_photos_batch(
                 [
                     {

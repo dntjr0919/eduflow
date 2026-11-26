@@ -9,10 +9,13 @@
 
 import abc
 import json
+import logging
 import urllib.request
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 from core.config_manager import ConfigManager
 from core.database import DatabaseManager
+
+logger = logging.getLogger(__name__)
 
 
 class BaseNotificationChannel(abc.ABC):
@@ -47,7 +50,7 @@ class DesktopToastChannel(BaseNotificationChannel):
                 self._tray_callback(title, message)
                 return True
             except Exception as e:
-                print(f"[DesktopToastChannel] 트레이 알림 오류: {e}")
+                logger.warning("[DesktopToastChannel] 트레이 알림 오류: %s", e)
                 return False
         return False
 
@@ -65,22 +68,10 @@ class KakaoPcMacroChannel(BaseNotificationChannel):
         return "PC 카카오톡 매크로"
 
     def send(self, title: str, message: str) -> bool:
-        room = self.target_room_name.strip()
-        if not room:
-            raise ValueError("PC 카카오톡 대상 채팅방 이름이 설정되지 않았습니다.")
-
-        try:
-            import ctypes
-            user32 = ctypes.windll.user32
-            hwnd = user32.FindWindowW(None, room)
-            if not hwnd:
-                raise RuntimeError(
-                    f"열려 있는 카카오톡 채팅방('{room}') 창을 찾을 수 없습니다. "
-                    "채팅방을 독립 창으로 열어두세요."
-                )
-            return True
-        except ImportError:
-            return False
+        raise NotImplementedError(
+            "PC 카카오톡 자동 전송 매크로 기능은 현재 지원되지 않습니다. "
+            "웹훅(Webhook) 또는 데스크톱 토스트 알림을 이용해 주세요."
+        )
 
 
 class KakaoWebhookChannel(BaseNotificationChannel):
@@ -138,31 +129,77 @@ class NotificationService:
     def register_tray_notifier(self, callback: Callable[[str, str], None]) -> None:
         self.toast_channel.set_tray_callback(callback)
 
-    def notify(self, title: str, message: str, force_external: bool = False) -> List[str]:
+    @staticmethod
+    def _normalize_channels(channels: Sequence[str]) -> List[str]:
+        alias_map = {
+            "toast": "toast",
+            "desktop_toast": "toast",
+            "kakao": "pc_macro",
+            "kakaotalk": "pc_macro",
+            "pc_macro": "pc_macro",
+            "webhook": "webhook",
+        }
+        normalized: List[str] = []
+        for ch in channels:
+            key = alias_map.get(str(ch or "").strip().lower())
+            if key and key not in normalized:
+                normalized.append(key)
+        return normalized
+
+    def _send_external_channel(self, mode: str, title: str, message: str) -> str:
+        if mode == "pc_macro":
+            room = self.config.get("api_and_integrations", "kakao_target_room_name", "")
+            macro_ch = KakaoPcMacroChannel(target_room_name=room)
+            macro_ch.send(title, message)
+            return f"PC 카카오톡('{room}') 전송 완료"
+        if mode == "webhook":
+            url = self.config.get("api_and_integrations", "kakao_webhook_url", "")
+            webhook_ch = KakaoWebhookChannel(webhook_url=url)
+            ok = webhook_ch.send(title, message)
+            if not ok:
+                raise RuntimeError("웹훅 응답 상태 코드가 성공 범위(2xx)가 아닙니다.")
+            return "웹훅(Webhook) 알림 전송 완료"
+        raise ValueError(f"지원하지 않는 외부 알림 채널입니다: {mode}")
+
+    def notify(
+        self,
+        title: str,
+        message: str,
+        force_external: bool = False,
+        channels: Optional[Sequence[str]] = None,
+    ) -> List[str]:
         results: List[str] = []
 
-        if self.config.get("system", "show_tray_notifications", True):
-            ok = self.toast_channel.send(title, message)
-            if ok:
-                results.append("데스크톱 토스트 발송 완료")
+        if channels is not None:
+            selected = self._normalize_channels(channels)
+            if "toast" in selected:
+                ok = self.toast_channel.send(title, message)
+                results.append(
+                    "데스크톱 토스트 발송 완료" if ok else "데스크톱 토스트 발송 실패 (트레이 미등록)"
+                )
+            for ext_mode in ("pc_macro", "webhook"):
+                if ext_mode in selected:
+                    try:
+                        results.append(self._send_external_channel(ext_mode, title, message))
+                    except Exception as exc:
+                        err_msg = f"외부 알림({ext_mode}) 전송 실패: {exc}"
+                        results.append(err_msg)
+                        self.db.add_log("WARN", "NotificationService", err_msg)
+        else:
+            if self.config.get("system", "show_tray_notifications", True):
+                ok = self.toast_channel.send(title, message)
+                if ok:
+                    results.append("데스크톱 토스트 발송 완료")
 
-        mode = self.config.get("api_and_integrations", "kakao_notify_mode", "toast_only")
-        if force_external or mode in ("pc_macro", "webhook"):
-            try:
-                if mode == "pc_macro":
-                    room = self.config.get("api_and_integrations", "kakao_target_room_name", "")
-                    macro_ch = KakaoPcMacroChannel(target_room_name=room)
-                    macro_ch.send(title, message)
-                    results.append(f"PC 카카오톡('{room}') 전송 완료")
-                elif mode == "webhook":
-                    url = self.config.get("api_and_integrations", "kakao_webhook_url", "")
-                    webhook_ch = KakaoWebhookChannel(webhook_url=url)
-                    webhook_ch.send(title, message)
-                    results.append("웹훅(Webhook) 알림 전송 완료")
-            except Exception as exc:
-                err_msg = f"외부 알림({mode}) 전송 실패: {exc}"
-                results.append(err_msg)
-                self.db.add_log("WARN", "NotificationService", err_msg)
+            mode = self.config.get("api_and_integrations", "kakao_notify_mode", "toast_only")
+            if force_external or mode in ("pc_macro", "webhook"):
+                if mode in ("pc_macro", "webhook"):
+                    try:
+                        results.append(self._send_external_channel(mode, title, message))
+                    except Exception as exc:
+                        err_msg = f"외부 알림({mode}) 전송 실패: {exc}"
+                        results.append(err_msg)
+                        self.db.add_log("WARN", "NotificationService", err_msg)
 
         self.db.add_log("INFO", "NotificationService", f"[{title}] {message} -> {', '.join(results) or '로그 기록됨'}")
         return results

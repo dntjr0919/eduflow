@@ -23,7 +23,7 @@ IMAGE_NOTICE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
 VALID_REPLY_FIELD_TYPES = ("radio", "checkbox", "text", "textarea")
 
-VALID_SIGNATURE_MODES = ("single", "both")
+VALID_SIGNATURE_MODES = ("none", "student", "parent", "both")
 
 NOTICE_CATEGORIES = ("가정통신문", "수요조사", "체험학습", "동의서", "기타")
 
@@ -37,7 +37,7 @@ NOTICE_OCR_JSON_PROMPT = (
     '  "content": "corrected_text와 동일한 전체 정리 본문",\n'
     '  "due_date": "YYYY-MM-DD (회신 마감일이 없으면 빈 문자열 \\"\\")",\n'
     '  "requires_reply": true,\n'
-    '  "signature_mode": "single | both (기본 single)",\n'
+    '  "signature_mode": "none | student | parent | both (기본 parent)",\n'
     '  "reply_schema": [\n'
     "    {\n"
     '      "key": "consent",\n'
@@ -56,8 +56,9 @@ NOTICE_OCR_JSON_PROMPT = (
     "3. 선택지(type/options) 생성 규칙: type은 radio, checkbox, text, textarea 중 하나만 사용하세요. "
     "예/아니오, 동의/비동의, 동의/미동의, 찬성/반대, 복수 선택 체크박스 등 선택지가 있는 문항은 "
     "반드시 type을 \"radio\" 또는 \"checkbox\"로 지정하고, 선택지 목록을 \"options\" 배열(예: [\"예\", \"아니오\"], [\"동의\", \"비동의\"])로 정확히 생성하세요.\n"
-    "4. signature_mode: 원문에 '학생 성명 (서명/인)'과 '학부모(보호자) 성명 (서명/인)'처럼 학생과 학부모 서명이 각각 별도로 요구되는 경우 \"both\", 일반 단일 서명만 있으면 \"single\"로 응답하세요.\n"
-    "5. 회신/서명이 전혀 필요 없는 단순 안내문이면 requires_reply는 false, reply_schema는 []로 응답하세요."
+    "4. signature_mode: 회신·서명이 필요 없으면 \"none\", 학생 서명만 필요하면 \"student\", 학부모(보호자) 서명만 필요하면 \"parent\", "
+    "원문에 '학생 성명 (서명/인)'과 '학부모(보호자) 성명 (서명/인)'처럼 학생과 학부모 서명이 각각 별도로 요구되는 경우 \"both\"로 응답하세요.\n"
+    "5. 회신/서명이 전혀 필요 없는 단순 안내문이면 requires_reply는 false, signature_mode는 \"none\", reply_schema는 []로 응답하세요."
 )
 
 
@@ -244,11 +245,16 @@ def parse_notice_ai_json(raw_or_dict: Any) -> Dict[str, Any]:
         requires_reply = bool(reply_schema)
 
     raw_sig_mode = str(data.get("signature_mode") or "").strip().lower()
-    signature_mode = (
-        "both"
-        if raw_sig_mode in ("both", "dual", "double", "2", "학생·학부모", "학생학부모")
-        else "single"
-    )
+    if raw_sig_mode in ("none", "열람용", "없음", "서명없음", "서명 없음"):
+        signature_mode = "none"
+    elif raw_sig_mode in ("both", "dual", "double", "2", "학생·학부모", "학생학부모"):
+        signature_mode = "both"
+    elif raw_sig_mode in ("student", "학생", "학생만"):
+        signature_mode = "student"
+    elif raw_sig_mode in ("parent", "single", "학부모", "학부모만", "보호자"):
+        signature_mode = "parent"
+    else:
+        signature_mode = "parent" if requires_reply else "none"
 
     return {
         "title": str(data.get("title") or "").strip(),

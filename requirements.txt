@@ -8,11 +8,12 @@ pandas>=2.0.0
 python-docx>=1.1.0
 pyinstaller>=6.3.0
 
-# 2. Firebase Cloud Firestore & Google Calendar API & HTTP 클라이언트
+# 2. Firebase Cloud Firestore & Google Calendar/Tasks/Drive API & HTTP 클라이언트
 firebase-admin>=7.0.0
 requests>=2.31.0
 google-api-python-client>=2.100.0
 google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
 
 # 3. 멀티 LLM 공식 SDK (선택 사항: 미설치 시에도 services/llm_client.py 내장 REST 클라이언트로 즉시 동작)
 google-genai>=1.0.0

@@ -76,11 +76,8 @@ class GoogleSheetWatchWorker(PeriodicWorker):
         self._tick_count = 0
 
     def _poll_once(self, worker: PeriodicWorker) -> None:
-        self._tick_count += 1
-        now_str = datetime.now().strftime("%H:%M:%S")
-        self.emit_progress(
-            0,
-            f"구글 시트 응답 폴링 확인 중... (최근 확인: {now_str}, {self._tick_count}회차)",
+        raise NotImplementedError(
+            "Google Sheets API 실시간 폴링 연동이 아직 구현되지 않았습니다."
         )
 
 
@@ -192,6 +189,7 @@ class NotificationCenterTab(QWidget):
         )
         self.edit_sheet_url.setMinimumHeight(34)
         self.edit_sheet_url.setPlaceholderText("https://docs.google.com/spreadsheets/d/...")
+        self.edit_sheet_url.setEnabled(False)
         form.addRow("감시 대상 Google 시트 URL:", self.edit_sheet_url)
 
         poll_row = QHBoxLayout()
@@ -204,25 +202,27 @@ class NotificationCenterTab(QWidget):
         self.spin_poll_interval.setValue(
             int(self.config.get("api_and_integrations", "google_sheet_poll_interval_sec", 30))
         )
+        self.spin_poll_interval.setEnabled(False)
         install_no_scroll_wheel_filter(self.spin_poll_interval)
 
-        self.btn_toggle_sheet = QPushButton("구글 시트 실시간 폴링 감시: OFF (시작)")
-        apply_qss_role(self.btn_toggle_sheet, role="primary", obj_name="BtnToggleSheetWatch")
+        self.btn_toggle_sheet = QPushButton("구글 시트 실시간 감시 (미지원 - 추후 연동 예정)")
+        apply_qss_role(self.btn_toggle_sheet, role="secondary", obj_name="BtnToggleSheetWatch")
         self.btn_toggle_sheet.setMinimumHeight(34)
-        self.btn_toggle_sheet.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_toggle_sheet.setEnabled(False)
+        self.btn_toggle_sheet.setToolTip("Google Sheets API 연동이 아직 구현되지 않았습니다.")
         self.btn_toggle_sheet.clicked.connect(self._toggle_sheet_watch)
-
-        self.btn_sim_row = QPushButton("새 설문지 응답 감지 시뮬레이션")
-        apply_qss_role(self.btn_sim_row, role="secondary", obj_name="BtnSimulateSheetRow")
-        self.btn_sim_row.setMinimumHeight(34)
-        self.btn_sim_row.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_sim_row.clicked.connect(self._simulate_new_row)
 
         poll_row.addWidget(self.spin_poll_interval)
         poll_row.addWidget(self.btn_toggle_sheet)
-        poll_row.addWidget(self.btn_sim_row)
         poll_row.addStretch()
         form.addRow("폴링 감시 주기 및 제어:", poll_row)
+
+        lbl_sheet_notice = QLabel(
+            "안내: Google Sheets API 연동이 아직 구현되지 않아 실시간 폴링 감시 기능이 비활성화되어 있습니다."
+        )
+        apply_qss_role(lbl_sheet_notice, role="mutedText")
+        lbl_sheet_notice.setWordWrap(True)
+        form.addRow("", lbl_sheet_notice)
 
         s_lay.addLayout(form)
         layout.addWidget(self.sheet_group)
@@ -254,8 +254,9 @@ class NotificationCenterTab(QWidget):
         ch_row.setSpacing(16)
         self.chk_target_toast = QCheckBox("데스크톱 토스트 (Desktop Toast)")
         self.chk_target_toast.setChecked(True)
-        self.chk_target_kakao = QCheckBox("PC 카카오톡 매크로 (KakaoTalk)")
-        self.chk_target_kakao.setChecked(True)
+        self.chk_target_kakao = QCheckBox("PC 카카오톡 매크로 (미지원)")
+        self.chk_target_kakao.setChecked(False)
+        self.chk_target_kakao.setToolTip("PC 카카오톡 자동 전송 매크로 기능은 현재 지원되지 않습니다.")
         self.chk_target_webhook = QCheckBox("웹훅 연동 (Webhook)")
         self.chk_target_webhook.setChecked(True)
         ch_row.addWidget(self.chk_target_toast)
@@ -584,16 +585,8 @@ class NotificationCenterTab(QWidget):
             obj_name="ChipToastStatus",
         )
 
-        kakao_room = str(api_sec.get("kakao_target_room_name", "")).strip()
-        kakao_mode = str(api_sec.get("kakao_notify_mode", "toast_only")).strip()
-        if kakao_mode == "pc_macro" or kakao_room:
-            self.chip_kakao.setText(
-                f"KakaoTalk Macro: Connected ({kakao_room or ' 기본방'})"
-            )
-            apply_qss_role(self.chip_kakao, role="badgePrimary", obj_name="ChipKakaoStatus")
-        else:
-            self.chip_kakao.setText("KakaoTalk Macro: Configured")
-            apply_qss_role(self.chip_kakao, role="badgeNeutral", obj_name="ChipKakaoStatus")
+        self.chip_kakao.setText("KakaoTalk Macro: 미지원 (준비 중)")
+        apply_qss_role(self.chip_kakao, role="badgeNeutral", obj_name="ChipKakaoStatus")
 
         webhook_url = str(api_sec.get("kakao_webhook_url", "")).strip()
         if webhook_url:
@@ -607,38 +600,17 @@ class NotificationCenterTab(QWidget):
         if self._watching_sheet:
             self.task_runner.stop_task(self.SHEET_WATCH_KEY)
             self._watching_sheet = False
-            self.btn_toggle_sheet.setText("구글 시트 실시간 폴링 감시: OFF (시작)")
-            apply_qss_role(self.btn_toggle_sheet, role="primary", obj_name="BtnToggleSheetWatch")
+            self.btn_toggle_sheet.setText("구글 시트 실시간 감시 (미지원 - 추후 연동 예정)")
+            apply_qss_role(self.btn_toggle_sheet, role="secondary", obj_name="BtnToggleSheetWatch")
             self._append_log("구글 시트 실시간 감시가 중지되었습니다.")
             return
 
-        url = self.edit_sheet_url.text().strip()
-        interval = float(self.spin_poll_interval.value())
-        self.config.set("api_and_integrations", "google_sheet_url", url)
-        self.config.set(
-            "api_and_integrations", "google_sheet_poll_interval_sec", int(interval)
+        self._append_log("구글 시트 실시간 감시는 현재 미지원 상태입니다. (Google Sheets API 미연동)")
+        QMessageBox.information(
+            self,
+            "미지원 기능 안내",
+            "Google Sheets API 실시간 폴링 연동이 아직 구현되지 않았습니다.",
         )
-        cred = str(self.config.get("api_and_integrations", "google_credentials_path", ""))
-
-        worker = GoogleSheetWatchWorker(
-            sheet_url=url,
-            credentials_path=cred,
-            interval_sec=interval,
-            row_detected_signal=self.new_sheet_row_signal,
-        )
-        self._watching_sheet = True
-        self.btn_toggle_sheet.setText("구글 시트 실시간 폴링 감시: ON (작동 중)")
-        apply_qss_role(self.btn_toggle_sheet, role="success", obj_name="BtnToggleSheetWatch")
-        self._append_log(f"구글 시트 폴링 감시 시작 (주기: {int(interval)}초)")
-        self.task_runner.start_worker(worker, task_key=self.SHEET_WATCH_KEY)
-
-    def _simulate_new_row(self) -> None:
-        sample = {
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "student": "10101 김민준",
-            "type": "교외체험학습 신청서 제출",
-        }
-        self.new_sheet_row_signal.emit(sample)
 
     def _on_new_sheet_row(self, row_data: dict) -> None:
         title = "구글 설문/시트 새 응답"
@@ -662,21 +634,29 @@ class NotificationCenterTab(QWidget):
             return
         title = self.edit_notify_title.text().strip() or "알림"
         body = self.edit_notify_msg.text().strip()
-        selected_channels = []
+        selected_channels: List[str] = []
+        channel_labels: List[str] = []
         if self.chk_target_toast.isChecked():
-            selected_channels.append("Toast")
+            selected_channels.append("toast")
+            channel_labels.append("Toast")
         if self.chk_target_kakao.isChecked():
-            selected_channels.append("KakaoTalk")
+            selected_channels.append("pc_macro")
+            channel_labels.append("KakaoTalk")
         if self.chk_target_webhook.isChecked():
-            selected_channels.append("Webhook")
+            selected_channels.append("webhook")
+            channel_labels.append("Webhook")
 
-        ch_summary = ", ".join(selected_channels) if selected_channels else "기본채널"
+        if not selected_channels:
+            QMessageBox.warning(self, "채널 선택", "발송할 알림 채널을 1개 이상 선택해 주세요.")
+            return
+
+        ch_summary = ", ".join(channel_labels)
         orig_text = self.btn_send_now.text()
         self.btn_send_now.setEnabled(False)
         self.btn_send_now.setText("발송 중...")
 
         def _work(_worker: Any) -> List[str]:
-            return self.notifier.notify(title, body, force_external=True)
+            return self.notifier.notify(title, body, channels=selected_channels)
 
         def _on_result(results: Any) -> None:
             res_list = list(results or [])

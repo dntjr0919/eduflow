@@ -855,7 +855,7 @@ class SettingsTab(QWidget):
         # 교사 프로필 및 학교·NEIS 설정 (멀티 테넌트 계정_교사 연동)
         self.edit_teacher_id = QLineEdit()
         configure_input_widget(self.edit_teacher_id)
-        self.edit_teacher_id.setPlaceholderText("예: 유우석 (계정_교사 ID)")
+        self.edit_teacher_id.setPlaceholderText("예: teacher01 (계정_교사 ID)")
 
         self.edit_teacher_name = QLineEdit()
         configure_input_widget(self.edit_teacher_name)
@@ -1105,9 +1105,6 @@ class SettingsTab(QWidget):
 
         self.main_scroll.setWidget(scroll_container)
         main_layout.addWidget(self.main_scroll)
-
-    def _toggle_card_focus(self, target: str) -> None:
-        pass
 
     # =========================================================================
     # AI 및 프롬프트 설정 실시간 즉시 저장 핸들러 (stateChanged / currentTextChanged / textChanged)
@@ -2379,7 +2376,11 @@ class SettingsTab(QWidget):
         wait_dlg.setMinimumDuration(0)
         wait_dlg.setAutoClose(False)
         wait_dlg.setAutoReset(False)
-        wait_dlg.canceled.connect(lambda: cancel_flag.__setitem__("cancelled", True))
+
+        def _on_canceled() -> None:
+            cancel_flag["cancelled"] = True
+
+        wait_dlg.canceled.connect(_on_canceled)
         wait_dlg.show()
 
         self.btn_gcal_connect_personal.setEnabled(False)
@@ -2395,6 +2396,10 @@ class SettingsTab(QWidget):
 
         def _cleanup_ui() -> None:
             try:
+                wait_dlg.canceled.disconnect(_on_canceled)
+            except Exception:
+                pass
+            try:
                 wait_dlg.close()
                 wait_dlg.deleteLater()
             except Exception:
@@ -2404,11 +2409,12 @@ class SettingsTab(QWidget):
             self._refresh_gcal_status()
 
         def _on_result(res: Any) -> None:
+            was_cancelled = bool(cancel_flag["cancelled"])
             _cleanup_ui()
             ok, msg = res if isinstance(res, tuple) and len(res) >= 2 else (False, str(res))
             if ok:
                 QMessageBox.information(self, "Google 계정 연결 완료", msg)
-            elif cancel_flag["cancelled"]:
+            elif was_cancelled:
                 QMessageBox.information(self, "Google 계정 연결 취소", "Google 계정 인증이 취소되었습니다.")
             else:
                 QMessageBox.warning(self, "Google 계정 연결 실패", msg)

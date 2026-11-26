@@ -15,6 +15,7 @@
 import abc
 import base64
 import json
+import logging
 import re
 import socket
 import urllib.error
@@ -23,6 +24,9 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.config_manager import ConfigManager
+
+logger = logging.getLogger(__name__)
+DEFAULT_OPENROUTER_REFERER = "https://eduflow.local"
 
 
 # =============================================================================
@@ -947,7 +951,7 @@ class MultiLlmClient:
                 model_name=self.model_name,
                 base_url=self.base_url or "https://openrouter.ai/api/v1",
                 extra_headers={
-                    "HTTP-Referer": "https://github.com/dntjr0919/eduflow",
+                    "HTTP-Referer": DEFAULT_OPENROUTER_REFERER,
                     "X-Title": "EduFlow",
                     "User-Agent": "EduFlow-Client/2.0",
                 },
@@ -1209,7 +1213,7 @@ def _list_openrouter_models(api_key: str, base_url: str = "") -> Tuple[List[str]
         url = cleaned if cleaned.endswith("/models") else f"{cleaned}/models"
     headers = {
         "Authorization": f"Bearer {api_key.strip()}",
-        "HTTP-Referer": "https://github.com/dntjr0919/eduflow",
+        "HTTP-Referer": DEFAULT_OPENROUTER_REFERER,
         "X-Title": "EduFlow",
         "User-Agent": "EduFlow-Client/2.0",
     }
@@ -1294,5 +1298,5 @@ def get_available_models(provider: str, api_key: str = "", base_url: str = "") -
     try:
         return fetch_available_models(provider, api_key, base_url)
     except Exception as exc:
-        print(f"[{provider} Model List Error]: {exc}")
+        logger.warning("[%s Model List Error]: %s", provider, exc)
         return [], ""

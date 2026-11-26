@@ -372,7 +372,7 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
                 def json(self) -> Dict[str, Any]:
                     return self._payload
 
-            def _fake_post(url: str, json: Dict[str, Any], timeout: int = 20):
+            def _fake_post(url: str, json: Dict[str, Any], timeout: int = 20, **_kwargs: Any):
                 captured_calls.append({"url": url, "json": json})
                 act = json.get("action")
                 if act == "login":
@@ -383,7 +383,7 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
                     return _FakeResp({"ok": True, "remote_id": "noti_doc_1"})
                 return _FakeResp({"ok": True})
 
-            with patch("requests.post", side_effect=_fake_post):
+            with patch("requests.Session.post", side_effect=_fake_post):
                 ok, user, err = svc.authenticate_account("teacher", "유우석", "pw1234")
                 self.assertTrue(ok, err)
                 self.assertEqual(user["teacher_id"], "유우석")
@@ -566,7 +566,7 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
             return _FakeOkResp()
 
         with patch("services.firestore_sync_service.has_local_credentials", return_value=False):
-            with patch("requests.post", side_effect=_fake_post_with_headers):
+            with patch("requests.Session.post", side_effect=_fake_post_with_headers):
                 rows = svc.fetch_homeroom_students(school_code="7010001", grade=2, class_no=4)
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(captured_kwargs[0]["timeout"], DEFAULT_VERCEL_TIMEOUT)
@@ -889,18 +889,40 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
 
         self.assertIn("signature_mode", NOTICE_OCR_JSON_PROMPT)
 
-        # 1) parse_notice_ai_json: 기본값 single 및 both 인식 검증
+        # 1) parse_notice_ai_json: 기본값(none/parent) 및 4가지 서명 방식 인식 검증
         p_default = parse_notice_ai_json({"title": "일반 안내", "content": "본문", "reply_schema": []})
-        self.assertEqual(p_default["signature_mode"], "single")
+        self.assertEqual(p_default["signature_mode"], "none")
+
+        p_parent = parse_notice_ai_json(
+            {"title": "동의서", "content": "학부모 서명", "requires_reply": True, "reply_schema": []}
+        )
+        self.assertEqual(p_parent["signature_mode"], "parent")
+
+        p_student = parse_notice_ai_json(
+            {"title": "서약서", "content": "학생 서명", "requires_reply": True, "signature_mode": "student", "reply_schema": []}
+        )
+        self.assertEqual(p_student["signature_mode"], "student")
 
         p_both = parse_notice_ai_json(
-            {"title": "서약서", "content": "학생 및 학부모 서명 필요", "signature_mode": "both", "reply_schema": []}
+            {"title": "서약서", "content": "학생 및 학부모 서명 필요", "requires_reply": True, "signature_mode": "both", "reply_schema": []}
         )
         self.assertEqual(p_both["signature_mode"], "both")
 
-        # 2) UI apply_ai_dock_result -> 콤보박스 반영 & _build_notice_payload -> Firestore 저장 검증
+        # 2) UI apply_ai_dock_result -> 콤보박스/체크박스 연동 & _build_notice_payload -> Firestore 저장 검증
         tab = ClassroomToolsTab(TaskRunner())
-        self.assertEqual(tab.combo_notice_signature_mode.currentData(), "single")
+        self.assertEqual(tab.combo_notice_signature_mode.currentData(), "parent")
+
+        # 회신·서명 필요 체크 해제 시 드롭다운이 자동으로 'none'으로 전환되는지 검증
+        tab.chk_notice_requires_reply.setChecked(False)
+        self.assertEqual(tab.combo_notice_signature_mode.currentData(), "none")
+        self.assertEqual(tab._build_notice_payload(is_published=False)["signature_mode"], "none")
+
+        # 드롭다운에서 'student' 선택 시 회신·서명 필요 체크가 자동으로 켜지는지 검증
+        student_idx = tab.combo_notice_signature_mode.findData("student")
+        self.assertGreaterEqual(student_idx, 0)
+        tab.combo_notice_signature_mode.setCurrentIndex(student_idx)
+        self.assertTrue(tab.chk_notice_requires_reply.isChecked())
+        self.assertEqual(tab._build_notice_payload(is_published=False)["signature_mode"], "student")
 
         tab.apply_ai_dock_result(
             {
@@ -924,6 +946,114 @@ class TestClassroomToolsAndTimetable(unittest.TestCase):
         self.assertEqual(rid, "notice_sig_both_1")
         saved = self.fake_fs.cols["가정통신문_목록"]["notice_sig_both_1"]
         self.assertEqual(saved["signature_mode"], "both")
+
+    def test_vercel_upload_timeout_applied_consistently(self) -> None:
+        from unittest.mock import patch
+        from services.firestore_sync_service import DEFAULT_VERCEL_API_URL, DEFAULT_VERCEL_UPLOAD_TIMEOUT
+
+        self.cfg.update_section("api_and_integrations", {"google_credentials_path": "", "google_apps_script_url": ""})
+        svc = FirestoreSyncService(config=self.cfg)
+        captured: List[Dict[str, Any]] = []
+
+        class _FakeUploadResp:
+            ok = True
+            status_code = 200
+
+            def json(self) -> Dict[str, Any]:
+                return {"ok": True, "file_id": "f123", "download_url": "https://drive.google.com/uc?id=f123"}
+
+        def _fake_post(url: str, json: Dict[str, Any], headers: Dict[str, str] = None, timeout: Any = None):
+            captured.append({"url": url, "action": json.get("action"), "timeout": timeout})
+            return _FakeUploadResp()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sample_pdf = Path(tmpdir) / "sample.pdf"
+            sample_pdf.write_bytes(b"%PDF-1.4\n")
+            with patch("services.firestore_sync_service.has_local_credentials", return_value=False):
+                with patch("services.google_calendar_service.GoogleCalendarService.get_connected_accounts", return_value=[]):
+                    with patch("requests.Session.post", side_effect=_fake_post):
+                        res1 = svc.upload_file("sample.pdf", file_bytes=b"hello")
+                        self.assertTrue(res1["ok"])
+                        res2 = svc.upload_notice_attachment(str(sample_pdf))
+                        self.assertTrue(res2["ok"])
+
+        self.assertEqual(len(captured), 2)
+        for item in captured:
+            self.assertEqual(item["url"], DEFAULT_VERCEL_API_URL)
+            self.assertEqual(item["action"], "upload_file")
+            self.assertEqual(item["timeout"], DEFAULT_VERCEL_UPLOAD_TIMEOUT)
+            self.assertGreaterEqual(item["timeout"][0], 10)
+            self.assertGreaterEqual(item["timeout"][1], 60)
+
+    def test_direct_admin_tenant_fields_and_notifications_schema(self) -> None:
+        orig_tp = dict(self.cfg.get_section("teacher_profile") or {})
+        try:
+            self.cfg.update_section(
+                "teacher_profile",
+                {
+                    "school_code": "7010001",
+                    "school_name": "테스트고등학교",
+                    "teacher_id": "t_hong",
+                    "name": "홍길동",
+                    "grade": 2,
+                    "class_no": 4,
+                },
+            )
+            svc = FirestoreSyncService(db=self.sync_svc.db, config=self.cfg, firestore_client=self.fake_fs)
+
+            # 1) publish_mobile_notice -> teacher_id 및 테넌트 필드 보완 검증
+            ok_n, nid = svc.publish_mobile_notice({"remote_id": "n_t1", "title": "가정통신문", "content": "본문"})
+            self.assertTrue(ok_n)
+            n_doc = self.fake_fs.cols["가정통신문_목록"][nid]
+            self.assertEqual(n_doc["school_code"], "7010001")
+            self.assertEqual(n_doc["school_name"], "테스트고등학교")
+            self.assertEqual(n_doc["teacher_id"], "t_hong")
+            self.assertEqual(n_doc["grade"], 2)
+            self.assertEqual(n_doc["class_no"], 4)
+
+            # 2) send_class_notification -> target_role, read_by, student_id, teacher_id 검증
+            ok_noti, noti_id = svc.send_class_notification(title="공지", message="내용")
+            self.assertTrue(ok_noti)
+            noti_doc = self.fake_fs.cols["Notifications"][noti_id]
+            self.assertEqual(noti_doc["school_code"], "7010001")
+            self.assertEqual(noti_doc["school_name"], "테스트고등학교")
+            self.assertEqual(noti_doc["teacher_id"], "t_hong")
+            self.assertEqual(noti_doc["grade"], 2)
+            self.assertEqual(noti_doc["class_no"], 4)
+            self.assertEqual(noti_doc["target_role"], "all")
+            self.assertEqual(noti_doc["read_by"], [])
+            self.assertEqual(noti_doc["student_id"], "")
+
+            # 3) upsert_board_notice -> grade, class_no, teacher_id 보완 검증
+            ok_b, bid = svc.upsert_board_notice({"remote_id": "b_t1", "title": "학급 공지", "content": "준비물"})
+            self.assertTrue(ok_b)
+            b_doc = self.fake_fs.cols["학급_공지게시판"][bid]
+            self.assertEqual(b_doc["school_code"], "7010001")
+            self.assertEqual(b_doc["school_name"], "테스트고등학교")
+            self.assertEqual(b_doc["teacher_id"], "t_hong")
+            self.assertEqual(b_doc["grade"], 2)
+            self.assertEqual(b_doc["class_no"], 4)
+
+            # 4) upsert_schedules & upsert_collection_rows(학급회비/출결) -> 테넌트 필드 보완 검증
+            ok_s = svc.upsert_schedules([{"title": "모의고사", "start_date": "2026-11-27"}])
+            self.assertTrue(ok_s)
+            sch_doc = next(iter(self.fake_fs.cols["Schedules"].values()))
+            self.assertEqual(sch_doc["school_code"], "7010001")
+            self.assertEqual(sch_doc["school_name"], "테스트고등학교")
+            self.assertEqual(sch_doc["teacher_id"], "t_hong")
+            self.assertEqual(sch_doc["grade"], 2)
+            self.assertEqual(sch_doc["class_no"], 4)
+
+            res_b = svc.upsert_collection_rows("학급회비", [{"remote_id": "fee_1", "item": "간식", "amount": 10000}])
+            self.assertTrue(res_b["ok"])
+            fee_doc = self.fake_fs.cols["학급회비"]["fee_1"]
+            self.assertEqual(fee_doc["school_code"], "7010001")
+            self.assertEqual(fee_doc["school_name"], "테스트고등학교")
+            self.assertEqual(fee_doc["teacher_id"], "t_hong")
+            self.assertEqual(fee_doc["grade"], 2)
+            self.assertEqual(fee_doc["class_no"], 4)
+        finally:
+            self.cfg.update_section("teacher_profile", orig_tp)
 
 
 if __name__ == "__main__":

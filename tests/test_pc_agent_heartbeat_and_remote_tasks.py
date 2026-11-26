@@ -121,7 +121,7 @@ class TestPcAgentHeartbeatAndRemoteTasks(unittest.TestCase):
                 resp.json.return_value = {"ok": True}
             return resp
 
-        with patch("requests.post", side_effect=_fake_post):
+        with patch("requests.Session.post", side_effect=_fake_post):
             self.assertTrue(svc.update_pc_agent_status(online=True, hostname="TEACHER-PC", app_version="2.0"))
             pending = svc.fetch_pending_remote_tasks()
             self.assertEqual(len(pending), 1)

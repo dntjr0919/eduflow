@@ -404,7 +404,6 @@ class GradeMaterialTab(QWidget):
         self.db = DatabaseManager()
         self._focused_card: Optional[str] = None
         self._updating_table: bool = False
-        self._loading_material_meta: bool = False
         self._editing_progress_id: Optional[int] = None
         self._comcigan_rows: List[Dict[str, Any]] = []
         self._eval_columns: List[Dict[str, str]] = []
@@ -777,7 +776,6 @@ class GradeMaterialTab(QWidget):
         tree_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         tree_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.tree_materials.itemDoubleClicked.connect(self._on_material_item_double_clicked)
-        self.tree_materials.currentItemChanged.connect(self._on_material_selection_changed)
         r_lay.addWidget(self.tree_materials, stretch=1)
 
         # 4) 하단 실용 액션 버튼 바 (2행 3열 배치로 좁은 폭에서도 글자 잘림 방지)
@@ -1471,8 +1469,6 @@ class GradeMaterialTab(QWidget):
             self.tree_materials.setCurrentItem(item_to_select)
         elif self.tree_materials.topLevelItemCount() > 0:
             self.tree_materials.setCurrentItem(self.tree_materials.topLevelItem(0))
-        else:
-            self._on_material_selection_changed(None, None)
 
     def _on_unit_filter_changed(self, text: str) -> None:
         self._populate_unit_tree(filter_title=text)
@@ -1693,21 +1689,6 @@ class GradeMaterialTab(QWidget):
         p_lay.addWidget(self.table_progress, stretch=1)
 
         return card
-
-    def _on_material_selection_changed(
-        self,
-        current: Optional[QTreeWidgetItem],
-        _previous: Optional[QTreeWidgetItem],
-    ) -> None:
-        self._loading_material_meta = True
-        try:
-            if current is None:
-                return
-        finally:
-            self._loading_material_meta = False
-
-    def _on_save_material_progress(self) -> None:
-        return
 
     def _get_selected_progress_course_meta(self) -> Dict[str, str]:
         if getattr(self, "combo_progress_course", None) is not None:

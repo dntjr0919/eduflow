@@ -168,27 +168,6 @@ def apply_qss_role(widget: QWidget, role: str = "", obj_name: str = "") -> None:
         st.polish(widget)
 
 
-SAMPLE_ROSTER: List[Tuple[str, str]] = [
-    ("10101", "강민서"),
-    ("10102", "김도윤"),
-    ("10103", "김하은"),
-    ("10104", "박시우"),
-    ("10105", "서준우"),
-    ("10106", "안채원"),
-    ("10107", "이서진"),
-    ("10108", "윤지민"),
-    ("10109", "이지훈"),
-    ("10110", "장하율"),
-    ("10111", "정예준"),
-    ("10112", "조유진"),
-    ("10113", "최민혁"),
-    ("10114", "한서아"),
-    ("10115", "배수아"),
-    ("10116", "송우진"),
-    ("10117", "곽시은"),
-    ("10118", "노현우"),
-]
-
 DUTY_AREAS: List[str] = [
     "칠판 및 교탁 정돈",
     "분리수거 및 쓰레기통",
@@ -1641,7 +1620,7 @@ class ClassroomToolsTab(QWidget):
         students = self.db.get_active_homeroom_students()
         if students:
             return [(str(s["student_id"]), str(s["name"])) for s in students]
-        return list(SAMPLE_ROSTER)
+        return []
 
     def _create_status_pill(
         self, title_text: str, value_text: str, badge_text: str, badge_role: str
@@ -2114,13 +2093,19 @@ class ClassroomToolsTab(QWidget):
         self.chk_notice_requires_reply = QCheckBox("회신·서명 필요")
         self.chk_notice_requires_reply.setChecked(True)
         self.combo_notice_signature_mode = QComboBox()
-        self.combo_notice_signature_mode.addItem("서명 1칸 (기본)", "single")
+        self.combo_notice_signature_mode.addItem("서명 없음 (열람용)", "none")
+        self.combo_notice_signature_mode.addItem("서명 1칸 (학생만)", "student")
+        self.combo_notice_signature_mode.addItem("서명 1칸 (학부모만)", "parent")
         self.combo_notice_signature_mode.addItem("서명 2칸 (학생·학부모)", "both")
-        self.combo_notice_signature_mode.setFixedWidth(160)
+        self.combo_notice_signature_mode.setCurrentIndex(2)
+        self.combo_notice_signature_mode.setFixedWidth(180)
         self.combo_notice_signature_mode.setToolTip(
-            "서명 방식을 선택합니다. 학생·학부모 서명이 각각 필요하면 '서명 2칸 (학생·학부모)'을 선택하세요."
+            "서명 방식을 선택합니다. 회신·서명이 필요 없으면 '서명 없음 (열람용)'이 선택됩니다."
         )
         install_no_scroll_wheel_filter(self.combo_notice_signature_mode)
+        self._last_active_signature_mode = "parent"
+        self.chk_notice_requires_reply.toggled.connect(self._on_notice_requires_reply_toggled)
+        self.combo_notice_signature_mode.currentIndexChanged.connect(self._on_notice_signature_mode_changed)
         notice_top.addWidget(self.edit_notice_title, stretch=1)
         notice_top.addWidget(self.combo_notice_category)
         notice_top.addWidget(self.edit_notice_due)
@@ -2625,7 +2610,7 @@ class ClassroomToolsTab(QWidget):
 
         self.edit_teacher_login_id = QLineEdit()
         self.edit_teacher_login_id.setMinimumHeight(38)
-        self.edit_teacher_login_id.setPlaceholderText("교사 로그인 ID (예: 유우석)")
+        self.edit_teacher_login_id.setPlaceholderText("교사 로그인 ID (예: teacher01)")
 
         pw_row = QHBoxLayout()
         pw_row.setSpacing(6)
@@ -3222,7 +3207,7 @@ class ClassroomToolsTab(QWidget):
         hr = self.db.get_active_homeroom_group()
         if hr and str(hr.get("group_name", "")).strip():
             return str(hr["group_name"]).strip()
-        return "예시 학급"
+        return "미등록 학급"
 
     def _refresh_roster_dependent_views(self) -> None:
         if self._logged_in_teacher and self._firebase_roster:
@@ -3485,10 +3470,17 @@ class ClassroomToolsTab(QWidget):
             self.txt_notice_content.setPlainText(notice_text)
         if hasattr(self, "lbl_notice_content_state"):
             self.lbl_notice_content_state.setText("AI 정리 완료")
-        self.chk_notice_requires_reply.setChecked(bool(parsed.get("requires_reply")))
+        requires_reply = bool(parsed.get("requires_reply"))
+        self.chk_notice_requires_reply.setChecked(requires_reply)
         if hasattr(self, "combo_notice_signature_mode"):
-            sig_mode = str(parsed.get("signature_mode") or "single").strip().lower()
+            sig_mode = str(parsed.get("signature_mode") or ("parent" if requires_reply else "none")).strip().lower()
+            if sig_mode == "single":
+                sig_mode = "parent"
+            if not requires_reply and sig_mode not in ("none", "student", "parent", "both"):
+                sig_mode = "none"
             sig_idx = self.combo_notice_signature_mode.findData(sig_mode)
+            if sig_idx < 0:
+                sig_idx = self.combo_notice_signature_mode.findData("parent" if requires_reply else "none")
             self.combo_notice_signature_mode.setCurrentIndex(sig_idx if sig_idx >= 0 else 0)
         self._populate_reply_schema_table(parsed.get("reply_schema") or [])
         if parsed.get("attachment_url"):
@@ -3993,6 +3985,42 @@ class ClassroomToolsTab(QWidget):
             on_error=lambda err: QMessageBox.warning(self, "저장 실패", str(err or "").splitlines()[0]),
         )
 
+    def _on_notice_requires_reply_toggled(self, checked: bool) -> None:
+        if not hasattr(self, "combo_notice_signature_mode"):
+            return
+        self.combo_notice_signature_mode.blockSignals(True)
+        try:
+            if not checked:
+                cur_mode = str(self.combo_notice_signature_mode.currentData() or "").strip().lower()
+                if cur_mode in ("student", "parent", "both"):
+                    self._last_active_signature_mode = cur_mode
+                idx = self.combo_notice_signature_mode.findData("none")
+                if idx >= 0:
+                    self.combo_notice_signature_mode.setCurrentIndex(idx)
+            else:
+                cur_mode = str(self.combo_notice_signature_mode.currentData() or "none").strip().lower()
+                if cur_mode == "none":
+                    target_mode = getattr(self, "_last_active_signature_mode", "parent")
+                    if target_mode not in ("student", "parent", "both"):
+                        target_mode = "parent"
+                    idx = self.combo_notice_signature_mode.findData(target_mode)
+                    if idx >= 0:
+                        self.combo_notice_signature_mode.setCurrentIndex(idx)
+        finally:
+            self.combo_notice_signature_mode.blockSignals(False)
+
+    def _on_notice_signature_mode_changed(self, _index: int) -> None:
+        if not hasattr(self, "chk_notice_requires_reply") or not hasattr(self, "combo_notice_signature_mode"):
+            return
+        mode = str(self.combo_notice_signature_mode.currentData() or "none").strip().lower()
+        if mode in ("student", "parent", "both"):
+            self._last_active_signature_mode = mode
+        self.chk_notice_requires_reply.blockSignals(True)
+        try:
+            self.chk_notice_requires_reply.setChecked(mode != "none")
+        finally:
+            self.chk_notice_requires_reply.blockSignals(False)
+
     def _build_notice_payload(self, *, is_published: bool) -> Dict[str, Any]:
         meta = self._teacher_meta()
         reply_schema = self._collect_reply_schema_from_table()
@@ -4003,17 +4031,23 @@ class ClassroomToolsTab(QWidget):
         ]
         target_grade = int(self.spin_notice_target_grade.value())
         target_class = int(self.spin_notice_target_class.value())
+        requires_reply = bool(self.chk_notice_requires_reply.isChecked())
+        sig_mode = (
+            str(self.combo_notice_signature_mode.currentData() or ("parent" if requires_reply else "none")).strip().lower()
+            if hasattr(self, "combo_notice_signature_mode")
+            else ("parent" if requires_reply else "none")
+        )
+        if not requires_reply:
+            sig_mode = "none"
+        elif sig_mode == "none":
+            sig_mode = "parent"
         return {
             "title": self.edit_notice_title.text().strip(),
             "category": self.combo_notice_category.currentText().strip() or "가정통신문",
             "content": self.txt_notice_content.toPlainText().strip(),
             "due_date": self.edit_notice_due.text().strip(),
-            "requires_reply": bool(self.chk_notice_requires_reply.isChecked()),
-            "signature_mode": str(
-                self.combo_notice_signature_mode.currentData() or "single"
-                if hasattr(self, "combo_notice_signature_mode")
-                else "single"
-            ),
+            "requires_reply": requires_reply,
+            "signature_mode": sig_mode,
             "reply_schema": reply_schema,
             "reply_schema_json": json.dumps(reply_schema, ensure_ascii=False),
             "reply_fields": reply_fields,
@@ -5391,8 +5425,8 @@ class ClassroomToolsTab(QWidget):
                 name = str(s.get("name", "")).strip()
                 num = _infer_student_number(s.get("number"), sid, idx)
                 out.append({"number": num, "student_id": sid, "name": name})
-        else:
-            for idx, (sid, name) in enumerate(SAMPLE_ROSTER, start=1):
+        elif self._firebase_roster:
+            for idx, (sid, name) in enumerate(self._firebase_roster, start=1):
                 num = _infer_student_number(None, sid, idx)
                 out.append({"number": num, "student_id": sid, "name": name})
         out.sort(key=lambda item: (int(item["number"]), str(item["student_id"])))
@@ -5479,6 +5513,14 @@ class ClassroomToolsTab(QWidget):
     def _update_duty_preview(self) -> None:
         """현재 시작 번호와 결석 제외·재배정 명단을 바탕으로 청소(6명)·게시판(2명) 번호순 명단을 갱신합니다."""
         students = self._get_ordered_duty_students()
+        if not students:
+            self._last_duty_plan = {"cleaning": [], "bulletin": []}
+            self._refresh_exception_badge()
+            self.table_cleaning.setRowCount(0)
+            self.txt_cleaning_result.setPlainText(
+                "등록된 담임 학급 명렬표가 없습니다. 환경설정 탭에서 명렬표를 등록하거나 교사 계정으로 로그인해 주세요."
+            )
+            return
         plan = compute_weekly_duty_rotation(
             students=students,
             cleaning_start_num=self.spin_clean_start.value(),
@@ -5892,65 +5934,6 @@ class ClassroomToolsTab(QWidget):
             self._save_current_seating_state()
             self._refresh_seating_cells()
 
-    def _on_randomize_seats(self, initial: bool = False) -> None:
-        if initial:
-            self._load_seating_into_ui()
-            return
-
-        roster = list(self._get_active_roster())
-        desk_count = self._active_desk_count(len(roster))
-        student_slots = min(len(roster), desk_count)
-        self._selected_seat_idx = None
-
-        ordered_students: List[Tuple[str, str]] = []
-        care_set = set(self._front_care_ids)
-        if self.chk_front_care.isChecked() and care_set and student_slots > 0:
-            seen_sids: Set[str] = set()
-            uniq_care: List[Tuple[str, str]] = []
-            for stu in roster[:desk_count]:
-                if stu[0] in care_set and stu[0] not in seen_sids:
-                    uniq_care.append(stu)
-                    seen_sids.add(stu[0])
-            others = [stu for stu in roster[:desk_count] if stu[0] not in seen_sids]
-            random.shuffle(uniq_care)
-            random.shuffle(others)
-
-            front_limit = min(12, student_slots)
-            assigned: List[Optional[Tuple[str, str]]] = [None] * student_slots
-            if len(uniq_care) <= front_limit:
-                front_positions = random.sample(range(front_limit), len(uniq_care))
-                for pos, stu in zip(front_positions, uniq_care):
-                    assigned[pos] = stu
-                rem_iter = iter(others)
-                for idx in range(student_slots):
-                    if assigned[idx] is None:
-                        assigned[idx] = next(rem_iter, ("-", "공석"))
-            else:
-                for idx in range(front_limit):
-                    assigned[idx] = uniq_care[idx]
-                rest_pool = uniq_care[front_limit:] + others
-                random.shuffle(rest_pool)
-                for offset, idx in enumerate(range(front_limit, student_slots)):
-                    assigned[idx] = rest_pool[offset] if offset < len(rest_pool) else ("-", "공석")
-
-            ordered_students = [item if item is not None else ("-", "공석") for item in assigned]
-        else:
-            shuffled = list(roster[:desk_count])
-            random.shuffle(shuffled)
-            ordered_students = shuffled
-
-        self._current_seating = []
-        for idx in range(desk_count):
-            desk_code = f"D-{idx + 1:02d}"
-            if idx < len(ordered_students):
-                sid, name = ordered_students[idx]
-                self._current_seating.append((desk_code, sid, name))
-            else:
-                self._current_seating.append((desk_code, "-", "공석"))
-
-        self._refresh_seating_cells()
-        self._save_current_seating_state()
-
     def _on_export_seating_chart(self) -> None:
         if not self._current_seating:
             self._load_seating_into_ui()
@@ -6092,30 +6075,6 @@ class ClassroomToolsTab(QWidget):
         suffix = f" ({clean_kw} 우수)"
         self.edit_observation.setText(f"{cur}{suffix}".strip())
         self.edit_observation.setFocus()
-
-    def _on_add_observation_log(self) -> None:
-        note = self.edit_observation.text().strip()
-        if not note:
-            QMessageBox.warning(self, "입력 확인", "기록할 학생 관찰 또는 상담 내용을 입력해 주세요.")
-            return
-
-        stu_data = self.combo_counsel_student.currentData()
-        if isinstance(stu_data, tuple) and len(stu_data) == 2:
-            sid, name = str(stu_data[0]), str(stu_data[1])
-        else:
-            raw_txt = self.combo_counsel_student.currentText().strip()
-            parts = raw_txt.split(" ", 1)
-            sid = parts[0] if parts else ""
-            name = parts[1] if len(parts) > 1 else (raw_txt or "미지정 학생")
-
-        new_id = self.db.add_observation_log(
-            self._current_homeroom_key(),
-            student_id=sid,
-            student_name=name,
-            content=note,
-        )
-        self.edit_observation.clear()
-        self._refresh_observation_view(select_log_id=new_id)
 
     def _on_edit_observation_item(self, item: QListWidgetItem) -> None:
         data = item.data(Qt.ItemDataRole.UserRole)

@@ -157,7 +157,7 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
             self.assertTrue(svc_vercel.is_vercel_api_mode())
             fake_resp = MagicMock(ok=True, status_code=200)
             fake_resp.json.return_value = {"ok": True, "count": 1}
-            with patch("requests.post", return_value=fake_resp) as mock_post:
+            with patch("requests.Session.post", return_value=fake_resp) as mock_post:
                 ok_vercel = svc_vercel.sync_subject_rosters_batch(roster_input)
                 self.assertTrue(ok_vercel)
                 mock_post.assert_called_once()
@@ -223,13 +223,13 @@ class TestSubjectRosterAndProgressSync(unittest.TestCase):
             svc_vercel = FirestoreSyncService(db=self.db, config=self.cfg)
             fake_resp_up = MagicMock(ok=True, status_code=200)
             fake_resp_up.json.return_value = {"ok": True}
-            with patch("requests.post", return_value=fake_resp_up) as mock_post_up:
+            with patch("requests.Session.post", return_value=fake_resp_up) as mock_post_up:
                 self.assertTrue(svc_vercel.sync_lesson_progress_batch(progress_items))
                 self.assertEqual(mock_post_up.call_args.kwargs["json"]["action"], "sync_lesson_progress_batch")
 
             fake_resp_get = MagicMock(ok=True, status_code=200)
             fake_resp_get.json.return_value = {"ok": True, "items": [written]}
-            with patch("requests.post", return_value=fake_resp_get) as mock_post_get:
+            with patch("requests.Session.post", return_value=fake_resp_get) as mock_post_get:
                 fetched_vercel = svc_vercel.fetch_lesson_progress(roster_key="subject_1", subject="정보")
                 self.assertEqual(len(fetched_vercel), 1)
                 self.assertEqual(fetched_vercel[0]["content"], "이진수 변환 실습")
