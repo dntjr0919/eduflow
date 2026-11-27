@@ -5357,11 +5357,11 @@ class AiExecutionDock(QFrame):
 
         self._active_pw_worker = worker
         self._pw_single_batches_applied = False
-        self.btn_pw_start.setEnabled(False)
-        self.btn_pw_stop.setEnabled(True)
+        self._set_pw_running_state(True)
+        self._sync_chat_send_button_state()
         self.progress_dock.setValue(0)
         self.lbl_dock_progress_meta.setText(f"[{task_label}] Playwright 브라우저 실행 중...")
-        self._append_pw_inline_card(f"[{task_label}] Playwright 브라우저 실행 중...")
+        self._ensure_pw_inline_card(f"[{task_label}] Playwright 브라우저 실행 중...", needs_login=False)
 
         delivered_payload: Dict[str, Any] = {}
         delivered_flag = {"sent": False}
@@ -5400,16 +5400,20 @@ class AiExecutionDock(QFrame):
                 on_result(merged)
 
         def _handle_error(err: str) -> None:
-            self._on_pw_worker_error(err)
+            self._on_pw_error(err)
             if callable(on_error):
                 on_error(err)
+
+        def _handle_finished() -> None:
+            self._on_pw_finished()
+            self._sync_chat_send_button_state()
 
         self.task_runner.start_worker(
             worker,
             task_key=self.TASK_DOCK_PLAYWRIGHT,
             on_result=_handle_result,
             on_error=_handle_error,
-            on_finished=self._on_pw_worker_finished,
+            on_finished=_handle_finished,
         )
         return True
 

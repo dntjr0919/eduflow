@@ -465,6 +465,99 @@ class TestNoticePdfMapperAndReset(unittest.TestCase):
             self.assertEqual(dlg.get_field_map()[0]["key"], "grade")
             dlg.close()
 
+    def test_real_ai_dock_run_playwright_single_prompt_no_attribute_error(self) -> None:
+        import types
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+        from PyQt6.QtWidgets import QApplication, QPushButton
+        from ui.components.ai_execution_dock import AiExecutionDock
+        from ui.dialogs.notice_pdf_mapper_dialog import NoticePdfMapperDialog
+
+        _ = QApplication.instance() or QApplication([])
+
+        captured_call: dict = {}
+
+        def _fake_start_worker(worker, **kwargs):
+            captured_call["worker"] = worker
+            captured_call.update(kwargs)
+            return worker
+
+        runner = MagicMock()
+        runner.start_worker.side_effect = _fake_start_worker
+        noop = lambda *args, **kwargs: None
+
+        dock = SimpleNamespace(
+            TASK_DOCK_PLAYWRIGHT=AiExecutionDock.TASK_DOCK_PLAYWRIGHT,
+            task_runner=runner,
+            _active_pw_worker=None,
+            _pw_provider="gemini",
+            _pw_single_batches_applied=False,
+            _pw_next_stage_pending=False,
+            _pw_waiting_collect=False,
+            _pw_inline_card=None,
+            btn_pw_stop=QPushButton("작업 중지"),
+            btn_pw_collect_next=QPushButton("응답 회수"),
+            btn_pw_confirm_login=QPushButton("로그인 완료"),
+            btn_send=QPushButton("전송"),
+            combo_web_provider=MagicMock(),
+            edit_chat_custom_url=MagicMock(),
+            combo_pw_exec_mode=MagicMock(),
+            chk_pw_keep_login=MagicMock(),
+            chk_pw_temp_chat=MagicMock(),
+            progress_dock=MagicMock(),
+            lbl_dock_progress_meta=MagicMock(),
+            current_mode_index=lambda: 2,
+            _ensure_pw_inline_card=MagicMock(),
+            _remove_pw_inline_card=MagicMock(),
+            _sync_body_scroll_visibility=MagicMock(),
+            _sync_chat_send_button_state=MagicMock(),
+            _on_dock_worker_progress=noop,
+            _on_pw_waiting_for_login=noop,
+            _on_pw_waiting_for_collect=noop,
+            _on_pw_waiting_for_click=noop,
+        )
+        dock.combo_pw_exec_mode.currentData.return_value = "auto"
+        dock.chk_pw_keep_login.isChecked.return_value = False
+        dock.chk_pw_temp_chat.isChecked.return_value = False
+        for method_name in (
+            "run_playwright_single_prompt",
+            "_set_pw_running_state",
+            "_on_pw_error",
+            "_on_pw_finished",
+        ):
+            setattr(dock, method_name, types.MethodType(getattr(AiExecutionDock, method_name), dock))
+
+        with tempfile.TemporaryDirectory() as td:
+            src_pdf = Path(td) / "pw_real_dock.pdf"
+            _make_sample_pdf(src_pdf, pages=1)
+            dlg = NoticePdfMapperDialog(
+                pdf_path=str(src_pdf),
+                reply_schema=[],
+                task_runner=None,
+                ai_dock=dock,
+            )
+            try:
+                with patch("ui.dialogs.notice_pdf_mapper_dialog.QMessageBox.information"):
+                    dlg._on_ai_vision_mapping()
+
+                runner.start_worker.assert_called_once()
+                self.assertTrue(dock.btn_pw_stop.isEnabled())
+                self.assertFalse(dock.btn_pw_stop.isHidden())
+
+                captured_call["on_result"](
+                    {
+                        "raw_response": '[{"index": 1, "page": 1, "x_ratio": 0.15, "y_ratio": 0.22, "w_ratio": 0.05, "h_ratio": 0.03}]'
+                    }
+                )
+                captured_call["on_finished"]()
+
+                self.assertIsNone(dock._active_pw_worker)
+                self.assertFalse(dock.btn_pw_stop.isEnabled())
+                self.assertEqual(len(dlg.get_field_map()), 1)
+                self.assertEqual(dlg.get_field_map()[0]["key"], "grade")
+            finally:
+                dlg.close()
+
 
 if __name__ == "__main__":
     unittest.main()
